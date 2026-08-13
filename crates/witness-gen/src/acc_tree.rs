@@ -1,20 +1,21 @@
-//! Host-side Poseidon Merkle tree.
+//! Host-side accumulator Merkle tree.
 //!
 //! Maintains a sparse tree in memory: only levels 0..dense_depth are stored,
 //! with zero_hash chaining for the remaining levels up to the full depth.
 //! Supports incremental leaf updates and Merkle proof extraction.
 
 use rayon::prelude::*;
-use zkasper_common::poseidon::{poseidon_leaf, poseidon_pair};
+use zkasper_common::acc::{self, Digest, ZERO};
+use zkasper_common::types::AccMultiProof;
 use zkasper_common::types::ValidatorData;
 
-/// Sparse Poseidon Merkle tree stored level-by-level.
+/// Sparse accumulator Merkle tree stored level-by-level.
 ///
 /// Only the dense portion (levels 0..dense_depth) is allocated.
 /// The full tree root at `depth` is computed by chaining the dense root
 /// through precomputed zero hashes for levels dense_depth..depth.
-pub struct PoseidonTree {
-    /// Full tree depth (e.g. 22 for POSEIDON_TREE_DEPTH).
+pub struct AccTree {
+    /// Full tree depth (e.g. 22 for ACC_TREE_DEPTH).
     pub(crate) depth: u32,
     /// Dense depth: only levels 0..dense_depth are stored.
     /// `dense_depth = ceil(log2(num_leaves))`, where num_leaves is rounded
@@ -22,10 +23,10 @@ pub struct PoseidonTree {
     pub(crate) dense_depth: u32,
     /// Nodes stored level-by-level. Level 0 = leaves, level `dense_depth` = dense root.
     /// Level d has `2^(dense_depth - d)` nodes.
-    pub(crate) levels: Vec<Vec<[u8; 32]>>,
-    /// Precomputed Poseidon zero hashes for each level 0..=depth.
-    /// zero_hashes[0] = [0;32], zero_hashes[d] = poseidon_pair(zh[d-1], zh[d-1])
-    pub(crate) zero_hashes: Vec<[u8; 32]>,
+    pub(crate) levels: Vec<Vec<Digest>>,
+    /// Precomputed accumulator zero hashes for each level 0..=depth.
+    /// zero_hashes[0] = [0;32], zero_hashes[d] = acc::compress(zh[d-1], zh[d-1])
+    pub(crate) zero_hashes: Vec<Digest>,
 }
 
 /// Compute the smallest d such that 2^d >= n. Returns 0 for n <= 1.
@@ -36,35 +37,35 @@ fn ceil_log2(n: usize) -> u32 {
     (n as u64).next_power_of_two().trailing_zeros()
 }
 
-/// Precompute Poseidon zero hashes for levels 0..=depth.
-fn compute_poseidon_zero_hashes(depth: u32) -> Vec<[u8; 32]> {
-    let mut zh = vec![[0u8; 32]; (depth + 1) as usize];
+/// Precompute accumulator zero hashes for levels 0..=depth.
+fn compute_zero_hashes(depth: u32) -> Vec<Digest> {
+    let mut zh = vec![ZERO; (depth + 1) as usize];
     for d in 1..=depth as usize {
-        zh[d] = poseidon_pair(&zh[d - 1], &zh[d - 1]);
+        zh[d] = acc::compress(&zh[d - 1], &zh[d - 1]);
     }
     zh
 }
 
-impl PoseidonTree {
+impl AccTree {
     /// Build the tree from a list of validators at a given epoch.
     ///
     /// Only allocates the dense portion (2^ceil(log2(n)) leaves).
     /// The full root at `depth` is computed via zero_hash chaining.
     pub fn build(validators: &[ValidatorData], epoch: u64, depth: u32) -> Self {
-        let zero_hashes = compute_poseidon_zero_hashes(depth);
+        let zero_hashes = compute_zero_hashes(depth);
 
         let dense_depth = ceil_log2(validators.len()).max(1).min(depth);
         let dense_capacity = 1usize << dense_depth;
 
         // Compute leaves in parallel (only the dense portion)
-        let mut leaves: Vec<[u8; 32]> = validators
+        let mut leaves: Vec<Digest> = validators
             .par_iter()
             .map(|v| {
                 let active_balance = v.active_effective_balance(epoch);
-                poseidon_leaf(&v.pubkey.0, active_balance)
+                acc::leaf(&v.pubkey.0, active_balance)
             })
             .collect();
-        leaves.resize(dense_capacity, [0u8; 32]);
+        leaves.resize(dense_capacity, ZERO);
 
         // Build levels bottom-up (0..dense_depth), parallelizing large levels
         let mut levels = Vec::with_capacity((dense_depth + 1) as usize);
@@ -72,9 +73,9 @@ impl PoseidonTree {
 
         for d in 0..dense_depth as usize {
             let prev = &levels[d];
-            let parents: Vec<[u8; 32]> = prev
+            let parents: Vec<Digest> = prev
                 .par_chunks_exact(2)
-                .map(|pair| poseidon_pair(&pair[0], &pair[1]))
+                .map(|pair| acc::compress(&pair[0], &pair[1]))
                 .collect();
             levels.push(parents);
         }
@@ -88,8 +89,8 @@ impl PoseidonTree {
     }
 
     /// Reconstruct from raw level data (for loading from DB).
-    pub fn from_raw(levels: Vec<Vec<[u8; 32]>>, depth: u32, dense_depth: u32) -> Self {
-        let zero_hashes = compute_poseidon_zero_hashes(depth);
+    pub fn from_raw(levels: Vec<Vec<Digest>>, depth: u32, dense_depth: u32) -> Self {
+        let zero_hashes = compute_zero_hashes(depth);
         Self {
             depth,
             dense_depth,
@@ -101,10 +102,10 @@ impl PoseidonTree {
     /// Current root hash at the full tree depth.
     ///
     /// Chains the dense root through zero hashes for levels dense_depth..depth.
-    pub fn root(&self) -> [u8; 32] {
+    pub fn root(&self) -> Digest {
         let mut current = self.levels[self.dense_depth as usize][0];
         for d in self.dense_depth..self.depth {
-            current = poseidon_pair(&current, &self.zero_hashes[d as usize]);
+            current = acc::compress(&current, &self.zero_hashes[d as usize]);
         }
         current
     }
@@ -113,7 +114,7 @@ impl PoseidonTree {
     ///
     /// For levels 0..dense_depth, siblings come from stored data.
     /// For levels dense_depth..depth, siblings are zero_hashes.
-    pub fn get_siblings(&self, index: u64) -> Vec<[u8; 32]> {
+    pub fn get_siblings(&self, index: u64) -> Vec<Digest> {
         let mut siblings = Vec::with_capacity(self.depth as usize);
         let mut idx = index as usize;
 
@@ -136,35 +137,46 @@ impl PoseidonTree {
     ///
     /// Collects auxiliary sibling nodes bottom-up, left-to-right — the same
     /// order the verifier consumes them.
-    pub fn build_multi_proof(&self, leaf_indices: &[u64]) -> zkasper_common::types::MerkleMultiProof {
-        use std::collections::BTreeSet;
+    /// Collect the auxiliary nodes a leaf set needs, in exactly the order
+    /// [`zkasper_common::merkle::batch_root`] consumes them.
+    ///
+    /// Mirrors the circuit's scan: a flat pass per level, left child before
+    /// right, ascending parent order. Keeping the two loops structurally
+    /// identical is what guarantees the ordering agrees.
+    pub fn build_multi_proof(&self, leaf_indices: &[u64]) -> AccMultiProof {
+        let mut idx: Vec<u64> = leaf_indices.to_vec();
+        idx.sort_unstable();
+        idx.dedup();
 
-        let mut known_at_level: BTreeSet<u64> = leaf_indices.iter().copied().collect();
         let mut auxiliaries = Vec::new();
+        let mut next: Vec<u64> = Vec::with_capacity(idx.len());
 
         for level in 0..self.depth {
-            let parent_indices: BTreeSet<u64> = known_at_level.iter().map(|&idx| idx / 2).collect();
-
-            for &parent_idx in &parent_indices {
-                let left_idx = parent_idx * 2;
-                let right_idx = parent_idx * 2 + 1;
-
-                if !known_at_level.contains(&left_idx) {
-                    auxiliaries.push(self.get_node(level, left_idx));
+            next.clear();
+            let mut i = 0usize;
+            while i < idx.len() {
+                let k = idx[i];
+                if k & 1 == 0 {
+                    if i + 1 < idx.len() && idx[i + 1] == k + 1 {
+                        i += 2;
+                    } else {
+                        auxiliaries.push(self.get_node(level, k + 1));
+                        i += 1;
+                    }
+                } else {
+                    auxiliaries.push(self.get_node(level, k - 1));
+                    i += 1;
                 }
-                if !known_at_level.contains(&right_idx) {
-                    auxiliaries.push(self.get_node(level, right_idx));
-                }
+                next.push(k >> 1);
             }
-
-            known_at_level = parent_indices;
+            std::mem::swap(&mut idx, &mut next);
         }
 
-        zkasper_common::types::MerkleMultiProof { auxiliaries }
+        AccMultiProof { auxiliaries }
     }
 
     /// Get the hash of a node at a given level and index.
-    fn get_node(&self, level: u32, idx: u64) -> [u8; 32] {
+    fn get_node(&self, level: u32, idx: u64) -> Digest {
         if level < self.dense_depth {
             let level_data = &self.levels[level as usize];
             if (idx as usize) < level_data.len() {
@@ -181,7 +193,7 @@ impl PoseidonTree {
     /// Returns the siblings BEFORE the update (for the witness).
     ///
     /// The full root (via `root()`) is automatically correct after this call.
-    pub fn update_leaf(&mut self, index: u64, new_leaf: [u8; 32]) -> Vec<[u8; 32]> {
+    pub fn update_leaf(&mut self, index: u64, new_leaf: Digest) -> Vec<Digest> {
         let siblings = self.get_siblings(index);
 
         // Update leaf
@@ -193,7 +205,7 @@ impl PoseidonTree {
             let parent_idx = idx / 2;
             let left = self.levels[d][parent_idx * 2];
             let right = self.levels[d][parent_idx * 2 + 1];
-            self.levels[d + 1][parent_idx] = poseidon_pair(&left, &right);
+            self.levels[d + 1][parent_idx] = acc::compress(&left, &right);
             idx = parent_idx;
         }
 
@@ -218,9 +230,9 @@ mod tests {
     #[test]
     fn test_build_small_tree() {
         let validators: Vec<_> = (0..4).map(dummy_validator).collect();
-        let tree = PoseidonTree::build(&validators, 100, 2); // depth 2 for 4 leaves
+        let tree = AccTree::build(&validators, 100, 2); // depth 2 for 4 leaves
         let root = tree.root();
-        assert_ne!(root, [0u8; 32]);
+        assert_ne!(root, ZERO);
         assert_eq!(tree.dense_depth, 2);
         assert_eq!(tree.depth, 2);
     }
@@ -228,10 +240,10 @@ mod tests {
     #[test]
     fn test_update_leaf() {
         let validators: Vec<_> = (0..4).map(dummy_validator).collect();
-        let mut tree = PoseidonTree::build(&validators, 100, 2);
+        let mut tree = AccTree::build(&validators, 100, 2);
         let old_root = tree.root();
 
-        let new_leaf = poseidon_leaf(&[99u8; 48], 16_000_000_000);
+        let new_leaf = acc::leaf(&[99u8; 48], 16_000_000_000);
         let _siblings = tree.update_leaf(1, new_leaf);
         let new_root = tree.root();
 
@@ -240,15 +252,14 @@ mod tests {
 
     #[test]
     fn test_siblings_verify() {
-        use zkasper_common::poseidon::verify_poseidon_merkle_proof;
-
         let validators: Vec<_> = (0..4).map(dummy_validator).collect();
-        let tree = PoseidonTree::build(&validators, 100, 2);
+        let tree = AccTree::build(&validators, 100, 2);
 
         for i in 0..4u64 {
             let leaf = tree.levels[0][i as usize];
             let siblings = tree.get_siblings(i);
-            assert!(verify_poseidon_merkle_proof(
+            assert!(zkasper_common::merkle::verify_proof(
+                acc::compress,
                 &leaf,
                 i,
                 &siblings,
@@ -259,14 +270,14 @@ mod tests {
 
     #[test]
     fn test_sparse_tree_depth_22() {
-        // Build a sparse tree with depth 22 (POSEIDON_TREE_DEPTH) but only 100 validators.
+        // Build a sparse tree with depth 22 (ACC_TREE_DEPTH) but only 100 validators.
         // This should NOT OOM (allocates ~256 leaves, not 2^22).
         let validators: Vec<_> = (0..100).map(dummy_validator).collect();
-        let tree = PoseidonTree::build(&validators, 100, 22);
+        let tree = AccTree::build(&validators, 100, 22);
 
         assert_eq!(tree.depth, 22);
         assert_eq!(tree.dense_depth, 7); // ceil(log2(100)) = 7 (2^7=128)
-        assert_ne!(tree.root(), [0u8; 32]);
+        assert_ne!(tree.root(), ZERO);
 
         // Verify siblings work at full depth
         let leaf = tree.levels[0][0];
@@ -274,8 +285,8 @@ mod tests {
         assert_eq!(siblings.len(), 22);
 
         // Verify merkle proof
-        use zkasper_common::poseidon::verify_poseidon_merkle_proof;
-        assert!(verify_poseidon_merkle_proof(
+        assert!(zkasper_common::merkle::verify_proof(
+            acc::compress,
             &leaf,
             0,
             &siblings,
@@ -289,17 +300,17 @@ mod tests {
         // the same root as a tree built with depth=2 when we account for
         // the zero-hash chaining.
         let validators: Vec<_> = (0..4).map(dummy_validator).collect();
-        let dense_tree = PoseidonTree::build(&validators, 100, 2);
-        let sparse_tree = PoseidonTree::build(&validators, 100, 10);
+        let dense_tree = AccTree::build(&validators, 100, 2);
+        let sparse_tree = AccTree::build(&validators, 100, 10);
 
         // The sparse root chains through zero_hashes[2..10]
         // The dense root is at depth 2
         // They should match because the sparse tree chains:
         //   root = dense_root -> zh[2] -> zh[3] -> ... -> zh[9]
         let mut expected_root = dense_tree.root();
-        let zh = compute_poseidon_zero_hashes(10);
-        for d in 2..10 {
-            expected_root = poseidon_pair(&expected_root, &zh[d]);
+        let zh = compute_zero_hashes(10);
+        for z in zh.iter().take(10).skip(2) {
+            expected_root = acc::compress(&expected_root, z);
         }
         assert_eq!(sparse_tree.root(), expected_root);
     }
@@ -307,11 +318,11 @@ mod tests {
     #[test]
     fn test_sparse_update_and_verify() {
         let validators: Vec<_> = (0..8).map(dummy_validator).collect();
-        let mut tree = PoseidonTree::build(&validators, 100, 20);
+        let mut tree = AccTree::build(&validators, 100, 20);
         let old_root = tree.root();
 
         // Update leaf 3
-        let new_leaf = poseidon_leaf(&[99u8; 48], 16_000_000_000);
+        let new_leaf = acc::leaf(&[99u8; 48], 16_000_000_000);
         let old_siblings = tree.update_leaf(3, new_leaf);
         let new_root = tree.root();
 
@@ -319,9 +330,9 @@ mod tests {
         assert_eq!(old_siblings.len(), 20);
 
         // Verify new leaf with new root
-        use zkasper_common::poseidon::verify_poseidon_merkle_proof;
         let new_siblings = tree.get_siblings(3);
-        assert!(verify_poseidon_merkle_proof(
+        assert!(zkasper_common::merkle::verify_proof(
+            acc::compress,
             &new_leaf,
             3,
             &new_siblings,

@@ -661,14 +661,43 @@ CI must test the full end-to-end pipeline with real Zisk proofs and verification
 
 Requires: `ziskup` (Zisk toolchain installer), `foundry` (forge/cast).
 
-## open questions for Jordi / Zisk team
+## open questions for Jordi / Zisk team — resolved
 
-1. **Poseidon precompile** — no dedicated Poseidon syscall exists. Poseidon through `arith256_mod` works but is the dominant cost (~28M calls in finality proof). Is a Poseidon precompile planned?
-2. **BLS12-381 pairing** — precompile list shows curve_add/dbl + complex field ops but no explicit pairing. Does `zisk-patch-bls12-381` implement full pairing via these? Cost per pairing?
-3. **Recursive proof composition** — bootstrap needs chunking. Is recursive verification available in Zisk?
-4. **Public inputs vs outputs** — how does the on-chain verifier bind proof public inputs? Is `set_output` the only mechanism?
-9. **Solidity verifier** — does `cargo-zisk prove -f` (final_snark) produce a proof verifiable on-chain? How do we get the Solidity verifier contract (`IZiskVerifier` impl)? Is there a `cargo-zisk export-verifier` or snarkjs-style command? What proof format does the on-chain verifier expect (bytes + uint32[] publicOutputs)?
-5. **`arith256_mod` generality** — does it work for arbitrary 256-bit moduli (BN254 Fr for Poseidon) or only curve-specific moduli?
-6. **Max cycle count** — what's the practical limit for a single proof? Can finality proof (~28M Poseidon) fit?
-7. **Hash-to-G2** — is there a Zisk-optimized implementation of IETF hash-to-curve for BLS12-381?
-8. **Zisk version** — target v0.15.0 or newer?
+All of the blocking ones were answered by code landing upstream. Recorded here
+with the version each arrived in, because they arrive in different releases and
+zkasper needs all of them.
+
+1. **Poseidon precompile** — shipped. `syscall_poseidon2` (Poseidon2 over
+   Goldilocks, width 16) since **v0.16.0**, joined by `syscall_poseidon1` in
+   v1.0.0-alpha. The accumulator was moved off BN254 Poseidon onto it; measured
+   3,117 per node against 50,746 for an SSZ node.
+2. **BLS12-381 pairing** — shipped. zisklib carries the full tower
+   (`miller_loop`, `final_exp`, `fp2/fp6/fp12`, `pairing`), backed by an
+   `arith384_mod` precompile, plus `hash_to_curve` and `bls.rs` from
+   **v1.0.0-alpha**. zisklib's own `bls_verify_bls12_381` uses the Basic-scheme
+   DST, so zkasper composes the primitives directly to get Ethereum's
+   proof-of-possession ciphersuite.
+3. **Recursive proof composition** — shipped. `verify_zisk_proof` since
+   **v0.18.0**. The proof blob also exposes the child's program verification key
+   and public values, which is what lets an aggregator bind *which* proof it is
+   verifying and not just that it verifies.
+4. **Public inputs vs outputs** — `set_output` became `pub(crate)`; guests now
+   commit a byte stream through `ziskos::io::commit_slice`, packed into 64 u32
+   public slots (256 bytes). Layout of a serialized proof, in u64 words:
+   `[minimal][n_publics][program_vk(4)][publics(64)][proof..][vadcop_vk(4)]`.
+5. **`arith256_mod` generality** — moot. The accumulator no longer needs a
+   256-bit modular multiply; BLS uses `arith384_mod`.
+6. **Max cycle count** — the real constraint turned out to be the per-proof cost
+   floor of 293,601,280, roughly one pairing check. Small proofs are mostly
+   overhead, which argues for batching rather than for splitting.
+7. **Hash-to-G2** — `hash_to_curve_g2_bls12_381`, measured at 18,594,420.
+8. **Zisk version** — v1.0.0-alpha. Nothing earlier has all three of poseidon2,
+   recursion and hash-to-curve.
+
+Still open:
+
+9. **Solidity verifier** — how to get an `IZiskVerifier` implementation and what
+   proof format it expects on chain.
+10. **Proving time and memory** — the cost model here comes from the emulator.
+    Actual prover wall-clock and RAM for a slot proof at mainnet scale are
+    unmeasured; that needs the proving key and real hardware.

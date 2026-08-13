@@ -1,3 +1,6 @@
+// Shared test helpers; each test binary uses a different subset.
+#![allow(dead_code)]
+
 //! MockBeaconApi and test helpers for witness-gen integration tests.
 
 use std::collections::HashMap;

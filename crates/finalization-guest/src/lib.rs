@@ -4,7 +4,7 @@ use zkasper_common::types::{FinalizationOutput, FinalizationWitness};
 
 /// Verify a finalization: two consecutive justification proofs.
 pub fn verify_finalization(witness: &FinalizationWitness) -> FinalizationOutput {
-    use zkasper_common::recursion::verify_proof;
+    use zkasper_common::recursion::verify_child;
 
     assert_eq!(
         witness.justification_outputs.len(),
@@ -15,15 +15,23 @@ pub fn verify_finalization(witness: &FinalizationWitness) -> FinalizationOutput 
     let just_e = &witness.justification_outputs[0];
     let just_e1 = &witness.justification_outputs[1];
 
-    // Recursive proof verification (no-op in native, real on Zisk)
-    verify_proof(
-        &witness.justification_proofs[0],
-        &[], // TODO: serialize justification output for real verification
-    );
-    verify_proof(
-        &witness.justification_proofs[1],
-        &[],
-    );
+    // Verify both justification proofs, bound to program and outputs.
+    for (i, (proof, output)) in witness
+        .justification_proofs
+        .iter()
+        .zip(witness.justification_outputs.iter())
+        .enumerate()
+    {
+        assert!(
+            verify_child(
+                proof,
+                &witness.justification_program_vk,
+                &output.public_bytes()
+            ),
+            "justification proof {} failed recursive verification",
+            i,
+        );
+    }
 
     // Both justifications must use the same accumulator commitment
     assert_eq!(

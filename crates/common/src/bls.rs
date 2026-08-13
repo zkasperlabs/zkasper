@@ -1,17 +1,44 @@
-//! BLS12-381 signature verification.
+//! BLS12-381 verification through the Zisk BLS library.
 //!
-//! Provides aggregate pubkey accumulation, hash-to-G2, and pairing-based
-//! signature checks.
-//!
-//! When the `bls` feature is enabled, uses the `blst` library for native
-//! verification. Without it, panics (placeholder for zkVM targets that
-//! will use precompile-based verification).
+//! zisklib ships a full pairing stack (`arith384_mod` + Fp2/Fp6/Fp12 towers,
+//! Miller loop, final exponentiation, hash-to-curve). Its own
+//! `bls_verify_bls12_381` uses the Basic-scheme DST, so we compose the
+//! primitives directly to get Ethereum's proof-of-possession ciphersuite and
+//! the FastAggregateVerify shape that attestations need.
+
+use alloc::vec::Vec;
+use ziskos::zisklib::{
+    add_complete_safe_bls12_381, add_complete_safe_twist_bls12_381, decompress_bls12_381,
+    decompress_twist_bls12_381, hash_to_curve_g2_bls12_381, is_on_subgroup_twist_bls12_381,
+    neg_bls12_381, pairing_check_safe_bls12_381,
+};
 
 use crate::ssz::sha256_pair;
 
-/// Ethereum BLS signature Domain Separation Tag (ciphersuite).
-#[cfg(feature = "bls")]
-const ETH_BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+/// Ethereum's BLS ciphersuite (proof-of-possession variant).
+pub const ETH_BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// DOMAIN_BEACON_ATTESTER as defined in the Ethereum consensus spec.
+pub const DOMAIN_BEACON_ATTESTER: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+
+/// Identity element of G1.
+const G1_IDENTITY: [u64; 12] = [0; 12];
+
+/// Generator of G1, in the little-endian limb layout zisklib expects.
+const G1_GENERATOR: [u64; 12] = [
+    0xFB3A_F00A_DB22_C6BB,
+    0x6C55_E83F_F97A_1AEF,
+    0xA14E_3A3F_171B_AC58,
+    0xC368_8C4F_9774_B905,
+    0x2695_638C_4FA9_AC0F,
+    0x17F1_D3A7_3197_D794,
+    0x0CAA_2329_46C5_E7E1,
+    0xD03C_C744_A288_8AE4,
+    0x00DB_18CB_2C04_B3ED,
+    0xFCF5_E095_D5D0_0AF6,
+    0xA09E_30ED_741D_8AE4,
+    0x08B3_F481_E3AA_A0F1,
+];
 
 /// Compute `signing_root = sha256(attestation_data_root || domain)`.
 pub fn compute_signing_root(attestation_data_root: &[u8; 32], domain: &[u8; 32]) -> [u8; 32] {
@@ -39,55 +66,168 @@ pub fn compute_domain(
     domain
 }
 
-/// DOMAIN_BEACON_ATTESTER as defined in the Ethereum consensus spec.
-pub const DOMAIN_BEACON_ATTESTER: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+/// Aggregate G1 public keys. Every attester in one aggregated attestation signs
+/// the same message, so the whole committee collapses to a single pairing input.
+///
+/// Public keys are not subgroup-checked. The consensus spec checks proof of
+/// possession once at deposit time and skips the check when verifying
+/// attestations; the accumulator only ever holds keys the beacon state already
+/// accepted, so re-checking here would cost a scalar multiplication per attester
+/// for no additional guarantee.
+pub fn aggregate_pubkeys(pubkeys: &[[u8; 48]]) -> Option<[u64; 12]> {
+    #[cfg(feature = "count-ops")]
+    crate::op_counter::inc_pubkey_aggregate(pubkeys.len() as u64);
 
-/// Verify an aggregate BLS signature over a signing root.
+    let mut agg = G1_IDENTITY;
+    for pk in pubkeys {
+        let (point, is_infinity) = decompress_bls12_381(pk).ok()?;
+        if is_infinity {
+            return None;
+        }
+        agg = add_complete_safe_bls12_381(&agg, &point).ok()?;
+    }
+    Some(agg)
+}
+
+/// FastAggregateVerify: one aggregate signature over one message signed by all
+/// of `pubkeys`.
 ///
-/// # Arguments
-/// - `pubkeys`: raw 48-byte BLS public keys to aggregate
-/// - `signing_root`: the message that was signed (attestation_data_root || domain)
-/// - `signature`: the 96-byte aggregate BLS signature
-///
-/// # Panics
-/// Panics if the signature is invalid or verification fails.
-#[cfg(feature = "bls")]
+/// Checks `e(-aggregate_pubkey, H(msg)) * e(G1, signature) == 1`, which is one
+/// hash-to-curve, two Miller loops and one final exponentiation regardless of
+/// how many keys were aggregated.
+pub fn fast_aggregate_verify(
+    pubkeys: &[[u8; 48]],
+    signing_root: &[u8; 32],
+    signature: &[u8; 96],
+) -> bool {
+    if pubkeys.is_empty() {
+        return false;
+    }
+
+    let Some(agg) = aggregate_pubkeys(pubkeys) else {
+        return false;
+    };
+
+    let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(signature) else {
+        return false;
+    };
+    if sig_is_infinity || !is_on_subgroup_twist_bls12_381(&sig) {
+        return false;
+    }
+
+    #[cfg(feature = "count-ops")]
+    {
+        crate::op_counter::inc_hash_to_curve(1);
+        crate::op_counter::inc_miller_loop(2);
+        crate::op_counter::inc_final_exp(1);
+    }
+
+    let q = hash_to_curve_g2_bls12_381(signing_root, ETH_BLS_DST);
+    let neg_agg = neg_bls12_381(&agg);
+
+    matches!(
+        pairing_check_safe_bls12_381(&[neg_agg, G1_GENERATOR], &[q, sig]),
+        Ok(true)
+    )
+}
+
+/// Verify an aggregate signature, panicking on failure.
 pub fn verify_aggregate_signature(
     pubkeys: &[[u8; 48]],
     signing_root: &[u8; 32],
     signature: &[u8; 96],
 ) {
-    use blst::min_pk::{PublicKey, Signature};
-    use blst::BLST_ERROR;
-
-    assert!(!pubkeys.is_empty(), "must have at least one pubkey");
-
-    let sig = Signature::from_bytes(signature).expect("invalid BLS signature encoding");
-
-    let pks: Vec<PublicKey> = pubkeys
-        .iter()
-        .map(|b| PublicKey::from_bytes(b.as_ref()).expect("invalid BLS pubkey encoding"))
-        .collect();
-    let pk_refs: Vec<&PublicKey> = pks.iter().collect();
-
-    let result = sig.fast_aggregate_verify(true, signing_root, ETH_BLS_DST, &pk_refs);
-    assert_eq!(
-        result,
-        BLST_ERROR::BLST_SUCCESS,
-        "BLS aggregate signature verification failed: {:?}",
-        result,
+    assert!(
+        fast_aggregate_verify(pubkeys, signing_root, signature),
+        "BLS aggregate signature verification failed"
     );
 }
 
-/// Fallback when `bls` feature is not enabled (e.g. zkVM targets).
-#[cfg(not(feature = "bls"))]
-pub fn verify_aggregate_signature(
-    _pubkeys: &[[u8; 48]],
-    _signing_root: &[u8; 32],
-    _signature: &[u8; 96],
-) {
-    unimplemented!(
-        "BLS aggregate signature verification requires the `bls` feature — \
-         enable it or use Zisk BLS12-381 pairing precompile"
-    );
+/// Identity element of G2.
+const G2_IDENTITY: [u64; 24] = [0; 24];
+
+/// One attestation's signature check: a committee, the message they signed, and
+/// their aggregate signature.
+pub struct SignedMessage<'a> {
+    pub pubkeys: &'a [[u8; 48]],
+    pub signing_root: &'a [u8; 32],
+    pub signature: &'a [u8; 96],
+}
+
+/// Verify many attestations with a single multi-pairing.
+///
+/// Checking each attestation on its own costs two Miller loops and a final
+/// exponentiation. The final exponentiation is by far the most expensive part
+/// and only has to happen once, so folding `n` attestations into one check
+/// costs `n + 1` Miller loops and a single final exponentiation:
+///
+/// ```text
+/// prod_i e(-aggregate_pubkey_i, H(msg_i)) * e(G1, sum_i signature_i) == 1
+/// ```
+///
+/// Messages must be pairwise distinct, which is what stops a rogue-key attack
+/// from cancelling one attestation against another. Attestations within a slot
+/// carry different `AttestationData`, so their signing roots differ; the check
+/// is enforced here rather than assumed.
+pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
+    if messages.is_empty() {
+        return false;
+    }
+
+    for (i, a) in messages.iter().enumerate() {
+        for b in &messages[i + 1..] {
+            if a.signing_root == b.signing_root {
+                return false;
+            }
+        }
+    }
+
+    let mut g1_points: Vec<[u64; 12]> = Vec::with_capacity(messages.len() + 1);
+    let mut g2_points: Vec<[u64; 24]> = Vec::with_capacity(messages.len() + 1);
+    let mut signature_sum = G2_IDENTITY;
+
+    for m in messages {
+        if m.pubkeys.is_empty() {
+            return false;
+        }
+        let Some(agg) = aggregate_pubkeys(m.pubkeys) else {
+            return false;
+        };
+        let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(m.signature) else {
+            return false;
+        };
+        if sig_is_infinity {
+            return false;
+        }
+        let Ok(sum) = add_complete_safe_twist_bls12_381(&signature_sum, &sig) else {
+            return false;
+        };
+        signature_sum = sum;
+
+        #[cfg(feature = "count-ops")]
+        crate::op_counter::inc_hash_to_curve(1);
+
+        g1_points.push(neg_bls12_381(&agg));
+        g2_points.push(hash_to_curve_g2_bls12_381(m.signing_root, ETH_BLS_DST));
+    }
+
+    // The individual signatures need no subgroup check of their own: the
+    // equation only ever involves their sum, so checking the sum is what binds.
+    if !is_on_subgroup_twist_bls12_381(&signature_sum) {
+        return false;
+    }
+
+    g1_points.push(G1_GENERATOR);
+    g2_points.push(signature_sum);
+
+    #[cfg(feature = "count-ops")]
+    {
+        crate::op_counter::inc_miller_loop(g1_points.len() as u64);
+        crate::op_counter::inc_final_exp(1);
+    }
+
+    matches!(
+        pairing_check_safe_bls12_381(&g1_points, &g2_points),
+        Ok(true)
+    )
 }

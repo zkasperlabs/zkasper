@@ -2,15 +2,15 @@
 
 extern crate alloc;
 
+pub mod acc;
 pub mod bls;
 pub mod merkle;
 #[cfg(feature = "count-ops")]
 pub mod op_counter;
-pub mod poseidon;
+pub mod recursion;
 pub mod ssz;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
-pub mod recursion;
 pub mod types;
 
 /// Which consensus-layer fork a beacon state belongs to.
@@ -25,7 +25,7 @@ pub enum ConsensusFork {
 pub struct ChainConfig {
     pub slots_per_epoch: u64,
     pub validators_tree_depth: u32,
-    pub poseidon_tree_depth: u32,
+    pub acc_tree_depth: u32,
     pub beacon_state_validators_field_index: u64,
     /// First epoch at which the Fulu fork is active. `u64::MAX` means not scheduled.
     pub fulu_fork_epoch: u64,
@@ -35,7 +35,7 @@ impl ChainConfig {
     pub const MAINNET: Self = Self {
         slots_per_epoch: 32,
         validators_tree_depth: 40,
-        poseidon_tree_depth: 22,
+        acc_tree_depth: 22,
         beacon_state_validators_field_index: 11,
         fulu_fork_epoch: 0, // Fulu already active on mainnet test data
     };
@@ -43,7 +43,7 @@ impl ChainConfig {
     pub const GNOSIS: Self = Self {
         slots_per_epoch: 16,
         validators_tree_depth: 40,
-        poseidon_tree_depth: 22,
+        acc_tree_depth: 22,
         beacon_state_validators_field_index: 11,
         fulu_fork_epoch: u64::MAX, // Fulu not yet scheduled on Gnosis
     };
@@ -64,10 +64,10 @@ pub mod constants {
     /// Depth of the SSZ validators data tree (capacity 2^40, per spec).
     pub const VALIDATORS_TREE_DEPTH: u32 = 40;
 
-    /// Depth of the Poseidon accumulator tree (capacity 2^22 = 4,194,304).
+    /// Depth of the accumulator tree (capacity 2^22 = 4,194,304).
     /// Independent of the SSZ tree depth — only needs to hold the actual
     /// validator count (~2.2M as of 2025).
-    pub const POSEIDON_TREE_DEPTH: u32 = 22;
+    pub const ACC_TREE_DEPTH: u32 = 22;
 
     /// Number of fields in a Validator container
     pub const VALIDATOR_FIELDS_COUNT: usize = 8;

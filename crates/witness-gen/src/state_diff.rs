@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 use zkasper_common::ssz::{sha256_pair, u64_to_chunk, validator_hash_tree_root};
-use zkasper_common::types::{BlsPubkey, MerkleMultiProof, ValidatorData};
+use zkasper_common::types::{BlsPubkey, SszMultiProof, ValidatorData};
 
 use crate::beacon_api::ValidatorResponse;
 
@@ -117,7 +117,7 @@ pub fn find_mutations(
 // ---------------------------------------------------------------------------
 
 /// Build a sparse SHA-256 Merkle tree from validator roots and return
-/// `(data_tree_root, MerkleMultiProof)` for the given leaf indices.
+/// `(data_tree_root, SszMultiProof)` for the given leaf indices.
 ///
 /// Only allocates the dense portion (2^ceil(log2(n)) leaves), then chains
 /// zero hashes for the remaining depth. This allows depth=40 with millions
@@ -126,7 +126,7 @@ pub fn build_validators_ssz_tree(
     validator_roots: &[[u8; 32]],
     depth: u32,
     leaf_indices: &[u64],
-) -> ([u8; 32], MerkleMultiProof) {
+) -> ([u8; 32], SszMultiProof) {
     // Precompute zero hashes
     let mut zero_hashes = vec![[0u8; 32]; (depth + 1) as usize];
     for d in 1..=depth as usize {
@@ -180,17 +180,29 @@ pub fn build_validators_ssz_tree(
             let right_idx = parent_idx * 2 + 1;
 
             if !known_at_level.contains(&left_idx) {
-                auxiliaries.push(get_node_hash(&levels, &zero_hashes, level, left_idx, dense_depth));
+                auxiliaries.push(get_node_hash(
+                    &levels,
+                    &zero_hashes,
+                    level,
+                    left_idx,
+                    dense_depth,
+                ));
             }
             if !known_at_level.contains(&right_idx) {
-                auxiliaries.push(get_node_hash(&levels, &zero_hashes, level, right_idx, dense_depth));
+                auxiliaries.push(get_node_hash(
+                    &levels,
+                    &zero_hashes,
+                    level,
+                    right_idx,
+                    dense_depth,
+                ));
             }
         }
 
         known_at_level = parent_indices;
     }
 
-    (root, MerkleMultiProof { auxiliaries })
+    (root, SszMultiProof { auxiliaries })
 }
 
 /// Look up a node hash from the built tree levels or zero hashes.

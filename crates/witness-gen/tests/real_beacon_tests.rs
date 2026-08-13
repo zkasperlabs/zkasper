@@ -12,10 +12,10 @@ mod common;
 
 use anyhow::Result;
 
-use zkasper_common::constants::{POSEIDON_TREE_DEPTH, VALIDATORS_TREE_DEPTH};
-use zkasper_common::ChainConfig;
-use zkasper_common::poseidon::accumulator_commitment;
+use zkasper_common::acc;
+use zkasper_common::constants::{ACC_TREE_DEPTH, VALIDATORS_TREE_DEPTH};
 use zkasper_common::ssz::list_hash_tree_root;
+use zkasper_common::ChainConfig;
 
 const CONFIG: ChainConfig = ChainConfig::MAINNET;
 
@@ -102,7 +102,10 @@ async fn test_real_bootstrap() {
 
     eprintln!("  validators: {num_validators}");
     eprintln!("  total_active_balance: {total_active_balance}");
-    eprintln!("  poseidon_root: 0x{}", hex::encode(tree.root()));
+    eprintln!(
+        "  acc_root: 0x{}",
+        hex::encode(zkasper_common::acc::to_bytes(&tree.root()))
+    );
 
     assert!(num_validators > 0, "should have validators");
     assert!(total_active_balance > 0, "should have non-zero balance");
@@ -110,13 +113,16 @@ async fn test_real_bootstrap() {
     assert_eq!(witness.validators.len(), num_validators as usize);
 
     // Verify with bootstrap guest
-    let (commitment, poseidon_root, balance) =
-        zkasper_bootstrap_guest::verify_bootstrap_with_depth(&witness, VALIDATORS_TREE_DEPTH, POSEIDON_TREE_DEPTH);
+    let (commitment, acc_root, balance) = zkasper_bootstrap_guest::verify_bootstrap_with_depth(
+        &witness,
+        VALIDATORS_TREE_DEPTH,
+        ACC_TREE_DEPTH,
+    );
 
-    assert_eq!(poseidon_root, tree.root());
+    assert_eq!(acc_root, tree.root());
     assert_eq!(balance, total_active_balance);
 
-    let expected_commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let expected_commitment = acc::commitment(&acc_root, total_active_balance);
     assert_eq!(commitment, expected_commitment);
     eprintln!("  guest verification passed");
 }
@@ -151,7 +157,7 @@ async fn test_real_epoch_diff() {
         zkasper_bootstrap_guest::verify_bootstrap_with_depth(
             &bootstrap_witness,
             VALIDATORS_TREE_DEPTH,
-            POSEIDON_TREE_DEPTH,
+            ACC_TREE_DEPTH,
         );
     assert_eq!(bootstrap_root, tree.root());
     assert_eq!(bootstrap_balance, total_active_balance);
@@ -175,13 +181,13 @@ async fn test_real_epoch_diff() {
     );
 
     // Verify epoch diff
-    let (commitment, poseidon_root, balance) =
+    let (commitment, acc_root, balance) =
         zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
 
-    assert_eq!(poseidon_root, tree.root());
+    assert_eq!(acc_root, tree.root());
     assert_eq!(balance, new_balance);
 
-    let expected_commitment = accumulator_commitment(&poseidon_root, new_balance);
+    let expected_commitment = acc::commitment(&acc_root, new_balance);
     assert_eq!(commitment, expected_commitment);
     eprintln!("  guest verification passed");
 }
@@ -211,7 +217,7 @@ async fn test_real_full_pipeline() {
     let (_bootstrap_commitment, _, _) = zkasper_bootstrap_guest::verify_bootstrap_with_depth(
         &bootstrap_witness,
         VALIDATORS_TREE_DEPTH,
-        POSEIDON_TREE_DEPTH,
+        ACC_TREE_DEPTH,
     );
 
     // Save to DB
@@ -252,7 +258,7 @@ async fn test_real_full_pipeline() {
     assert_eq!(diff_balance, new_balance);
 
     // Verify accumulator commitment chain
-    let expected_diff_commitment = accumulator_commitment(&diff_root, new_balance);
+    let expected_diff_commitment = acc::commitment(&diff_root, new_balance);
     assert_eq!(diff_commitment, expected_diff_commitment);
 
     eprintln!("  pipeline: {} -> {} validators", num_validators, new_count);

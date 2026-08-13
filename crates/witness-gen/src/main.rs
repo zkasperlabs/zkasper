@@ -1,15 +1,6 @@
-mod attestation_collector;
-mod beacon_api;
-mod db;
-mod epoch_state;
-mod poseidon_tree;
-mod ssz_state;
-mod state_diff;
-mod witness_bootstrap;
-mod witness_epoch_diff;
-mod witness_finality;
-mod witness_justification;
-mod witness_slot_proof;
+use zkasper_witness_gen::{
+    beacon_api, db, epoch_state, witness_bootstrap, witness_epoch_diff, witness_slot_proof,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -63,17 +54,6 @@ enum Command {
         slot1: u64,
         /// Last slot of the current epoch
         slot2: u64,
-    },
-    /// Generate finality proof witness for a given epoch
-    Finality {
-        /// The epoch whose checkpoint to prove finalized
-        epoch: u64,
-        /// Target block root (hex, 0x-prefixed)
-        #[arg(long)]
-        target_root: String,
-        /// Signing domain (hex, 0x-prefixed). Precomputed from fork version + genesis validators root.
-        #[arg(long)]
-        signing_domain: String,
     },
     /// Generate per-slot proof witnesses for a target checkpoint
     SlotProofs {
@@ -167,41 +147,6 @@ async fn main() -> Result<()> {
             );
         }
 
-        Command::Finality {
-            epoch,
-            target_root,
-            signing_domain,
-        } => {
-            eprintln!("finality proof for epoch {epoch}...");
-
-            let (tree, _cursor_epoch, total_active_balance, _num_validators) = db
-                .load()?
-                .context("no saved state — run bootstrap + epoch-diff first")?;
-
-            let target_root = parse_hex_bytes32(&target_root)?;
-            let signing_domain = parse_hex_bytes32(&signing_domain)?;
-
-            let witness = witness_finality::build(
-                &api,
-                &config,
-                &tree,
-                epoch,
-                target_root,
-                total_active_balance,
-                signing_domain,
-            )
-            .await?;
-
-            // Serialize witness
-            let output_path = format!("{}/finality_input.bin", cli.output_dir);
-            let bytes = bincode::serialize(&witness).context("serialize finality witness")?;
-            std::fs::write(&output_path, bytes).context("write finality witness")?;
-            eprintln!(
-                "wrote {output_path} ({} bytes)",
-                std::fs::metadata(&output_path)?.len()
-            );
-        }
-
         Command::SlotProofs {
             epoch,
             target_root,
@@ -231,10 +176,7 @@ async fn main() -> Result<()> {
 
             // Serialize each slot witness
             for sw in &slot_witnesses {
-                let output_path = format!(
-                    "{}/slot_proof_input_{}.bin",
-                    cli.output_dir, sw.slot
-                );
+                let output_path = format!("{}/slot_proof_input_{}.bin", cli.output_dir, sw.slot);
                 let bytes =
                     bincode::serialize(&sw.witness).context("serialize slot proof witness")?;
                 std::fs::write(&output_path, &bytes).context("write slot proof witness")?;
@@ -256,10 +198,7 @@ async fn main() -> Result<()> {
                 .collect();
             let bytes = bincode::serialize(&metadata).context("serialize metadata")?;
             std::fs::write(&output_path, &bytes).context("write metadata")?;
-            eprintln!(
-                "wrote {output_path} ({} bytes)",
-                bytes.len(),
-            );
+            eprintln!("wrote {output_path} ({} bytes)", bytes.len(),);
         }
 
         Command::Run => {

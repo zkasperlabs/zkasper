@@ -7,40 +7,30 @@ use zkasper_common::types::{SlotProofOutput, SlotProofWitness};
 ///
 /// This is the core slot-proof circuit logic. It:
 /// 1. Verifies the accumulator commitment
-/// 2. Verifies each validator via Poseidon multi-proof
-/// 3. Verifies BLS aggregate signatures per attestation
+/// 2. Verifies each validator against the accumulator in one batched proof
+/// 3. Verifies every attestation signature in a single multi-pairing
 /// 4. Computes a commitment over counted validator indices (for cross-slot dedup)
 ///
 /// Does NOT check supermajority — that's the justification proof's job.
 pub fn verify_slot_proof(witness: &SlotProofWitness) -> SlotProofOutput {
-    verify_slot_proof_with_depth(
-        witness,
-        zkasper_common::constants::POSEIDON_TREE_DEPTH,
-    )
+    verify_slot_proof_with_depth(witness, zkasper_common::constants::ACC_TREE_DEPTH)
 }
 
-/// Slot-proof verification with configurable Poseidon tree depth.
-pub fn verify_slot_proof_with_depth(
-    witness: &SlotProofWitness,
-    poseidon_depth: u32,
-) -> SlotProofOutput {
-    use zkasper_common::bls::{compute_signing_root, verify_aggregate_signature};
-    use zkasper_common::poseidon::{
-        accumulator_commitment, counted_validators_commitment, poseidon_leaf,
-        verify_poseidon_multi_proof,
-    };
+/// Slot-proof verification with a configurable accumulator tree depth.
+pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) -> SlotProofOutput {
+    use zkasper_common::acc;
+    use zkasper_common::bls::{compute_signing_root, verify_attestation_batch, SignedMessage};
 
-    // Verify the accumulator commitment binds poseidon_root + total_active_balance
-    let expected_commitment =
-        accumulator_commitment(&witness.poseidon_root, witness.total_active_balance);
+    // Verify the accumulator commitment binds acc_root + total_active_balance
+    let expected_commitment = acc::commitment(&witness.acc_root, witness.total_active_balance);
     assert_eq!(
         expected_commitment, witness.accumulator_commitment,
         "accumulator commitment mismatch",
     );
 
-    // Phase 1: Collect all unique Poseidon leaves from attestations.
+    // Phase 1: Collect the accumulator leaves the attestations claim.
     let mut attesting_balance: u64 = 0;
-    let mut multi_proof_leaves: Vec<([u8; 32], u64)> = Vec::new();
+    let mut multi_proof_leaves: Vec<(zkasper_common::acc::Digest, u64)> = Vec::new();
     let mut counted_indices: Vec<u64> = Vec::new();
 
     for attestation in &witness.attestations {
@@ -62,7 +52,7 @@ pub fn verify_slot_proof_with_depth(
                 attesting_balance += v.active_effective_balance;
                 counted_indices.push(v.validator_index);
 
-                let leaf = poseidon_leaf(&v.pubkey.0, v.active_effective_balance);
+                let leaf = acc::leaf(&v.pubkey.0, v.active_effective_balance);
                 multi_proof_leaves.push((leaf, v.validator_index));
             }
         }
@@ -80,20 +70,24 @@ pub fn verify_slot_proof_with_depth(
         );
     }
 
-    // Phase 2: Verify all Poseidon leaves at once via multi-proof
-    let computed_root = verify_poseidon_multi_proof(
+    // Phase 2: Check every claimed leaf against the accumulator root at once
+    let computed_root = zkasper_common::merkle::batch_root(
+        acc::compress,
         &multi_proof_leaves,
-        &witness.poseidon_multi_proof,
-        poseidon_depth,
+        &witness.acc_multi_proof.auxiliaries,
+        acc_depth,
     );
-    assert_eq!(
-        computed_root, witness.poseidon_root,
-        "Poseidon multi-proof root mismatch",
-    );
+    assert_eq!(computed_root, witness.acc_root, "accumulator root mismatch",);
 
-    // Phase 3: Verify BLS signatures and attestation target for each attestation
+    // Phase 3: Verify every attestation's signature in one multi-pairing.
+    //
+    // Each attestation contributes one Miller loop; the final exponentiation —
+    // the dominant cost by a wide margin — happens once for the whole slot.
+    let mut pubkeys_per_attestation: Vec<Vec<[u8; 48]>> =
+        Vec::with_capacity(witness.attestations.len());
+    let mut signing_roots: Vec<[u8; 32]> = Vec::with_capacity(witness.attestations.len());
+
     for attestation in &witness.attestations {
-        // Recompute attestation_data_root from raw fields and verify target
         assert_eq!(
             attestation.data_target_epoch, witness.target_epoch,
             "attestation target_epoch mismatch",
@@ -113,20 +107,35 @@ pub fn verify_slot_proof_with_depth(
             &attestation.data_target_root,
         );
 
-        let pubkeys: Vec<[u8; 48]> = attestation
-            .attesting_validators
-            .iter()
-            .map(|v| v.pubkey.0)
-            .collect();
-
-        let signing_root = compute_signing_root(&data_root, &witness.signing_domain);
-
-        verify_aggregate_signature(&pubkeys, &signing_root, &attestation.signature.0);
+        signing_roots.push(compute_signing_root(&data_root, &witness.signing_domain));
+        pubkeys_per_attestation.push(
+            attestation
+                .attesting_validators
+                .iter()
+                .map(|v| v.pubkey.0)
+                .collect(),
+        );
     }
+
+    let messages: Vec<SignedMessage> = witness
+        .attestations
+        .iter()
+        .enumerate()
+        .map(|(i, a)| SignedMessage {
+            pubkeys: &pubkeys_per_attestation[i],
+            signing_root: &signing_roots[i],
+            signature: &a.signature.0,
+        })
+        .collect();
+
+    assert!(
+        verify_attestation_batch(&messages),
+        "BLS aggregate signature verification failed",
+    );
 
     // Phase 4: Compute counted validators commitment
     counted_indices.sort_unstable();
-    let commitment = counted_validators_commitment(&counted_indices);
+    let commitment = acc::commit_indices(&counted_indices);
 
     SlotProofOutput {
         accumulator_commitment: witness.accumulator_commitment,

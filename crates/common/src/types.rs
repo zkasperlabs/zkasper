@@ -2,15 +2,22 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-/// Merkle multi-proof: verify multiple leaves against a single root
-/// using a minimal set of auxiliary sibling nodes.
+use crate::acc::Digest;
+
+/// Merkle multi-proof: the sibling nodes a leaf set does not itself determine.
 ///
-/// The auxiliary nodes are ordered bottom-up, left-to-right — the same
-/// order the verifier consumes them when walking from leaves to root.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MerkleMultiProof {
-    pub auxiliaries: Vec<[u8; 32]>,
+/// Ordered bottom-up, and within a level in ascending parent order, left child
+/// before right — the order [`crate::merkle::batch_root`] consumes them in.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MultiProof<T> {
+    pub auxiliaries: Vec<T>,
 }
+
+/// Multi-proof over the SSZ (SHA-256) tree.
+pub type SszMultiProof = MultiProof<[u8; 32]>;
+
+/// Multi-proof over the accumulator (Poseidon2-Goldilocks) tree.
+pub type AccMultiProof = MultiProof<Digest>;
 
 /// 48-byte BLS public key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +69,7 @@ pub struct Checkpoint {
 pub struct ValidatorMutation {
     pub validator_index: u64,
     /// True if this validator is new (not present in the old state).
-    /// When true, the old leaf in both SSZ and Poseidon trees is all-zeros.
+    /// When true, the old leaf in both SSZ and accumulator trees is all-zeros.
     pub is_new: bool,
     pub old_data: ValidatorData,
     pub new_data: ValidatorData,
@@ -72,8 +79,8 @@ pub struct ValidatorMutation {
     /// Raw pubkey split into 2x32-byte SSZ chunks (to verify field_leaves[0]).
     pub old_pubkey_chunks: [[u8; 32]; 2],
     pub new_pubkey_chunks: [[u8; 32]; 2],
-    /// Poseidon Merkle siblings (depth = POSEIDON_TREE_DEPTH).
-    pub poseidon_siblings: Vec<[u8; 32]>,
+    /// Accumulator Merkle siblings (depth = ACC_TREE_DEPTH).
+    pub acc_siblings: Vec<Digest>,
 }
 
 /// Witness for Proof 1: Epoch Diff.
@@ -82,7 +89,7 @@ pub struct EpochDiffWitness {
     // -- public inputs (bound by on-chain state) --
     pub state_root_1: [u8; 32],
     pub state_root_2: [u8; 32],
-    pub poseidon_root_1: [u8; 32],
+    pub acc_root_1: Digest,
     pub total_active_balance_1: u64,
     /// Epoch of state_root_1 (used for old is_active checks).
     pub epoch_1: u64,
@@ -99,10 +106,8 @@ pub struct EpochDiffWitness {
     pub mutations: Vec<ValidatorMutation>,
 
     // -- SSZ multi-proofs for validator trees --
-    /// Multi-proof for old validator tree (state 1).
-    pub ssz_multi_proof_1: MerkleMultiProof,
-    /// Multi-proof for new validator tree (state 2).
-    pub ssz_multi_proof_2: MerkleMultiProof,
+    pub ssz_multi_proof_1: SszMultiProof,
+    pub ssz_multi_proof_2: SszMultiProof,
 }
 
 /// Per-validator data carried inside an attestation witness.
@@ -117,7 +122,7 @@ pub struct AttestingValidator {
     pub count_balance: bool,
 }
 
-/// One aggregated attestation for the finality proof.
+/// One aggregated attestation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestationWitness {
     // -- Raw AttestationData fields (circuit recomputes hash_tree_root) --
@@ -134,47 +139,22 @@ pub struct AttestationWitness {
     pub attesting_validators: Vec<AttestingValidator>,
 }
 
-/// Witness for Proof 2: Finality.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FinalityWitness {
-    // -- public inputs (circuit outputs) --
-    /// `poseidon(poseidon_root, total_active_balance)` — binds to the accumulator
-    /// state tracked by the epoch-diff chain. The circuit verifies this internally.
-    pub accumulator_commitment: [u8; 32],
-    /// The block root being proven finalized (circuit output).
-    pub finalized_block_root: [u8; 32],
-
-    // -- private witness --
-    pub poseidon_root: [u8; 32],
-    pub total_active_balance: u64,
-    /// `compute_domain(DOMAIN_BEACON_ATTESTER, fork_version, genesis_validators_root)`,
-    /// precomputed by the witness generator.
-    pub signing_domain: [u8; 32],
-
-    // -- attestations --
-    pub attestations: Vec<AttestationWitness>,
-
-    /// Poseidon multi-proof for all unique attesting validators at once.
-    /// Proves every (poseidon_leaf, validator_index) against poseidon_root.
-    pub poseidon_multi_proof: MerkleMultiProof,
-}
-
 // ---------------------------------------------------------------------------
-// Slot-level proving types (incremental architecture)
+// Slot-level proving types
 // ---------------------------------------------------------------------------
 
 /// Public outputs of a slot proof.
 ///
 /// After recursive verification, the justification circuit sees only these values.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotProofOutput {
-    pub accumulator_commitment: [u8; 32],
+    pub accumulator_commitment: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     /// Sum of `active_effective_balance` for validators with `count_balance=true`.
     pub attesting_balance: u64,
-    /// Poseidon hash chain over sorted counted validator indices.
-    pub counted_validators_commitment: [u8; 32],
+    /// Sponge commitment over sorted counted validator indices.
+    pub counted_validators_commitment: Digest,
     /// Number of counted validators (for commitment verification).
     pub num_counted_validators: u64,
 }
@@ -183,22 +163,22 @@ pub struct SlotProofOutput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlotProofWitness {
     // -- public inputs --
-    pub accumulator_commitment: [u8; 32],
+    pub accumulator_commitment: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub signing_domain: [u8; 32],
 
     // -- private witness --
-    pub poseidon_root: [u8; 32],
+    pub acc_root: Digest,
     pub total_active_balance: u64,
     pub attestations: Vec<AttestationWitness>,
-    pub poseidon_multi_proof: MerkleMultiProof,
+    pub acc_multi_proof: AccMultiProof,
 }
 
 /// Public outputs of a justification proof.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JustificationOutput {
-    pub accumulator_commitment: [u8; 32],
+    pub accumulator_commitment: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
 }
@@ -207,24 +187,29 @@ pub struct JustificationOutput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JustificationWitness {
     // -- public inputs --
-    pub accumulator_commitment: [u8; 32],
+    pub accumulator_commitment: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub total_active_balance: u64,
 
-    // -- slot proof outputs (verified recursively via ziskos::verify_proof) --
+    /// Verification key of the slot-proof program. Bound into the justification
+    /// output so the on-chain verifier can pin which program the slot proofs
+    /// came from.
+    pub slot_program_vk: crate::recursion::ProgramVk,
+
+    // -- slot proof outputs, verified recursively --
     pub slot_proof_outputs: Vec<SlotProofOutput>,
-    /// Opaque proof bytes per slot (empty in native testing mode).
-    pub slot_proof_proofs: Vec<Vec<u8>>,
+    /// Zisk proof words per slot (empty in native testing mode).
+    pub slot_proofs: Vec<Vec<u64>>,
 
     // -- dedup witness: per-slot sorted counted validator indices --
     pub counted_indices_per_slot: Vec<Vec<u64>>,
 }
 
 /// Public outputs of a finalization proof.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizationOutput {
-    pub accumulator_commitment: [u8; 32],
+    pub accumulator_commitment: Digest,
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
 }
@@ -232,18 +217,16 @@ pub struct FinalizationOutput {
 /// Witness for a finalization proof (pairs two consecutive justifications).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalizationWitness {
-    pub accumulator_commitment: [u8; 32],
+    pub accumulator_commitment: Digest,
+    /// Verification key of the justification program.
+    pub justification_program_vk: crate::recursion::ProgramVk,
     /// Justification outputs for epochs E and E+1.
     pub justification_outputs: Vec<JustificationOutput>,
-    /// Opaque proof bytes for each justification (empty in native testing mode).
-    pub justification_proofs: Vec<Vec<u8>>,
+    /// Zisk proof words for each justification (empty in native testing mode).
+    pub justification_proofs: Vec<Vec<u64>>,
 }
 
-// ---------------------------------------------------------------------------
-// Original types
-// ---------------------------------------------------------------------------
-
-/// Witness for Bootstrap: one-time Poseidon tree construction.
+/// Witness for Bootstrap: one-time accumulator tree construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BootstrapWitness {
     pub state_root: [u8; 32],
@@ -256,4 +239,45 @@ pub struct BootstrapWitness {
     pub validator_field_chunks: Vec<[[u8; 32]; 8]>,
     /// Per-validator: raw pubkey split into 2x32-byte SSZ chunks.
     pub validator_pubkey_chunks: Vec<[[u8; 32]; 2]>,
+}
+
+// ---------------------------------------------------------------------------
+// Public output encoding
+// ---------------------------------------------------------------------------
+
+use crate::recursion::PublicWriter;
+
+impl SlotProofOutput {
+    /// Bytes this proof commits to, and that the justification proof checks the
+    /// child proof against.
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .u64(self.target_epoch)
+            .bytes32(&self.target_root)
+            .u64(self.attesting_balance)
+            .digest(&self.counted_validators_commitment)
+            .u64(self.num_counted_validators)
+            .finish()
+    }
+}
+
+impl JustificationOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .u64(self.target_epoch)
+            .bytes32(&self.target_root)
+            .finish()
+    }
+}
+
+impl FinalizationOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .u64(self.finalized_epoch)
+            .bytes32(&self.finalized_root)
+            .finish()
+    }
 }

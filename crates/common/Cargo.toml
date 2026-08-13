@@ -8,14 +8,9 @@ default = ["std"]
 std = []
 test-utils = []
 count-ops = []
-bls = ["blst"]
 
 [dependencies]
 serde = { workspace = true }
 serde-big-array = "0.5"
 bincode = { workspace = true }
-sha2 = { workspace = true }
-ark-ff = { workspace = true }
-ark-bn254 = { workspace = true }
-light-poseidon = { workspace = true }
-blst = { workspace = true, optional = true }
+ziskos = { workspace = true }

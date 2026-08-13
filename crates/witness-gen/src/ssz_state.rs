@@ -5,8 +5,8 @@
 //! needed to prove the validators field (index 11) against the state root.
 
 use anyhow::{Context, Result};
-use zkasper_common::{ChainConfig, ConsensusFork};
 use zkasper_common::ssz::sha256_pair;
+use zkasper_common::{ChainConfig, ConsensusFork};
 
 /// Result of parsing the SSZ state: proof siblings + computed state root.
 pub struct StateProof {
@@ -260,7 +260,10 @@ const SSZ_VALIDATOR_SIZE: usize = 121;
 
 /// Extract validators from raw SSZ state as `ValidatorResponse` structs.
 #[allow(dead_code)]
-pub fn extract_validators(raw_ssz: &[u8], config: &ChainConfig) -> Result<Vec<crate::beacon_api::ValidatorResponse>> {
+pub fn extract_validators(
+    raw_ssz: &[u8],
+    config: &ChainConfig,
+) -> Result<Vec<crate::beacon_api::ValidatorResponse>> {
     let fork = config.fork_at_slot(extract_slot(raw_ssz));
     let ranges = parse_field_ranges(raw_ssz, fork)?;
     let (val_start, val_end) = ranges[11];
@@ -315,7 +318,10 @@ pub fn extract_fork_version(raw_ssz: &[u8]) -> [u8; 4] {
 
 /// Extract slot and state_root from raw SSZ state (fields 2 and embedded in the block header).
 #[allow(dead_code)]
-pub fn extract_header(raw_ssz: &[u8], config: &ChainConfig) -> Result<crate::beacon_api::HeaderResponse> {
+pub fn extract_header(
+    raw_ssz: &[u8],
+    config: &ChainConfig,
+) -> Result<crate::beacon_api::HeaderResponse> {
     let fork = config.fork_at_slot(extract_slot(raw_ssz));
     let ranges = parse_field_ranges(raw_ssz, fork)?;
 
@@ -1058,8 +1064,8 @@ mod tests {
     fn test_state_tree_extracts_correct_siblings() {
         // Build a 64-leaf tree with known values (Fulu depth 6)
         let mut leaves = [[0u8; 32]; STATE_TREE_LEAVES];
-        for i in 0..STATE_TREE_LEAVES {
-            leaves[i][0] = i as u8;
+        for (i, leaf) in leaves.iter_mut().enumerate() {
+            leaf[0] = i as u8;
         }
         let (root, siblings) = build_state_tree_and_extract(&leaves, 11);
         assert_eq!(siblings.len(), STATE_TREE_DEPTH);

@@ -7,17 +7,17 @@ mod common;
 
 use common::{make_header, validator_data_to_response, MockBeaconApi};
 
+use zkasper_common::acc;
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
-use zkasper_common::poseidon::accumulator_commitment;
 use zkasper_common::ssz::attestation_data_root;
-use zkasper_common::test_utils::build_poseidon_tree;
 use zkasper_common::types::*;
 use zkasper_common::ChainConfig;
+use zkasper_witness_gen::acc_tree::AccTree;
 
 const TEST_CONFIG: ChainConfig = ChainConfig {
     slots_per_epoch: 4,
     validators_tree_depth: 2,
-    poseidon_tree_depth: 2,
+    acc_tree_depth: 2,
     beacon_state_validators_field_index: 11,
     fulu_fork_epoch: 0,
 };
@@ -44,8 +44,7 @@ fn generate_test_keys(n: usize) -> Vec<(blst::min_pk::SecretKey, [u8; 48])> {
 
 fn sign_message(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
     let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    let sigs: Vec<blst::min_pk::Signature> =
-        sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
+    let sigs: Vec<blst::min_pk::Signature> = sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
     let sig_refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
     let agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true).unwrap();
     agg.to_signature().to_bytes()
@@ -59,6 +58,7 @@ fn sign_message(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
 ///
 /// `validator_indices` indexes into the `keys` array.
 /// `seen` tracks which validators have already been counted across attestations.
+#[allow(clippy::too_many_arguments)]
 fn make_test_attestation(
     keys: &[(blst::min_pk::SecretKey, [u8; 48])],
     validator_data: &[ValidatorData],
@@ -152,16 +152,11 @@ fn test_e2e_full_pipeline() {
         &genesis_validators_root,
     );
 
-    // 4. Build Poseidon tree
+    // 4. Build the accumulator tree
     let epoch_e = 10u64;
-    let poseidon_leaves: Vec<[u8; 32]> = validators
-        .iter()
-        .map(|v| {
-            zkasper_common::poseidon::poseidon_leaf(&v.pubkey.0, v.active_effective_balance(epoch_e))
-        })
-        .collect();
-    let (poseidon_root, _poseidon_siblings) = build_poseidon_tree(&poseidon_leaves, TEST_DEPTH);
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let acc_tree = AccTree::build(&validators, epoch_e, TEST_DEPTH);
+    let acc_root = acc_tree.root();
+    let commitment = acc::commitment(&acc_root, total_active_balance);
 
     // 5. Target roots (synthetic block roots for epoch E and E+1)
     let target_root_e = [0x07u8; 32];
@@ -183,8 +178,7 @@ fn test_e2e_full_pipeline() {
     let header = make_header(bootstrap_slot, &responses, TEST_DEPTH);
     mock.validators
         .insert(bootstrap_slot.to_string(), responses.clone());
-    mock.headers
-        .insert(bootstrap_slot.to_string(), header);
+    mock.headers.insert(bootstrap_slot.to_string(), header);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (bootstrap_witness, tree, _epoch_state, boot_balance, boot_count) = rt
@@ -207,7 +201,7 @@ fn test_e2e_full_pipeline() {
         );
 
     assert_eq!(boot_poseidon_root, tree.root());
-    assert_eq!(boot_poseidon_root, poseidon_root);
+    assert_eq!(boot_poseidon_root, acc_root);
     assert_eq!(boot_total_balance, total_active_balance);
     assert_eq!(boot_commitment, commitment);
 
@@ -263,17 +257,17 @@ fn test_e2e_full_pipeline() {
         .map(|v| v.validator_index)
         .collect();
     let (_, slot0_poseidon_proof) =
-        build_poseidon_tree_multi_proof(&poseidon_leaves, TEST_DEPTH, &slot0_leaf_indices);
+        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &slot0_leaf_indices);
 
     let slot0_witness = SlotProofWitness {
         accumulator_commitment: commitment,
         target_epoch: epoch_e,
         target_root: target_root_e,
         signing_domain,
-        poseidon_root,
+        acc_root,
         total_active_balance,
         attestations: vec![att_e_slot0],
-        poseidon_multi_proof: slot0_poseidon_proof,
+        acc_multi_proof: slot0_poseidon_proof,
     };
 
     let slot0_output =
@@ -295,17 +289,17 @@ fn test_e2e_full_pipeline() {
         .map(|v| v.validator_index)
         .collect();
     let (_, slot1_poseidon_proof) =
-        build_poseidon_tree_multi_proof(&poseidon_leaves, TEST_DEPTH, &slot1_leaf_indices);
+        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &slot1_leaf_indices);
 
     let slot1_witness = SlotProofWitness {
         accumulator_commitment: commitment,
         target_epoch: epoch_e,
         target_root: target_root_e,
         signing_domain,
-        poseidon_root,
+        acc_root,
         total_active_balance,
         attestations: vec![att_e_slot1],
-        poseidon_multi_proof: slot1_poseidon_proof,
+        acc_multi_proof: slot1_poseidon_proof,
     };
 
     let slot1_output =
@@ -320,12 +314,13 @@ fn test_e2e_full_pipeline() {
     // Step C: Justification for epoch E
     // =========================================================
     let just_e_witness = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch: epoch_e,
         target_root: target_root_e,
         total_active_balance,
         slot_proof_outputs: vec![slot0_output.clone(), slot1_output.clone()],
-        slot_proof_proofs: vec![vec![], vec![]], // stub proofs
+        slot_proofs: vec![vec![], vec![]], // stub proofs
         counted_indices_per_slot: vec![slot0_indices.clone(), slot1_indices.clone()],
     };
 
@@ -378,19 +373,19 @@ fn test_e2e_full_pipeline() {
 
     // Poseidon tree is the same (no epoch diff yet)
     let (_, slot_e1_0_proof) =
-        build_poseidon_tree_multi_proof(&poseidon_leaves, TEST_DEPTH, &[0, 1]);
+        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[0, 1]);
     let (_, slot_e1_1_proof) =
-        build_poseidon_tree_multi_proof(&poseidon_leaves, TEST_DEPTH, &[2, 3]);
+        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[2, 3]);
 
     let slot_e1_0_witness = SlotProofWitness {
         accumulator_commitment: commitment,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         signing_domain,
-        poseidon_root,
+        acc_root,
         total_active_balance,
         attestations: vec![att_e1_slot0],
-        poseidon_multi_proof: slot_e1_0_proof,
+        acc_multi_proof: slot_e1_0_proof,
     };
 
     let slot_e1_0_output =
@@ -401,10 +396,10 @@ fn test_e2e_full_pipeline() {
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         signing_domain,
-        poseidon_root,
+        acc_root,
         total_active_balance,
         attestations: vec![att_e1_slot1],
-        poseidon_multi_proof: slot_e1_1_proof,
+        acc_multi_proof: slot_e1_1_proof,
     };
 
     let slot_e1_1_output =
@@ -416,12 +411,13 @@ fn test_e2e_full_pipeline() {
     // Step E: Justification for epoch E+1
     // =========================================================
     let just_e1_witness = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         total_active_balance,
         slot_proof_outputs: vec![slot_e1_0_output, slot_e1_1_output],
-        slot_proof_proofs: vec![vec![], vec![]],
+        slot_proofs: vec![vec![], vec![]],
         counted_indices_per_slot: vec![vec![0, 1], vec![2, 3]],
     };
 
@@ -437,6 +433,7 @@ fn test_e2e_full_pipeline() {
     // Step F: Finalization (two consecutive justifications)
     // =========================================================
     let finalization_witness = FinalizationWitness {
+        justification_program_vk: [0; 4],
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e_output, just_e1_output],
         justification_proofs: vec![vec![], vec![]],
@@ -449,7 +446,11 @@ fn test_e2e_full_pipeline() {
     assert_eq!(finalization_output.finalized_epoch, epoch_e);
     assert_eq!(finalization_output.finalized_root, target_root_e);
 
-    eprintln!("✓ Finalization verified: epoch={}, root=0x{}", epoch_e, hex::encode(target_root_e));
+    eprintln!(
+        "✓ Finalization verified: epoch={}, root=0x{}",
+        epoch_e,
+        hex::encode(target_root_e)
+    );
 
     // =========================================================
     // Step G: Epoch diff (mutate validator 0's balance: 32 → 16 ETH)
@@ -468,8 +469,7 @@ fn test_e2e_full_pipeline() {
 
     // Add slot_e2 data to mock
     let header_e2 = make_header(slot_e2, &responses_e2, TEST_DEPTH);
-    mock.validators
-        .insert(slot_e2.to_string(), responses_e2);
+    mock.validators.insert(slot_e2.to_string(), responses_e2);
     mock.headers.insert(slot_e2.to_string(), header_e2);
 
     // We need the bootstrap slot validators too (for the old state)
@@ -504,10 +504,13 @@ fn test_e2e_full_pipeline() {
     assert_eq!(diff_balance, new_balance);
     assert_ne!(diff_commitment, commitment); // balance changed
 
-    let expected_diff_commitment = accumulator_commitment(&diff_poseidon_root, new_balance);
+    let expected_diff_commitment = acc::commitment(&diff_poseidon_root, new_balance);
     assert_eq!(diff_commitment, expected_diff_commitment);
 
-    eprintln!("✓ Epoch diff verified: balance {} → {}", total_active_balance, new_balance);
+    eprintln!(
+        "✓ Epoch diff verified: balance {} → {}",
+        total_active_balance, new_balance
+    );
 
     // =========================================================
     // Verify accumulator commitment chain
@@ -515,13 +518,11 @@ fn test_e2e_full_pipeline() {
     // Bootstrap → epoch diff: commitment chains correctly
     assert_eq!(boot_commitment, commitment);
     assert_eq!(
-        epoch_diff_witness.poseidon_root_1,
-        poseidon_root,
+        epoch_diff_witness.acc_root_1, acc_root,
         "epoch diff should start from bootstrap's poseidon root"
     );
     assert_eq!(
-        epoch_diff_witness.total_active_balance_1,
-        total_active_balance,
+        epoch_diff_witness.total_active_balance_1, total_active_balance,
         "epoch diff should start from bootstrap's total balance"
     );
 
@@ -530,101 +531,16 @@ fn test_e2e_full_pipeline() {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build Poseidon tree multi-proof from poseidon leaves
+// Accumulator helpers — thin wrappers over the production tree, so the test
+// exercises the same multi-proof ordering the circuit consumes.
 // ---------------------------------------------------------------------------
 
-fn build_poseidon_tree_multi_proof(
-    poseidon_leaves: &[[u8; 32]],
+fn build_acc_tree_multi_proof(
+    validators: &[ValidatorData],
+    epoch: u64,
     depth: u32,
     leaf_indices: &[u64],
-) -> ([u8; 32], MerkleMultiProof) {
-    use std::collections::BTreeSet;
-    use zkasper_common::poseidon::poseidon_pair;
-
-    // Build the full tree
-    let (root, _all_siblings) = build_poseidon_tree(poseidon_leaves, depth);
-
-    // Build multi-proof using the same algorithm as test_utils::build_ssz_tree_multi_proof
-    // but with poseidon_pair
-    let mut zero_hashes = vec![[0u8; 32]; (depth + 1) as usize];
-    for d in 1..=depth as usize {
-        zero_hashes[d] = poseidon_pair(&zero_hashes[d - 1], &zero_hashes[d - 1]);
-    }
-
-    let dense_depth = if poseidon_leaves.is_empty() {
-        1u32
-    } else {
-        (poseidon_leaves.len() as u64)
-            .next_power_of_two()
-            .trailing_zeros()
-    }
-    .max(1)
-    .min(depth);
-    let dense_capacity = 1usize << dense_depth;
-
-    let mut levels: Vec<Vec<[u8; 32]>> = Vec::new();
-    let mut leaves = vec![[0u8; 32]; dense_capacity];
-    for (i, leaf) in poseidon_leaves.iter().enumerate() {
-        leaves[i] = *leaf;
-    }
-    levels.push(leaves);
-
-    for d in 0..dense_depth as usize {
-        let prev = &levels[d];
-        let parent_count = prev.len() / 2;
-        let mut parents = Vec::with_capacity(parent_count);
-        for i in 0..parent_count {
-            parents.push(poseidon_pair(&prev[i * 2], &prev[i * 2 + 1]));
-        }
-        levels.push(parents);
-    }
-
-    // Build auxiliaries
-    let mut known_at_level: BTreeSet<u64> = leaf_indices.iter().copied().collect();
-    let mut auxiliaries = Vec::new();
-
-    for level in 0..depth {
-        let parent_indices: BTreeSet<u64> = known_at_level.iter().map(|&idx| idx / 2).collect();
-
-        for &parent_idx in &parent_indices {
-            let left_idx = parent_idx * 2;
-            let right_idx = parent_idx * 2 + 1;
-
-            if !known_at_level.contains(&left_idx) {
-                let node = get_poseidon_node(&levels, &zero_hashes, level, left_idx, dense_depth);
-                auxiliaries.push(node);
-            }
-            if !known_at_level.contains(&right_idx) {
-                let node = get_poseidon_node(&levels, &zero_hashes, level, right_idx, dense_depth);
-                auxiliaries.push(node);
-            }
-        }
-
-        known_at_level = parent_indices;
-    }
-
-    (root, MerkleMultiProof { auxiliaries })
-}
-
-fn get_poseidon_node(
-    levels: &[Vec<[u8; 32]>],
-    zero_hashes: &[[u8; 32]],
-    level: u32,
-    idx: u64,
-    dense_depth: u32,
-) -> [u8; 32] {
-    if level < dense_depth {
-        let level_data = &levels[level as usize];
-        if (idx as usize) < level_data.len() {
-            level_data[idx as usize]
-        } else {
-            zero_hashes[level as usize]
-        }
-    } else {
-        if idx == 0 && level == dense_depth {
-            levels[dense_depth as usize][0]
-        } else {
-            zero_hashes[level as usize]
-        }
-    }
+) -> (acc::Digest, AccMultiProof) {
+    let tree = AccTree::build(validators, epoch, depth);
+    (tree.root(), tree.build_multi_proof(leaf_indices))
 }

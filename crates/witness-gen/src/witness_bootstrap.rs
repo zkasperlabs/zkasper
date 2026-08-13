@@ -4,31 +4,31 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use tracing::{info, info_span};
 
-use zkasper_common::ChainConfig;
 use zkasper_common::types::BootstrapWitness;
+use zkasper_common::ChainConfig;
 
+use crate::acc_tree::AccTree;
 use crate::beacon_api::BeaconApi;
-use crate::poseidon_tree::PoseidonTree;
+use crate::epoch_state::EpochState;
 use crate::ssz_state;
 use crate::state_diff::{
     build_validator_roots, make_state_proof, validator_response_to_data,
     validator_response_to_field_leaves, validator_response_to_pubkey_chunks,
 };
-use crate::epoch_state::EpochState;
 
-/// Build a BootstrapWitness and PoseidonTree from a beacon state at `slot`.
+/// Build a BootstrapWitness and AccTree from a beacon state at `slot`.
 ///
 /// `ssz_depth`: depth of the SSZ validators data tree (40 per spec).
-/// `poseidon_depth`: depth of the Poseidon accumulator tree (22 for mainnet).
+/// `acc_depth`: depth of the Poseidon accumulator tree (22 for mainnet).
 /// Returns `(witness, tree, epoch_state, total_active_balance, num_validators)`.
 pub async fn build(
     api: &impl BeaconApi,
     config: &ChainConfig,
     slot: u64,
-) -> Result<(BootstrapWitness, PoseidonTree, EpochState, u64, u64)> {
+) -> Result<(BootstrapWitness, AccTree, EpochState, u64, u64)> {
     let ssz_depth = config.validators_tree_depth;
-    let poseidon_depth = config.poseidon_tree_depth;
-    let _span = info_span!("bootstrap", slot, ssz_depth, poseidon_depth).entered();
+    let acc_depth = config.acc_tree_depth;
+    let _span = info_span!("bootstrap", slot, ssz_depth, acc_depth).entered();
     let slot_str = slot.to_string();
 
     // Fetch header to get the state_root
@@ -54,7 +54,10 @@ pub async fn build(
     // Convert to common types + SSZ chunks
     let (validator_data, field_chunks, pubkey_chunks) = {
         let _span = info_span!("convert").entered();
-        let data: Vec<_> = validators.par_iter().map(validator_response_to_data).collect();
+        let data: Vec<_> = validators
+            .par_iter()
+            .map(validator_response_to_data)
+            .collect();
         let fields: Vec<_> = validators
             .par_iter()
             .map(validator_response_to_field_leaves)
@@ -94,8 +97,7 @@ pub async fn build(
             proof.siblings
         } else {
             // Synthetic fallback for mock-based tests
-            let (computed_state_root, siblings) =
-                make_state_proof(&ssz_data_root, num_validators);
+            let (computed_state_root, siblings) = make_state_proof(&ssz_data_root, num_validators);
             anyhow::ensure!(
                 computed_state_root == state_root,
                 "synthetic state root does not match header"
@@ -106,8 +108,8 @@ pub async fn build(
 
     // Build Poseidon tree
     let tree = {
-        let _span = info_span!("poseidon_tree").entered();
-        PoseidonTree::build(&validator_data, epoch, poseidon_depth)
+        let _span = info_span!("acc_tree").entered();
+        AccTree::build(&validator_data, epoch, acc_depth)
     };
 
     // Compute total active balance
@@ -137,5 +139,11 @@ pub async fn build(
         validator_pubkey_chunks: pubkey_chunks,
     };
 
-    Ok((witness, tree, epoch_state, total_active_balance, num_validators))
+    Ok((
+        witness,
+        tree,
+        epoch_state,
+        total_active_balance,
+        num_validators,
+    ))
 }

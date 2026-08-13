@@ -1,30 +1,75 @@
-use sha2::{Digest, Sha256};
+//! SSZ hashing over the SHA-256 domain.
+//!
+//! `sha256_pair` is the hot path — every SSZ Merkle level and every container
+//! hash_tree_root goes through it. It is expressed as two `syscall_sha256_f`
+//! compressions with no allocation and no message-scheduling code: the first
+//! block is the 64 bytes of input, the second is the fixed padding block for a
+//! 64-byte message.
+
+use ziskos::syscalls::{syscall_sha256_f, SyscallSha256Params};
 
 use crate::merkle;
-use crate::types::ValidatorData;
+use crate::types::{SszMultiProof, ValidatorData};
 
-/// SHA-256 hash of two concatenated 32-byte inputs.
+/// SHA-256 initial hash values.
+const IV: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+/// Padding block for a message of exactly 64 bytes: `0x80`, zeros, then the
+/// bit length (512) as a big-endian u64 in the final 8 bytes.
+const PAD_512: [u64; 8] = [0x80, 0, 0, 0, 0, 0, 0, 0x0002_0000_0000_0000];
+
+/// SHA-256 of two concatenated 32-byte inputs — the SSZ Merkle compression.
 pub fn sha256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     #[cfg(feature = "count-ops")]
-    crate::op_counter::inc_sha256();
-    let mut hasher = Sha256::new();
-    hasher.update(left);
-    hasher.update(right);
-    hasher.finalize().into()
+    crate::op_counter::inc_sha256f(2);
+
+    let mut state = [
+        IV[0] as u64 | (IV[1] as u64) << 32,
+        IV[2] as u64 | (IV[3] as u64) << 32,
+        IV[4] as u64 | (IV[5] as u64) << 32,
+        IV[6] as u64 | (IV[7] as u64) << 32,
+    ];
+
+    let mut block = [0u64; 8];
+    for i in 0..4 {
+        block[i] = u64::from_le_bytes(left[8 * i..8 * i + 8].try_into().unwrap());
+        block[4 + i] = u64::from_le_bytes(right[8 * i..8 * i + 8].try_into().unwrap());
+    }
+    syscall_sha256_f(&mut SyscallSha256Params {
+        state: &mut state,
+        input: &block,
+    });
+    syscall_sha256_f(&mut SyscallSha256Params {
+        state: &mut state,
+        input: &PAD_512,
+    });
+
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        out[8 * i..8 * i + 4].copy_from_slice(&(state[i] as u32).to_be_bytes());
+        out[8 * i + 4..8 * i + 8].copy_from_slice(&((state[i] >> 32) as u32).to_be_bytes());
+    }
+    out
 }
 
 /// Merkleize 8 leaves (depth-3 binary tree, 7 hashes).
 /// Used for the Validator container hash_tree_root.
 pub fn validator_hash_tree_root(field_leaves: &[[u8; 32]; 8]) -> [u8; 32] {
-    // level 2 (4 nodes)
     let n0 = sha256_pair(&field_leaves[0], &field_leaves[1]);
     let n1 = sha256_pair(&field_leaves[2], &field_leaves[3]);
     let n2 = sha256_pair(&field_leaves[4], &field_leaves[5]);
     let n3 = sha256_pair(&field_leaves[6], &field_leaves[7]);
-    // level 1 (2 nodes)
     let n4 = sha256_pair(&n0, &n1);
     let n5 = sha256_pair(&n2, &n3);
-    // root
     sha256_pair(&n4, &n5)
 }
 
@@ -38,23 +83,42 @@ pub fn validator_hash_tree_root_pair(
     old_leaves: &[[u8; 32]; 8],
     new_leaves: &[[u8; 32]; 8],
 ) -> ([u8; 32], [u8; 32]) {
-    // level 2 (4 nodes)
-    let (old_n0, new_n0) = shared_sha256_pair(&old_leaves[0], &old_leaves[1], &new_leaves[0], &new_leaves[1]);
-    let (old_n1, new_n1) = shared_sha256_pair(&old_leaves[2], &old_leaves[3], &new_leaves[2], &new_leaves[3]);
-    let (old_n2, new_n2) = shared_sha256_pair(&old_leaves[4], &old_leaves[5], &new_leaves[4], &new_leaves[5]);
-    let (old_n3, new_n3) = shared_sha256_pair(&old_leaves[6], &old_leaves[7], &new_leaves[6], &new_leaves[7]);
-    // level 1
+    let (old_n0, new_n0) = shared_sha256_pair(
+        &old_leaves[0],
+        &old_leaves[1],
+        &new_leaves[0],
+        &new_leaves[1],
+    );
+    let (old_n1, new_n1) = shared_sha256_pair(
+        &old_leaves[2],
+        &old_leaves[3],
+        &new_leaves[2],
+        &new_leaves[3],
+    );
+    let (old_n2, new_n2) = shared_sha256_pair(
+        &old_leaves[4],
+        &old_leaves[5],
+        &new_leaves[4],
+        &new_leaves[5],
+    );
+    let (old_n3, new_n3) = shared_sha256_pair(
+        &old_leaves[6],
+        &old_leaves[7],
+        &new_leaves[6],
+        &new_leaves[7],
+    );
     let (old_n4, new_n4) = shared_sha256_pair(&old_n0, &old_n1, &new_n0, &new_n1);
     let (old_n5, new_n5) = shared_sha256_pair(&old_n2, &old_n3, &new_n2, &new_n3);
-    // root
     shared_sha256_pair(&old_n4, &old_n5, &new_n4, &new_n5)
 }
 
 /// Hash two pairs, but compute only once if both pairs are identical.
 #[inline]
 fn shared_sha256_pair(
-    old_l: &[u8; 32], old_r: &[u8; 32],
-    new_l: &[u8; 32], new_r: &[u8; 32],
+    old_l: &[u8; 32],
+    old_r: &[u8; 32],
+    new_l: &[u8; 32],
+    new_r: &[u8; 32],
 ) -> ([u8; 32], [u8; 32]) {
     if old_l == new_l && old_r == new_r {
         let h = sha256_pair(new_l, new_r);
@@ -66,9 +130,7 @@ fn shared_sha256_pair(
 
 /// SSZ List hash_tree_root: `sha256(data_tree_root || le_pad32(length))`.
 pub fn list_hash_tree_root(data_tree_root: &[u8; 32], length: u64) -> [u8; 32] {
-    let mut length_chunk = [0u8; 32];
-    length_chunk[..8].copy_from_slice(&length.to_le_bytes());
-    sha256_pair(data_tree_root, &length_chunk)
+    sha256_pair(data_tree_root, &u64_to_chunk(length))
 }
 
 /// Compute a SHA-256 Merkle root from leaf, index, and siblings.
@@ -86,14 +148,13 @@ pub fn verify_ssz_merkle_proof(
     merkle::verify_proof(sha256_pair, leaf, index, siblings, root)
 }
 
-/// Verify multiple leaves against a single SHA-256 Merkle root using a multi-proof.
-/// Returns the computed root.
+/// Recompute the SSZ root covering many leaves at once.
 pub fn verify_ssz_multi_proof(
     leaves: &[([u8; 32], u64)],
-    proof: &crate::types::MerkleMultiProof,
+    proof: &SszMultiProof,
     depth: u32,
 ) -> [u8; 32] {
-    merkle::verify_multi_proof(sha256_pair, leaves, proof, depth)
+    merkle::batch_root(sha256_pair, leaves, &proof.auxiliaries, depth)
 }
 
 /// Compute `hash_tree_root(AttestationData)` from its constituent fields.
@@ -258,6 +319,30 @@ pub fn verify_field_leaves_no_pubkey_hash(
 mod tests {
     use super::*;
     use crate::test_utils::{make_field_leaves, make_pubkey_chunks, make_validator};
+
+    /// SSZ zero-hash at depth 1 — sha256 of 64 zero bytes. Pins the hand-rolled
+    /// two-block compression against the real SHA-256.
+    #[test]
+    fn sha256_pair_known_answer() {
+        let expected: [u8; 32] = [
+            0xf5, 0xa5, 0xfd, 0x42, 0xd1, 0x6a, 0x20, 0x30, 0x27, 0x98, 0xef, 0x6e, 0xd3, 0x09,
+            0x97, 0x9b, 0x43, 0x00, 0x3d, 0x23, 0x20, 0xd9, 0xf0, 0xe8, 0xea, 0x98, 0x31, 0xa9,
+            0x27, 0x59, 0xfb, 0x4b,
+        ];
+        assert_eq!(sha256_pair(&[0u8; 32], &[0u8; 32]), expected);
+    }
+
+    /// Second SSZ zero-hash, chaining the first — catches a wrong IV reload.
+    #[test]
+    fn sha256_pair_chains_correctly() {
+        let z1 = sha256_pair(&[0u8; 32], &[0u8; 32]);
+        let expected: [u8; 32] = [
+            0xdb, 0x56, 0x11, 0x4e, 0x00, 0xfd, 0xd4, 0xc1, 0xf8, 0x5c, 0x89, 0x2b, 0xf3, 0x5a,
+            0xc9, 0xa8, 0x92, 0x89, 0xaa, 0xec, 0xb1, 0xeb, 0xd0, 0xa9, 0x6c, 0xde, 0x60, 0x6a,
+            0x74, 0x8b, 0x5d, 0x71,
+        ];
+        assert_eq!(sha256_pair(&z1, &z1), expected);
+    }
 
     #[test]
     fn test_sha256_pair() {

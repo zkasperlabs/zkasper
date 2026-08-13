@@ -5,8 +5,8 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{Context, Result};
 use tracing::info;
 
-use zkasper_common::ChainConfig;
 use zkasper_common::types::{AttestationWitness, AttestingValidator, BlsPubkey, BlsSignature};
+use zkasper_common::ChainConfig;
 
 use crate::beacon_api::{AttestationResponse, BeaconApi, CommitteeResponse, ValidatorResponse};
 use crate::state_diff::validator_response_to_data;
@@ -18,119 +18,6 @@ use crate::state_diff::validator_response_to_data;
 ///
 /// Scans blocks in `[target_epoch * SLOTS_PER_EPOCH .. (target_epoch + 2) * SLOTS_PER_EPOCH)`
 /// for attestations whose target matches `(target_epoch, target_root)`.
-pub async fn collect_for_checkpoint(
-    api: &impl BeaconApi,
-    config: &ChainConfig,
-    target_epoch: u64,
-    target_root: &[u8; 32],
-    validators: &[ValidatorResponse],
-    epoch: u64,
-    total_active_balance: u64,
-) -> Result<(Vec<AttestationWitness>, Vec<u64>)> {
-    let spe = config.slots_per_epoch;
-
-    // Fetch committees for the target epoch
-    let slot_str = (target_epoch * spe).to_string();
-    let committees = api
-        .get_committees(&slot_str, target_epoch)
-        .await
-        .context("fetch committees")?;
-
-    // Build committee map: (slot, committee_index) -> validator_indices
-    let committee_map = build_committee_map(&committees);
-
-    // Scan blocks for matching attestations
-    let scan_start = target_epoch * spe;
-    let scan_end = (target_epoch + 2) * spe;
-    let mut matching_attestations: Vec<AttestationResponse> = Vec::new();
-
-    for slot in scan_start..scan_end {
-        let block_id = slot.to_string();
-        match api.get_block_attestations(&block_id).await {
-            Ok(attestations) => {
-                for att in attestations {
-                    if att.data_target_epoch == target_epoch && att.data_target_root == *target_root
-                    {
-                        matching_attestations.push(att);
-                    }
-                }
-            }
-            Err(_) => {
-                // Block may not exist (missed slot), skip
-                continue;
-            }
-        }
-    }
-
-    // Build one AttestationWitness per on-chain attestation.
-    // Track unique validators for dedup and early stopping.
-    let two_thirds_balance = (total_active_balance as u128 * 2 / 3) as u64;
-    let mut seen_validators: BTreeSet<u64> = BTreeSet::new();
-    let mut unique_attesting_balance: u64 = 0;
-    let mut result = Vec::with_capacity(matching_attestations.len());
-
-    for att in &matching_attestations {
-        let attesting_indices =
-            resolve_attesting_validators(att, &committee_map).context("resolve attestors")?;
-
-        // Use BTreeSet to get strictly ascending order (required by guest verifier)
-        let sorted_indices: BTreeSet<u64> = attesting_indices.into_iter().collect();
-
-        if sorted_indices.is_empty() {
-            continue;
-        }
-
-        let mut attesting_validators = Vec::with_capacity(sorted_indices.len());
-
-        for &idx in &sorted_indices {
-            let v_resp = validators
-                .get(idx as usize)
-                .context("validator index out of range")?;
-            let v_data = validator_response_to_data(v_resp);
-            let active_balance = v_data.active_effective_balance(epoch);
-            let count_balance = seen_validators.insert(idx);
-
-            if count_balance {
-                unique_attesting_balance += active_balance;
-            }
-
-            attesting_validators.push(AttestingValidator {
-                validator_index: idx,
-                pubkey: BlsPubkey(v_resp.pubkey),
-                active_effective_balance: active_balance,
-                count_balance,
-            });
-        }
-
-        result.push(AttestationWitness {
-            data_slot: att.data_slot,
-            data_index: att.data_index,
-            data_beacon_block_root: att.data_beacon_block_root,
-            data_source_epoch: att.data_source_epoch,
-            data_source_root: att.data_source_root,
-            data_target_epoch: att.data_target_epoch,
-            data_target_root: att.data_target_root,
-            signature: BlsSignature(att.signature),
-            attesting_validators,
-        });
-
-        // Stop early once we have >= 2/3 of total active balance
-        if unique_attesting_balance >= two_thirds_balance {
-            info!(
-                attestations = result.len(),
-                unique_validators = seen_validators.len(),
-                unique_balance = unique_attesting_balance,
-                total_balance = total_active_balance,
-                "reached 2/3 supermajority, stopping",
-            );
-            break;
-        }
-    }
-
-    let unique_indices: Vec<u64> = seen_validators.into_iter().collect();
-    Ok((result, unique_indices))
-}
-
 /// Per-slot attestation data.
 pub struct SlotAttestations {
     pub slot: u64,
@@ -335,4 +222,3 @@ fn get_bit(bitfield: &[u8], idx: usize) -> bool {
     }
     (bitfield[byte_idx] >> bit_idx) & 1 == 1
 }
-

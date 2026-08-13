@@ -1,4 +1,4 @@
-//! Persistent storage for the Poseidon tree state and epoch cursor.
+//! Persistent storage for the accumulator tree state and epoch cursor.
 //!
 //! Uses simple file-based persistence with bincode serialization.
 
@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use zkasper_common::acc::Digest;
 
-use crate::poseidon_tree::PoseidonTree;
+use crate::acc_tree::AccTree;
 
 #[derive(Serialize, Deserialize)]
 struct DbState {
-    tree_levels: Vec<Vec<[u8; 32]>>,
+    tree_levels: Vec<Vec<Digest>>,
     tree_depth: u32,
     dense_depth: u32,
     cursor_epoch: u64,
@@ -30,10 +31,10 @@ impl Db {
         }
     }
 
-    /// Save the Poseidon tree and tracking metadata to disk.
+    /// Save the accumulator tree and tracking metadata to disk.
     pub fn save(
         &self,
-        tree: &PoseidonTree,
+        tree: &AccTree,
         cursor_epoch: u64,
         total_active_balance: u64,
         num_validators: u64,
@@ -55,13 +56,13 @@ impl Db {
     ///
     /// Returns `None` if the file does not exist.
     /// Returns `(tree, cursor_epoch, total_active_balance, num_validators)`.
-    pub fn load(&self) -> Result<Option<(PoseidonTree, u64, u64, u64)>> {
+    pub fn load(&self) -> Result<Option<(AccTree, u64, u64, u64)>> {
         if !self.path.exists() {
             return Ok(None);
         }
         let bytes = std::fs::read(&self.path).context("read db file")?;
         let state: DbState = bincode::deserialize(&bytes).context("deserialize db state")?;
-        let tree = PoseidonTree::from_raw(state.tree_levels, state.tree_depth, state.dense_depth);
+        let tree = AccTree::from_raw(state.tree_levels, state.tree_depth, state.dense_depth);
         Ok(Some((
             tree,
             state.cursor_epoch,

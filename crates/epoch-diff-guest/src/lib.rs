@@ -3,27 +3,28 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use zkasper_common::acc::Digest;
 use zkasper_common::types::EpochDiffWitness;
 
 /// Core epoch-diff verification logic. Returns (new_accumulator_commitment, new_poseidon_root, new_total_active_balance).
-pub fn verify_epoch_diff(witness: &EpochDiffWitness) -> ([u8; 32], [u8; 32], u64) {
+pub fn verify_epoch_diff(witness: &EpochDiffWitness) -> (Digest, Digest, u64) {
     verify_epoch_diff_with_depth(
         witness,
         zkasper_common::constants::VALIDATORS_TREE_DEPTH,
-        zkasper_common::constants::POSEIDON_TREE_DEPTH,
+        zkasper_common::constants::ACC_TREE_DEPTH,
     )
 }
 
 /// Epoch-diff verification with configurable tree depths.
 ///
 /// `ssz_depth`: depth of the SSZ validators data tree (40 per spec).
-/// `poseidon_depth`: depth of the Poseidon accumulator tree.
+/// `acc_depth`: depth of the accumulator tree.
 pub fn verify_epoch_diff_with_depth(
     witness: &EpochDiffWitness,
     ssz_depth: u32,
-    poseidon_depth: u32,
-) -> ([u8; 32], [u8; 32], u64) {
-    use zkasper_common::poseidon::{compute_poseidon_merkle_root, poseidon_leaf};
+    acc_depth: u32,
+) -> (Digest, Digest, u64) {
+    use zkasper_common::acc;
     use zkasper_common::ssz::{
         compute_ssz_merkle_root, list_hash_tree_root, validator_hash_tree_root,
         validator_hash_tree_root_pair, verify_field_leaves, verify_field_leaves_no_pubkey_hash,
@@ -33,14 +34,14 @@ pub fn verify_epoch_diff_with_depth(
     // Verify Poseidon siblings length matches expected depth
     for mutation in &witness.mutations {
         assert_eq!(
-            mutation.poseidon_siblings.len(),
-            poseidon_depth as usize,
+            mutation.acc_siblings.len(),
+            acc_depth as usize,
             "poseidon siblings length mismatch for validator {}",
             mutation.validator_index,
         );
     }
 
-    let mut poseidon_root = witness.poseidon_root_1;
+    let mut acc_root = witness.acc_root_1;
     let mut total_active_balance = witness.total_active_balance_1;
     let epoch_old = witness.epoch_1;
     let epoch_new = witness.epoch_2;
@@ -54,16 +55,18 @@ pub fn verify_epoch_diff_with_depth(
         let idx = mutation.validator_index;
 
         if mutation.is_new {
-            // New validator: old leaf is all-zeros in both SSZ and Poseidon trees
-            let zero_leaf = [0u8; 32];
-            old_ssz_leaves.push((zero_leaf, idx));
+            // New validator: the old leaf is empty in both trees.
+            old_ssz_leaves.push(([0u8; 32], idx));
 
-            // Verify Poseidon: old leaf is zero
-            let computed_old_root =
-                compute_poseidon_merkle_root(&zero_leaf, idx, &mutation.poseidon_siblings);
+            let computed_old_root = zkasper_common::merkle::compute_root(
+                acc::compress,
+                &acc::ZERO,
+                idx,
+                &mutation.acc_siblings,
+            );
             assert_eq!(
-                computed_old_root, poseidon_root,
-                "Poseidon root mismatch before new validator {}",
+                computed_old_root, acc_root,
+                "accumulator root mismatch before new validator {}",
                 idx
             );
 
@@ -104,23 +107,31 @@ pub fn verify_epoch_diff_with_depth(
             old_ssz_leaves.push((old_validator_root, idx));
             new_ssz_leaves.push((new_validator_root, idx));
 
-            // -- Verify and update Poseidon accumulator (old) --
+            // -- Verify the accumulator leaf the mutation replaces --
             let old_active_balance = mutation.old_data.active_effective_balance(epoch_old);
-            let old_poseidon = poseidon_leaf(&mutation.old_data.pubkey.0, old_active_balance);
-            let computed_old_root =
-                compute_poseidon_merkle_root(&old_poseidon, idx, &mutation.poseidon_siblings);
+            let old_acc_leaf = acc::leaf(&mutation.old_data.pubkey.0, old_active_balance);
+            let computed_old_root = zkasper_common::merkle::compute_root(
+                acc::compress,
+                &old_acc_leaf,
+                idx,
+                &mutation.acc_siblings,
+            );
             assert_eq!(
-                computed_old_root, poseidon_root,
-                "Poseidon root mismatch before mutation {}",
+                computed_old_root, acc_root,
+                "accumulator root mismatch before mutation {}",
                 idx
             );
         }
 
-        // -- Update Poseidon accumulator (new) --
+        // -- Write the new accumulator leaf --
         let new_active_balance = mutation.new_data.active_effective_balance(epoch_new);
-        let new_poseidon = poseidon_leaf(&mutation.new_data.pubkey.0, new_active_balance);
-        poseidon_root =
-            compute_poseidon_merkle_root(&new_poseidon, idx, &mutation.poseidon_siblings);
+        let new_acc_leaf = acc::leaf(&mutation.new_data.pubkey.0, new_active_balance);
+        acc_root = zkasper_common::merkle::compute_root(
+            acc::compress,
+            &new_acc_leaf,
+            idx,
+            &mutation.acc_siblings,
+        );
 
         // -- Balance delta --
         let old_active_balance = if mutation.is_new {
@@ -132,8 +143,10 @@ pub fn verify_epoch_diff_with_depth(
     }
 
     // Phase 2: SSZ multi-proof verification
-    let ssz_data_root_1 = verify_ssz_multi_proof(&old_ssz_leaves, &witness.ssz_multi_proof_1, ssz_depth);
-    let ssz_data_root_2 = verify_ssz_multi_proof(&new_ssz_leaves, &witness.ssz_multi_proof_2, ssz_depth);
+    let ssz_data_root_1 =
+        verify_ssz_multi_proof(&old_ssz_leaves, &witness.ssz_multi_proof_1, ssz_depth);
+    let ssz_data_root_2 =
+        verify_ssz_multi_proof(&new_ssz_leaves, &witness.ssz_multi_proof_2, ssz_depth);
 
     // -- Verify SSZ data tree roots link to state roots --
     let validators_field_index = zkasper_common::constants::BEACON_STATE_VALIDATORS_FIELD_INDEX;
@@ -160,8 +173,7 @@ pub fn verify_epoch_diff_with_depth(
         "state_root_2 mismatch"
     );
 
-    let commitment =
-        zkasper_common::poseidon::accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = zkasper_common::acc::commitment(&acc_root, total_active_balance);
 
-    (commitment, poseidon_root, total_active_balance)
+    (commitment, acc_root, total_active_balance)
 }

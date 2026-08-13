@@ -9,6 +9,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  ZISK_VERSION: "1.0.0-alpha"
 
 jobs:
   prove:
@@ -26,7 +27,10 @@ jobs:
       - name: Install Zisk toolchain
         run: |
           curl -sSf https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
-          SETUP_KEY=proving "$HOME/.zisk/bin/ziskup"
+          # Pinned: installing whatever is on main means every run tests a
+          # different prover, and the cost model in BENCHMARKS.md is tied to a
+          # specific version.
+          "$HOME/.zisk/bin/ziskup" --version "${ZISK_VERSION}" --provingkey --cpu -y
           echo "$HOME/.zisk/bin" >> "$GITHUB_PATH"
 
       - name: Run full proof pipeline

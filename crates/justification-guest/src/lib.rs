@@ -5,8 +5,8 @@ use zkasper_common::types::{JustificationOutput, JustificationWitness};
 
 /// Verify a justification: aggregate slot proofs, dedup validators, check 2/3.
 pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutput {
-    use zkasper_common::poseidon::counted_validators_commitment;
-    use zkasper_common::recursion::verify_proof;
+    use zkasper_common::acc;
+    use zkasper_common::recursion::verify_child;
 
     assert!(
         !witness.slot_proof_outputs.is_empty(),
@@ -22,10 +22,16 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
 
     // Phase 1: Verify each slot proof and its counted-validators commitment
     for (i, slot_output) in witness.slot_proof_outputs.iter().enumerate() {
-        // Recursive proof verification (no-op in native, real on Zisk)
-        verify_proof(
-            &witness.slot_proof_proofs[i],
-            &[], // TODO: serialize slot_output for real verification
+        // Verify the slot proof, and bind it to this exact program and these
+        // exact outputs — a proof of a different slot must not be accepted.
+        assert!(
+            verify_child(
+                &witness.slot_proofs[i],
+                &witness.slot_program_vk,
+                &slot_output.public_bytes(),
+            ),
+            "slot proof {} failed recursive verification",
+            i,
         );
 
         // Verify all slot proofs target the same checkpoint and accumulator
@@ -53,7 +59,7 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
             "slot proof {} counted validator count mismatch",
             i,
         );
-        let recomputed = counted_validators_commitment(indices);
+        let recomputed = acc::commit_indices(indices);
         assert_eq!(
             recomputed, slot_output.counted_validators_commitment,
             "slot proof {} counted validators commitment mismatch",

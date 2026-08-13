@@ -3,12 +3,12 @@
 use anyhow::{Context, Result};
 use tracing::{info, info_span};
 
-use zkasper_common::ChainConfig;
-use zkasper_common::poseidon::accumulator_commitment;
+use zkasper_common::acc;
 use zkasper_common::types::SlotProofWitness;
+use zkasper_common::ChainConfig;
 
+use crate::acc_tree::AccTree;
 use crate::beacon_api::BeaconApi;
-use crate::poseidon_tree::PoseidonTree;
 
 /// Per-slot witness with metadata needed by the justification witness builder.
 pub struct SlotWitnessData {
@@ -22,7 +22,7 @@ pub struct SlotWitnessData {
 pub async fn build_per_slot(
     api: &impl BeaconApi,
     config: &ChainConfig,
-    poseidon_tree: &PoseidonTree,
+    acc_tree: &AccTree,
     target_epoch: u64,
     target_root: [u8; 32],
     total_active_balance: u64,
@@ -37,8 +37,8 @@ pub async fn build_per_slot(
         .await
         .context("fetch validators for slot proofs")?;
 
-    let poseidon_root = poseidon_tree.root();
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let acc_root = acc_tree.root();
+    let commitment = acc::commitment(&acc_root, total_active_balance);
 
     // Collect attestations grouped by block slot
     let per_slot = crate::attestation_collector::collect_per_slot_for_checkpoint(
@@ -59,13 +59,13 @@ pub async fn build_per_slot(
 
         // Build Poseidon multi-proof for this slot's unique validators
         let multi_proof_indices: Vec<u64> = slot_data.all_validator_indices.clone();
-        let poseidon_multi_proof = poseidon_tree.build_multi_proof(&multi_proof_indices);
+        let acc_multi_proof = acc_tree.build_multi_proof(&multi_proof_indices);
 
         info!(
             attestations = slot_data.attestations.len(),
             validators = multi_proof_indices.len(),
             counted = slot_data.counted_indices.len(),
-            auxiliaries = poseidon_multi_proof.auxiliaries.len(),
+            auxiliaries = acc_multi_proof.auxiliaries.len(),
             "slot proof witness built",
         );
 
@@ -74,10 +74,10 @@ pub async fn build_per_slot(
             target_epoch,
             target_root,
             signing_domain,
-            poseidon_root,
+            acc_root,
             total_active_balance,
             attestations: slot_data.attestations,
-            poseidon_multi_proof,
+            acc_multi_proof,
         };
 
         result.push(SlotWitnessData {

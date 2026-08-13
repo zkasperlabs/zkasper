@@ -3,21 +3,21 @@
 use anyhow::{Context, Result};
 use tracing::{info, info_span};
 
-use zkasper_common::ChainConfig;
-use zkasper_common::poseidon::poseidon_leaf;
+use zkasper_common::acc;
 use zkasper_common::ssz::validator_hash_tree_root;
 use zkasper_common::types::{BlsPubkey, EpochDiffWitness, ValidatorData, ValidatorMutation};
+use zkasper_common::ChainConfig;
 
+use crate::acc_tree::AccTree;
 use crate::beacon_api::BeaconApi;
-use crate::poseidon_tree::PoseidonTree;
+use crate::epoch_state::EpochState;
 use crate::ssz_state;
 use crate::state_diff::{
     build_validators_ssz_tree, find_mutations, make_state_proof, validator_response_to_data,
     validator_response_to_field_leaves, validator_response_to_pubkey_chunks,
 };
-use crate::epoch_state::EpochState;
 
-/// Build an EpochDiffWitness and update the PoseidonTree in place.
+/// Build an EpochDiffWitness and update the AccTree in place.
 ///
 /// Uses `old_state` (from bootstrap or previous epoch diff) to avoid recomputing
 /// O(n) validator roots and re-parsing the old SSZ state.
@@ -26,7 +26,7 @@ use crate::epoch_state::EpochState;
 pub async fn build(
     api: &impl BeaconApi,
     config: &ChainConfig,
-    poseidon_tree: &mut PoseidonTree,
+    acc_tree: &mut AccTree,
     old_state: &EpochState,
     slot_2: u64,
     total_active_balance_1: u64,
@@ -97,7 +97,13 @@ pub async fn build(
         let (new_data_root, new_proof) =
             build_validators_ssz_tree(&new_roots, ssz_depth, &mutation_indices);
 
-        (old_data_root, old_proof, new_data_root, new_proof, new_roots)
+        (
+            old_data_root,
+            old_proof,
+            new_data_root,
+            new_proof,
+            new_roots,
+        )
     };
 
     // State proofs: reuse old from cache, compute new from SSZ blob
@@ -111,7 +117,10 @@ pub async fn build(
 
         // Old state proof: use cache if available
         let (sr1, ss1) = if !old_state.state_to_validators_siblings.is_empty() {
-            (old_state.state_root, old_state.state_to_validators_siblings.clone())
+            (
+                old_state.state_root,
+                old_state.state_to_validators_siblings.clone(),
+            )
         } else if let Some(raw) = api.get_state_ssz(&slot_1.to_string()).await? {
             let header = api
                 .get_header(&slot_1.to_string())
@@ -147,7 +156,7 @@ pub async fn build(
     };
 
     // Build mutations — process sequentially for correct Poseidon siblings
-    let poseidon_root_1 = poseidon_tree.root();
+    let acc_root_1 = acc_tree.root();
     let mutations = {
         let _span = info_span!("build_mutations").entered();
         let mut mutations = Vec::with_capacity(mutation_indices.len());
@@ -160,8 +169,8 @@ pub async fn build(
 
             // Compute new Poseidon leaf and update tree — returns old siblings
             let new_active_balance = new_data.active_effective_balance(epoch_2);
-            let new_poseidon_leaf = poseidon_leaf(&new_data.pubkey.0, new_active_balance);
-            let poseidon_siblings = poseidon_tree.update_leaf(idx, new_poseidon_leaf);
+            let new_poseidon_leaf = acc::leaf(&new_data.pubkey.0, new_active_balance);
+            let acc_siblings = acc_tree.update_leaf(idx, new_poseidon_leaf);
 
             if is_new {
                 let zero_data = ValidatorData {
@@ -180,7 +189,7 @@ pub async fn build(
                     new_field_leaves: validator_response_to_field_leaves(new_v),
                     old_pubkey_chunks: [[0u8; 32]; 2],
                     new_pubkey_chunks: validator_response_to_pubkey_chunks(new_v),
-                    poseidon_siblings,
+                    acc_siblings,
                 });
             } else {
                 let old_v = &validators_1[idx as usize];
@@ -195,7 +204,7 @@ pub async fn build(
                     new_field_leaves: validator_response_to_field_leaves(new_v),
                     old_pubkey_chunks: validator_response_to_pubkey_chunks(old_v),
                     new_pubkey_chunks: validator_response_to_pubkey_chunks(new_v),
-                    poseidon_siblings,
+                    acc_siblings,
                 });
             }
         }
@@ -235,7 +244,7 @@ pub async fn build(
     let witness = EpochDiffWitness {
         state_root_1,
         state_root_2,
-        poseidon_root_1,
+        acc_root_1,
         total_active_balance_1,
         epoch_1,
         epoch_2,
@@ -248,5 +257,10 @@ pub async fn build(
         ssz_multi_proof_2,
     };
 
-    Ok((witness, new_epoch_state, new_total_active_balance, num_validators_2))
+    Ok((
+        witness,
+        new_epoch_state,
+        new_total_active_balance,
+        num_validators_2,
+    ))
 }

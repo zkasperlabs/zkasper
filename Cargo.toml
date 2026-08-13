@@ -3,11 +3,11 @@ members = [
     "crates/common",
     "crates/witness-gen",
     "crates/epoch-diff-guest",
-    "crates/finality-guest",
     "crates/bootstrap-guest",
     "crates/slot-proof-guest",
     "crates/justification-guest",
     "crates/finalization-guest",
+    "crates/bench-guest",
 ]
 resolver = "2"
 
@@ -18,14 +18,13 @@ edition = "2021"
 [workspace.dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
 bincode = "1.3"
-sha2 = "0.10"
-ark-ff = "0.5"
-ark-bn254 = "0.5"
-ark-bls12-381 = "0.5"
-ark-ec = "0.5"
-ark-serialize = "0.5"
-light-poseidon = "0.4"
-blst = "0.3"
 
-# Zisk guest OS
-ziskos = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v0.15.0" }
+# Zisk guest OS. Provides the precompile syscalls (poseidon2, sha256f,
+# arith384_mod) and zisklib (BLS12-381 pairing, hash-to-curve, recursive proof
+# verification). Every syscall has a software fallback on native targets, so the
+# same code runs on the host and in the guest.
+#
+# Pinned rather than tracking main: poseidon1/poseidon2, zisklib's bls.rs
+# (aggregate verify) and hash_to_curve, and zisk_verifier.rs (recursion) all
+# land in different releases, and only v1.0.0-alpha has all of them.
+ziskos = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v1.0.0-alpha" }

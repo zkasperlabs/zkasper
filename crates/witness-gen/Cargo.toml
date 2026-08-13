@@ -16,14 +16,12 @@ name = "gen-test-witness"
 path = "src/bin/gen_test_witness.rs"
 
 [dependencies]
+ziskos = { workspace = true }
 zkasper-common = { path = "../common", features = ["test-utils"] }
 serde = { workspace = true, features = ["std"] }
 serde_json = "1"
 bincode = { workspace = true }
-sha2 = { workspace = true }
-ark-ff = { workspace = true }
-ark-bn254 = { workspace = true }
-light-poseidon = { workspace = true }
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -32,22 +30,20 @@ tracing = "0.1"
 rayon = "1"
 hex = "0.4"
 async-trait = "0.1"
-blst = { workspace = true }
+blst = "0.3"
 
 [features]
 default = []
 count-ops = ["zkasper-common/count-ops"]
-bls = ["zkasper-common/bls"]
 
 [dev-dependencies]
 zkasper-bootstrap-guest = { path = "../bootstrap-guest", features = ["count-ops"] }
 zkasper-epoch-diff-guest = { path = "../epoch-diff-guest", features = ["count-ops"] }
-zkasper-finality-guest = { path = "../finality-guest", features = ["bls"] }
-zkasper-slot-proof-guest = { path = "../slot-proof-guest", features = ["bls"] }
+zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }
 zkasper-finalization-guest = { path = "../finalization-guest" }
-zkasper-common = { path = "../common", features = ["test-utils", "count-ops", "bls"] }
-blst = { workspace = true }
+zkasper-common = { path = "../common", features = ["test-utils", "count-ops"] }
+blst = "0.3"
 tempfile = "3"
 flate2 = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

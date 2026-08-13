@@ -7,13 +7,13 @@ use zkasper_common::ChainConfig;
 const TEST_CONFIG: ChainConfig = ChainConfig {
     slots_per_epoch: 32,
     validators_tree_depth: 2,
-    poseidon_tree_depth: 2,
+    acc_tree_depth: 2,
     beacon_state_validators_field_index: 11,
     fulu_fork_epoch: 0,
 };
 /// Small tree depth for tests (2^2 = 4 leaves)
 const TEST_DEPTH: u32 = 2;
-use zkasper_common::poseidon::accumulator_commitment;
+use zkasper_common::acc;
 use zkasper_common::test_utils::make_validator;
 use zkasper_common::types::ValidatorData;
 
@@ -120,15 +120,15 @@ fn test_find_mutations_epoch_boundary_exit() {
 
 #[test]
 fn test_db_save_and_load() {
+    use zkasper_witness_gen::acc_tree::AccTree;
     use zkasper_witness_gen::db::Db;
-    use zkasper_witness_gen::poseidon_tree::PoseidonTree;
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let db = Db::new(&db_path);
 
     let validators: Vec<_> = (0..4).map(|i| make_validator(i, 32)).collect();
-    let tree = PoseidonTree::build(&validators, 100, 2);
+    let tree = AccTree::build(&validators, 100, 2);
     let expected_root = tree.root();
 
     db.save(&tree, 100, 128_000_000_000, 4).unwrap();
@@ -183,13 +183,13 @@ async fn test_bootstrap_round_trip() {
     assert_eq!(witness.validators.len(), 4);
 
     // Verify with bootstrap guest verification function
-    let (commitment, poseidon_root, balance) =
+    let (commitment, acc_root, balance) =
         zkasper_bootstrap_guest::verify_bootstrap_with_depth(&witness, TEST_DEPTH, TEST_DEPTH);
 
-    assert_eq!(poseidon_root, tree.root());
+    assert_eq!(acc_root, tree.root());
     assert_eq!(balance, total_active_balance);
 
-    let expected_commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let expected_commitment = acc::commitment(&acc_root, total_active_balance);
     assert_eq!(commitment, expected_commitment);
 }
 
@@ -228,7 +228,7 @@ async fn test_epoch_diff_round_trip() {
     mock.headers.insert(slot_1.to_string(), header_1);
     mock.headers.insert(slot_2.to_string(), header_2);
 
-    // First bootstrap to build the PoseidonTree
+    // First bootstrap to build the AccTree
     let (_, mut tree, epoch_state, total_active_balance_1, _) =
         zkasper_witness_gen::witness_bootstrap::build(&mock, &TEST_CONFIG, slot_1)
             .await
@@ -255,13 +255,13 @@ async fn test_epoch_diff_round_trip() {
     assert_ne!(tree.root(), old_root);
 
     // Verify with epoch-diff guest verification function
-    let (commitment, poseidon_root, balance) =
+    let (commitment, acc_root, balance) =
         zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(&witness, TEST_DEPTH, TEST_DEPTH);
 
-    assert_eq!(poseidon_root, tree.root());
+    assert_eq!(acc_root, tree.root());
     assert_eq!(balance, new_total_active_balance);
 
-    let expected_commitment = accumulator_commitment(&poseidon_root, balance);
+    let expected_commitment = acc::commitment(&acc_root, balance);
     assert_eq!(commitment, expected_commitment);
 }
 
@@ -309,7 +309,11 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
 
     // Verify bootstrap
     let (_bootstrap_commitment, bootstrap_poseidon_root, bootstrap_balance) =
-        zkasper_bootstrap_guest::verify_bootstrap_with_depth(&bootstrap_witness, TEST_DEPTH, TEST_DEPTH);
+        zkasper_bootstrap_guest::verify_bootstrap_with_depth(
+            &bootstrap_witness,
+            TEST_DEPTH,
+            TEST_DEPTH,
+        );
     assert_eq!(bootstrap_poseidon_root, tree.root());
     assert_eq!(bootstrap_balance, total_active_balance);
 
@@ -340,13 +344,17 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
 
     // Verify epoch diff
     let (_diff_commitment, diff_poseidon_root, diff_balance) =
-        zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(&epoch_diff_witness, TEST_DEPTH, TEST_DEPTH);
+        zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(
+            &epoch_diff_witness,
+            TEST_DEPTH,
+            TEST_DEPTH,
+        );
 
     assert_eq!(diff_poseidon_root, loaded_tree.root());
     assert_eq!(diff_balance, new_balance);
 
     // epoch 101: v0 exits (0 ETH active), v1=32, v2=32, v3=24
-    let expected = 0 + 32_000_000_000 + 32_000_000_000 + 24_000_000_000;
+    let expected = 32_000_000_000 + 32_000_000_000 + 24_000_000_000;
     assert_eq!(new_balance, expected);
 }
 
@@ -356,38 +364,40 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
 
 #[test]
 fn test_counted_validators_commitment_deterministic() {
-    use zkasper_common::poseidon::counted_validators_commitment;
+    use zkasper_common::acc;
 
     let indices = vec![0, 1, 2, 3];
-    let a = counted_validators_commitment(&indices);
-    let b = counted_validators_commitment(&indices);
+    let a = acc::commit_indices(&indices);
+    let b = acc::commit_indices(&indices);
     assert_eq!(a, b);
-    assert_ne!(a, [0u8; 32]);
+    assert_ne!(a, zkasper_common::acc::ZERO);
 }
 
 #[test]
 fn test_counted_validators_commitment_empty() {
-    use zkasper_common::poseidon::counted_validators_commitment;
+    use zkasper_common::acc;
 
-    let result = counted_validators_commitment(&[]);
-    assert_eq!(result, [0u8; 32]);
+    // An empty list still absorbs its length, so it must not collide with a
+    // list that happens to contain a zero index.
+    assert_eq!(acc::commit_indices(&[]), acc::commit_indices(&[]));
+    assert_ne!(acc::commit_indices(&[]), acc::commit_indices(&[0]));
 }
 
 #[test]
 fn test_counted_validators_commitment_order_matters() {
-    use zkasper_common::poseidon::counted_validators_commitment;
+    use zkasper_common::acc;
 
-    let a = counted_validators_commitment(&[0, 1, 2]);
-    let b = counted_validators_commitment(&[2, 1, 0]);
+    let a = acc::commit_indices(&[0, 1, 2]);
+    let b = acc::commit_indices(&[2, 1, 0]);
     assert_ne!(a, b);
 }
 
 #[test]
 fn test_counted_validators_commitment_different_lengths() {
-    use zkasper_common::poseidon::counted_validators_commitment;
+    use zkasper_common::acc;
 
-    let a = counted_validators_commitment(&[0, 1]);
-    let b = counted_validators_commitment(&[0, 1, 2]);
+    let a = acc::commit_indices(&[0, 1]);
+    let b = acc::commit_indices(&[0, 1, 2]);
     assert_ne!(a, b);
 }
 
@@ -397,14 +407,12 @@ fn test_counted_validators_commitment_different_lengths() {
 
 #[test]
 fn test_justification_round_trip() {
-    use zkasper_common::poseidon::{accumulator_commitment, counted_validators_commitment};
-    use zkasper_common::types::{
-        JustificationWitness, SlotProofOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{JustificationWitness, SlotProofOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
     let target_epoch = 100u64;
     let target_root = [7u8; 32];
 
@@ -416,8 +424,8 @@ fn test_justification_round_trip() {
     let slot0_indices = vec![0u64, 1];
     let slot1_indices = vec![2u64, 3];
 
-    let slot0_commitment = counted_validators_commitment(&slot0_indices);
-    let slot1_commitment = counted_validators_commitment(&slot1_indices);
+    let slot0_commitment = acc::commit_indices(&slot0_indices);
+    let slot1_commitment = acc::commit_indices(&slot1_indices);
 
     let slot_proof_outputs = vec![
         SlotProofOutput {
@@ -439,12 +447,13 @@ fn test_justification_round_trip() {
     ];
 
     let witness = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch,
         target_root,
         total_active_balance,
         slot_proof_outputs,
-        slot_proof_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
+        slot_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
         counted_indices_per_slot: vec![slot0_indices, slot1_indices],
     };
 
@@ -458,14 +467,12 @@ fn test_justification_round_trip() {
 #[test]
 #[should_panic(expected = "cross-slot duplicate validator")]
 fn test_justification_rejects_cross_slot_duplicate() {
-    use zkasper_common::poseidon::{accumulator_commitment, counted_validators_commitment};
-    use zkasper_common::types::{
-        JustificationWitness, SlotProofOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{JustificationWitness, SlotProofOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
     let target_epoch = 100u64;
     let target_root = [7u8; 32];
 
@@ -473,8 +480,8 @@ fn test_justification_rejects_cross_slot_duplicate() {
     let slot0_indices = vec![0u64, 1];
     let slot1_indices = vec![1u64, 2]; // validator 1 duplicated!
 
-    let slot0_commitment = counted_validators_commitment(&slot0_indices);
-    let slot1_commitment = counted_validators_commitment(&slot1_indices);
+    let slot0_commitment = acc::commit_indices(&slot0_indices);
+    let slot1_commitment = acc::commit_indices(&slot1_indices);
 
     let slot_proof_outputs = vec![
         SlotProofOutput {
@@ -496,12 +503,13 @@ fn test_justification_rejects_cross_slot_duplicate() {
     ];
 
     let witness = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch,
         target_root,
         total_active_balance,
         slot_proof_outputs,
-        slot_proof_proofs: vec![vec![], vec![]],
+        slot_proofs: vec![vec![], vec![]],
         counted_indices_per_slot: vec![slot0_indices, slot1_indices],
     };
 
@@ -512,20 +520,18 @@ fn test_justification_rejects_cross_slot_duplicate() {
 #[test]
 #[should_panic(expected = "insufficient attesting balance")]
 fn test_justification_rejects_insufficient_balance() {
-    use zkasper_common::poseidon::{accumulator_commitment, counted_validators_commitment};
-    use zkasper_common::types::{
-        JustificationWitness, SlotProofOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{JustificationWitness, SlotProofOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000; // 128 ETH total
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
     let target_epoch = 100u64;
     let target_root = [7u8; 32];
 
     // Only 1 slot with 1 validator (32 ETH) — not enough for 2/3 of 128 ETH
     let indices = vec![0u64];
-    let slot_commitment = counted_validators_commitment(&indices);
+    let slot_commitment = acc::commit_indices(&indices);
 
     let slot_proof_outputs = vec![SlotProofOutput {
         accumulator_commitment: commitment,
@@ -537,12 +543,13 @@ fn test_justification_rejects_insufficient_balance() {
     }];
 
     let witness = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch,
         target_root,
         total_active_balance,
         slot_proof_outputs,
-        slot_proof_proofs: vec![vec![]],
+        slot_proofs: vec![vec![]],
         counted_indices_per_slot: vec![indices],
     };
 
@@ -555,14 +562,12 @@ fn test_justification_rejects_insufficient_balance() {
 
 #[test]
 fn test_finalization_round_trip() {
-    use zkasper_common::poseidon::accumulator_commitment;
-    use zkasper_common::types::{
-        FinalizationWitness, JustificationOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{FinalizationWitness, JustificationOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
 
     let just_e = JustificationOutput {
         accumulator_commitment: commitment,
@@ -577,6 +582,7 @@ fn test_finalization_round_trip() {
     };
 
     let witness = FinalizationWitness {
+        justification_program_vk: [0; 4],
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e.clone(), just_e1],
         justification_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
@@ -592,14 +598,12 @@ fn test_finalization_round_trip() {
 #[test]
 #[should_panic(expected = "justification epochs not consecutive")]
 fn test_finalization_rejects_non_consecutive_epochs() {
-    use zkasper_common::poseidon::accumulator_commitment;
-    use zkasper_common::types::{
-        FinalizationWitness, JustificationOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{FinalizationWitness, JustificationOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
 
     let just_e = JustificationOutput {
         accumulator_commitment: commitment,
@@ -615,6 +619,7 @@ fn test_finalization_rejects_non_consecutive_epochs() {
     };
 
     let witness = FinalizationWitness {
+        justification_program_vk: [0; 4],
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e, just_e2],
         justification_proofs: vec![vec![], vec![]],
@@ -626,14 +631,12 @@ fn test_finalization_rejects_non_consecutive_epochs() {
 #[test]
 #[should_panic(expected = "justification 1 accumulator mismatch")]
 fn test_finalization_rejects_accumulator_mismatch() {
-    use zkasper_common::poseidon::accumulator_commitment;
-    use zkasper_common::types::{
-        FinalizationWitness, JustificationOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{FinalizationWitness, JustificationOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
 
     let just_e = JustificationOutput {
         accumulator_commitment: commitment,
@@ -643,12 +646,13 @@ fn test_finalization_rejects_accumulator_mismatch() {
 
     // Different accumulator commitment
     let just_e1 = JustificationOutput {
-        accumulator_commitment: [99u8; 32], // mismatch!
+        accumulator_commitment: [99u64; 4], // mismatch!
         target_epoch: 101,
         target_root: [8u8; 32],
     };
 
     let witness = FinalizationWitness {
+        justification_program_vk: [0; 4],
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]],
@@ -663,21 +667,20 @@ fn test_finalization_rejects_accumulator_mismatch() {
 
 #[test]
 fn test_full_justification_to_finalization_pipeline() {
-    use zkasper_common::poseidon::{accumulator_commitment, counted_validators_commitment};
-    use zkasper_common::types::{
-        FinalizationWitness, JustificationWitness, SlotProofOutput,
-    };
+    use zkasper_common::acc;
+    use zkasper_common::types::{FinalizationWitness, JustificationWitness, SlotProofOutput};
 
-    let poseidon_root = [42u8; 32];
+    let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let commitment = acc::commitment(&acc_root, total_active_balance);
 
     // Build justification for epoch 100
     let epoch_100_root = [7u8; 32];
     let indices_100 = vec![0u64, 1, 2, 3]; // all 4 validators
-    let commitment_100 = counted_validators_commitment(&indices_100);
+    let commitment_100 = acc::commit_indices(&indices_100);
 
     let just_witness_100 = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch: 100,
         target_root: epoch_100_root,
@@ -690,7 +693,7 @@ fn test_full_justification_to_finalization_pipeline() {
             counted_validators_commitment: commitment_100,
             num_counted_validators: 4,
         }],
-        slot_proof_proofs: vec![vec![]],
+        slot_proofs: vec![vec![]],
         counted_indices_per_slot: vec![indices_100],
     };
 
@@ -700,9 +703,10 @@ fn test_full_justification_to_finalization_pipeline() {
     // Build justification for epoch 101
     let epoch_101_root = [8u8; 32];
     let indices_101 = vec![0u64, 1, 2, 3];
-    let commitment_101 = counted_validators_commitment(&indices_101);
+    let commitment_101 = acc::commit_indices(&indices_101);
 
     let just_witness_101 = JustificationWitness {
+        slot_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch: 101,
         target_root: epoch_101_root,
@@ -715,7 +719,7 @@ fn test_full_justification_to_finalization_pipeline() {
             counted_validators_commitment: commitment_101,
             num_counted_validators: 4,
         }],
-        slot_proof_proofs: vec![vec![]],
+        slot_proofs: vec![vec![]],
         counted_indices_per_slot: vec![indices_101],
     };
 
@@ -724,6 +728,7 @@ fn test_full_justification_to_finalization_pipeline() {
 
     // Finalization: pair two consecutive justifications
     let finalization_witness = FinalizationWitness {
+        justification_program_vk: [0; 4],
         accumulator_commitment: commitment,
         justification_outputs: vec![output_100, output_101],
         justification_proofs: vec![vec![], vec![]],

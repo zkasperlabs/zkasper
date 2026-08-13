@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing_subscriber::fmt::format::FmtSpan;
 
-use zkasper_common::constants::{POSEIDON_TREE_DEPTH, VALIDATORS_TREE_DEPTH};
+use zkasper_common::constants::VALIDATORS_TREE_DEPTH;
 use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::beacon_api::{
@@ -231,9 +231,8 @@ fn ensure_file(filename: &str) -> String {
         return path.to_str().unwrap().to_string();
     }
 
-    let url = format!(
-        "https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/{filename}",
-    );
+    let url =
+        format!("https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/{filename}",);
     eprintln!("downloading {url} ...");
 
     let status = std::process::Command::new("curl")
@@ -261,10 +260,13 @@ fn load_one_state() -> (SszFileApi, u64) {
 fn load_two_states() -> (SszFileApi, u64, u64) {
     let path1 = ensure_state(&STATE_1);
     let path2 = ensure_state(&STATE_2);
-    let api = SszFileApi::load(&[
-        (&path1, STATE_1.expected_root),
-        (&path2, STATE_2.expected_root),
-    ], &ChainConfig::MAINNET);
+    let api = SszFileApi::load(
+        &[
+            (&path1, STATE_1.expected_root),
+            (&path2, STATE_2.expected_root),
+        ],
+        &ChainConfig::MAINNET,
+    );
 
     let slots: Vec<u64> = api.states.values().map(|s| s.header.slot).collect();
     let slot_1 = *slots.iter().min().unwrap();
@@ -312,7 +314,9 @@ async fn test_ssz_file_epoch_diff() {
     let (api, slot_1, slot_2) = load_two_states();
     let epoch_1 = slot_1 / CONFIG.slots_per_epoch;
     let epoch_2 = slot_2 / CONFIG.slots_per_epoch;
-    eprintln!("testing epoch diff: slot {slot_1} (epoch {epoch_1}) -> slot {slot_2} (epoch {epoch_2})");
+    eprintln!(
+        "testing epoch diff: slot {slot_1} (epoch {epoch_1}) -> slot {slot_2} (epoch {epoch_2})"
+    );
 
     // Bootstrap at slot_1
     let (_witness, mut tree, epoch_state, total_active_balance, _num_validators) =
@@ -338,21 +342,17 @@ async fn test_ssz_file_epoch_diff() {
     assert_eq!(diff_witness.state_to_validators_siblings_2.len(), 6);
 
     // Verify the witness through the guest circuit logic
-    let (commitment, poseidon_root, total_active_balance_out) =
+    let (commitment, acc_root, total_active_balance_out) =
         zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
 
-    assert_eq!(
-        poseidon_root,
-        tree.root(),
-        "poseidon root mismatch after verify"
-    );
+    assert_eq!(acc_root, tree.root(), "poseidon root mismatch after verify");
     assert_eq!(
         total_active_balance_out, new_balance,
         "total active balance mismatch"
     );
     assert_eq!(
         commitment,
-        zkasper_common::poseidon::accumulator_commitment(&poseidon_root, total_active_balance_out),
+        zkasper_common::acc::commitment(&acc_root, total_active_balance_out),
     );
 }
 
@@ -363,8 +363,8 @@ async fn test_ssz_file_epoch_diff() {
 #[tokio::test]
 #[ignore = "downloads ~640MB, takes ~3min"]
 async fn bench_epoch_diff_guest_ops() {
+    use zkasper_common::acc;
     use zkasper_common::op_counter;
-    use zkasper_common::poseidon::{compute_poseidon_merkle_root, poseidon_leaf};
     use zkasper_common::ssz::{
         compute_ssz_merkle_root, list_hash_tree_root, validator_hash_tree_root,
         validator_hash_tree_root_pair, verify_field_leaves, verify_field_leaves_no_pubkey_hash,
@@ -416,7 +416,11 @@ async fn bench_epoch_diff_guest_ops() {
             verify_field_leaves(&m.new_data, &m.new_field_leaves, &m.new_pubkey_chunks);
         } else {
             verify_field_leaves(&m.new_data, &m.new_field_leaves, &m.new_pubkey_chunks);
-            verify_field_leaves_no_pubkey_hash(&m.old_data, &m.old_field_leaves, &m.old_pubkey_chunks);
+            verify_field_leaves_no_pubkey_hash(
+                &m.old_data,
+                &m.old_field_leaves,
+                &m.old_pubkey_chunks,
+            );
         }
     }
     let phase_field_leaves = op_counter::snapshot().delta(&s0);
@@ -446,18 +450,28 @@ async fn bench_epoch_diff_guest_ops() {
             old_leaves.push(([0u8; 32], idx));
             new_leaves.push((validator_hash_tree_root(&m.new_field_leaves), idx));
         } else {
-            let (old_root, new_root) = validator_hash_tree_root_pair(&m.old_field_leaves, &m.new_field_leaves);
+            let (old_root, new_root) =
+                validator_hash_tree_root_pair(&m.old_field_leaves, &m.new_field_leaves);
             old_leaves.push((old_root, idx));
             new_leaves.push((new_root, idx));
         }
     }
     op_counter::reset();
     let s0 = op_counter::snapshot();
-    verify_ssz_multi_proof(&old_leaves, &diff_witness.ssz_multi_proof_1, VALIDATORS_TREE_DEPTH);
-    verify_ssz_multi_proof(&new_leaves, &diff_witness.ssz_multi_proof_2, VALIDATORS_TREE_DEPTH);
+    verify_ssz_multi_proof(
+        &old_leaves,
+        &diff_witness.ssz_multi_proof_1,
+        VALIDATORS_TREE_DEPTH,
+    );
+    verify_ssz_multi_proof(
+        &new_leaves,
+        &diff_witness.ssz_multi_proof_2,
+        VALIDATORS_TREE_DEPTH,
+    );
     let phase_ssz_merkle = op_counter::snapshot().delta(&s0);
-    let ssz_merkle_sha256 = phase_ssz_merkle.sha256;
-    eprintln!("ssz_multi_proofs:    sha256: {} (~{}M constraints)",
+    let ssz_merkle_sha256 = phase_ssz_merkle.sha256f;
+    eprintln!(
+        "ssz_multi_proofs:    sha256: {} (~{}M constraints)",
         ssz_merkle_sha256,
         ssz_merkle_sha256 * 29_000 / 1_000_000,
     );
@@ -468,10 +482,10 @@ async fn bench_epoch_diff_guest_ops() {
     for m in &diff_witness.mutations {
         if !m.is_new {
             let old_balance = m.old_data.active_effective_balance(epoch_1);
-            poseidon_leaf(&m.old_data.pubkey.0, old_balance);
+            acc::leaf(&m.old_data.pubkey.0, old_balance);
         }
         let new_balance = m.new_data.active_effective_balance(epoch_2);
-        poseidon_leaf(&m.new_data.pubkey.0, new_balance);
+        acc::leaf(&m.new_data.pubkey.0, new_balance);
     }
     let phase_poseidon_leaf = op_counter::snapshot().delta(&s0);
     eprintln!("poseidon_leaf:       {phase_poseidon_leaf}");
@@ -482,51 +496,52 @@ async fn bench_epoch_diff_guest_ops() {
     for m in &diff_witness.mutations {
         let idx = m.validator_index;
         if m.is_new {
-            compute_poseidon_merkle_root(&[0u8; 32], idx, &m.poseidon_siblings);
+            zkasper_common::merkle::compute_root(acc::compress, &acc::ZERO, idx, &m.acc_siblings);
         } else {
             let old_balance = m.old_data.active_effective_balance(epoch_1);
-            let old_leaf = poseidon_leaf(&m.old_data.pubkey.0, old_balance);
-            compute_poseidon_merkle_root(&old_leaf, idx, &m.poseidon_siblings);
+            let old_leaf = acc::leaf(&m.old_data.pubkey.0, old_balance);
+            zkasper_common::merkle::compute_root(acc::compress, &old_leaf, idx, &m.acc_siblings);
         }
         let new_balance = m.new_data.active_effective_balance(epoch_2);
-        let new_leaf = poseidon_leaf(&m.new_data.pubkey.0, new_balance);
-        compute_poseidon_merkle_root(&new_leaf, idx, &m.poseidon_siblings);
+        let new_leaf = acc::leaf(&m.new_data.pubkey.0, new_balance);
+        zkasper_common::merkle::compute_root(acc::compress, &new_leaf, idx, &m.acc_siblings);
     }
     let phase_poseidon_merkle = op_counter::snapshot().delta(&s0);
-    let poseidon_merkle_t3 = phase_poseidon_merkle.poseidon_t3 - phase_poseidon_leaf.poseidon_t3;
-    eprintln!("poseidon_merkle:     poseidon_t3: {} (~{}k constraints), (leaf ops excluded)",
-        poseidon_merkle_t3,
-        poseidon_merkle_t3 * 250 / 1_000,
+    let poseidon_merkle_ops = phase_poseidon_merkle.poseidon2 - phase_poseidon_leaf.poseidon2;
+    eprintln!(
+        "poseidon_merkle:     poseidon_t3: {} (~{}k constraints), (leaf ops excluded)",
+        poseidon_merkle_ops,
+        poseidon_merkle_ops * 250 / 1_000,
     );
 
     // Phase 6: State proofs (2x list_hash_tree_root + 2x compute_ssz_merkle_root)
     op_counter::reset();
     let s0 = op_counter::snapshot();
-    let dummy = [0u8; 32];
-    list_hash_tree_root(&dummy, 100);
-    list_hash_tree_root(&dummy, 100);
-    compute_ssz_merkle_root(&dummy, 11, &diff_witness.state_to_validators_siblings_1);
-    compute_ssz_merkle_root(&dummy, 11, &diff_witness.state_to_validators_siblings_2);
+    let ssz_dummy = [0u8; 32];
+    list_hash_tree_root(&ssz_dummy, 100);
+    list_hash_tree_root(&ssz_dummy, 100);
+    compute_ssz_merkle_root(&ssz_dummy, 11, &diff_witness.state_to_validators_siblings_1);
+    compute_ssz_merkle_root(&ssz_dummy, 11, &diff_witness.state_to_validators_siblings_2);
     let phase_state_proof = op_counter::snapshot().delta(&s0);
     eprintln!("state_proofs:        {phase_state_proof}");
 
-    // Phase 7: accumulator_commitment (1 poseidon_pair)
+    // Phase 7: accumulator_commitment (1 acc::compress)
     op_counter::reset();
     let s0 = op_counter::snapshot();
-    zkasper_common::poseidon::accumulator_commitment(&dummy, 100);
+    zkasper_common::acc::commitment(&zkasper_common::acc::ZERO, 100);
     let phase_commit = op_counter::snapshot().delta(&s0);
     eprintln!("accumulator_commit:  {phase_commit}");
 
     // Summary
     eprintln!("\n=== constraint breakdown ===\n");
     let items: &[(&str, u64)] = &[
-        ("verify_field_leaves", phase_field_leaves.total_constraints()),
-        ("validator_htr", phase_htr.total_constraints()),
+        ("verify_field_leaves", phase_field_leaves.cost()),
+        ("validator_htr", phase_htr.cost()),
         ("ssz_multi_proofs", ssz_merkle_sha256 * 29_000),
-        ("poseidon_leaf", phase_poseidon_leaf.total_constraints()),
-        ("poseidon_merkle", poseidon_merkle_t3 * 250),
-        ("state_proofs", phase_state_proof.total_constraints()),
-        ("accumulator_commit", phase_commit.total_constraints()),
+        ("poseidon_leaf", phase_poseidon_leaf.cost()),
+        ("poseidon_merkle", poseidon_merkle_ops * 250),
+        ("state_proofs", phase_state_proof.cost()),
+        ("accumulator_commit", phase_commit.cost()),
     ];
     let grand_total: u64 = items.iter().map(|(_, c)| c).sum();
     for (name, constraints) in items {
@@ -534,11 +549,16 @@ async fn bench_epoch_diff_guest_ops() {
         eprintln!("  {name:24} {constraints:>12} ({pct:5.1}%)");
     }
     eprintln!("  {:24} {:>12}", "TOTAL", grand_total);
-    eprintln!("\n  per mutation: ~{} constraints", grand_total / num_mutations as u64);
+    eprintln!(
+        "\n  per mutation: ~{} constraints",
+        grand_total / num_mutations as u64
+    );
 
-    eprintln!("\n  multi-proof auxiliaries: old={}, new={}",
+    eprintln!(
+        "\n  multi-proof auxiliaries: old={}, new={}",
         diff_witness.ssz_multi_proof_1.auxiliaries.len(),
-        diff_witness.ssz_multi_proof_2.auxiliaries.len());
+        diff_witness.ssz_multi_proof_2.auxiliaries.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +583,10 @@ async fn test_ssz_file_finality() {
     let finality_path = ensure_file(FINALITY_DATA);
     let (target_epoch, target_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
-    eprintln!("target_epoch={target_epoch}, target_root=0x{}", hex::encode(target_root));
+    eprintln!(
+        "target_epoch={target_epoch}, target_root=0x{}",
+        hex::encode(target_root)
+    );
 
     // Bootstrap: build Poseidon tree + get total_active_balance
     let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
@@ -576,7 +599,10 @@ async fn test_ssz_file_finality() {
     let raw_ssz = &api.get_state(&slot.to_string()).raw_ssz;
     let genesis_validators_root = ssz_state::extract_genesis_validators_root(raw_ssz);
     let fork_version = ssz_state::extract_fork_version(raw_ssz);
-    eprintln!("genesis_validators_root=0x{}", hex::encode(genesis_validators_root));
+    eprintln!(
+        "genesis_validators_root=0x{}",
+        hex::encode(genesis_validators_root)
+    );
     eprintln!("fork_version=0x{}", hex::encode(fork_version));
 
     // Compute signing domain
@@ -587,8 +613,8 @@ async fn test_ssz_file_finality() {
     );
     eprintln!("signing_domain=0x{}", hex::encode(signing_domain));
 
-    // Build the finality witness
-    let witness = zkasper_witness_gen::witness_finality::build(
+    // Build one slot-proof witness per block slot, then aggregate.
+    let slots = zkasper_witness_gen::witness_slot_proof::build_per_slot(
         &api,
         &CONFIG,
         &tree,
@@ -600,42 +626,49 @@ async fn test_ssz_file_finality() {
     .await
     .unwrap();
 
-    let num_attestations = witness.attestations.len();
-    let total_attesting_validators: usize =
-        witness.attestations.iter().map(|a| a.attesting_validators.len()).sum();
-    let unique_counted: usize = witness
-        .attestations
+    let num_attestations: usize = slots.iter().map(|s| s.witness.attestations.len()).sum();
+    let unique_counted: usize = slots.iter().map(|s| s.counted_indices.len()).sum();
+    let auxiliaries: usize = slots
         .iter()
-        .flat_map(|a| &a.attesting_validators)
-        .filter(|v| v.count_balance)
-        .count();
-    let attesting_balance: u64 = witness
-        .attestations
-        .iter()
-        .flat_map(|a| &a.attesting_validators)
-        .filter(|v| v.count_balance)
-        .map(|v| v.active_effective_balance)
+        .map(|s| s.witness.acc_multi_proof.auxiliaries.len())
         .sum();
     eprintln!(
-        "attestations={num_attestations}, total_validators={total_attesting_validators}, \
-         unique={unique_counted}, attesting_balance={attesting_balance} ({:.1}%), \
-         multi_proof_auxiliaries={}",
-        attesting_balance as f64 / total_active_balance as f64 * 100.0,
-        witness.poseidon_multi_proof.auxiliaries.len(),
+        "slots={}, attestations={num_attestations}, unique_counted={unique_counted}, \
+         multi_proof_auxiliaries={auxiliaries}",
+        slots.len(),
     );
 
-    // Verify: run the finality guest verifier (includes real BLS signature checks)
-    let (commitment, block_root) = zkasper_finality_guest::verify_finality(&witness);
+    // Run each slot proof, then fold them with the justification circuit.
+    let mut outputs = Vec::with_capacity(slots.len());
+    let mut counted_per_slot = Vec::with_capacity(slots.len());
+    for s in &slots {
+        outputs.push(zkasper_slot_proof_guest::verify_slot_proof(&s.witness));
+        counted_per_slot.push(s.counted_indices.clone());
+    }
 
-    assert_eq!(block_root, target_root);
-    assert_eq!(
-        commitment,
-        zkasper_common::poseidon::accumulator_commitment(
-            &tree.root(),
+    let attesting_balance: u64 = outputs.iter().map(|o| o.attesting_balance).sum();
+    eprintln!(
+        "attesting_balance={attesting_balance} ({:.1}%)",
+        attesting_balance as f64 / total_active_balance as f64 * 100.0,
+    );
+
+    let commitment = zkasper_common::acc::commitment(&tree.root(), total_active_balance);
+    let justification = zkasper_justification_guest::verify_justification(
+        &zkasper_witness_gen::witness_justification::build(
+            outputs,
+            vec![Vec::new(); slots.len()],
+            counted_per_slot,
+            commitment,
+            [0; 4],
+            target_epoch,
+            target_root,
             total_active_balance,
         ),
     );
-    eprintln!("finality proof verified successfully!");
+
+    assert_eq!(justification.target_root, target_root);
+    assert_eq!(justification.accumulator_commitment, commitment);
+    eprintln!("justification proof verified successfully!");
 }
 
 // ---------------------------------------------------------------------------

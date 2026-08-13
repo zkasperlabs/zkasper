@@ -1,0 +1,12 @@
+[package]
+name = "zkasper-bench-guest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkasper-bench-guest"
+path = "src/main.rs"
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+ziskos = { workspace = true }

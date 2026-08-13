@@ -18,7 +18,4 @@ default = []
 zkasper-common = { path = "../common", default-features = false }
 serde = { workspace = true }
 bincode = { workspace = true }
-ark-ff = { workspace = true }
-ark-bn254 = { workspace = true }
-light-poseidon = { workspace = true }
 ziskos = { workspace = true }

@@ -5,16 +5,16 @@
 
 use std::collections::HashMap;
 
+use zkasper_common::acc::{self, Digest};
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
-use zkasper_common::poseidon::{accumulator_commitment, counted_validators_commitment};
 use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::test_utils::make_validator;
 use zkasper_common::types::*;
 use zkasper_common::ChainConfig;
 
+use zkasper_witness_gen::acc_tree::AccTree;
 use zkasper_witness_gen::beacon_api::{BeaconApi, HeaderResponse, ValidatorResponse};
-use zkasper_witness_gen::poseidon_tree::PoseidonTree;
 use zkasper_witness_gen::state_diff::{
     build_validator_roots, build_validators_ssz_tree, make_state_proof,
 };
@@ -114,8 +114,7 @@ fn generate_test_keys(n: usize) -> Vec<(blst::min_pk::SecretKey, [u8; 48])> {
 
 fn sign_message(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
     let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    let sigs: Vec<blst::min_pk::Signature> =
-        sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
+    let sigs: Vec<blst::min_pk::Signature> = sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
     let sig_refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
     let agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true).unwrap();
     agg.to_signature().to_bytes()
@@ -125,7 +124,11 @@ fn sign_message(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
 fn test_signing_domain() -> [u8; 32] {
     let fork_version = [0x04, 0x00, 0x00, 0x00];
     let genesis_validators_root = [0xAA; 32];
-    compute_domain(&DOMAIN_BEACON_ATTESTER, &fork_version, &genesis_validators_root)
+    compute_domain(
+        &DOMAIN_BEACON_ATTESTER,
+        &fork_version,
+        &genesis_validators_root,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -152,15 +155,16 @@ fn gen_bootstrap(output_path: &str) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (witness, _, _, _, _) = rt
         .block_on(zkasper_witness_gen::witness_bootstrap::build(
-            &mock,
-            &CONFIG,
-            slot,
+            &mock, &CONFIG, slot,
         ))
         .unwrap();
 
     let bytes = bincode::serialize(&witness).unwrap();
     std::fs::write(output_path, &bytes).unwrap();
-    eprintln!("wrote bootstrap witness: {} bytes -> {output_path}", bytes.len());
+    eprintln!(
+        "wrote bootstrap witness: {} bytes -> {output_path}",
+        bytes.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +205,7 @@ fn gen_epoch_diff(output_path: &str) {
 
     let (_, mut tree, epoch_state, total_active_balance_1, _) = rt
         .block_on(zkasper_witness_gen::witness_bootstrap::build(
-            &mock,
-            &CONFIG,
-            slot_1,
+            &mock, &CONFIG, slot_1,
         ))
         .unwrap();
 
@@ -234,10 +236,10 @@ fn gen_epoch_diff(output_path: &str) {
 struct SlotTestData {
     keys: Vec<(blst::min_pk::SecretKey, [u8; 48])>,
     validators: Vec<ValidatorData>,
-    tree: PoseidonTree,
-    poseidon_root: [u8; 32],
+    tree: AccTree,
+    acc_root: Digest,
     total_active_balance: u64,
-    commitment: [u8; 32],
+    commitment: Digest,
     signing_domain: [u8; 32],
 }
 
@@ -257,16 +259,16 @@ fn build_slot_test_data() -> SlotTestData {
         .collect();
 
     let total_active_balance = 4 * balance_gwei;
-    let tree = PoseidonTree::build(&validators, epoch, CONFIG.poseidon_tree_depth);
-    let poseidon_root = tree.root();
-    let commitment = accumulator_commitment(&poseidon_root, total_active_balance);
+    let tree = AccTree::build(&validators, epoch, CONFIG.acc_tree_depth);
+    let acc_root = tree.root();
+    let commitment = acc::commitment(&acc_root, total_active_balance);
     let signing_domain = test_signing_domain();
 
     SlotTestData {
         keys,
         validators,
         tree,
-        poseidon_root,
+        acc_root,
         total_active_balance,
         commitment,
         signing_domain,
@@ -329,7 +331,12 @@ fn build_slot_witness(
     // Collect leaf indices that have count_balance=true for the multi-proof
     let counted_leaf_indices: Vec<u64> = validator_indices
         .iter()
-        .filter(|&&i| attestation.attesting_validators.iter().any(|v| v.validator_index == i as u64 && v.count_balance))
+        .filter(|&&i| {
+            attestation
+                .attesting_validators
+                .iter()
+                .any(|v| v.validator_index == i as u64 && v.count_balance)
+        })
         .map(|&i| i as u64)
         .collect();
 
@@ -340,10 +347,10 @@ fn build_slot_witness(
         target_epoch: epoch,
         target_root,
         signing_domain: data.signing_domain,
-        poseidon_root: data.poseidon_root,
+        acc_root: data.acc_root,
         total_active_balance: data.total_active_balance,
         attestations: vec![attestation],
-        poseidon_multi_proof: multi_proof,
+        acc_multi_proof: multi_proof,
     }
 }
 
@@ -358,7 +365,7 @@ fn compute_slot_output(
     let attesting_balance = validator_indices.len() as u64 * balance_per;
     let mut sorted_indices: Vec<u64> = validator_indices.iter().map(|&i| i as u64).collect();
     sorted_indices.sort_unstable();
-    let commitment = counted_validators_commitment(&sorted_indices);
+    let commitment = acc::commit_indices(&sorted_indices);
 
     let output = SlotProofOutput {
         accumulator_commitment: data.commitment,
@@ -378,7 +385,14 @@ fn gen_slot_proof(output_path: &str) {
     let data_slot = epoch * CONFIG.slots_per_epoch;
 
     let mut seen = std::collections::BTreeSet::new();
-    let witness = build_slot_witness(&data, epoch, target_root, data_slot, &[0, 1, 2, 3], &mut seen);
+    let witness = build_slot_witness(
+        &data,
+        epoch,
+        target_root,
+        data_slot,
+        &[0, 1, 2, 3],
+        &mut seen,
+    );
 
     let bytes = bincode::serialize(&witness).unwrap();
     std::fs::write(output_path, &bytes).unwrap();
@@ -407,7 +421,8 @@ fn gen_justification(output_path: &str) {
         target_root,
         total_active_balance: data.total_active_balance,
         slot_proof_outputs: vec![output_0, output_1],
-        slot_proof_proofs: vec![vec![], vec![]], // stub proofs (verify_proof is no-op)
+        slot_program_vk: [0; 4],
+        slot_proofs: vec![vec![], vec![]], // native mode: no real child proofs
         counted_indices_per_slot: vec![indices_0, indices_1],
     };
 
@@ -442,6 +457,7 @@ fn gen_finalization(output_path: &str) {
     };
 
     let witness = FinalizationWitness {
+        justification_program_vk: [0; 4],
         accumulator_commitment: data.commitment,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]], // stub proofs
