@@ -26,7 +26,8 @@ MODES = [
     (3, "acc::leaf (validator)",    2000, 4000),
     (4, "sha256_pair (SSZ node)",   2000, 4000),
     (5, "G1 decompress (pubkey)",    100,  200),
-    (6, "G1 add (aggregate)",        200,  400),
+    (6, "G1 add (complete-safe)",    200,  400),
+    (10, "G1 add (raw precompile)",  200,  400),
     (7, "hash-to-curve G2",           50,  100),
     (8, "pairing check (2 Miller)",   10,   20),
 ]

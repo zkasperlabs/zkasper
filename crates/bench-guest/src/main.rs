@@ -12,7 +12,10 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-use ziskos::syscalls::syscall_poseidon2;
+use ziskos::syscalls::{
+    syscall_bls12_381_curve_add, syscall_poseidon2, SyscallBls12_381CurveAddParams, SyscallPoint384,
+};
+use ziskos::zisklib::scalar_mul_bls12_381;
 use ziskos::zisklib::{
     add_complete_safe_bls12_381, decompress_bls12_381, hash_to_curve_g2_bls12_381, neg_bls12_381,
     pairing_check_safe_bls12_381,
@@ -43,6 +46,8 @@ const MODE_PAIRING_CHECK: u32 = 8;
 /// pairs. Comparing two batch sizes isolates the marginal Miller loop from the
 /// single final exponentiation.
 const MODE_PAIRING_BATCH: u32 = 9;
+/// Aggregation through the raw precompile, as `bls::aggregate_points` does it.
+const MODE_G1_ADD_RAW: u32 = 10;
 
 fn main() {
     let input = read_input();
@@ -160,6 +165,30 @@ fn run(mode: u32, n: usize) -> u64 {
                 g2.push(q);
             }
             pairing_check_safe_bls12_381(&g1, &g2).expect("pairing") as u64
+        }
+
+        MODE_G1_ADD_RAW => {
+            // Same shape as MODE_G1_ADD, but driving the precompile directly
+            // instead of going through add_complete_safe_bls12_381.
+            let (g, _) = decompress_bls12_381(&G1_GENERATOR_COMPRESSED).expect("decompress");
+            let addend = SyscallPoint384 {
+                x: g[0..6].try_into().unwrap(),
+                y: g[6..12].try_into().unwrap(),
+            };
+            // Start at 3G: the precompile rejects p1 == p2, and every later
+            // iteration is (k)G + G with k >= 3.
+            let start = scalar_mul_bls12_381(&g, &[3, 0, 0, 0]);
+            let mut acc = SyscallPoint384 {
+                x: start[0..6].try_into().unwrap(),
+                y: start[6..12].try_into().unwrap(),
+            };
+            for _ in 0..n {
+                syscall_bls12_381_curve_add(&mut SyscallBls12_381CurveAddParams {
+                    p1: &mut acc,
+                    p2: &addend,
+                });
+            }
+            acc.x[0]
         }
 
         _ => panic!("unknown mode {mode}"),

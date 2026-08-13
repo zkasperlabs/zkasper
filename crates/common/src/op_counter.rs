@@ -19,9 +19,10 @@ pub mod cost {
     pub const ACC_LEAF: u64 = 3_979;
     /// One SHA-256 compression; an SSZ node is two of them.
     pub const SHA256F: u64 = 25_331;
-    /// Add one public key into a running aggregate. The key arrives decompressed
-    /// from the accumulator leaf, so this no longer includes a decompression.
-    pub const PUBKEY_AGGREGATE: u64 = 67_854;
+    /// Add one public key into a running aggregate, through the raw curve-add
+    /// precompile. `add_complete_safe_bls12_381` costs 67,854 for the same work
+    /// because it re-validates both operands every call.
+    pub const PUBKEY_AGGREGATE: u64 = 2_428;
     /// Decompress one 48-byte public key. Only bootstrap and epoch-diff pay it.
     pub const DECOMPRESS: u64 = 49_311;
     /// Hash one message to G2.

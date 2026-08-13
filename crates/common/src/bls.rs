@@ -7,10 +7,13 @@
 //! the FastAggregateVerify shape that attestations need.
 
 use alloc::vec::Vec;
+use ziskos::syscalls::{
+    syscall_bls12_381_curve_add, SyscallBls12_381CurveAddParams, SyscallPoint384,
+};
 use ziskos::zisklib::{
-    add_complete_safe_bls12_381, add_complete_safe_twist_bls12_381, decompress_bls12_381,
-    decompress_twist_bls12_381, hash_to_curve_g2_bls12_381, is_on_subgroup_twist_bls12_381,
-    neg_bls12_381, pairing_check_safe_bls12_381,
+    add_complete_safe_twist_bls12_381, decompress_bls12_381, decompress_twist_bls12_381,
+    hash_to_curve_g2_bls12_381, is_on_subgroup_twist_bls12_381, neg_bls12_381,
+    pairing_check_safe_bls12_381,
 };
 
 use crate::acc::G1Point;
@@ -22,9 +25,6 @@ pub const ETH_BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 /// DOMAIN_BEACON_ATTESTER as defined in the Ethereum consensus spec.
 pub const DOMAIN_BEACON_ATTESTER: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
-
-/// Identity element of G1.
-const G1_IDENTITY: [u64; 12] = [0; 12];
 
 /// Generator of G1, in the little-endian limb layout zisklib expects.
 const G1_GENERATOR: [u64; 12] = [
@@ -75,20 +75,53 @@ pub fn compute_domain(
 /// commits to the decompressed form, so there is nothing left to validate here:
 /// a point that is not the committed one fails the accumulator check instead.
 ///
+/// This drives `syscall_bls12_381_curve_add` directly rather than going through
+/// `add_complete_safe_bls12_381`. That wrapper re-validates both operands on
+/// every call — two `is_on_curve` checks, four range comparisons, and the array
+/// shuffling around them — which costs 67,854 against 1,896 for the precompile
+/// itself. All of it re-establishes facts the accumulator already guarantees:
+/// the points are committed, and a sum of on-curve points is on-curve.
+///
 /// Public keys are not subgroup-checked. The consensus spec checks proof of
 /// possession once at deposit time and skips the check when verifying
 /// attestations; the accumulator only ever holds keys the beacon state already
 /// accepted, so re-checking here would cost a scalar multiplication per attester
 /// for no additional guarantee.
+///
+/// The precompile requires `p1 != p2` and `p1 != -p2`, both of which share an
+/// x-coordinate. Validator public keys are distinct by construction, so a
+/// collision means a partial sum landed exactly on the next point or its
+/// negation — a discrete-log problem, not something a prover can arrange. It is
+/// still checked, and rejected rather than assumed away.
 pub fn aggregate_points(points: &[G1Point]) -> Option<G1Point> {
     #[cfg(feature = "count-ops")]
     crate::op_counter::inc_pubkey_aggregate(points.len() as u64);
 
-    let mut agg = G1_IDENTITY;
-    for point in points {
-        agg = add_complete_safe_bls12_381(&agg, point).ok()?;
+    let (first, rest) = points.split_first()?;
+
+    let mut acc = SyscallPoint384 {
+        x: first[0..6].try_into().ok()?,
+        y: first[6..12].try_into().ok()?,
+    };
+
+    for point in rest {
+        if acc.x[..] == point[0..6] {
+            return None;
+        }
+        let addend = SyscallPoint384 {
+            x: point[0..6].try_into().ok()?,
+            y: point[6..12].try_into().ok()?,
+        };
+        syscall_bls12_381_curve_add(&mut SyscallBls12_381CurveAddParams {
+            p1: &mut acc,
+            p2: &addend,
+        });
     }
-    Some(agg)
+
+    let mut out = [0u64; 12];
+    out[0..6].copy_from_slice(&acc.x);
+    out[6..12].copy_from_slice(&acc.y);
+    Some(out)
 }
 
 /// Decompress a 48-byte public key into the form the accumulator leaf commits to.

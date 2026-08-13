@@ -12,7 +12,8 @@ COST = {
     "acc_leaf": 3_979,
     "acc_leaf_compressed": 3_460,   # previous format, for the comparison
     "decompress": 49_311,
-    "g1_add": 67_854,
+    "g1_add": 2_428,
+    "g1_add_complete": 67_854,   # previous path, for the comparison
     "hash_to_curve": 18_594_336,
     "miller": 39_299_490,
     "final_exp": 169_455_773,
@@ -39,11 +40,13 @@ def batched_nodes(num_leaves, depth=ACC_DEPTH):
     return total
 
 
-def epoch_cost(validators, attestations_per_slot, leaf_cost, decompress_per_attester):
+def epoch_cost(validators, attestations_per_slot, leaf_cost, decompress_per_attester,
+               g1_add=None):
     per_slot_attesters = validators / SLOTS_PER_EPOCH
 
     accumulator = per_slot_attesters * leaf_cost + batched_nodes(per_slot_attesters) * COST["acc_node"]
-    pubkeys = per_slot_attesters * (COST["g1_add"] + (COST["decompress"] if decompress_per_attester else 0))
+    add_cost = COST["g1_add"] if g1_add is None else g1_add
+    pubkeys = per_slot_attesters * (add_cost + (COST["decompress"] if decompress_per_attester else 0))
     bls = (
         attestations_per_slot * COST["hash_to_curve"]
         + (attestations_per_slot + 1) * COST["miller"]
@@ -72,14 +75,15 @@ def main():
     args = ap.parse_args()
 
     before = epoch_cost(args.validators, args.attestations_per_slot,
-                        COST["acc_leaf_compressed"], decompress_per_attester=True)
+                        COST["acc_leaf_compressed"], decompress_per_attester=True,
+                        g1_add=COST["g1_add_complete"])
     after = epoch_cost(args.validators, args.attestations_per_slot,
                        COST["acc_leaf"], decompress_per_attester=False)
 
     print(f"\nOne epoch: {args.validators:,} active validators, "
           f"{args.attestations_per_slot} aggregates/slot, "
           f"{SLOTS_PER_EPOCH} slot proofs + 1 justification\n")
-    print(f"{'component':<24}{'compressed leaf':>16}{'point leaf':>16}{'change':>12}")
+    print(f"{'component':<24}{'before':>16}{'after':>16}{'change':>12}")
     print("-" * 68)
     for key, label in [
         ("accumulator", "accumulator hashing"),
@@ -93,9 +97,9 @@ def main():
         delta = (after[key] - before[key]) / before[key] * 100
         print(f"{label:<24}{fmt(before[key])}{fmt(after[key])}{delta:>11.1f}%")
 
-    print(f"\nper attester: {COST['acc_leaf_compressed'] + COST['decompress'] + COST['g1_add']:,}"
-          f" -> {COST['acc_leaf'] + COST['g1_add']:,}"
-          f"  ({(1 - (COST['acc_leaf'] + COST['g1_add']) / (COST['acc_leaf_compressed'] + COST['decompress'] + COST['g1_add'])) * 100:.1f}% off)")
+    old = COST["acc_leaf_compressed"] + COST["decompress"] + COST["g1_add_complete"]
+    new = COST["acc_leaf"] + COST["g1_add"]
+    print(f"\nper attester: {old:,} -> {new:,}  ({(1 - new / old) * 100:.1f}% off)")
     print(f"epoch-diff pays {COST['decompress']:,} per changed validator instead"
           f" ({COST['decompress'] * 200 / 1e9:.2f}B for 200 mutations)\n")
 
