@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = ["std"]
 std = []
-test-utils = []
+test-utils = ["dep:blst"]
 count-ops = []
 
 [dependencies]
@@ -14,3 +14,6 @@ serde = { workspace = true }
 serde-big-array = "0.5"
 bincode = { workspace = true }
 ziskos = { workspace = true }
+# Test fixtures need real public keys: the accumulator leaf commits to the
+# decompressed point, so a synthetic 48-byte pattern is no longer a valid leaf.
+blst = { version = "0.3", optional = true }

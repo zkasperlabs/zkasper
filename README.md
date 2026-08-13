@@ -131,7 +131,8 @@ justification once the epoch completes.
 - [x] Witness generator (beacon API, state diffing, attestation collection, DB persistence)
 - [x] Measured cost model ([BENCHMARKS.md](BENCHMARKS.md), `scripts/bench.py`)
 - [x] All guests build for `riscv64ima-zisk-zkvm-elf` and run under `ziskemu`
-- [ ] Store decompressed public keys in the accumulator leaf (~24% off an epoch)
+- [x] Accumulator leaf commits the decompressed public key (28.4% off a mainnet epoch)
+- [ ] Projective or batched-inversion G1 aggregation (now the largest cost)
 - [ ] Solidity verifier integration with the Zisk proof format
 - [ ] Bootstrap chunking across recursive proofs
 

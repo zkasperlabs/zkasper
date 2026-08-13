@@ -61,8 +61,9 @@ impl AccTree {
         let mut leaves: Vec<Digest> = validators
             .par_iter()
             .map(|v| {
-                let active_balance = v.active_effective_balance(epoch);
-                acc::leaf(&v.pubkey.0, active_balance)
+                let point = crate::pubkey::decompress(&v.pubkey.0)
+                    .expect("validator has an invalid public key");
+                acc::leaf(&point, v.active_effective_balance(epoch))
             })
             .collect();
         leaves.resize(dense_capacity, ZERO);
@@ -220,7 +221,7 @@ mod tests {
 
     fn dummy_validator(i: u8) -> ValidatorData {
         ValidatorData {
-            pubkey: BlsPubkey([i; 48]),
+            pubkey: BlsPubkey(zkasper_common::test_utils::make_pubkey(i)),
             effective_balance: 32_000_000_000,
             activation_epoch: 0,
             exit_epoch: u64::MAX,
@@ -243,7 +244,7 @@ mod tests {
         let mut tree = AccTree::build(&validators, 100, 2);
         let old_root = tree.root();
 
-        let new_leaf = acc::leaf(&[99u8; 48], 16_000_000_000);
+        let new_leaf = acc::leaf(&[99u64; 12], 16_000_000_000);
         let _siblings = tree.update_leaf(1, new_leaf);
         let new_root = tree.root();
 
@@ -322,7 +323,7 @@ mod tests {
         let old_root = tree.root();
 
         // Update leaf 3
-        let new_leaf = acc::leaf(&[99u8; 48], 16_000_000_000);
+        let new_leaf = acc::leaf(&[99u64; 12], 16_000_000_000);
         let old_siblings = tree.update_leaf(3, new_leaf);
         let new_root = tree.root();
 

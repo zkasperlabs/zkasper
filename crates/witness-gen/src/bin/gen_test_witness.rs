@@ -309,7 +309,7 @@ fn build_slot_witness(
             let count_balance = seen.insert(i as u64);
             AttestingValidator {
                 validator_index: i as u64,
-                pubkey: v.pubkey.clone(),
+                pubkey: zkasper_witness_gen::pubkey::decompress(&v.pubkey.0).unwrap(),
                 active_effective_balance: v.active_effective_balance(epoch),
                 count_balance,
             }

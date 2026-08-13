@@ -8,16 +8,29 @@ use crate::ssz::{sha256_pair, u64_to_chunk};
 use crate::types::*;
 
 /// Create a dummy validator with deterministic data.
+/// Deterministic validator fixture.
+///
+/// The public key is a real BLS key derived from `index`. It has to be: the
+/// accumulator leaf commits to the decompressed point, so an arbitrary 48-byte
+/// pattern is not a public key that can be decompressed at all.
 pub fn make_validator(index: u8, balance_eth: u64) -> ValidatorData {
-    let mut pubkey = [0u8; 48];
-    pubkey[0] = index;
-    pubkey[1] = index.wrapping_mul(7);
     ValidatorData {
-        pubkey: BlsPubkey(pubkey),
+        pubkey: BlsPubkey(make_pubkey(index)),
         effective_balance: balance_eth * 1_000_000_000,
         activation_epoch: 0,
         exit_epoch: u64::MAX,
     }
+}
+
+/// A real compressed BLS public key, derived deterministically from `index`.
+pub fn make_pubkey(index: u8) -> [u8; 48] {
+    let mut ikm = [0u8; 32];
+    ikm[0] = index;
+    ikm[1] = index.wrapping_mul(7).wrapping_add(1);
+    blst::min_pk::SecretKey::key_gen(&ikm, &[])
+        .expect("key_gen")
+        .sk_to_pk()
+        .compress()
 }
 
 /// Build the 8 SSZ field leaves for a validator.

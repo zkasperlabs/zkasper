@@ -40,24 +40,56 @@ pub fn compress(left: &Digest, right: &Digest) -> Digest {
     [st[0], st[1], st[2], st[3]]
 }
 
-/// Accumulator leaf for one validator: `H(pubkey, active_effective_balance)`.
+/// A G1 point in the little-endian limb layout zisklib uses: x then y, six
+/// 64-bit limbs each.
+pub type G1Point = [u64; 12];
+
+/// Number of Goldilocks elements a G1 point packs into.
+const POINT_ELEMENTS: usize = 13;
+
+/// Bits per packed element. Any value below 2^60 is below the Goldilocks
+/// modulus, so the packing is canonical; 64-bit limbs would not be.
+const PACK_BITS: u32 = 60;
+
+/// Repack a G1 point's 768 bits into 13 disjoint 60-bit windows.
 ///
-/// The 48-byte pubkey is split into twelve 32-bit limbs and the balance into
-/// two. A 32-bit limb is always below the Goldilocks modulus, so the byte to
-/// field map is injective — packing 8 bytes per element would not be.
+/// Injective because the windows tile the input: every bit lands in exactly one
+/// element, and 13 * 60 = 780 covers all 768.
 #[inline]
-pub fn leaf(pubkey: &[u8; 48], active_effective_balance: u64) -> Digest {
-    let mut st = [0u64; 16];
-    for i in 0..12 {
-        st[i] = u32::from_le_bytes([
-            pubkey[4 * i],
-            pubkey[4 * i + 1],
-            pubkey[4 * i + 2],
-            pubkey[4 * i + 3],
-        ]) as u64;
+fn pack_point(point: &G1Point) -> [u64; POINT_ELEMENTS] {
+    let mut out = [0u64; POINT_ELEMENTS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let bit = i * PACK_BITS as usize;
+        let limb = bit / 64;
+        let offset = (bit % 64) as u32;
+
+        let mut v = point[limb] >> offset;
+        if offset + PACK_BITS > 64 && limb + 1 < point.len() {
+            v |= point[limb + 1] << (64 - offset);
+        }
+        *slot = v & ((1u64 << PACK_BITS) - 1);
     }
-    st[12] = active_effective_balance & 0xFFFF_FFFF;
-    st[13] = active_effective_balance >> 32;
+    out
+}
+
+/// Accumulator leaf for one validator:
+/// `H(uncompressed_pubkey, active_effective_balance)`.
+///
+/// The leaf commits to the *decompressed* G1 point rather than the 48-byte
+/// compressed key the beacon state stores. Decompression is cheap but not free —
+/// 49,395 cost units — and a compressed leaf makes every slot proof decompress
+/// every key it touches, which at mainnet scale is every active validator, once
+/// per epoch. Committing the point instead moves that work into the epoch-diff
+/// proof, which only touches validators that actually changed.
+///
+/// The point packs into 13 elements and the balance into 2, so this is still a
+/// single permutation.
+#[inline]
+pub fn leaf(point: &G1Point, active_effective_balance: u64) -> Digest {
+    let mut st = [0u64; 16];
+    st[..POINT_ELEMENTS].copy_from_slice(&pack_point(point));
+    st[13] = active_effective_balance & 0xFFFF_FFFF;
+    st[14] = active_effective_balance >> 32;
     st[15] = DOMAIN_LEAF;
     permute(&mut st);
     [st[0], st[1], st[2], st[3]]
@@ -125,6 +157,7 @@ pub fn from_bytes(b: &[u8; 32]) -> Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate alloc;
 
     #[test]
     fn compress_is_order_dependent() {
@@ -135,22 +168,61 @@ mod tests {
 
     #[test]
     fn leaf_binds_balance() {
-        let pk = [42u8; 48];
-        assert_ne!(leaf(&pk, 32_000_000_000), leaf(&pk, 0));
+        let p = [42u64; 12];
+        assert_ne!(leaf(&p, 32_000_000_000), leaf(&p, 0));
     }
 
-    /// A leaf whose trailing pubkey limbs and balance are all zero must not
-    /// collide with the internal-node compression of its first two limb groups.
+    /// Every bit of the point must reach exactly one packed element, or two
+    /// distinct public keys could share a leaf.
+    #[test]
+    fn pack_point_is_injective_over_single_bits() {
+        let mut seen = alloc::vec::Vec::new();
+        for limb in 0..12 {
+            for bit in 0..64 {
+                let mut p = [0u64; 12];
+                p[limb] = 1u64 << bit;
+                let packed = pack_point(&p);
+                assert_eq!(
+                    packed.iter().filter(|&&v| v != 0).count(),
+                    1,
+                    "limb {limb} bit {bit} did not land in exactly one element",
+                );
+                assert!(!seen.contains(&packed), "limb {limb} bit {bit} collided");
+                seen.push(packed);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_elements_are_canonical() {
+        let packed = pack_point(&[u64::MAX; 12]);
+        for v in packed {
+            assert!(v < 1u64 << PACK_BITS);
+        }
+    }
+
+    #[test]
+    fn leaf_binds_every_point_limb() {
+        let base = [7u64; 12];
+        let baseline = leaf(&base, 32_000_000_000);
+        for limb in 0..12 {
+            let mut p = base;
+            p[limb] ^= 1;
+            assert_ne!(leaf(&p, 32_000_000_000), baseline, "limb {limb} not bound");
+        }
+    }
+
+    /// A leaf whose packed tail and balance are all zero must not collide with
+    /// the internal-node compression of the same leading elements.
     #[test]
     fn leaf_and_node_domains_are_separated() {
-        let mut pk = [0u8; 48];
-        pk[..16].copy_from_slice(&[7u8; 16]);
-        let l = leaf(&pk, 0);
-        let n = compress(
-            &[7 * 0x0101_0101, 0x0707_0707, 0x0707_0707, 0x0707_0707],
-            &ZERO,
+        let mut p = [0u64; 12];
+        p[0] = 0x0707_0707_0707;
+        let packed = pack_point(&p);
+        assert_ne!(
+            leaf(&p, 0),
+            compress(&[packed[0], packed[1], packed[2], packed[3]], &ZERO),
         );
-        assert_ne!(l, n);
     }
 
     #[test]

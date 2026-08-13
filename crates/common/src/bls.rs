@@ -13,6 +13,8 @@ use ziskos::zisklib::{
     neg_bls12_381, pairing_check_safe_bls12_381,
 };
 
+use crate::acc::G1Point;
+
 use crate::ssz::sha256_pair;
 
 /// Ethereum's BLS ciphersuite (proof-of-possession variant).
@@ -69,24 +71,39 @@ pub fn compute_domain(
 /// Aggregate G1 public keys. Every attester in one aggregated attestation signs
 /// the same message, so the whole committee collapses to a single pairing input.
 ///
+/// The points come straight from the accumulator leaf preimage, which already
+/// commits to the decompressed form, so there is nothing left to validate here:
+/// a point that is not the committed one fails the accumulator check instead.
+///
 /// Public keys are not subgroup-checked. The consensus spec checks proof of
 /// possession once at deposit time and skips the check when verifying
 /// attestations; the accumulator only ever holds keys the beacon state already
 /// accepted, so re-checking here would cost a scalar multiplication per attester
 /// for no additional guarantee.
-pub fn aggregate_pubkeys(pubkeys: &[[u8; 48]]) -> Option<[u64; 12]> {
+pub fn aggregate_points(points: &[G1Point]) -> Option<G1Point> {
     #[cfg(feature = "count-ops")]
-    crate::op_counter::inc_pubkey_aggregate(pubkeys.len() as u64);
+    crate::op_counter::inc_pubkey_aggregate(points.len() as u64);
 
     let mut agg = G1_IDENTITY;
-    for pk in pubkeys {
-        let (point, is_infinity) = decompress_bls12_381(pk).ok()?;
-        if is_infinity {
-            return None;
-        }
-        agg = add_complete_safe_bls12_381(&agg, &point).ok()?;
+    for point in points {
+        agg = add_complete_safe_bls12_381(&agg, point).ok()?;
     }
     Some(agg)
+}
+
+/// Decompress a 48-byte public key into the form the accumulator leaf commits to.
+///
+/// Only the bootstrap and epoch-diff proofs call this — once per validator that
+/// enters or changes, rather than once per attester per slot.
+pub fn decompress_pubkey(compressed: &[u8; 48]) -> Option<G1Point> {
+    #[cfg(feature = "count-ops")]
+    crate::op_counter::inc_decompress(1);
+
+    let (point, is_infinity) = decompress_bls12_381(compressed).ok()?;
+    if is_infinity {
+        return None;
+    }
+    Some(point)
 }
 
 /// FastAggregateVerify: one aggregate signature over one message signed by all
@@ -96,7 +113,7 @@ pub fn aggregate_pubkeys(pubkeys: &[[u8; 48]]) -> Option<[u64; 12]> {
 /// hash-to-curve, two Miller loops and one final exponentiation regardless of
 /// how many keys were aggregated.
 pub fn fast_aggregate_verify(
-    pubkeys: &[[u8; 48]],
+    pubkeys: &[G1Point],
     signing_root: &[u8; 32],
     signature: &[u8; 96],
 ) -> bool {
@@ -104,7 +121,7 @@ pub fn fast_aggregate_verify(
         return false;
     }
 
-    let Some(agg) = aggregate_pubkeys(pubkeys) else {
+    let Some(agg) = aggregate_points(pubkeys) else {
         return false;
     };
 
@@ -133,7 +150,7 @@ pub fn fast_aggregate_verify(
 
 /// Verify an aggregate signature, panicking on failure.
 pub fn verify_aggregate_signature(
-    pubkeys: &[[u8; 48]],
+    pubkeys: &[G1Point],
     signing_root: &[u8; 32],
     signature: &[u8; 96],
 ) {
@@ -149,7 +166,8 @@ const G2_IDENTITY: [u64; 24] = [0; 24];
 /// One attestation's signature check: a committee, the message they signed, and
 /// their aggregate signature.
 pub struct SignedMessage<'a> {
-    pub pubkeys: &'a [[u8; 48]],
+    /// Decompressed public keys, as committed by the accumulator leaves.
+    pub pubkeys: &'a [G1Point],
     pub signing_root: &'a [u8; 32],
     pub signature: &'a [u8; 96],
 }
@@ -190,7 +208,7 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
         if m.pubkeys.is_empty() {
             return false;
         }
-        let Some(agg) = aggregate_pubkeys(m.pubkeys) else {
+        let Some(agg) = aggregate_points(m.pubkeys) else {
             return false;
         };
         let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(m.signature) else {

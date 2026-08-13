@@ -54,6 +54,12 @@ pub fn verify_epoch_diff_with_depth(
     for mutation in &witness.mutations {
         let idx = mutation.validator_index;
 
+        // Decompressed once per mutation and reused for both the old and the new
+        // leaf. Public keys never change for an existing validator, which the
+        // field-leaf checks below enforce, so one decompression covers both.
+        let point = zkasper_common::bls::decompress_pubkey(&mutation.new_data.pubkey.0)
+            .unwrap_or_else(|| panic!("validator {idx} has an invalid public key"));
+
         if mutation.is_new {
             // New validator: the old leaf is empty in both trees.
             old_ssz_leaves.push(([0u8; 32], idx));
@@ -109,7 +115,7 @@ pub fn verify_epoch_diff_with_depth(
 
             // -- Verify the accumulator leaf the mutation replaces --
             let old_active_balance = mutation.old_data.active_effective_balance(epoch_old);
-            let old_acc_leaf = acc::leaf(&mutation.old_data.pubkey.0, old_active_balance);
+            let old_acc_leaf = acc::leaf(&point, old_active_balance);
             let computed_old_root = zkasper_common::merkle::compute_root(
                 acc::compress,
                 &old_acc_leaf,
@@ -125,7 +131,7 @@ pub fn verify_epoch_diff_with_depth(
 
         // -- Write the new accumulator leaf --
         let new_active_balance = mutation.new_data.active_effective_balance(epoch_new);
-        let new_acc_leaf = acc::leaf(&mutation.new_data.pubkey.0, new_active_balance);
+        let new_acc_leaf = acc::leaf(&point, new_active_balance);
         acc_root = zkasper_common::merkle::compute_root(
             acc::compress,
             &new_acc_leaf,

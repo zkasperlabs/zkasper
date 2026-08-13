@@ -13,18 +13,23 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Measured Zisk cost units, from `scripts/bench.py` against zisk v1.0.0-alpha.
 pub mod cost {
-    /// One accumulator node or leaf: a `syscall_poseidon2` plus state marshalling.
-    pub const POSEIDON2: u64 = 3_117;
+    /// One accumulator node: a `syscall_poseidon2` plus state marshalling.
+    pub const POSEIDON2: u64 = 3_033;
+    /// One accumulator leaf: the same permutation over a packed G1 point.
+    pub const ACC_LEAF: u64 = 3_979;
     /// One SHA-256 compression; an SSZ node is two of them.
-    pub const SHA256F: u64 = 25_373;
-    /// Decompress one 48-byte public key and add it into the aggregate.
-    pub const PUBKEY_AGGREGATE: u64 = 117_333;
+    pub const SHA256F: u64 = 25_331;
+    /// Add one public key into a running aggregate. The key arrives decompressed
+    /// from the accumulator leaf, so this no longer includes a decompression.
+    pub const PUBKEY_AGGREGATE: u64 = 67_854;
+    /// Decompress one 48-byte public key. Only bootstrap and epoch-diff pay it.
+    pub const DECOMPRESS: u64 = 49_311;
     /// Hash one message to G2.
-    pub const HASH_TO_CURVE: u64 = 18_594_420;
+    pub const HASH_TO_CURVE: u64 = 18_594_336;
     /// One Miller loop — the marginal cost of adding a pair to a multi-pairing.
     pub const MILLER_LOOP: u64 = 39_299_490;
     /// Final exponentiation, paid once per multi-pairing however many pairs it has.
-    pub const FINAL_EXP: u64 = 169_455_857;
+    pub const FINAL_EXP: u64 = 169_455_773;
 
     /// Cost floor every proof pays regardless of what it computes. Roughly one
     /// pairing check, which is why small proofs are almost all overhead.
@@ -72,6 +77,7 @@ counters! {
     hash_to_curve => inc_hash_to_curve, HASH_TO_CURVE;
     miller_loop => inc_miller_loop, MILLER_LOOP;
     final_exp => inc_final_exp, FINAL_EXP;
+    decompress => inc_decompress, DECOMPRESS;
     recursive_verify => inc_recursive_verify_n, RECURSIVE_VERIFY;
 }
 
@@ -90,6 +96,7 @@ impl OpCounts {
     pub fn cost(&self) -> u64 {
         self.poseidon2 * cost::POSEIDON2
             + self.sha256f * cost::SHA256F
+            + self.decompress * cost::DECOMPRESS
             + self.pubkey_aggregate * cost::PUBKEY_AGGREGATE
             + self.hash_to_curve * cost::HASH_TO_CURVE
             + self.miller_loop * cost::MILLER_LOOP
@@ -98,7 +105,8 @@ impl OpCounts {
 
     /// Share of [`Self::cost`] spent on BLS.
     pub fn bls_fraction(&self) -> f64 {
-        let bls = self.pubkey_aggregate * cost::PUBKEY_AGGREGATE
+        let bls = self.decompress * cost::DECOMPRESS
+            + self.pubkey_aggregate * cost::PUBKEY_AGGREGATE
             + self.hash_to_curve * cost::HASH_TO_CURVE
             + self.miller_loop * cost::MILLER_LOOP
             + self.final_exp * cost::FINAL_EXP;
@@ -115,10 +123,11 @@ impl core::fmt::Display for OpCounts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "poseidon2={} sha256f={} pubkeys={} h2c={} miller={} final_exp={} recursion={} \
-             => cost {}",
+            "poseidon2={} sha256f={} decompress={} pubkeys={} h2c={} miller={} final_exp={} \
+             recursion={} => cost {}",
             self.poseidon2,
             self.sha256f,
+            self.decompress,
             self.pubkey_aggregate,
             self.hash_to_curve,
             self.miller_loop,

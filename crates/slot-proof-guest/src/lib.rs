@@ -52,7 +52,7 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
                 attesting_balance += v.active_effective_balance;
                 counted_indices.push(v.validator_index);
 
-                let leaf = acc::leaf(&v.pubkey.0, v.active_effective_balance);
+                let leaf = acc::leaf(&v.pubkey, v.active_effective_balance);
                 multi_proof_leaves.push((leaf, v.validator_index));
             }
         }
@@ -83,7 +83,7 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
     //
     // Each attestation contributes one Miller loop; the final exponentiation —
     // the dominant cost by a wide margin — happens once for the whole slot.
-    let mut pubkeys_per_attestation: Vec<Vec<[u8; 48]>> =
+    let mut pubkeys_per_attestation: Vec<Vec<zkasper_common::acc::G1Point>> =
         Vec::with_capacity(witness.attestations.len());
     let mut signing_roots: Vec<[u8; 32]> = Vec::with_capacity(witness.attestations.len());
 
@@ -112,7 +112,7 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
             attestation
                 .attesting_validators
                 .iter()
-                .map(|v| v.pubkey.0)
+                .map(|v| v.pubkey)
                 .collect(),
         );
     }

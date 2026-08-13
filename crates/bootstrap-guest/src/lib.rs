@@ -38,7 +38,9 @@ pub fn verify_bootstrap_with_depth(
         validator_roots.push(root);
 
         let active_balance = witness.validators[i].active_effective_balance(witness.epoch);
-        let p_leaf = acc::leaf(&witness.validators[i].pubkey.0, active_balance);
+        let point = zkasper_common::bls::decompress_pubkey(&witness.validators[i].pubkey.0)
+            .unwrap_or_else(|| panic!("validator {i} has an invalid public key"));
+        let p_leaf = acc::leaf(&point, active_balance);
         acc_leaves.push(p_leaf);
 
         total_active_balance += active_balance;

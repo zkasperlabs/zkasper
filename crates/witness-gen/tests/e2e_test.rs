@@ -101,7 +101,7 @@ fn make_test_attestation(
         let count_balance = seen.insert(idx as u64);
         attesting_validators.push(AttestingValidator {
             validator_index: idx as u64,
-            pubkey: BlsPubkey(keys[idx].1),
+            pubkey: zkasper_witness_gen::pubkey::decompress(&keys[idx].1).unwrap(),
             active_effective_balance: v.active_effective_balance(epoch),
             count_balance,
         });

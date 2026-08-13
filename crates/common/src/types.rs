@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-use crate::acc::Digest;
+use crate::acc::{Digest, G1Point};
 
 /// Merkle multi-proof: the sibling nodes a leaf set does not itself determine.
 ///
@@ -114,7 +114,8 @@ pub struct EpochDiffWitness {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestingValidator {
     pub validator_index: u64,
-    pub pubkey: BlsPubkey,
+    /// Decompressed public key, matching what the accumulator leaf commits to.
+    pub pubkey: G1Point,
     pub active_effective_balance: u64,
     /// Whether this validator's balance should be counted towards the
     /// attesting total. False when the same validator appears in an

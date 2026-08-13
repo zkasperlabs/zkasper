@@ -169,7 +169,9 @@ pub async fn build(
 
             // Compute new Poseidon leaf and update tree — returns old siblings
             let new_active_balance = new_data.active_effective_balance(epoch_2);
-            let new_poseidon_leaf = acc::leaf(&new_data.pubkey.0, new_active_balance);
+            let point = crate::pubkey::decompress(&new_data.pubkey.0)
+                .context("decompress validator public key")?;
+            let new_poseidon_leaf = acc::leaf(&point, new_active_balance);
             let acc_siblings = acc_tree.update_leaf(idx, new_poseidon_leaf);
 
             if is_new {

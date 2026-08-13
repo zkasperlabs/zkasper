@@ -82,11 +82,12 @@ fn run(mode: u32, n: usize) -> u64 {
         }
 
         MODE_ACC_LEAF => {
-            let mut pubkey = [7u8; 48];
+            let (mut point, _) =
+                decompress_bls12_381(&G1_GENERATOR_COMPRESSED).expect("decompress");
             let mut out = 0u64;
             for i in 0..n {
-                pubkey[0] = i as u8;
-                out ^= acc::leaf(&pubkey, 32_000_000_000)[0];
+                point[0] = i as u64;
+                out ^= acc::leaf(&point, 32_000_000_000)[0];
             }
             out
         }

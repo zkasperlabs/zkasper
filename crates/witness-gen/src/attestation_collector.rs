@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{Context, Result};
 use tracing::info;
 
-use zkasper_common::types::{AttestationWitness, AttestingValidator, BlsPubkey, BlsSignature};
+use zkasper_common::types::{AttestationWitness, AttestingValidator, BlsSignature};
 use zkasper_common::ChainConfig;
 
 use crate::beacon_api::{AttestationResponse, BeaconApi, CommitteeResponse, ValidatorResponse};
@@ -113,7 +113,8 @@ pub async fn collect_per_slot_for_checkpoint(
 
                 attesting_validators.push(AttestingValidator {
                     validator_index: idx,
-                    pubkey: BlsPubkey(v_resp.pubkey),
+                    pubkey: crate::pubkey::decompress(&v_resp.pubkey)
+                        .context("decompress attester public key")?,
                     active_effective_balance: active_balance,
                     count_balance,
                 });

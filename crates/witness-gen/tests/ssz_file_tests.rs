@@ -482,10 +482,16 @@ async fn bench_epoch_diff_guest_ops() {
     for m in &diff_witness.mutations {
         if !m.is_new {
             let old_balance = m.old_data.active_effective_balance(epoch_1);
-            acc::leaf(&m.old_data.pubkey.0, old_balance);
+            acc::leaf(
+                &zkasper_witness_gen::pubkey::decompress(&m.old_data.pubkey.0).unwrap(),
+                old_balance,
+            );
         }
         let new_balance = m.new_data.active_effective_balance(epoch_2);
-        acc::leaf(&m.new_data.pubkey.0, new_balance);
+        acc::leaf(
+            &zkasper_witness_gen::pubkey::decompress(&m.new_data.pubkey.0).unwrap(),
+            new_balance,
+        );
     }
     let phase_poseidon_leaf = op_counter::snapshot().delta(&s0);
     eprintln!("poseidon_leaf:       {phase_poseidon_leaf}");
@@ -499,11 +505,17 @@ async fn bench_epoch_diff_guest_ops() {
             zkasper_common::merkle::compute_root(acc::compress, &acc::ZERO, idx, &m.acc_siblings);
         } else {
             let old_balance = m.old_data.active_effective_balance(epoch_1);
-            let old_leaf = acc::leaf(&m.old_data.pubkey.0, old_balance);
+            let old_leaf = acc::leaf(
+                &zkasper_witness_gen::pubkey::decompress(&m.old_data.pubkey.0).unwrap(),
+                old_balance,
+            );
             zkasper_common::merkle::compute_root(acc::compress, &old_leaf, idx, &m.acc_siblings);
         }
         let new_balance = m.new_data.active_effective_balance(epoch_2);
-        let new_leaf = acc::leaf(&m.new_data.pubkey.0, new_balance);
+        let new_leaf = acc::leaf(
+            &zkasper_witness_gen::pubkey::decompress(&m.new_data.pubkey.0).unwrap(),
+            new_balance,
+        );
         zkasper_common::merkle::compute_root(acc::compress, &new_leaf, idx, &m.acc_siblings);
     }
     let phase_poseidon_merkle = op_counter::snapshot().delta(&s0);
