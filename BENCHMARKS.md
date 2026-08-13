@@ -21,7 +21,8 @@ python3 scripts/bench.py --build
 | `acc::leaf` — one validator | 3,979 | `poseidon2` |
 | `sha256_pair` — one SSZ node | 50,662 | `sha256` ×2 |
 | G1 decompress — one public key | 49,311 | `arith384_mod` |
-| G1 add — aggregate one key | 67,854 | `bls12_381_curve_add` |
+| G1 add — `add_complete_safe_bls12_381` | 67,854 | `bls12_381_curve_add` |
+| G1 add — raw `syscall_bls12_381_curve_add` | 2,428 | `bls12_381_curve_add` |
 | hash-to-curve G2 | 18,594,336 | Fp2 tower |
 | Miller loop (marginal) | 39,299,490 | Fp2 tower |
 | final exponentiation | 169,455,773 | Fp2 tower |
@@ -97,27 +98,64 @@ disappears:
 `scripts/mainnet_cost.py`, at 1,050,000 active validators and 8 aggregates per
 slot — 32 slot proofs plus one justification:
 
-| component | compressed leaf | point leaf | change |
+| component | before | after | change |
 |---|---:|---:|---:|
 | accumulator hashing | 26.3B | 26.8B | +2.1% |
-| public keys | 123.0B | 71.2B | −42.1% |
+| public keys | 123.0B | 2.5B | −97.9% |
 | pairings | 21.5B | 21.5B | — |
 | per-proof floor | 9.7B | 9.7B | — |
-| **total** | **180.5B** | **129.3B** | **−28.4%** |
+| **total** | **180.5B** | **60.6B** | **−66.4%** |
+
+Per attester: 120,625 → 6,407, **94.7% off**. The second half of that comes from
+the aggregation change below.
+
+## Aggregating with the raw precompile
+
+`add_complete_safe_bls12_381` costs 67,854. The `bls12_381_curve_add` precompile
+it wraps costs 2,428. **97% of the call is the wrapper**: it re-validates both
+operands on every addition — two `is_on_curve` checks, four range comparisons,
+and the array shuffling around them.
+
+None of that is needed in the aggregation loop. The points come from accumulator
+leaves that already commit to them, and the sum of on-curve points is on-curve.
+Driving the precompile directly is **27.9x** cheaper and drops public keys from
+the largest line item in the system to 4% of an epoch.
+
+The precompile does have preconditions the wrapper was covering: `p1 != p2` and
+`p1 != -p2`, which both mean a shared x-coordinate. Validator public keys are
+distinct by construction, so a collision would need a partial sum to land exactly
+on the next point or its negation — a discrete-log problem, not something a
+prover can arrange. `aggregate_points` checks for it and rejects rather than
+assuming it away.
 
 ## Where the next win is
 
-At mainnet scale the ranking inverts once more. A pairing is the most expensive
-*single* operation, but an epoch has ~256 aggregates and ~1.05M attesters, so
-**G1 point addition is now the largest line item in the whole system** — 71.2B
-against 21.5B for every pairing combined.
+With public keys handled, an epoch is:
 
-`add_complete_safe_bls12_381` works in affine coordinates, which needs a field
-inversion per addition. Accumulating in projective coordinates, or summing
-pairwise and batching the inversions with Montgomery's trick, would replace
-~32K inversions per slot with a handful. That is the next thing worth measuring;
-zisklib exposes only complete affine addition today, so it may need either
-field-level access or an upstream addition.
+| | | share |
+|---|---:|---:|
+| accumulator hashing | 26.8B | 44% |
+| pairings | 21.5B | 35% |
+| per-proof floor | 9.7B | 16% |
+| public keys | 2.5B | 4% |
+
+Three things worth measuring next, in rough order of size:
+
+1. **Accumulator membership is proven 32 times over.** Each slot proof opens a
+   different scattered 1/32 of the tree, which is the worst case for a
+   multi-proof: the upper levels get rebuilt in every one of the 32 proofs.
+   Proving membership once per epoch over the union of attesters — effectively
+   rebuilding the whole tree once — is ~16.9B against 26.8B. It moves work from
+   the slot proofs into the justification proof, which also makes the slot
+   proofs cheaper to parallelise.
+
+2. **Aggregate count drives the pairings.** The 21.5B assumes 8 aggregates per
+   slot. Post-Electra a single aggregate can cover every committee in a slot, so
+   this scales directly with how many a block actually carries — at one per slot
+   it is 8.5B.
+
+3. **The floor is 16% and it is pure overhead.** 33 proofs at 293,601,280 each.
+   Fewer, larger proofs trade that against parallelism.
 
 ## Composite: real slot proof
 

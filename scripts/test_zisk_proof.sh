@@ -1,49 +1,46 @@
 #!/bin/bash
 set -euo pipefail
 
-# Test ZK proof generation and verification using Zisk.
+# Generate and verify a real Zisk proof, and report how long proving took.
 #
 # Usage: ./scripts/test_zisk_proof.sh [proof-type]
 #   proof-type: bootstrap | epoch-diff | slot-proof | justification | finalization
 #
-# Requires: cargo-zisk, ziskemu installed via ziskup
+# Requires a proving key: ziskup --version 1.0.0-alpha --cpu --provingkey -y
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 PROOF_TYPE=${1:-bootstrap}
-GUEST_CRATE="crates/${PROOF_TYPE}-guest"
 GUEST_BIN="zkasper-${PROOF_TYPE}-guest"
-ELF="target/riscv64ima-zisk-zkvm-elf/release/${GUEST_BIN}"
-INPUT="${GUEST_CRATE}/input.bin"
+ELF="target/elf/riscv64ima-zisk-zkvm-elf/release/${GUEST_BIN}"
+WORK="target/proofs/${PROOF_TYPE}"
+mkdir -p "$WORK"
 
-echo "=== Zisk proof test: ${PROOF_TYPE} ==="
-echo ""
+echo "=== Zisk proof: ${PROOF_TYPE} ==="
 
-echo "--- Step 1: Generate test witness ---"
-cargo run --release --bin gen-test-witness -- "$PROOF_TYPE" "$INPUT"
-echo ""
+echo "--- Witness ---"
+cargo run --release --bin gen-test-witness -- "$PROOF_TYPE" "${WORK}/witness.bin"
+# The emulator and prover take length-prefixed, 8-byte-aligned input.
+python3 scripts/zisk_input.py "${WORK}/witness.bin" "${WORK}/input.bin"
 
-echo "--- Step 2: Build guest for Zisk (RISC-V) ---"
-# cargo-zisk build doesn't support -p, must cd into the guest crate
-(cd "$GUEST_CRATE" && cargo-zisk build --release)
-echo ""
+echo "--- Build guest ---"
+cargo-zisk build --release -p "${GUEST_BIN}"
 
-echo "--- Step 3: Run in Zisk emulator ---"
-ziskemu -e "$ELF" -i "$INPUT"
-echo ""
+echo "--- Cost report ---"
+ziskemu -X -e "$ELF" -i "${WORK}/input.bin" | head -16
 
-echo "--- Step 4: ROM setup ---"
-cargo-zisk rom-setup -e "$ELF"
-echo ""
+echo "--- ROM setup ---"
+cargo-zisk setup -e "$ELF"
 
-echo "--- Step 5: Generate proof ---"
-cargo-zisk prove -e "$ELF" -i "$INPUT" -o "${GUEST_CRATE}/proof" -a -y
-echo ""
+echo "--- Prove ---"
+# Wall-clock here is what turns the emulator's trace-cell counts into seconds;
+# see BENCHMARKS.md.
+/usr/bin/time -v cargo-zisk prove -e "$ELF" -i "${WORK}/input.bin" -o "${WORK}/proof" -a -y \
+  2>&1 | grep -E "Elapsed|Maximum resident|error" || true
 
-echo "--- Step 6: Verify proof ---"
-cargo-zisk verify -p "${GUEST_CRATE}/proof/vadcop_final_proof.bin"
-echo ""
+echo "--- Verify ---"
+cargo-zisk verify -p "${WORK}/proof/vadcop_final_proof.bin"
 
-echo "=== PASSED: ${PROOF_TYPE} proof generated and verified ==="
+echo "=== PASSED: ${PROOF_TYPE} ==="
