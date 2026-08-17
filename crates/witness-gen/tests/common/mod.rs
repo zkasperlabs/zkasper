@@ -4,14 +4,16 @@
 //! MockBeaconApi and test helpers for witness-gen integration tests.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use anyhow::Result;
 
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
-use zkasper_common::types::ValidatorData;
+use zkasper_common::types::{Checkpoint, ValidatorData};
 
 use zkasper_witness_gen::beacon_api::{
-    AttestationResponse, BeaconApi, CommitteeResponse, HeaderResponse, ValidatorResponse,
+    AttestationResponse, BeaconApi, ChainStatusApi, CommitteeResponse, FinalityCheckpoints,
+    HeaderResponse, ValidatorResponse,
 };
 
 /// A mock beacon API that returns synthetic data for testing.
@@ -24,6 +26,17 @@ pub struct MockBeaconApi {
     pub attestations: HashMap<String, Vec<AttestationResponse>>,
     /// Committees per (state_id, epoch)
     pub committees: HashMap<(String, u64), Vec<CommitteeResponse>>,
+    /// Block roots per block_id. A slot missing from here reads as skipped.
+    pub block_roots: HashMap<String, [u8; 32]>,
+    /// Finality checkpoints per state_id
+    pub finality: HashMap<String, FinalityCheckpoints>,
+    pub genesis_validators_root: [u8; 32],
+    pub fork_version: [u8; 4],
+    /// Every block_id `get_block_attestations` was called with, in order.
+    ///
+    /// Continuous mode is supposed to stop fetching blocks the moment the 2/3
+    /// threshold is crossed, which is only observable by what it asked for.
+    pub attestation_requests: Mutex<Vec<String>>,
 }
 
 impl MockBeaconApi {
@@ -33,7 +46,55 @@ impl MockBeaconApi {
             headers: HashMap::new(),
             attestations: HashMap::new(),
             committees: HashMap::new(),
+            block_roots: HashMap::new(),
+            finality: HashMap::new(),
+            genesis_validators_root: [0xAA; 32],
+            fork_version: [0x04, 0x00, 0x00, 0x00],
+            attestation_requests: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Block ids `get_block_attestations` was called with.
+    pub fn requested_blocks(&self) -> Vec<String> {
+        self.attestation_requests.lock().unwrap().clone()
+    }
+
+    /// Report the same finality checkpoints for every state id.
+    pub fn set_finality(&mut self, finalized_epoch: u64, root: [u8; 32]) {
+        let checkpoint = Checkpoint {
+            epoch: finalized_epoch,
+            root,
+        };
+        self.finality.insert(
+            "head".to_string(),
+            FinalityCheckpoints {
+                previous_justified: checkpoint.clone(),
+                current_justified: checkpoint.clone(),
+                finalized: checkpoint,
+            },
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainStatusApi for MockBeaconApi {
+    async fn get_block_root(&self, block_id: &str) -> Result<Option<[u8; 32]>> {
+        Ok(self.block_roots.get(block_id).copied())
+    }
+
+    async fn get_genesis_validators_root(&self) -> Result<[u8; 32]> {
+        Ok(self.genesis_validators_root)
+    }
+
+    async fn get_fork_version(&self, _state_id: &str) -> Result<[u8; 4]> {
+        Ok(self.fork_version)
+    }
+
+    async fn get_finality_checkpoints(&self, state_id: &str) -> Result<FinalityCheckpoints> {
+        self.finality
+            .get(state_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no finality checkpoints for state_id={state_id}"))
     }
 }
 
@@ -47,6 +108,10 @@ impl BeaconApi for MockBeaconApi {
     }
 
     async fn get_block_attestations(&self, block_id: &str) -> Result<Vec<AttestationResponse>> {
+        self.attestation_requests
+            .lock()
+            .unwrap()
+            .push(block_id.to_string());
         self.attestations
             .get(block_id)
             .cloned()
