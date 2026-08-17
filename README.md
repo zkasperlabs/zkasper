@@ -117,6 +117,51 @@ Each epoch-diff advances the accumulator by one epoch. Slot proofs can be
 generated as soon as a slot's attestations are available, and folded into a
 justification once the epoch completes.
 
+## Continuous mode — `zkasperd`
+
+The subcommands above each do one step. `zkasperd` runs the whole thing as a
+service: it bootstraps from the node's finalized checkpoint, then follows the
+chain, writing witnesses and a status manifest as it goes.
+
+```sh
+cargo run --release --bin zkasperd -- --beacon-url http://localhost:5052 \
+    --db-path zkasperd.db --output-dir zkasper-out
+```
+
+Per epoch it runs one epoch diff to advance the accumulator, then streams slot
+proofs as blocks arrive and fires the justification the moment the counted
+balance crosses 2/3 — around slot 22 of a mainnet epoch, not at the epoch
+boundary. Blocks past that point are never fetched. A finalization follows
+whenever two consecutive epochs justify.
+
+Output:
+
+```
+zkasper-out/
+  status.json              # accumulator, checkpoints, per-stage timings
+  epoch-000123456/
+    epoch_diff.bin
+    slot_proof_<slot>.bin
+    justification.bin
+    finalization.bin
+```
+
+`--once` catches up to the node's head and exits. `--bootstrap-slot` picks a
+different starting state. `--signing-domain` overrides the domain otherwise
+derived from the node's fork and genesis.
+
+**It generates witnesses, it does not prove.** Proving is behind the `Prover`
+trait in `crates/witness-gen/src/prover.rs` — witness in, `(public output,
+proof)` out. The default implementation runs each guest's logic natively and
+returns an empty proof, so every witness written has been checked by the same
+circuit that will later prove it. A prover that drives `cargo-zisk` implements
+the same trait; nothing else changes.
+
+Restarts are safe. The accumulator is a chain, so `crates/witness-gen/src/store.rs`
+writes atomically, checksums what it writes, rehashes the tree on load and
+compares it against the recorded root, and refuses any epoch diff that is not
+exactly one epoch forward.
+
 ## Status
 
 - [x] Core library (SSZ, accumulator, Merkle, types)
