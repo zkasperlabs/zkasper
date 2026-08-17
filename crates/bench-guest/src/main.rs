@@ -552,15 +552,15 @@ fn shuffle_naive(index_count: usize, rounds: u8, seed: &[u8; 32]) -> Vec<u32> {
         buf[32] = r;
         let pivot = (u64::from_le_bytes(sha256_short(&buf[..33])[0..8].try_into().unwrap())
             % index_count as u64) as usize;
-        for i in 0..index_count {
-            let x = indices[i] as usize;
+        for slot in indices.iter_mut() {
+            let x = *slot as usize;
             let flip = (pivot + index_count - x) % index_count;
             let position = if x > flip { x } else { flip };
             buf[33..37].copy_from_slice(&((position / 256) as u32).to_le_bytes());
             let source = sha256_short(&buf[..37]);
             let byte_v = source[(position % 256) / 8];
             if (byte_v >> (position % 8)) & 1 == 1 {
-                indices[i] = flip as u32;
+                *slot = flip as u32;
             }
         }
     }
