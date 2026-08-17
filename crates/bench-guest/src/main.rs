@@ -13,7 +13,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use ziskos::syscalls::{
-    syscall_bls12_381_curve_add, syscall_poseidon2, SyscallBls12_381CurveAddParams, SyscallPoint384,
+    syscall_bls12_381_curve_add, syscall_poseidon2, syscall_sha256_f,
+    SyscallBls12_381CurveAddParams, SyscallPoint384, SyscallSha256Params,
 };
 use ziskos::zisklib::scalar_mul_bls12_381;
 use ziskos::zisklib::{
@@ -48,6 +49,30 @@ const MODE_PAIRING_CHECK: u32 = 8;
 const MODE_PAIRING_BATCH: u32 = 9;
 /// Aggregation through the raw precompile, as `bls::aggregate_points` does it.
 const MODE_G1_ADD_RAW: u32 = 10;
+/// 4-ary accumulator node: Poseidon2-16 absorbs four 4-element digests in one
+/// permutation, the same permutation a 2-ary node uses for half the fan-in.
+const MODE_ACC_COMPRESS4: u32 = 19;
+/// One SHA-256 compression on a short message, the shape every shuffle hash has.
+const MODE_SHA256_ONE: u32 = 11;
+/// `n` is the list size: a whole-list 90-round shuffle, hashes included.
+const MODE_SHUFFLE_LIST: u32 = 12;
+/// Same loop with the hashing stubbed out, to split loop cost from hash cost.
+const MODE_SHUFFLE_LIST_NOHASH: u32 = 13;
+/// `compute_shuffled_index` for one index at a time, 90 rounds each.
+const MODE_SHUFFLED_INDEX: u32 = 14;
+
+/// `n` trajectories with the 90 pivot hashes precomputed and shared.
+const MODE_SHUFFLED_INDEX_BATCH: u32 = 16;
+/// Native-only: check the optimized shuffle against a spec transcription.
+const MODE_SHUFFLE_SELFTEST: u32 = 15;
+/// Tuned whole-list shuffle: the source byte is fetched once per run of eight
+/// positions instead of re-tested every iteration, and the swap skips bounds
+/// checks. Same permutation as MODE_SHUFFLE_LIST.
+const MODE_SHUFFLE_FAST: u32 = 17;
+/// Native-only: assert the tuned shuffle matches the reference element-for-element.
+const MODE_SHUFFLE_FAST_SELFTEST: u32 = 18;
+
+const SHUFFLE_ROUND_COUNT: u8 = 90;
 
 fn main() {
     let input = read_input();
@@ -191,8 +216,367 @@ fn run(mode: u32, n: usize) -> u64 {
             acc.x[0]
         }
 
+        MODE_SHA256_ONE => {
+            let mut msg = [0u8; 33];
+            let mut out = 0u64;
+            for i in 0..n {
+                msg[0] = i as u8;
+                msg[1] = (i >> 8) as u8;
+                out ^= sha256_short(&msg)[0] as u64;
+            }
+            out
+        }
+
+        MODE_SHUFFLE_LIST | MODE_SHUFFLE_LIST_NOHASH => {
+            let mut list: Vec<u32> = (0..n as u32).collect();
+            shuffle_list(
+                &mut list,
+                SHUFFLE_ROUND_COUNT,
+                &[7u8; 32],
+                mode == MODE_SHUFFLE_LIST,
+            );
+            list[0] as u64 ^ list[n - 1] as u64
+        }
+
+        MODE_SHUFFLE_FAST => {
+            let mut list: Vec<u32> = (0..n as u32).collect();
+            shuffle_list_fast(&mut list, SHUFFLE_ROUND_COUNT, &[7u8; 32]);
+            list[0] as u64 ^ list[n - 1] as u64
+        }
+
+        MODE_SHUFFLE_FAST_SELFTEST => {
+            let mut a: Vec<u32> = (0..n as u32).collect();
+            let mut b: Vec<u32> = (0..n as u32).collect();
+            shuffle_list(&mut a, SHUFFLE_ROUND_COUNT, &[7u8; 32], true);
+            shuffle_list_fast(&mut b, SHUFFLE_ROUND_COUNT, &[7u8; 32]);
+            assert_eq!(a, b, "tuned shuffle diverges from the reference");
+            a.iter().enumerate().fold(0u64, |acc, (i, v)| {
+                acc ^ (*v as u64).wrapping_mul(i as u64 + 1)
+            })
+        }
+
+        MODE_SHUFFLED_INDEX => {
+            let mut out = 0u64;
+            for i in 0..n {
+                out ^= shuffled_index_single(i, 1_048_576, SHUFFLE_ROUND_COUNT, &[7u8; 32]) as u64;
+            }
+            out
+        }
+
+        MODE_SHUFFLED_INDEX_BATCH => {
+            let index_count = 1_048_576usize;
+            let seed = [7u8; 32];
+            let mut buf = [0u8; 37];
+            buf[..32].copy_from_slice(&seed);
+            // The pivot of each round is the same for every validator, so it is
+            // hoisted out of the per-validator loop: 90 hashes for the batch.
+            let mut pivots = [0usize; SHUFFLE_ROUND_COUNT as usize];
+            for r in 0..SHUFFLE_ROUND_COUNT {
+                buf[32] = r;
+                pivots[r as usize] =
+                    (u64::from_le_bytes(sha256_short(&buf[..33])[0..8].try_into().unwrap())
+                        % index_count as u64) as usize;
+            }
+            let mut out = 0u64;
+            for v in 0..n {
+                let mut index = v;
+                // Reverse round order inverts the permutation: validator -> position.
+                for step in 0..SHUFFLE_ROUND_COUNT {
+                    let r = SHUFFLE_ROUND_COUNT - 1 - step;
+                    let pivot = pivots[r as usize];
+                    let flip = (pivot + index_count - index) % index_count;
+                    let position = if index > flip { index } else { flip };
+                    buf[32] = r;
+                    buf[33..37].copy_from_slice(&((position / 256) as u32).to_le_bytes());
+                    let source = sha256_short(&buf[..37]);
+                    if (source[(position % 256) / 8] >> (position % 8)) & 1 == 1 {
+                        index = flip;
+                    }
+                }
+                out ^= index as u64;
+            }
+            out
+        }
+
+        MODE_SHUFFLE_SELFTEST => {
+            let seed = [7u8; 32];
+            let mut fast: Vec<u32> = (0..n as u32).collect();
+            shuffle_list(&mut fast, SHUFFLE_ROUND_COUNT, &seed, true);
+            let mut back: Vec<u32> = (0..n as u32).collect();
+            shuffle_list_dir(&mut back, SHUFFLE_ROUND_COUNT, &seed, true, false);
+            let slow = shuffle_naive(n, SHUFFLE_ROUND_COUNT, &seed);
+            assert_eq!(back, slow, "reverse-round whole-list shuffle == spec permutation");
+            // The whole-list form permutes positions; the spec form reports, for
+            // each starting index, where it ended up. They are inverses.
+            let mut inv = alloc::vec![0u32; n];
+            for (pos, &idx) in fast.iter().enumerate() {
+                inv[idx as usize] = pos as u32;
+            }
+            let ok = inv == slow;
+            let mut sig = 0u64;
+            for (i, v) in fast.iter().enumerate().take(8) {
+                sig |= (*v as u64) << (i * 8);
+            }
+            (ok as u64) << 63 | sig
+        }
+
+        MODE_ACC_COMPRESS4 => {
+            let mut d = [1u64, 2, 3, 4];
+            for _ in 0..n {
+                let mut st = [0u64; 16];
+                st[0..4].copy_from_slice(&d);
+                st[4..8].copy_from_slice(&[5, 6, 7, 8]);
+                st[8..12].copy_from_slice(&[9, 10, 11, 12]);
+                st[12..16].copy_from_slice(&[13, 14, 15, 16]);
+                unsafe { syscall_poseidon2(&mut st as *mut [u64; 16]) };
+                d = [st[0], st[1], st[2], st[3]];
+            }
+            d[0]
+        }
+
         _ => panic!("unknown mode {mode}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shuffling probe (scratch, not for commit).
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of a message shorter than 56 bytes: exactly one compression.
+fn sha256_short(msg: &[u8]) -> [u8; 32] {
+    const IV: [u32; 8] = [
+        0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c, 0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let mut block = [0u8; 64];
+    block[..msg.len()].copy_from_slice(msg);
+    block[msg.len()] = 0x80;
+    let bits = (msg.len() as u64) * 8;
+    block[56..64].copy_from_slice(&bits.to_be_bytes());
+
+    let mut input = [0u64; 8];
+    for i in 0..8 {
+        input[i] = u64::from_le_bytes(block[8 * i..8 * i + 8].try_into().unwrap());
+    }
+    let mut state = [
+        IV[0] as u64 | (IV[1] as u64) << 32,
+        IV[2] as u64 | (IV[3] as u64) << 32,
+        IV[4] as u64 | (IV[5] as u64) << 32,
+        IV[6] as u64 | (IV[7] as u64) << 32,
+    ];
+    syscall_sha256_f(&mut SyscallSha256Params {
+        state: &mut state,
+        input: &input,
+    });
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        out[8 * i..8 * i + 4].copy_from_slice(&(state[i] as u32).to_be_bytes());
+        out[8 * i + 4..8 * i + 8].copy_from_slice(&((state[i] >> 32) as u32).to_be_bytes());
+    }
+    out
+}
+
+/// Whole-list swap-or-not shuffle, the standard optimized form: one pivot hash
+/// per round and one source hash per 256 positions, shared across the round.
+/// `hashing` off replaces the source with a fixed byte string so the loop cost
+/// can be read separately from the hash cost.
+fn shuffle_list(input: &mut [u32], rounds: u8, seed: &[u8; 32], hashing: bool) {
+    shuffle_list_dir(input, rounds, seed, hashing, true)
+}
+
+fn shuffle_list_dir(input: &mut [u32], rounds: u8, seed: &[u8; 32], hashing: bool, forwards: bool) {
+    let list_size = input.len();
+    if list_size <= 1 {
+        return;
+    }
+    let mut buf = [0u8; 37];
+    buf[..32].copy_from_slice(seed);
+    let fixed = [0xa5u8; 32];
+
+    for step in 0..rounds {
+        let r = if forwards { step } else { rounds - 1 - step };
+        buf[32] = r;
+        let pivot = if hashing {
+            (u64::from_le_bytes(sha256_short(&buf[..33])[0..8].try_into().unwrap())
+                % list_size as u64) as usize
+        } else {
+            (0x5a5a_5a5a_u64.wrapping_mul(r as u64 + 1) % list_size as u64) as usize
+        };
+
+        let hash_at = |pos_bucket: usize, buf: &mut [u8; 37]| -> [u8; 32] {
+            if hashing {
+                buf[33..37].copy_from_slice(&(pos_bucket as u32).to_le_bytes());
+                sha256_short(&buf[..37])
+            } else {
+                fixed
+            }
+        };
+
+        // Lower mirror: j walks down from pivot.
+        let mirror = (pivot + 1) >> 1;
+        let mut source = hash_at(pivot >> 8, &mut buf);
+        let mut byte_v = source[(pivot & 0xff) >> 3];
+        for i in 0..mirror {
+            let j = pivot - i;
+            if j & 0xff == 0xff {
+                source = hash_at(j >> 8, &mut buf);
+            }
+            if j & 0x07 == 0x07 {
+                byte_v = source[(j & 0xff) >> 3];
+            }
+            if (byte_v >> (j & 0x07)) & 1 == 1 {
+                input.swap(i, j);
+            }
+        }
+
+        // Upper mirror: j walks down from the end of the list.
+        let mirror = (pivot + list_size + 1) >> 1;
+        let end = list_size - 1;
+        let mut source = hash_at(end >> 8, &mut buf);
+        let mut byte_v = source[(end & 0xff) >> 3];
+        for (loop_iter, i) in (pivot + 1..mirror).enumerate() {
+            let j = end - loop_iter;
+            if j & 0xff == 0xff {
+                source = hash_at(j >> 8, &mut buf);
+            }
+            if j & 0x07 == 0x07 {
+                byte_v = source[(j & 0xff) >> 3];
+            }
+            if (byte_v >> (j & 0x07)) & 1 == 1 {
+                input.swap(i, j);
+            }
+        }
+    }
+}
+
+/// Tuned form of [`shuffle_list`].
+///
+/// Same algorithm and same output; the difference is instruction count in the
+/// inner loop, which is what a zkVM charges for. `j` descends, so consecutive
+/// positions share a source byte while `j >> 3` holds. Fetching that byte once
+/// per run of up to eight, rather than re-testing `j & 7 == 7` every iteration,
+/// removes two branches and a load per position. Runs are aligned to 8 and 256
+/// is a multiple of 8, so a run never straddles a hash boundary and the refresh
+/// check stays at run start.
+fn shuffle_list_fast(input: &mut [u32], rounds: u8, seed: &[u8; 32]) {
+    let list_size = input.len();
+    if list_size <= 1 {
+        return;
+    }
+    let mut buf = [0u8; 37];
+    buf[..32].copy_from_slice(seed);
+
+    for r in 0..rounds {
+        buf[32] = r;
+        let pivot = (u64::from_le_bytes(sha256_short(&buf[..33])[0..8].try_into().unwrap())
+            % list_size as u64) as usize;
+
+        // Lower mirror: i ascends from 0, j descends from pivot.
+        let mirror = (pivot + 1) >> 1;
+        let mut source = {
+            buf[33..37].copy_from_slice(&((pivot >> 8) as u32).to_le_bytes());
+            sha256_short(&buf[..37])
+        };
+        let mut i = 0usize;
+        while i < mirror {
+            let j = pivot - i;
+            if j & 0xff == 0xff {
+                buf[33..37].copy_from_slice(&((j >> 8) as u32).to_le_bytes());
+                source = sha256_short(&buf[..37]);
+            }
+            let byte_v = source[(j & 0xff) >> 3];
+            let run = core::cmp::min((j & 7) + 1, mirror - i);
+            for k in 0..run {
+                if (byte_v >> ((j - k) & 7)) & 1 == 1 {
+                    unsafe {
+                        let a = *input.get_unchecked(i + k);
+                        let b = *input.get_unchecked(j - k);
+                        *input.get_unchecked_mut(i + k) = b;
+                        *input.get_unchecked_mut(j - k) = a;
+                    }
+                }
+            }
+            i += run;
+        }
+
+        // Upper mirror: i ascends from pivot+1, j descends from the end.
+        let mirror = (pivot + list_size + 1) >> 1;
+        let end = list_size - 1;
+        let mut source = {
+            buf[33..37].copy_from_slice(&((end >> 8) as u32).to_le_bytes());
+            sha256_short(&buf[..37])
+        };
+        let mut i = pivot + 1;
+        let mut done = 0usize;
+        while i < mirror {
+            let j = end - done;
+            if j & 0xff == 0xff {
+                buf[33..37].copy_from_slice(&((j >> 8) as u32).to_le_bytes());
+                source = sha256_short(&buf[..37]);
+            }
+            let byte_v = source[(j & 0xff) >> 3];
+            let run = core::cmp::min((j & 7) + 1, mirror - i);
+            for k in 0..run {
+                if (byte_v >> ((j - k) & 7)) & 1 == 1 {
+                    unsafe {
+                        let a = *input.get_unchecked(i + k);
+                        let b = *input.get_unchecked(j - k);
+                        *input.get_unchecked_mut(i + k) = b;
+                        *input.get_unchecked_mut(j - k) = a;
+                    }
+                }
+            }
+            i += run;
+            done += run;
+        }
+    }
+}
+
+/// Spec-faithful `compute_shuffled_permutation`: no bucket cache, no mirror
+/// trick. Every index pays its own source hash every round.
+#[allow(dead_code)]
+fn shuffle_naive(index_count: usize, rounds: u8, seed: &[u8; 32]) -> Vec<u32> {
+    let mut indices: Vec<u32> = (0..index_count as u32).collect();
+    let mut buf = [0u8; 37];
+    buf[..32].copy_from_slice(seed);
+    for r in 0..rounds {
+        buf[32] = r;
+        let pivot = (u64::from_le_bytes(sha256_short(&buf[..33])[0..8].try_into().unwrap())
+            % index_count as u64) as usize;
+        for i in 0..index_count {
+            let x = indices[i] as usize;
+            let flip = (pivot + index_count - x) % index_count;
+            let position = if x > flip { x } else { flip };
+            buf[33..37].copy_from_slice(&((position / 256) as u32).to_le_bytes());
+            let source = sha256_short(&buf[..37]);
+            let byte_v = source[(position % 256) / 8];
+            if (byte_v >> (position % 8)) & 1 == 1 {
+                indices[i] = flip as u32;
+            }
+        }
+    }
+    indices
+}
+
+/// `compute_shuffled_index` for a single index: 90 rounds, one pivot hash and
+/// one source hash each, nothing shared.
+fn shuffled_index_single(mut index: usize, index_count: usize, rounds: u8, seed: &[u8; 32]) -> usize {
+    let mut buf = [0u8; 37];
+    buf[..32].copy_from_slice(seed);
+    for r in 0..rounds {
+        buf[32] = r;
+        let pivot = (u64::from_le_bytes(sha256_short(&buf[..33])[0..8].try_into().unwrap())
+            % index_count as u64) as usize;
+        let flip = (pivot + index_count - index) % index_count;
+        let position = if index > flip { index } else { flip };
+        buf[33..37].copy_from_slice(&((position / 256) as u32).to_le_bytes());
+        let source = sha256_short(&buf[..37]);
+        let byte_v = source[(position % 256) / 8];
+        if (byte_v >> (position % 8)) & 1 == 1 {
+            index = flip;
+        }
+    }
+    index
 }
 
 #[cfg(target_os = "zkvm")]
