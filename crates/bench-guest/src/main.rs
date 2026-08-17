@@ -305,7 +305,10 @@ fn run(mode: u32, n: usize) -> u64 {
             let mut back: Vec<u32> = (0..n as u32).collect();
             shuffle_list_dir(&mut back, SHUFFLE_ROUND_COUNT, &seed, true, false);
             let slow = shuffle_naive(n, SHUFFLE_ROUND_COUNT, &seed);
-            assert_eq!(back, slow, "reverse-round whole-list shuffle == spec permutation");
+            assert_eq!(
+                back, slow,
+                "reverse-round whole-list shuffle == spec permutation"
+            );
             // The whole-list form permutes positions; the spec form reports, for
             // each starting index, where it ended up. They are inverses.
             let mut inv = alloc::vec![0u32; n];
@@ -345,7 +348,13 @@ fn run(mode: u32, n: usize) -> u64 {
 /// SHA-256 of a message shorter than 56 bytes: exactly one compression.
 fn sha256_short(msg: &[u8]) -> [u8; 32] {
     const IV: [u32; 8] = [
-        0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c, 0x1f83_d9ab,
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
         0x5be0_cd19,
     ];
     let mut block = [0u8; 64];
@@ -560,7 +569,12 @@ fn shuffle_naive(index_count: usize, rounds: u8, seed: &[u8; 32]) -> Vec<u32> {
 
 /// `compute_shuffled_index` for a single index: 90 rounds, one pivot hash and
 /// one source hash each, nothing shared.
-fn shuffled_index_single(mut index: usize, index_count: usize, rounds: u8, seed: &[u8; 32]) -> usize {
+fn shuffled_index_single(
+    mut index: usize,
+    index_count: usize,
+    rounds: u8,
+    seed: &[u8; 32],
+) -> usize {
     let mut buf = [0u8; 37];
     buf[..32].copy_from_slice(seed);
     for r in 0..rounds {

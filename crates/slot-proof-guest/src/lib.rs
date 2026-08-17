@@ -29,6 +29,14 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
     );
 
     // Phase 1: Collect the accumulator leaves the attestations claim.
+    //
+    // Membership is proven for *every* attester, not just the ones whose
+    // balance is counted. Two reasons. The witness generator builds the
+    // multi-proof over every attester, so proving a subset leaves auxiliaries
+    // unconsumed and the batch aborts. More importantly, Phase 3 aggregates the
+    // public keys of every attester: a key that is never opened against the
+    // accumulator is a key the prover chose freely, which is a rogue-key
+    // opening. `count_balance` governs the balance sum only.
     let mut attesting_balance: u64 = 0;
     let mut multi_proof_leaves: Vec<(zkasper_common::acc::Digest, u64)> = Vec::new();
     let mut counted_indices: Vec<u64> = Vec::new();
@@ -48,25 +56,33 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
             }
             last_index = Some(v.validator_index);
 
+            multi_proof_leaves.push((
+                acc::leaf(&v.pubkey, v.active_effective_balance),
+                v.validator_index,
+            ));
+
             if v.count_balance {
                 attesting_balance += v.active_effective_balance;
                 counted_indices.push(v.validator_index);
-
-                let leaf = acc::leaf(&v.pubkey, v.active_effective_balance);
-                multi_proof_leaves.push((leaf, v.validator_index));
             }
         }
     }
 
-    // Sort multi-proof leaves by validator index
+    // A validator may appear in more than one aggregate in the same slot. The
+    // accumulator leaf is a function of the validator alone, so duplicates are
+    // identical and collapse; the batch scan requires strictly increasing
+    // indices.
     multi_proof_leaves.sort_unstable_by_key(|&(_, idx)| idx);
+    multi_proof_leaves.dedup_by_key(|&mut (_, idx)| idx);
 
-    // Verify no duplicate validator was counted
-    for i in 1..multi_proof_leaves.len() {
+    // Every counted validator must be distinct — this is what stops a balance
+    // from being counted twice within the slot.
+    counted_indices.sort_unstable();
+    for i in 1..counted_indices.len() {
         assert!(
-            multi_proof_leaves[i].1 > multi_proof_leaves[i - 1].1,
+            counted_indices[i] > counted_indices[i - 1],
             "duplicate validator counted: {}",
-            multi_proof_leaves[i].1,
+            counted_indices[i],
         );
     }
 
@@ -133,8 +149,7 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
         "BLS aggregate signature verification failed",
     );
 
-    // Phase 4: Compute counted validators commitment
-    counted_indices.sort_unstable();
+    // Phase 4: Compute counted validators commitment (already sorted above)
     let commitment = acc::commit_indices(&counted_indices);
 
     SlotProofOutput {

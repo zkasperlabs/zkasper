@@ -11,9 +11,9 @@ use ziskos::syscalls::{
     syscall_bls12_381_curve_add, SyscallBls12_381CurveAddParams, SyscallPoint384,
 };
 use ziskos::zisklib::{
-    add_complete_safe_twist_bls12_381, decompress_bls12_381, decompress_twist_bls12_381,
-    hash_to_curve_g2_bls12_381, is_on_subgroup_twist_bls12_381, neg_bls12_381,
-    pairing_check_safe_bls12_381,
+    add_complete_safe_bls12_381, add_complete_safe_twist_bls12_381, decompress_bls12_381,
+    decompress_twist_bls12_381, hash_to_curve_g2_bls12_381, is_on_subgroup_twist_bls12_381,
+    neg_bls12_381, pairing_check_safe_bls12_381,
 };
 
 use crate::acc::G1Point;
@@ -225,16 +225,24 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
         return false;
     }
 
-    for (i, a) in messages.iter().enumerate() {
-        for b in &messages[i + 1..] {
-            if a.signing_root == b.signing_root {
-                return false;
-            }
-        }
-    }
-
-    let mut g1_points: Vec<[u64; 12]> = Vec::with_capacity(messages.len() + 1);
-    let mut g2_points: Vec<[u64; 24]> = Vec::with_capacity(messages.len() + 1);
+    // Group by signing root, then fold each group into one pairing input.
+    //
+    // Post-Electra, `AttestationData.index` is pinned to 0 and committee
+    // identity lives in `committee_bits`, so two aggregates in the same block
+    // covering different committees carry byte-identical `AttestationData` and
+    // therefore the same signing root. Rejecting that case rejects real
+    // mainnet blocks — measured, 4 of 34 slots in epoch 430529.
+    //
+    // Merging is sound and is what the distinctness rule is actually for. The
+    // rogue-key concern is about a signer's key appearing against a message
+    // nobody committed to; summing two aggregates over the *same* message adds
+    // their public keys and their signatures in step, so the pairing equation
+    // stays balanced:
+    //   e(P1 + P2, H(m)) == e(G1, s1 + s2)
+    // It is also strictly cheaper — one Miller loop per distinct message rather
+    // than per aggregate.
+    let mut roots: Vec<[u8; 32]> = Vec::with_capacity(messages.len());
+    let mut aggs: Vec<[u64; 12]> = Vec::with_capacity(messages.len());
     let mut signature_sum = G2_IDENTITY;
 
     for m in messages {
@@ -255,17 +263,34 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
         };
         signature_sum = sum;
 
-        #[cfg(feature = "count-ops")]
-        crate::op_counter::inc_hash_to_curve(1);
-
-        g1_points.push(neg_bls12_381(&agg));
-        g2_points.push(hash_to_curve_g2_bls12_381(m.signing_root, ETH_BLS_DST));
+        match roots.iter().position(|r| r == m.signing_root) {
+            Some(i) => {
+                // Same message as an earlier aggregate: fold the public keys.
+                let Ok(merged) = add_complete_safe_bls12_381(&aggs[i], &agg) else {
+                    return false;
+                };
+                aggs[i] = merged;
+            }
+            None => {
+                roots.push(*m.signing_root);
+                aggs.push(agg);
+            }
+        }
     }
 
     // The individual signatures need no subgroup check of their own: the
     // equation only ever involves their sum, so checking the sum is what binds.
     if !is_on_subgroup_twist_bls12_381(&signature_sum) {
         return false;
+    }
+
+    let mut g1_points: Vec<[u64; 12]> = Vec::with_capacity(roots.len() + 1);
+    let mut g2_points: Vec<[u64; 24]> = Vec::with_capacity(roots.len() + 1);
+    for (root, agg) in roots.iter().zip(&aggs) {
+        #[cfg(feature = "count-ops")]
+        crate::op_counter::inc_hash_to_curve(1);
+        g1_points.push(neg_bls12_381(agg));
+        g2_points.push(hash_to_curve_g2_bls12_381(root, ETH_BLS_DST));
     }
 
     g1_points.push(G1_GENERATOR);

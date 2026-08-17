@@ -73,6 +73,7 @@ macro_rules! counters {
 
 counters! {
     poseidon2 => inc_poseidon2_n, POSEIDON2;
+    acc_leaf => inc_acc_leaf, ACC_LEAF_C;
     sha256f => inc_sha256f, SHA256F;
     pubkey_aggregate => inc_pubkey_aggregate, PUBKEY_AGGREGATE;
     hash_to_curve => inc_hash_to_curve, HASH_TO_CURVE;
@@ -96,6 +97,7 @@ impl OpCounts {
     /// Estimated Zisk cost of these operations, excluding the per-proof floor.
     pub fn cost(&self) -> u64 {
         self.poseidon2 * cost::POSEIDON2
+            + self.acc_leaf * cost::ACC_LEAF
             + self.sha256f * cost::SHA256F
             + self.decompress * cost::DECOMPRESS
             + self.pubkey_aggregate * cost::PUBKEY_AGGREGATE
@@ -124,9 +126,10 @@ impl core::fmt::Display for OpCounts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "poseidon2={} sha256f={} decompress={} pubkeys={} h2c={} miller={} final_exp={} \
-             recursion={} => cost {}",
+            "poseidon2={} acc_leaf={} sha256f={} decompress={} pubkeys={} h2c={} miller={} \
+             final_exp={} recursion={} => cost {}",
             self.poseidon2,
+            self.acc_leaf,
             self.sha256f,
             self.decompress,
             self.pubkey_aggregate,

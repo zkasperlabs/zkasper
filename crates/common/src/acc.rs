@@ -26,6 +26,12 @@ const DOMAIN_INDEX_LIST: u64 = 3;
 fn permute(state: &mut [u64; 16]) {
     #[cfg(feature = "count-ops")]
     crate::op_counter::inc_poseidon2();
+    permute_uncounted(state);
+}
+
+/// The permutation without the counter, for call sites that charge themselves.
+#[inline(always)]
+fn permute_uncounted(state: &mut [u64; 16]) {
     unsafe { syscall_poseidon2(state as *mut [u64; 16]) };
 }
 
@@ -91,7 +97,14 @@ pub fn leaf(point: &G1Point, active_effective_balance: u64) -> Digest {
     st[13] = active_effective_balance & 0xFFFF_FFFF;
     st[14] = active_effective_balance >> 32;
     st[15] = DOMAIN_LEAF;
-    permute(&mut st);
+    #[cfg(feature = "count-ops")]
+    {
+        // Charged as ACC_LEAF, not POSEIDON2: the leaf marshals a packed G1
+        // point into the state and measures 3,979 against a node's 3,033.
+        crate::op_counter::inc_acc_leaf(1);
+        crate::op_counter::inc_poseidon2_n(0);
+    }
+    permute_uncounted(&mut st);
     [st[0], st[1], st[2], st[3]]
 }
 
