@@ -1,11 +1,15 @@
 pub mod acc_tree;
+pub mod artifacts;
 pub mod attestation_collector;
 pub mod beacon_api;
 pub mod db;
 pub mod epoch_state;
+pub mod orchestrator;
+pub mod prover;
 pub mod pubkey;
 pub mod ssz_state;
 pub mod state_diff;
+pub mod store;
 pub mod witness_bootstrap;
 pub mod witness_epoch_diff;
 pub mod witness_justification;

@@ -24,8 +24,37 @@ contract ZkasperVerifier {
     IZiskVerifier public immutable finalityVerifier;
     IZiskVerifier public immutable bootstrapVerifier;
 
+
+    // ---------------------------------------------------------------------
+    // Public-output layout, in 32-bit words.
+    //
+    // These MUST match `PublicWriter` usage in the guest `main.rs` files.
+    // They previously did not: the contract read the accumulator root where it
+    // expected state_root_1, and the epoch where it expected the finalized
+    // root. Nothing caught it because no proof was ever verified end to end.
+    // A Digest is 4 u64 = 8 words; a bytes32 is 8 words; a u64 is 2 words.
+    // ---------------------------------------------------------------------
+
+    // bootstrap: commitment, acc_root, total_active_balance, state_root, epoch
+    uint256 private constant BOOT_COMMITMENT = 0;
+    uint256 private constant BOOT_STATE_ROOT = 18;
+
+    // epoch-diff: commitment_1, state_root_1, epoch_1,
+    //             commitment_2, acc_root_2, total_active_balance_2,
+    //             state_root_2, epoch_2
+    uint256 private constant DIFF_COMMITMENT_1 = 0;
+    uint256 private constant DIFF_STATE_ROOT_1 = 8;
+    uint256 private constant DIFF_COMMITMENT_2 = 18;
+    uint256 private constant DIFF_STATE_ROOT_2 = 36;
+
+    // finalization: commitment, finalized_epoch, finalized_root, finalized_state_root
+    uint256 private constant FIN_COMMITMENT = 0;
+    uint256 private constant FIN_ROOT = 10;
+    uint256 private constant FIN_STATE_ROOT = 18;
+
     bytes32 public accumulatorCommitment;
     bytes32 public latestStateRoot;
+    bytes32 public latestFinalizedStateRoot;
     bytes32 public latestFinalizedBlockRoot;
     bool public initialized;
 
@@ -53,8 +82,8 @@ contract ZkasperVerifier {
         require(publicOutputs.length >= 16, "invalid outputs length");
         require(bootstrapVerifier.verify(proof, publicOutputs), "invalid proof");
 
-        accumulatorCommitment = _extractBytes32(publicOutputs, 0);
-        latestStateRoot = _extractBytes32(publicOutputs, 8);
+        accumulatorCommitment = _extractBytes32(publicOutputs, BOOT_COMMITMENT);
+        latestStateRoot = _extractBytes32(publicOutputs, BOOT_STATE_ROOT);
         initialized = true;
 
         emit Bootstrapped(latestStateRoot, accumulatorCommitment);
@@ -70,11 +99,20 @@ contract ZkasperVerifier {
         require(publicOutputs.length >= 24, "invalid outputs length");
         require(epochDiffVerifier.verify(proof, publicOutputs), "invalid proof");
 
-        bytes32 provenStateRoot1 = _extractBytes32(publicOutputs, 8);
-        require(provenStateRoot1 == latestStateRoot, "state root 1 mismatch");
+        // Bind BOTH endpoints. The proof now names the accumulator it started
+        // from, so the chain is enforced on the commitment, not just the state
+        // root — a proof built against a different accumulator is rejected here.
+        require(
+            _extractBytes32(publicOutputs, DIFF_COMMITMENT_1) == accumulatorCommitment,
+            "epoch diff does not start from the current accumulator"
+        );
+        require(
+            _extractBytes32(publicOutputs, DIFF_STATE_ROOT_1) == latestStateRoot,
+            "state root 1 mismatch"
+        );
 
-        accumulatorCommitment = _extractBytes32(publicOutputs, 0);
-        latestStateRoot = _extractBytes32(publicOutputs, 16);
+        accumulatorCommitment = _extractBytes32(publicOutputs, DIFF_COMMITMENT_2);
+        latestStateRoot = _extractBytes32(publicOutputs, DIFF_STATE_ROOT_2);
 
         emit EpochDiffVerified(latestStateRoot, accumulatorCommitment);
     }
@@ -89,10 +127,13 @@ contract ZkasperVerifier {
         require(publicOutputs.length >= 16, "invalid outputs length");
         require(finalityVerifier.verify(proof, publicOutputs), "invalid proof");
 
-        bytes32 provenCommitment = _extractBytes32(publicOutputs, 0);
+        bytes32 provenCommitment = _extractBytes32(publicOutputs, FIN_COMMITMENT);
         require(provenCommitment == accumulatorCommitment, "accumulator mismatch");
 
-        latestFinalizedBlockRoot = _extractBytes32(publicOutputs, 8);
+        latestFinalizedBlockRoot = _extractBytes32(publicOutputs, FIN_ROOT);
+        // Anchors the accumulator: the state root a real supermajority attested
+        // to. A branched accumulator can never produce a matching value.
+        latestFinalizedStateRoot = _extractBytes32(publicOutputs, FIN_STATE_ROOT);
 
         emit FinalityVerified(latestFinalizedBlockRoot);
     }

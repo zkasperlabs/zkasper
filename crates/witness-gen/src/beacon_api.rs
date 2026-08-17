@@ -5,8 +5,16 @@
 //! - `/eth/v2/beacon/blocks/{block_id}/attestations` — block attestations
 //! - `/eth/v1/beacon/states/{state_id}/committees` — committee assignments
 //! - `/eth/v1/beacon/headers/{block_id}` — block header
+//!
+//! Continuous operation needs a few more, split out into [`ChainStatusApi`] so
+//! that fixture-backed sources can keep implementing [`BeaconApi`] alone:
+//! - `/eth/v1/beacon/blocks/{block_id}/root` — checkpoint roots
+//! - `/eth/v1/beacon/genesis` — genesis validators root
+//! - `/eth/v1/beacon/states/{state_id}/fork` — fork version
+//! - `/eth/v1/beacon/states/{state_id}/finality_checkpoints` — where the node is
 
 use anyhow::{Context, Result};
+use zkasper_common::types::Checkpoint;
 
 /// Trait abstracting beacon API access. Implement this for mock-based testing.
 #[async_trait::async_trait]
@@ -19,6 +27,36 @@ pub trait BeaconApi {
     /// Fetch the raw SSZ-encoded BeaconState from the debug API endpoint.
     /// Returns `None` if the endpoint is not available (e.g., mock API).
     async fn get_state_ssz(&self, state_id: &str) -> Result<Option<Vec<u8>>>;
+}
+
+/// The chain-following half of the beacon API.
+///
+/// [`BeaconApi`] is enough to build any single witness from data the caller
+/// already knows how to address. A daemon does not know: it has to ask the node
+/// where the chain is, which block a checkpoint refers to, and which domain
+/// attestations were signed under. Those live here so that file-backed sources
+/// used in tests are not forced to fake them.
+#[async_trait::async_trait]
+pub trait ChainStatusApi {
+    /// Block root of `block_id`, or `None` when that slot holds no block.
+    async fn get_block_root(&self, block_id: &str) -> Result<Option<[u8; 32]>>;
+
+    /// Genesis validators root, one of the two inputs to the signing domain.
+    async fn get_genesis_validators_root(&self) -> Result<[u8; 32]>;
+
+    /// Fork version in effect at `state_id`, the other input to the domain.
+    async fn get_fork_version(&self, state_id: &str) -> Result<[u8; 4]>;
+
+    /// The node's own view of justification and finalization.
+    async fn get_finality_checkpoints(&self, state_id: &str) -> Result<FinalityCheckpoints>;
+}
+
+/// The node's `finality_checkpoints` response.
+#[derive(Debug, Clone)]
+pub struct FinalityCheckpoints {
+    pub previous_justified: Checkpoint,
+    pub current_justified: Checkpoint,
+    pub finalized: Checkpoint,
 }
 
 pub struct BeaconApiClient {
@@ -119,6 +157,46 @@ impl BeaconApi for BeaconApiClient {
     }
 }
 
+#[async_trait::async_trait]
+impl ChainStatusApi for BeaconApiClient {
+    async fn get_block_root(&self, block_id: &str) -> Result<Option<[u8; 32]>> {
+        let url = format!("{}/eth/v1/beacon/blocks/{}/root", self.base_url, block_id);
+        let resp = self.client.get(&url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // A skipped slot has no block, which is not an error.
+            return Ok(None);
+        }
+        let resp: serde_json::Value = resp.error_for_status()?.json().await?;
+        Ok(Some(parse_hex_bytes32(&resp["data"], "root")?))
+    }
+
+    async fn get_genesis_validators_root(&self) -> Result<[u8; 32]> {
+        let url = format!("{}/eth/v1/beacon/genesis", self.base_url);
+        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        parse_hex_bytes32(&resp["data"], "genesis_validators_root")
+    }
+
+    async fn get_fork_version(&self, state_id: &str) -> Result<[u8; 4]> {
+        let url = format!("{}/eth/v1/beacon/states/{}/fork", self.base_url, state_id);
+        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        parse_hex_bytes4(&resp["data"], "current_version")
+    }
+
+    async fn get_finality_checkpoints(&self, state_id: &str) -> Result<FinalityCheckpoints> {
+        let url = format!(
+            "{}/eth/v1/beacon/states/{}/finality_checkpoints",
+            self.base_url, state_id
+        );
+        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let data = &resp["data"];
+        Ok(FinalityCheckpoints {
+            previous_justified: parse_checkpoint(&data["previous_justified"])?,
+            current_justified: parse_checkpoint(&data["current_justified"])?,
+            finalized: parse_checkpoint(&data["finalized"])?,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
@@ -185,6 +263,27 @@ fn parse_hex_bytes32(val: &serde_json::Value, field: &str) -> Result<[u8; 32]> {
     let mut result = [0u8; 32];
     result.copy_from_slice(&bytes);
     Ok(result)
+}
+
+fn parse_hex_bytes4(val: &serde_json::Value, field: &str) -> Result<[u8; 4]> {
+    let s = val[field].as_str().context(format!("missing {field}"))?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).context(format!("invalid hex in {field}"))?;
+    anyhow::ensure!(
+        bytes.len() == 4,
+        "{field}: expected 4 bytes, got {}",
+        bytes.len()
+    );
+    let mut result = [0u8; 4];
+    result.copy_from_slice(&bytes);
+    Ok(result)
+}
+
+fn parse_checkpoint(val: &serde_json::Value) -> Result<Checkpoint> {
+    Ok(Checkpoint {
+        epoch: parse_u64_str(val, "epoch")?,
+        root: parse_hex_bytes32(val, "root")?,
+    })
 }
 
 fn parse_hex_bytes48(val: &serde_json::Value, field: &str) -> Result<[u8; 48]> {

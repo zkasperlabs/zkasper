@@ -14,6 +14,7 @@ use zkasper_common::types::ValidatorData;
 /// Only the dense portion (levels 0..dense_depth) is allocated.
 /// The full tree root at `depth` is computed by chaining the dense root
 /// through precomputed zero hashes for levels dense_depth..depth.
+#[derive(Clone)]
 pub struct AccTree {
     /// Full tree depth (e.g. 22 for ACC_TREE_DEPTH).
     pub(crate) depth: u32,
@@ -98,6 +99,48 @@ impl AccTree {
             levels,
             zero_hashes,
         }
+    }
+
+    /// Recompute every internal level from the leaves and check it matches.
+    ///
+    /// The accumulator is a chain: epoch N's root is only meaningful if epoch
+    /// N-1's was right. A tree read back from disk is therefore checked to be a
+    /// well-formed Merkle tree before anything is built on top of it, rather
+    /// than trusted because the bytes deserialized.
+    pub fn verify_consistent(&self) -> Result<(), String> {
+        if self.levels.len() != self.dense_depth as usize + 1 {
+            return Err(format!(
+                "expected {} levels for dense_depth {}, got {}",
+                self.dense_depth + 1,
+                self.dense_depth,
+                self.levels.len(),
+            ));
+        }
+        if self.dense_depth > self.depth {
+            return Err(format!(
+                "dense_depth {} exceeds depth {}",
+                self.dense_depth, self.depth,
+            ));
+        }
+        for (d, level) in self.levels.iter().enumerate() {
+            let expected = 1usize << (self.dense_depth as usize - d);
+            if level.len() != expected {
+                return Err(format!(
+                    "level {d} has {} nodes, expected {expected}",
+                    level.len(),
+                ));
+            }
+        }
+        for d in 0..self.dense_depth as usize {
+            let recomputed: Vec<Digest> = self.levels[d]
+                .par_chunks_exact(2)
+                .map(|pair| acc::compress(&pair[0], &pair[1]))
+                .collect();
+            if recomputed != self.levels[d + 1] {
+                return Err(format!("level {} does not hash to level {}", d, d + 1));
+            }
+        }
+        Ok(())
     }
 
     /// Current root hash at the full tree depth.

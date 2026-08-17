@@ -83,6 +83,28 @@ pub struct ValidatorMutation {
     pub acc_siblings: Vec<Digest>,
 }
 
+/// Public outputs of an epoch-diff proof.
+///
+/// Names *both* endpoints of the transition, not just the new one. A diff that
+/// only published where it arrived cannot be checked against where it was
+/// supposed to start, so anything consuming a chain of diffs — the finalization
+/// circuit, or an on-chain contract holding the current commitment — has to take
+/// the link on trust. Publishing `prev_accumulator_commitment` makes the link
+/// part of the statement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochDiffOutput {
+    /// Commitment the diff started from: `H(acc_root_1, total_active_balance_1)`.
+    pub prev_accumulator_commitment: Digest,
+    /// Commitment the diff produced.
+    pub accumulator_commitment: Digest,
+    pub acc_root: Digest,
+    pub total_active_balance: u64,
+    pub state_root_1: [u8; 32],
+    pub state_root_2: [u8; 32],
+    pub epoch_1: u64,
+    pub epoch_2: u64,
+}
+
 /// Witness for Proof 1: Epoch Diff.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EpochDiffWitness {
@@ -220,7 +242,11 @@ pub struct BlockHeaderFields {
 /// Public outputs of a finalization proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizationOutput {
+    /// Accumulator epoch E was justified against.
     pub accumulator_commitment: Digest,
+    /// Accumulator epoch E+1 was justified against, proven to be the one above
+    /// advanced by exactly the epoch diff E -> E+1.
+    pub next_accumulator_commitment: Digest,
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
     /// Beacon state root of the finalized block, opened from its header.
@@ -238,15 +264,20 @@ pub struct FinalizationOutput {
 /// Witness for a finalization proof (pairs two consecutive justifications).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalizationWitness {
-    pub accumulator_commitment: Digest,
     /// Verification key of the justification program.
     pub justification_program_vk: crate::recursion::ProgramVk,
+    /// Verification key of the epoch-diff program.
+    pub epoch_diff_program_vk: crate::recursion::ProgramVk,
     /// Header of the finalized block, checked against `finalized_root`.
     pub finalized_header: BlockHeaderFields,
     /// Justification outputs for epochs E and E+1.
     pub justification_outputs: Vec<JustificationOutput>,
     /// Zisk proof words for each justification (empty in native testing mode).
     pub justification_proofs: Vec<Vec<u64>>,
+    /// Output of the epoch diff that carries the accumulator from E to E+1.
+    pub epoch_diff_output: EpochDiffOutput,
+    /// Zisk proof words for the epoch diff (empty in native testing mode).
+    pub epoch_diff_proof: Vec<u64>,
 }
 
 /// Witness for Bootstrap: one-time accumulator tree construction.
@@ -285,6 +316,21 @@ impl SlotProofOutput {
     }
 }
 
+impl EpochDiffOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.prev_accumulator_commitment)
+            .digest(&self.accumulator_commitment)
+            .digest(&self.acc_root)
+            .u64(self.total_active_balance)
+            .bytes32(&self.state_root_1)
+            .bytes32(&self.state_root_2)
+            .u64(self.epoch_1)
+            .u64(self.epoch_2)
+            .finish()
+    }
+}
+
 impl JustificationOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
@@ -299,6 +345,7 @@ impl FinalizationOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
+            .digest(&self.next_accumulator_commitment)
             .u64(self.finalized_epoch)
             .bytes32(&self.finalized_root)
             .bytes32(&self.finalized_state_root)

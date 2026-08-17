@@ -11,13 +11,6 @@ use zkasper_common::ChainConfig;
 use crate::beacon_api::{AttestationResponse, BeaconApi, CommitteeResponse, ValidatorResponse};
 use crate::state_diff::validator_response_to_data;
 
-/// Collect attestations targeting a specific checkpoint.
-///
-/// Stops early once the unique attesting balance reaches 2/3 of `total_active_balance`.
-/// Returns `(attestation_witnesses, unique_validator_indices)`.
-///
-/// Scans blocks in `[target_epoch * SLOTS_PER_EPOCH .. (target_epoch + 2) * SLOTS_PER_EPOCH)`
-/// for attestations whose target matches `(target_epoch, target_root)`.
 /// Per-slot attestation data.
 pub struct SlotAttestations {
     pub slot: u64,
@@ -28,68 +21,78 @@ pub struct SlotAttestations {
     pub all_validator_indices: Vec<u64>,
 }
 
-/// Collect attestations grouped by the block slot they were included in.
+/// Incremental collector for one target checkpoint.
 ///
-/// Unlike `collect_for_checkpoint`, does NOT early-stop at 2/3 (that's the
-/// justification proof's job). Maintains cross-slot dedup for `count_balance`.
+/// Attestations for a checkpoint arrive over the whole epoch, so the collector
+/// is fed one block at a time rather than handed the finished epoch. It carries
+/// the committee table and the running cross-slot `seen` set, which is what
+/// makes the `count_balance` flag correct without a second pass, and what lets a
+/// caller stop the moment the 2/3 threshold is crossed instead of scanning to
+/// the end of the epoch.
 ///
-/// Returns one `SlotAttestations` per block slot that contained matching attestations.
-pub async fn collect_per_slot_for_checkpoint(
-    api: &impl BeaconApi,
-    config: &ChainConfig,
+/// Slots must be fed in ascending order: which slot gets to count a validator is
+/// first-come, and the justification proof checks that the merged per-slot index
+/// lists are strictly increasing.
+pub struct SlotStream {
     target_epoch: u64,
-    target_root: &[u8; 32],
-    validators: &[ValidatorResponse],
-    epoch: u64,
-) -> Result<Vec<SlotAttestations>> {
-    let spe = config.slots_per_epoch;
+    target_root: [u8; 32],
+    /// Epoch each attester's `active_effective_balance` is evaluated at.
+    balance_epoch: u64,
+    committee_map: HashMap<(u64, u64), Vec<u64>>,
+    seen_validators: BTreeSet<u64>,
+}
 
-    // Fetch committees for the target epoch
-    let slot_str = (target_epoch * spe).to_string();
-    let committees = api
-        .get_committees(&slot_str, target_epoch)
-        .await
-        .context("fetch committees")?;
+impl SlotStream {
+    /// Fetch the target epoch's committees and open a stream over them.
+    pub async fn open(
+        api: &impl BeaconApi,
+        config: &ChainConfig,
+        target_epoch: u64,
+        target_root: [u8; 32],
+        balance_epoch: u64,
+    ) -> Result<Self> {
+        let slot_str = (target_epoch * config.slots_per_epoch).to_string();
+        let committees = api
+            .get_committees(&slot_str, target_epoch)
+            .await
+            .context("fetch committees")?;
 
-    let committee_map = build_committee_map(&committees);
-
-    // Scan blocks, group matching attestations by block slot
-    let scan_start = target_epoch * spe;
-    let scan_end = (target_epoch + 2) * spe;
-
-    let mut per_slot: Vec<(u64, Vec<AttestationResponse>)> = Vec::new();
-
-    for slot in scan_start..scan_end {
-        let block_id = slot.to_string();
-        match api.get_block_attestations(&block_id).await {
-            Ok(attestations) => {
-                let matching: Vec<_> = attestations
-                    .into_iter()
-                    .filter(|att| {
-                        att.data_target_epoch == target_epoch
-                            && att.data_target_root == *target_root
-                    })
-                    .collect();
-                if !matching.is_empty() {
-                    per_slot.push((slot, matching));
-                }
-            }
-            Err(_) => continue,
-        }
+        Ok(Self {
+            target_epoch,
+            target_root,
+            balance_epoch,
+            committee_map: build_committee_map(&committees),
+            seen_validators: BTreeSet::new(),
+        })
     }
 
-    // Build per-slot witnesses with cross-slot dedup
-    let mut seen_validators: BTreeSet<u64> = BTreeSet::new();
-    let mut result = Vec::with_capacity(per_slot.len());
+    /// Number of distinct validators counted so far, across every slot fed in.
+    pub fn counted_so_far(&self) -> usize {
+        self.seen_validators.len()
+    }
 
-    for (slot, slot_attestations) in &per_slot {
-        let mut attestation_witnesses = Vec::with_capacity(slot_attestations.len());
+    /// Feed one block's attestations.
+    ///
+    /// Returns `None` when the block carries nothing for this checkpoint, which
+    /// covers both a skipped slot and a block whose attestations all target
+    /// something else.
+    pub fn ingest(
+        &mut self,
+        slot: u64,
+        attestations: &[AttestationResponse],
+        validators: &[ValidatorResponse],
+    ) -> Result<Option<SlotAttestations>> {
+        let matching = attestations.iter().filter(|att| {
+            att.data_target_epoch == self.target_epoch && att.data_target_root == self.target_root
+        });
+
+        let mut attestation_witnesses = Vec::new();
         let mut slot_counted_indices: BTreeSet<u64> = BTreeSet::new();
         let mut slot_all_indices: BTreeSet<u64> = BTreeSet::new();
 
-        for att in slot_attestations {
-            let attesting_indices =
-                resolve_attesting_validators(att, &committee_map).context("resolve attestors")?;
+        for att in matching {
+            let attesting_indices = resolve_attesting_validators(att, &self.committee_map)
+                .context("resolve attestors")?;
 
             let sorted_indices: BTreeSet<u64> = attesting_indices.into_iter().collect();
             if sorted_indices.is_empty() {
@@ -103,8 +106,8 @@ pub async fn collect_per_slot_for_checkpoint(
                     .get(idx as usize)
                     .context("validator index out of range")?;
                 let v_data = validator_response_to_data(v_resp);
-                let active_balance = v_data.active_effective_balance(epoch);
-                let count_balance = seen_validators.insert(idx);
+                let active_balance = v_data.active_effective_balance(self.balance_epoch);
+                let count_balance = self.seen_validators.insert(idx);
 
                 if count_balance {
                     slot_counted_indices.insert(idx);
@@ -133,19 +136,52 @@ pub async fn collect_per_slot_for_checkpoint(
             });
         }
 
-        if !attestation_witnesses.is_empty() {
-            result.push(SlotAttestations {
-                slot: *slot,
-                attestations: attestation_witnesses,
-                counted_indices: slot_counted_indices.into_iter().collect(),
-                all_validator_indices: slot_all_indices.into_iter().collect(),
-            });
+        if attestation_witnesses.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(SlotAttestations {
+            slot,
+            attestations: attestation_witnesses,
+            counted_indices: slot_counted_indices.into_iter().collect(),
+            all_validator_indices: slot_all_indices.into_iter().collect(),
+        }))
+    }
+}
+
+/// Collect attestations grouped by the block slot they were included in.
+///
+/// Scans every block in `[target_epoch, target_epoch + 2)` with no early stop.
+/// Continuous mode drives [`SlotStream`] directly so that it can stop at the
+/// threshold; this stays for one-shot generation of a whole epoch's witnesses.
+///
+/// Returns one `SlotAttestations` per block slot that contained matching
+/// attestations.
+pub async fn collect_per_slot_for_checkpoint(
+    api: &impl BeaconApi,
+    config: &ChainConfig,
+    target_epoch: u64,
+    target_root: &[u8; 32],
+    validators: &[ValidatorResponse],
+    epoch: u64,
+) -> Result<Vec<SlotAttestations>> {
+    let spe = config.slots_per_epoch;
+    let mut stream = SlotStream::open(api, config, target_epoch, *target_root, epoch).await?;
+
+    let mut result = Vec::new();
+
+    for slot in target_epoch * spe..(target_epoch + 2) * spe {
+        let Ok(attestations) = api.get_block_attestations(&slot.to_string()).await else {
+            continue;
+        };
+        if let Some(slot_data) = stream.ingest(slot, &attestations, validators)? {
+            result.push(slot_data);
         }
     }
 
     info!(
         slots = result.len(),
-        total_unique_validators = seen_validators.len(),
+        total_unique_validators = stream.counted_so_far(),
         "collected per-slot attestations",
     );
 
