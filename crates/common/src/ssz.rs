@@ -197,6 +197,26 @@ pub fn attestation_data_root(
     sha256_pair(&n4, &n5)
 }
 
+/// `hash_tree_root(BeaconBlockHeader)` from its five fields.
+///
+/// Spec order is `slot, proposer_index, parent_root, state_root, body_root`
+/// (phase0/beacon-chain.md:473), so `state_root` is field 3. Five fields
+/// merkleize into an eight-leaf tree, three of them zero.
+pub fn block_header_root(
+    slot: u64,
+    proposer_index: u64,
+    parent_root: &[u8; 32],
+    state_root: &[u8; 32],
+    body_root: &[u8; 32],
+) -> [u8; 32] {
+    let zero = [0u8; 32];
+    let n0 = sha256_pair(&u64_to_chunk(slot), &u64_to_chunk(proposer_index));
+    let n1 = sha256_pair(parent_root, state_root);
+    let n2 = sha256_pair(body_root, &zero);
+    let n3 = sha256_pair(&zero, &zero);
+    sha256_pair(&sha256_pair(&n0, &n1), &sha256_pair(&n2, &n3))
+}
+
 /// Pad a u64 value to a 32-byte LE SSZ chunk.
 pub fn u64_to_chunk(val: u64) -> [u8; 32] {
     let mut chunk = [0u8; 32];

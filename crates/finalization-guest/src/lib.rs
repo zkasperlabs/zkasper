@@ -52,10 +52,34 @@ pub fn verify_finalization(witness: &FinalizationWitness) -> FinalizationOutput 
         just_e1.target_epoch,
     );
 
+    // Open the finalized block's header to recover its beacon state root.
+    //
+    // This is what anchors the accumulator chain. epoch-diff proves a registry
+    // delta between two claimed state roots but never proves the second is the
+    // canonical successor of the first, so a prover can branch the accumulator
+    // onto a fabricated validator set. Publishing the state root of a block that
+    // 2/3 of the real validator set attested to lets a consumer reject any
+    // branch: an attacker would need a real supermajority to name their
+    // fabricated state, which is the assumption the whole system already rests
+    // on.
+    let h = &witness.finalized_header;
+    assert_eq!(
+        zkasper_common::ssz::block_header_root(
+            h.slot,
+            h.proposer_index,
+            &h.parent_root,
+            &h.state_root,
+            &h.body_root,
+        ),
+        just_e.target_root,
+        "finalized header does not hash to the finalized root",
+    );
+
     // Finalized epoch is E, root is E's target root
     FinalizationOutput {
         accumulator_commitment: witness.accumulator_commitment,
         finalized_epoch: just_e.target_epoch,
         finalized_root: just_e.target_root,
+        finalized_state_root: h.state_root,
     }
 }

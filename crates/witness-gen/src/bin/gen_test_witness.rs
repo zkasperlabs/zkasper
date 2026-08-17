@@ -442,7 +442,23 @@ fn gen_finalization(output_path: &str) {
     let data = build_slot_test_data();
     let epoch_e = 100u64;
     let epoch_e1 = 101u64;
-    let target_root_e = [0x07u8; 32];
+    // The finalized root must be the header's own root, since the circuit now
+    // opens the header to recover the beacon state root that anchors the
+    // accumulator. Derive the root from the header rather than inventing one.
+    let finalized_header = BlockHeaderFields {
+        slot: epoch_e * 32,
+        proposer_index: 1234,
+        parent_root: [0x06u8; 32],
+        state_root: [0xABu8; 32],
+        body_root: [0x09u8; 32],
+    };
+    let target_root_e = zkasper_common::ssz::block_header_root(
+        finalized_header.slot,
+        finalized_header.proposer_index,
+        &finalized_header.parent_root,
+        &finalized_header.state_root,
+        &finalized_header.body_root,
+    );
     let target_root_e1 = [0x08u8; 32];
 
     let just_e = JustificationOutput {
@@ -458,6 +474,7 @@ fn gen_finalization(output_path: &str) {
 
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        finalized_header,
         accumulator_commitment: data.commitment,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]], // stub proofs

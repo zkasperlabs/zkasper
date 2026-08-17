@@ -572,7 +572,7 @@ fn test_finalization_round_trip() {
     let just_e = JustificationOutput {
         accumulator_commitment: commitment,
         target_epoch: 100,
-        target_root: [7u8; 32],
+        target_root: fin_root(),
     };
 
     let just_e1 = JustificationOutput {
@@ -583,6 +583,7 @@ fn test_finalization_round_trip() {
 
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        finalized_header: fin_header(),
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e.clone(), just_e1],
         justification_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
@@ -592,7 +593,7 @@ fn test_finalization_round_trip() {
 
     assert_eq!(output.accumulator_commitment, commitment);
     assert_eq!(output.finalized_epoch, 100);
-    assert_eq!(output.finalized_root, [7u8; 32]);
+    assert_eq!(output.finalized_root, fin_root());
 }
 
 #[test]
@@ -620,6 +621,7 @@ fn test_finalization_rejects_non_consecutive_epochs() {
 
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        finalized_header: fin_header(),
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e, just_e2],
         justification_proofs: vec![vec![], vec![]],
@@ -653,6 +655,7 @@ fn test_finalization_rejects_accumulator_mismatch() {
 
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        finalized_header: fin_header(),
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]],
@@ -675,7 +678,7 @@ fn test_full_justification_to_finalization_pipeline() {
     let commitment = acc::commitment(&acc_root, total_active_balance);
 
     // Build justification for epoch 100
-    let epoch_100_root = [7u8; 32];
+    let epoch_100_root = fin_root();
     let indices_100 = vec![0u64, 1, 2, 3]; // all 4 validators
     let commitment_100 = acc::commit_indices(&indices_100);
 
@@ -729,6 +732,7 @@ fn test_full_justification_to_finalization_pipeline() {
     // Finalization: pair two consecutive justifications
     let finalization_witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        finalized_header: fin_header(),
         accumulator_commitment: commitment,
         justification_outputs: vec![output_100, output_101],
         justification_proofs: vec![vec![], vec![]],
@@ -749,4 +753,28 @@ fn test_full_justification_to_finalization_pipeline() {
 fn make_response(index: u8, balance_eth: u64) -> ValidatorResponse {
     let v = make_validator(index, balance_eth);
     validator_data_to_response(&v, index as u64)
+}
+
+/// Fixed header used by finalization tests, plus the root it hashes to.
+/// The circuit opens the header and checks it against the finalized root, so
+/// tests must derive the root rather than invent one.
+fn fin_header() -> zkasper_common::types::BlockHeaderFields {
+    zkasper_common::types::BlockHeaderFields {
+        slot: 3200,
+        proposer_index: 7,
+        parent_root: [0x06u8; 32],
+        state_root: [0xABu8; 32],
+        body_root: [0x09u8; 32],
+    }
+}
+
+fn fin_root() -> [u8; 32] {
+    let h = fin_header();
+    zkasper_common::ssz::block_header_root(
+        h.slot,
+        h.proposer_index,
+        &h.parent_root,
+        &h.state_root,
+        &h.body_root,
+    )
 }

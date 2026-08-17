@@ -207,12 +207,32 @@ pub struct JustificationWitness {
     pub counted_indices_per_slot: Vec<Vec<u64>>,
 }
 
+/// The five fields of a `BeaconBlockHeader`, enough to recompute its root.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockHeaderFields {
+    pub slot: u64,
+    pub proposer_index: u64,
+    pub parent_root: [u8; 32],
+    pub state_root: [u8; 32],
+    pub body_root: [u8; 32],
+}
+
 /// Public outputs of a finalization proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizationOutput {
     pub accumulator_commitment: Digest,
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
+    /// Beacon state root of the finalized block, opened from its header.
+    ///
+    /// This anchors the accumulator to the canonical chain. `epoch-diff` proves
+    /// a registry delta between two states but cannot prove the second is the
+    /// real successor of the first, so the accumulator advances optimistically.
+    /// A consumer must require that every state root the chain passed through is
+    /// later named by a finalization proof — which an attacker cannot forge
+    /// without 2/3 of the real validator set attesting to their fabricated
+    /// state. A branched accumulator can therefore never be confirmed.
+    pub finalized_state_root: [u8; 32],
 }
 
 /// Witness for a finalization proof (pairs two consecutive justifications).
@@ -221,6 +241,8 @@ pub struct FinalizationWitness {
     pub accumulator_commitment: Digest,
     /// Verification key of the justification program.
     pub justification_program_vk: crate::recursion::ProgramVk,
+    /// Header of the finalized block, checked against `finalized_root`.
+    pub finalized_header: BlockHeaderFields,
     /// Justification outputs for epochs E and E+1.
     pub justification_outputs: Vec<JustificationOutput>,
     /// Zisk proof words for each justification (empty in native testing mode).
@@ -279,6 +301,7 @@ impl FinalizationOutput {
             .digest(&self.accumulator_commitment)
             .u64(self.finalized_epoch)
             .bytes32(&self.finalized_root)
+            .bytes32(&self.finalized_state_root)
             .finish()
     }
 }

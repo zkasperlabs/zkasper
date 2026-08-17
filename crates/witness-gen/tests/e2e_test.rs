@@ -159,7 +159,7 @@ fn test_e2e_full_pipeline() {
     let commitment = acc::commitment(&acc_root, total_active_balance);
 
     // 5. Target roots (synthetic block roots for epoch E and E+1)
-    let target_root_e = [0x07u8; 32];
+    let target_root_e = fin_root();
     let target_root_e1 = [0x08u8; 32];
     let source_root = [0x01u8; 32];
 
@@ -434,6 +434,7 @@ fn test_e2e_full_pipeline() {
     // =========================================================
     let finalization_witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        finalized_header: fin_header(),
         accumulator_commitment: commitment,
         justification_outputs: vec![just_e_output, just_e1_output],
         justification_proofs: vec![vec![], vec![]],
@@ -543,4 +544,28 @@ fn build_acc_tree_multi_proof(
 ) -> (acc::Digest, AccMultiProof) {
     let tree = AccTree::build(validators, epoch, depth);
     (tree.root(), tree.build_multi_proof(leaf_indices))
+}
+
+/// Fixed header used by finalization tests, plus the root it hashes to.
+/// The circuit opens the header and checks it against the finalized root, so
+/// tests must derive the root rather than invent one.
+fn fin_header() -> zkasper_common::types::BlockHeaderFields {
+    zkasper_common::types::BlockHeaderFields {
+        slot: 3200,
+        proposer_index: 7,
+        parent_root: [0x06u8; 32],
+        state_root: [0xABu8; 32],
+        body_root: [0x09u8; 32],
+    }
+}
+
+fn fin_root() -> [u8; 32] {
+    let h = fin_header();
+    zkasper_common::ssz::block_header_root(
+        h.slot,
+        h.proposer_index,
+        &h.parent_root,
+        &h.state_root,
+        &h.body_root,
+    )
 }
