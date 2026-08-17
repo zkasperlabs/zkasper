@@ -15,9 +15,21 @@ path = "src/main.rs"
 name = "gen-test-witness"
 path = "src/bin/gen_test_witness.rs"
 
+[[bin]]
+name = "zkasperd"
+path = "src/bin/zkasperd.rs"
+
 [dependencies]
 ziskos = { workspace = true }
 zkasper-common = { path = "../common", features = ["test-utils"] }
+# The guest crates are the circuits. The orchestrator runs them natively behind
+# the `Prover` hook, so every witness it writes has already been checked by the
+# same logic that will later prove it.
+zkasper-bootstrap-guest = { path = "../bootstrap-guest" }
+zkasper-epoch-diff-guest = { path = "../epoch-diff-guest" }
+zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
+zkasper-justification-guest = { path = "../justification-guest" }
+zkasper-finalization-guest = { path = "../finalization-guest" }
 serde = { workspace = true, features = ["std"] }
 serde_json = "1"
 bincode = { workspace = true }
@@ -27,6 +39,7 @@ reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 rayon = "1"
 hex = "0.4"
 async-trait = "0.1"
