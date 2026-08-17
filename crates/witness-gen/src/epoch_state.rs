@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 /// Cached state from a processed epoch, used to speed up the next epoch diff.
 ///
 /// Avoids recomputing O(n) validator roots and re-parsing the SSZ state blob
 /// when only O(k) validators changed.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EpochState {
     pub slot: u64,
     pub state_root: [u8; 32],
