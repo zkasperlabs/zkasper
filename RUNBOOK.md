@@ -325,10 +325,33 @@ ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasperd \
 
 `--stages group,slot_proof` starts a server for part of a pipeline; each guest
 costs a ROM setup and gigabytes of `~/.zisk/cache`, so do not set up nine when
-the run needs two.
+the run needs two. `--mode streaming` sets up **nine**, not six: the first epoch
+after a bootstrap has nothing before it to finalize, so it goes through the
+batch path — slot proofs and a justification — before the streaming path takes
+over. Build all nine guests.
 
 Only for a single-box run does the prover go in the daemon: add
 `--features zisk-prover` here and use `--prover zisk`.
+
+Tell the daemon what the card costs, so every epoch it publishes can be priced:
+
+```sh
+  --prover-usd-per-hour 0.51
+```
+
+It is published as given and nothing multiplies by it. The daemon measures
+prover milliseconds per epoch and publishes those separately, because an hourly
+rate is a fact about a rental contract rather than about the pipeline. See
+[docs/api-v1.md](docs/api-v1.md#what-an-epoch-cost).
+
+**The bootstrap witness does not fit in a frame, and that is expected.** On
+mainnet it serializes to **916 MB** against the 512 MB `MAX_FRAME_BYTES` cap
+(2,338,764 validators, measured 2026-08-18), so the bootstrap gets the empty
+proof a witness-only run gets and the daemon carries on. Nothing downstream
+verifies the bootstrap proof — the bootstrap state is the declared root of trust,
+see [docs/assumptions.md](docs/assumptions.md) — so the accumulator chain is
+unaffected and every stage after it is really proven. The client does not spool a
+witness it cannot send, because a retry of it would fail identically for ever.
 
 ### Step 7 — Check the node still holds the state you will bootstrap from
 
@@ -396,6 +419,7 @@ cd /root/.openclaw/workspace/zkasper || exit 1
 RUN=/mnt/ssd/zkasper-run
 mkdir -p "$RUN/out"
 n=0
+fails=0
 while true; do
   n=$((n + 1))
   echo "=== zkasperd start #$n at $(date -Is) ===" >> "$RUN/zkasperd.log"
@@ -419,6 +443,20 @@ while true; do
     echo "=== bootstrap epoch pruned; re-bootstrapping at $(date -Is) ===" \
       >> "$RUN/zkasperd.log"
     rm -f "$RUN/zkasperd.db"
+    fails=0
+  fi
+
+  # Anything else that no number of restarts fixes. Five, not one, because a
+  # re-bootstrap breaks the accumulator chain and — with a real prover — leaves
+  # the epoch that restarts it unproven. Observed 2026-08-18: the daemon
+  # crashlooped nine times on `SSZ state root mismatch at slot_2` before the
+  # node's state window slid past the epoch and the rule above caught it.
+  if [ "$rc" -eq 0 ]; then fails=0; else fails=$((fails + 1)); fi
+  if [ "$fails" -ge 5 ]; then
+    echo "=== $fails consecutive failures; re-bootstrapping at $(date -Is) ===" \
+      >> "$RUN/zkasperd.log"
+    rm -f "$RUN/zkasperd.db"
+    fails=0
   fi
 
   sleep 5
