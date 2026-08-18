@@ -319,7 +319,20 @@ while true; do
     --chain mainnet \
     --mode streaming \
     >> "$RUN/zkasperd.log" 2>&1
-  echo "=== zkasperd exited rc=$? at $(date -Is) ===" >> "$RUN/zkasperd.log"
+  rc=$?
+  echo "=== zkasperd exited rc=$rc at $(date -Is) ===" >> "$RUN/zkasperd.log"
+
+  # An epoch whose first slot was empty cannot be finalized by the current
+  # circuits, and no number of restarts changes that -- the slot will never gain
+  # a block. Re-bootstrap past it. This breaks the accumulator chain at that
+  # point, which is the price of continuing; drop this block if an unbroken
+  # chain matters more than uninterrupted epochs.
+  if tail -n 40 "$RUN/zkasperd.log" \
+       | grep -q "different state than its block produced"; then
+    echo "=== empty epoch boundary; re-bootstrapping at $(date -Is) ===" \
+      >> "$RUN/zkasperd.log"
+    rm -f "$RUN/zkasperd.db"
+  fi
   sleep 5
 done
 EOF
