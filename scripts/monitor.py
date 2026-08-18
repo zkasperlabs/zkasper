@@ -19,16 +19,21 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-DEFAULT_STATUS = "/mnt/ssd/zkasper-run/out/status.json"
 
 
 def status_path():
-    """Where the *running* daemon writes, not where one used to.
+    """Where the *running* daemon writes, or `None` when none is running.
 
     A hardcoded path made this check fail loudly the moment the daemon was
     restarted with a different --output-dir, which is the fastest way to teach
-    an operator to ignore an alert. Ask the process instead, and fall back only
-    when nothing is running.
+    an operator to ignore an alert. Ask the process instead.
+
+    `None` rather than a default path, because the two states are not the same
+    and reporting them the same way is worse than reporting neither. On
+    2026-08-18 the daemon was down for half an hour while this read the manifest
+    of a run that had already ended and called it healthy: the epoch, the head
+    and the gossip counters were all real, and all history. A monitor that
+    cannot tell "stopped" from "fine" is the one thing a monitor must not be.
     """
     try:
         pids = subprocess.run(["pgrep", "-f", "release/zkasperd"],
@@ -40,7 +45,7 @@ def status_path():
                     return str(Path(argv[i + 1].decode()) / "status.json")
     except Exception:
         pass
-    return DEFAULT_STATUS
+    return None
 VAST_KEY_FILE = "/root/.openclaw/workspace/.vast-api"
 API = "https://api.zkasper.com/v1/status"
 SITE = "https://zkasper.com"
@@ -56,10 +61,13 @@ def check(name, ok, detail):
 
 def daemon():
     """The daemon, from the manifest it rewrites after every stage."""
+    path = status_path()
+    if path is None:
+        return [check("daemon", False, "no daemon running")]
     try:
-        s = json.loads(Path(status_path()).read_text())
+        s = json.loads(Path(path).read_text())
     except Exception as e:
-        return [check("daemon", False, f"no manifest at {status_path()}: {e}")]
+        return [check("daemon", False, f"no manifest at {path}: {e}")]
 
     out, age = [], time.time() - s.get("updated_unix", 0)
     out.append(check("daemon", age <= STALE_S,
