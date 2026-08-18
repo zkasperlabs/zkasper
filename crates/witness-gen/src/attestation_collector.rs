@@ -374,6 +374,15 @@ impl SlotStream {
         self.closed.insert(slot);
     }
 
+    /// Network aggregates seen for `slot` so far.
+    ///
+    /// The trigger reads this rather than the count of attesters: a slot's
+    /// gossip arrives in two pieces, and this says whether the second has
+    /// started. See [`crate::streaming::Filling`].
+    pub fn aggregates(&self, slot: u64) -> usize {
+        self.pending.get(&slot).map_or(0, Vec::len)
+    }
+
     /// Attestation slots that have been fed and not yet closed.
     pub fn open_slots(&self) -> Vec<u64> {
         let mut slots: Vec<u64> = self

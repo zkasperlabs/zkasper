@@ -74,18 +74,21 @@
 //! Complement proving inverts the usual latency trade. A slot proof opens the
 //! validators that did *not* attest, so an attestation still in flight when the
 //! trigger fires is one more absentee to open — at
-//! [`ProverModel::per_named_s`], 1.79 ms each. Mainnet epoch 430529 crosses 2/3
-//! 42.7% of the way through slot 21's arrivals, with 17,128 of that slot's
+//! [`ProverModel::per_named_s`], 1.5365 ms each. Mainnet epoch 430529 crosses
+//! 2/3 42.7% of the way through slot 21's arrivals, with 17,128 of that slot's
 //! attesters still in flight: firing on the instant would buy back the wait and
-//! pay 30.7 s of extra proving for it.
+//! pay 26.3 s of extra proving for it.
 //!
 //! So there are two moments, and the objective is the second: the earliest
 //! instant the circuit would accept, and the instant that minimises `T2`.
-//! [`StreamPolicy::worth_waiting`] is the rule between them — keep waiting while
-//! the last interval's arrivals shortened the proof by more than the interval
-//! cost, which is 558 attesters a second at the measured per-leaf price.
-//! [`Schedule::threshold_s`] is measured at 2/3 regardless, so any wait shows up
-//! in `T2 − T` rather than hiding in the choice of `T`.
+//! [`StreamPolicy::worth_waiting`] is the rule between them, and one interval of
+//! waiting pays for itself above 651 attesters a second at the measured per-leaf
+//! price. What the rule cannot do is read that rate off one interval and call it
+//! the future: a slot's gossip is two arrivals, unaggregated and aggregate, with
+//! a silence between them, and a live mainnet run stopped in that silence with
+//! thousands of attestations still to come. [`Filling`] is what the rule reads
+//! instead. [`Schedule::threshold_s`] is measured at 2/3 regardless, so any wait
+//! shows up in `T2 − T` rather than hiding in the choice of `T`.
 
 use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
@@ -281,8 +284,12 @@ impl ProverModel {
     /// This is the price of firing early, and the only number the trigger needs.
     /// A scattered leaf touches every level above it — `scattered_nodes` is
     /// linear in the leaf count at any density a slot reaches — so at mainnet's
-    /// depth-22 accumulator it is 834.7 us of validator plus 22 x 43.5 us of
-    /// node, or 1.79 ms. One second of waiting is worth 558 attesters.
+    /// depth-22 accumulator it is 834.7 us of validator plus 22 x 31.9 us of
+    /// node, or 1.5365 ms. One second of waiting is worth 651 attesters.
+    ///
+    /// It was 1.79 ms and 558 attesters while `acc_node_s` was v1.0.0-alpha's
+    /// 43.5 us. That pair is stale wherever it still appears: the node is
+    /// 31.9 us on v1.1.0-alpha and this is derived, never written down.
     pub fn per_named_s(&self) -> f64 {
         self.per_validator_s + self.acc_depth as f64 * self.acc_node_s
     }
@@ -402,6 +409,40 @@ pub enum LanePool {
     Specialised,
 }
 
+/// What one trigger interval saw of the slot gossip is still filling.
+///
+/// Every field is a reading of that one slot, and the two counts are the same
+/// quantity a tick apart: accumulator leaves the final proof would open if it
+/// fired now, and how many of them the last interval took off that list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Filling {
+    /// Leaves the final proof would open if the trigger fired on this tick.
+    pub in_flight: usize,
+    /// How many the last interval removed.
+    pub removed: usize,
+    /// Network aggregates the node has published for this slot.
+    pub aggregates: usize,
+    /// How many of those arrived in the last interval.
+    pub new_aggregates: usize,
+}
+
+impl Filling {
+    /// Whether the aggregate half of this slot's gossip may still deliver.
+    ///
+    /// A slot that has had no aggregate at all has not had that arrival yet; one
+    /// that had an aggregate this interval may have more coming. A slot whose
+    /// aggregates have been quiet for a whole interval has had both halves and
+    /// is finished, and waiting on it buys nothing.
+    ///
+    /// This is a statement about *which* gossip has been seen, not about when it
+    /// was due — a node that never publishes aggregates leaves this true, and
+    /// the in-flight clause in [`StreamPolicy::worth_waiting`] and `max_wait_s`
+    /// are what end the wait then.
+    pub fn aggregates_pending(&self) -> bool {
+        self.aggregates == 0 || self.new_aggregates > 0
+    }
+}
+
 /// How to cut an epoch.
 #[derive(Clone, Debug)]
 pub struct StreamPolicy {
@@ -468,30 +509,61 @@ impl StreamPolicy {
         (total_active_balance as u128 * 2).div_ceil(3)
     }
 
-    /// Whether the last interval of waiting paid for itself.
+    /// Whether one interval of waiting bought more than it cost.
     ///
     /// The objective is the earliest *postable* proof, not the earliest proof
     /// start, and complement proving separates the two: `interval_s` of waiting
     /// delays the start by exactly that, and removes `removed` absentees the
     /// final proof would otherwise have opened at [`ProverModel::per_named_s`]
-    /// each. So the wait is worth taking while arrivals run above 558 validators
-    /// a second, and the trigger fires the interval they do not — which is the
-    /// burst draining, not a fixed delay. `waited_s`, the whole wait so far, is
-    /// only the guard against a source that trickles for ever.
+    /// each. So an interval pays for itself while arrivals run above 651
+    /// validators a second.
+    pub fn interval_paid(&self, removed: usize, interval_s: f64) -> bool {
+        removed as f64 * self.prover.per_named_s() > interval_s
+    }
+
+    /// Whether the wait is still worth taking.
     ///
-    /// Nothing here models when attestations arrive. The rule reads the rate off
-    /// the last interval, so a chain that gossips earlier or later than mainnet
-    /// moves the firing instant without moving this code.
+    /// [`Self::interval_paid`] alone was the whole rule, and it is wrong on its
+    /// own for a reason that is not noise: a slot's gossip is **two arrivals,
+    /// not one**. The unaggregated attestations burst and drain, and then the
+    /// aggregates land in a piece, and between them is a silence that says
+    /// nothing at all about whether the slot is finished. A rule that reads only
+    /// the last interval's rate stops in the first silence it meets.
     ///
-    /// `max_wait_s` is 10 s because a smaller one decides the firing instant
-    /// itself. Mainnet arrivals stay above break-even until 8–9 s into a slot
-    /// and the burst drains at a p90 of 9.8 s, both from the start of the slot;
-    /// the wait is counted from the threshold crossing, which lands anywhere in
-    /// it. A live run at 6 s fired every steady-state epoch with 5,000 to 8,200
-    /// attesters still in flight — 9 to 15 s of absentee opening bought back for
-    /// at most 4 s of waiting.
-    pub fn worth_waiting(&self, removed: usize, interval_s: f64, waited_s: f64) -> bool {
-        waited_s < self.max_wait_s && removed as f64 * self.prover.per_named_s() > interval_s
+    /// So the wait continues while either the last interval paid for itself, or
+    /// the aggregate half of the slot's gossip has not yet been and gone. The
+    /// second clause is not a licence to wait for ever: it holds only while what
+    /// is still in flight could pay for the silence so far, which is the same
+    /// per-leaf price the first clause is denominated in, and is why a slot that
+    /// has already converged fires rather than waiting for aggregates that
+    /// cannot be worth much. `waited_s`, the whole wait so far, is the guard
+    /// against a source that trickles for ever, and on mainnet it does not bind.
+    ///
+    /// Nothing here models *when* attestations arrive. Both halves are read off
+    /// the gossip itself — the rate off the last interval, the second arrival
+    /// off whether the node has published an aggregate for this slot yet — so a
+    /// chain that gossips earlier or later, or aggregates on a different
+    /// schedule, moves the firing instant without moving this code.
+    ///
+    /// The rule can only ever cost latency. `T` is measured at the threshold the
+    /// circuit itself enforces, so waiting past it changes what a proof costs
+    /// and never what it proves.
+    ///
+    /// `max_wait_s` is 10 s and is meant not to bind. Replaying the rule against
+    /// 23 measured mainnet epochs fires at a median 8.7 s into the filling slot;
+    /// caps of 6, 10 and 20 s give the identical result and only a cap of 4 s
+    /// changes it.
+    pub fn worth_waiting(
+        &self,
+        filling: Filling,
+        interval_s: f64,
+        stalled_s: f64,
+        waited_s: f64,
+    ) -> bool {
+        waited_s < self.max_wait_s
+            && (self.interval_paid(filling.removed, interval_s)
+                || (filling.aggregates_pending()
+                    && filling.in_flight as f64 * self.prover.per_named_s() > stalled_s))
     }
 
     /// Lanes each stage may run on, in the order it should prefer them.
@@ -1546,6 +1618,16 @@ mod tests {
         assert_eq!(plan.attesting_balance, 68);
     }
 
+    /// A slot whose gossip is finished: both halves seen, aggregates quiet.
+    fn drained(in_flight: usize, removed: usize) -> Filling {
+        Filling {
+            in_flight,
+            removed,
+            aggregates: 64,
+            new_aggregates: 0,
+        }
+    }
+
     /// The trigger's whole argument in the units it is made of: an arrival rate
     /// above one validator per `per_named_s` shortens the proof by more than the
     /// wait costs, and below it does not.
@@ -1555,15 +1637,74 @@ mod tests {
         let per_second = 1.0 / policy.prover.per_named_s();
         assert!((per_second - 650.8).abs() < 0.1, "{per_second} a second");
 
-        assert!(
-            policy.worth_waiting(700, 1.0, 1.0),
-            "700 a second did not wait"
-        );
-        assert!(!policy.worth_waiting(600, 1.0, 1.0), "600 a second waited");
+        assert!(policy.interval_paid(700, 1.0), "700 a second did not pay");
+        assert!(!policy.interval_paid(600, 1.0), "600 a second paid");
         // The burst mainnet epoch 430529 actually crosses in: 17,128 attesters
-        // still in flight, 30.7 s of absentee openings, against a wait measured
+        // still in flight, 26.3 s of absentee openings, against a wait measured
         // in hundreds of milliseconds.
-        assert!(policy.worth_waiting(17_128, 0.3, 0.3));
+        assert!(policy.worth_waiting(drained(17_128, 17_128), 0.3, 0.0, 0.3));
+    }
+
+    /// The rule the live run needed and did not have. A slot's unaggregated
+    /// attestations drain seconds before its aggregates land, and the silence
+    /// between them is not the slot finishing. Firing into it left a measured
+    /// 6,563 leaves on the median epoch.
+    #[test]
+    fn a_silence_before_the_aggregates_is_not_the_slot_finishing() {
+        let policy = StreamPolicy::default();
+        let singles_drained = Filling {
+            in_flight: 6_300,
+            removed: 0,
+            aggregates: 0,
+            new_aggregates: 0,
+        };
+        assert!(
+            policy.worth_waiting(singles_drained, 0.2, 2.0, 3.0),
+            "fired into the silence before the aggregates",
+        );
+
+        // The aggregates land, and the interval that carries them pays for
+        // itself many times over.
+        let landing = Filling {
+            in_flight: 2_150,
+            removed: 4_150,
+            aggregates: 64,
+            new_aggregates: 64,
+        };
+        assert!(policy.worth_waiting(landing, 0.2, 0.0, 3.2));
+
+        // One quiet interval after them, both halves have been and gone.
+        assert!(
+            !policy.worth_waiting(drained(2_150, 0), 0.2, 0.2, 3.4),
+            "kept waiting on a slot whose gossip was finished",
+        );
+    }
+
+    /// The hold is not unconditional: it costs latency, so it is taken only
+    /// while what is in flight could pay for it at the same per-leaf price the
+    /// rest of the rule is denominated in.
+    #[test]
+    fn a_converged_slot_does_not_wait_for_aggregates_it_cannot_use() {
+        let policy = StreamPolicy::default();
+        let converged = Filling {
+            in_flight: 300,
+            removed: 0,
+            aggregates: 0,
+            new_aggregates: 0,
+        };
+        // 300 leaves are 0.46 s of proving, so half a second of silence is
+        // already more than they are worth.
+        assert!(policy.worth_waiting(converged, 0.2, 0.2, 1.0));
+        assert!(!policy.worth_waiting(converged, 0.2, 0.6, 1.4));
+    }
+
+    /// Nothing in flight is the catch-up case, and it must fire on the instant
+    /// rather than inventing a wait it never observed.
+    #[test]
+    fn an_empty_slot_fires_immediately() {
+        let policy = StreamPolicy::default();
+        assert!(!policy.worth_waiting(Filling::default(), 0.2, 0.0, 0.0));
+        assert!(!policy.worth_waiting(drained(0, 0), 0.2, 0.0, 0.0));
     }
 
     /// The guard, not the rule: a source that keeps trickling attestations must
@@ -1571,7 +1712,7 @@ mod tests {
     #[test]
     fn the_wait_is_capped_however_fast_they_arrive() {
         let policy = StreamPolicy::default();
-        assert!(!policy.worth_waiting(1_000_000, 0.2, policy.max_wait_s));
+        assert!(!policy.worth_waiting(drained(1_000_000, 1_000_000), 0.2, 0.0, policy.max_wait_s));
     }
 
     /// A quarter of the validators offline: the threshold is never reached, and
