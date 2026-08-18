@@ -797,15 +797,16 @@ off the critical path.
 | 469379 | 8,027 | 7,835 | 111 | 0 | 1 | catch-up |
 | 469380 | 4,276 | 4,204 | 89 | 0 | 1 | catch-up |
 | **469381** | **1,642** | **1,355** | **6,822** | **21** | **0** | **steady state** |
+| **469382** | **1,230** | **924** | **8,159** | **20** | **0** | **steady state** |
 
-**Only 469375 and 469381 are steady-state epochs** — the only two the daemon
-followed from near their first slot, folding a group per slot as gossip closed
-it, 16 and 21 in total. Every other row is an epoch opened already in progress
-after a bootstrap or a restart, which folds nothing before the trigger and so
-reports `folded_groups = 0` and `late_groups = 1`. Those rows say what a
+**Only 469375, 469381 and 469382 are steady-state epochs** — the only three the
+daemon followed from near their first slot, folding a group per slot as gossip
+closed it, 16/21/20 in total. Every other row is an epoch opened already in
+progress after a bootstrap or a restart, which folds nothing before the trigger
+and so reports `folded_groups = 0` and `late_groups = 1`. Those rows say what a
 catch-up costs, not what the pipeline costs. **Do not quote them as a
-steady-state result.** Two epochs are not a distribution either; what follows is
-what two epochs can support.
+steady-state result.** Three epochs are not a distribution either; what follows
+is what three epochs can support.
 
 - **`late_groups = 0` on both steady-state epochs, and 1 on every catch-up.**
   The alert is meaningful and the daemon keeps up with the chain once it is on
@@ -815,11 +816,24 @@ what two epochs can support.
   GPU run will report a similar `T2 - T` for an entirely different reason, so
   these are a baseline for the *trigger*, not for proving.
 - **`tail_named` is the number that will hurt on a GPU, and it is two orders of
-  magnitude larger in steady state**: 4,999 and 6,822, against 75–111 on every
-  catch-up. At the README's 1.79 ms per named leaf that is **8.9 s and 12.2 s of
-  proving** on the critical path, against a `T2 - T` of 1.6–7.0 s today. Read
-  with the trigger-cap section above: the two steady-state epochs waited 6,378 ms
-  and 1,355 ms and neither got the burst, which drains at a median of 7,326 ms.
+  magnitude larger in steady state**: 4,999 / 6,822 / 8,159, against 75–111 on
+  every catch-up. At the README's 1.79 ms per named leaf that is **8.9 s, 12.2 s
+  and 14.6 s of proving** on the critical path, against a `T2 - T` of 1.2–7.0 s
+  today.
+- **Waiting longer does buy fewer absentees, and the three epochs show it in the
+  predicted direction:**
+
+  | `wait_millis` | 924 | 1,355 | 6,378 |
+  |---|---|---|---|
+  | `tail_named` | 8,159 | 6,822 | 4,999 |
+  | that costs, at 1.79 ms | 14.6 s | 12.2 s | 8.9 s |
+
+  Monotonic, and it is the mechanism the trigger exists to exploit. It is three
+  points from three different epochs with different arrival patterns, so treat it
+  as a direction rather than a slope. Note that even the longest wait observed —
+  6,378 ms, which hit the cap — still left 8.9 s of proving, and that the burst
+  does not drain until a median of 7,326 ms. **The cap is below the useful range
+  at every point measured.**
 
 The catch-up rows are not noise, incidentally — they are what every epoch after
 a restart looks like, and §6 explains why restarts happen.
