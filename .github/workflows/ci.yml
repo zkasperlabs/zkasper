@@ -10,7 +10,7 @@ env:
   # Pinned deliberately. syscall_poseidon2 lands in v0.16.0, zisk_verifier in
   # v0.18.0 and zisklib hash_to_curve in v1.0.0-alpha; zkasper needs all three,
   # and the cost model in BENCHMARKS.md is tied to a specific version.
-  ZISK_VERSION: "1.0.0-alpha"
+  ZISK_VERSION: "1.1.0-alpha"
 
 jobs:
   check:
