@@ -30,7 +30,7 @@ import time_model as tm
 SLOTS_PER_EPOCH = tm.SLOTS_PER_EPOCH
 
 
-def fixed_group_critical_path(validators, aggregates_per_slot, group_slots, absentee_rate):
+def fixed_group_critical_path(validators, aggregates_per_slot, group_slots):
     """Last group, justification, finalization — three proofs, in series.
 
     The pre-streaming schedule enumerated attesters rather than naming absentees,
@@ -105,7 +105,7 @@ def main():
     baseline, base_proofs = report(
         f"fixed groups of {args.group_slots}, four-stage tail, attesters enumerated",
         fixed_group_critical_path(args.validators, args.aggregates_per_slot,
-                                  args.group_slots, args.absentee_rate),
+                                  args.group_slots),
     )
     streaming, stream_proofs = report(
         "streaming, collapsed tail, absentees named",
