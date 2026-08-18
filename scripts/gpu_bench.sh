@@ -13,18 +13,40 @@ set -euo pipefail
 #   bench n=220k 866,953,297 units -> 1030.0 s
 #   fit: time = 333.4 s + units / 1,244,523
 #
-# GPU result (RTX 5090, Zisk 1.0.0-alpha, 2026-08-18), warm proves:
-#   slot-proof   575,395,812 units ->  27.70 s   (5 samples, 27.09-28.70)
-#   bench n=220k 866,953,297 units ->  32.30 s   (2 samples, 32.03-32.56)
-#   fit: time = 19.5 s + units / 67,452,592
-#   -> 54x the CPU marginal throughput; 29x end-to-end on the slot proof.
-#   wrap --minimal: 18.5 s wall, of which only 0.2 s is the compression itself.
+# GPU result (RTX 5090, Zisk 1.0.0-alpha, 2026-08-18). 29 sizes, 3 warm proves
+# each, n = 10,000 .. 1,000,000. Raw data in data/gpu_bench/, fit reproduced by
+# `python3 scripts/fit_gpu_bench.py`.
 #
-# That fit is a least-squares line over five bench sizes (n = 55k, 110k, 220k,
-# 440k, 660k), not the two points below; residuals are under 0.12 s. The
-# slot-proof measurement was not used to build it and lands 1.3% off it, which
-# is the evidence that Zisk cost units really are hardware-portable across two
-# very different workloads (BLS precompiles vs poseidon2).
+# Regress on VARIABLE, not TOTAL: TOTAL contains the BASE constant, so fitting
+# against it assumes the thing you are trying to measure.
+#
+#   prover's `Proof generated`   floor 4.940 s +/- 0.096
+#                                slope 69,714,770 +/- 420,107 units/s   rms 0.328 s
+#   wall clock per invocation    floor 18.470 s +/- 0.273
+#                                slope 69,965,637 +/- 1,199,943 units/s rms 0.931 s
+#   empty guest, measured direct 4.843 s +/- 0.028   <- the floor, not extrapolated
+#   per-invocation overhead      13.49 s (87 proves) <- what a warm prover saves
+#
+# This supersedes the earlier `time = 19.5 s + units / 67,452,592`. That slope
+# was 3.4% low, and its 19.5 s intercept was never a proving floor: it is 13.5 s
+# of process start and GPU allocation plus ~5 s of actual floor, which is why it
+# must not be added on top of a per-proof `BASE` term.
+#
+# BASE = 293,601,280 is a compile-time constant in zisk that does not describe
+# the shipped proving key. An empty guest instantiates ELEVEN full AIRs
+# (Main, Binary, BinaryExtension, Mem, MemAlign, Dma64AlignedMem, Rom, RomData,
+# InputData, VirtualTableZisk0, VirtualTableZisk1) totalling 1,447,034,880 trace
+# cells, 4.93x what the constant charges. In *time* the gap is much smaller —
+# 4.843 s x 69.7 M/s = 338 M units, 1.15x — because padded and constant rows
+# prove ~4.3x faster per cell than poseidon2 rows.
+#
+# Cost units are therefore NOT a portable currency, and this is the single most
+# important caveat in the file. Effective throughput measured on real guests:
+#     poseidon2 sweep                        70 M units/s
+#     group proof, 308,000 attesters        249 M units/s
+# Baseline integer work is nearly free: bench mode 0 at n=0 and at n=100,000
+# differ by 83.6 M cost units, instantiate the same 11 AIRs, and take the same
+# 4.84 s. Non-precompile work costs nothing until it adds an AIR instance.
 #
 # Usage: ./scripts/gpu_bench.sh
 #
