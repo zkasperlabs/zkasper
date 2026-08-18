@@ -122,7 +122,7 @@ In `alerts.yml`. Page-worthy:
 | `ZkasperDaemonDown` | `/metrics` not answering for two minutes — eight scrapes, because one failed scrape is not an outage. |
 | `ZkasperEpochNotAdvancing` | Alive, not progressing, for half an hour. An epoch is 6.4 minutes. |
 | `ZkasperGossipDropped` | Any increase at all. |
-| `ZkasperGpuIdle` | A card running with no proof coming back for half an hour. |
+| `ZkasperGpuIdle` | A card running with no proof reaching the daemon for half an hour. It measures work arriving *here*, so a card rented for a benchmark trips it — deliberately, because an unattended benchmark card is the same bill. |
 | `ZkasperCreditLow` | Less than a day of credit at the current burn. |
 
 Warnings, which is where a single late epoch belongs:
