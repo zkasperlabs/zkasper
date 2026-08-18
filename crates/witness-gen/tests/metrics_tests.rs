@@ -33,6 +33,9 @@ const FIRST_EPOCH: u64 = 10;
 const LAST_EPOCH: u64 = 13;
 const VALIDATORS: usize = 4;
 const SLOTS_TO_THRESHOLD: u64 = 3;
+/// Any rate at all, so the derived cost families exist. The value is the
+/// deployment's business; that it is published and multiplied is this test's.
+const RATE_USD_PER_HOUR: f64 = 0.51;
 
 /// Every series the alerts and the dashboard name. A metric that is only ever
 /// described but never recorded does not appear in the exposition, so this is
@@ -49,13 +52,21 @@ const EXPECTED: &[&str] = &[
     "zkasper_epochs_justified_total",
     "zkasper_epochs_finalized_total",
     "zkasper_groups_folded_total",
-    "zkasper_groups_late_total",
-    "zkasper_proof_bytes_total",
+    "zkasper_proof_size_bytes",
+    "zkasper_proof_cost_usd",
+    "zkasper_epoch_cost_usd",
+    "zkasper_epoch_prover_seconds",
+    "zkasper_prover_usd_per_hour",
     "zkasper_t2_minus_t_seconds",
     "zkasper_trigger_wait_seconds",
     "zkasper_tail_named",
-    "zkasper_stage_duration_seconds",
-    "zkasper_stage_busy_seconds",
+    "zkasper_proof_duration_seconds",
+    "zkasper_proof_busy_seconds",
+    "zkasper_proof_start_delay_seconds",
+    "zkasper_witness_duration_seconds",
+    "zkasper_witness_busy_seconds",
+    "zkasper_retained_epochs",
+    "zkasper_output_bytes",
 ];
 
 /// Stages that must have been measured by their span. `bootstrap` and
@@ -78,6 +89,7 @@ async fn metrics_expose_a_streamed_epoch() {
     let _tracing =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(StageMetrics));
     zkasper_witness_gen::metrics::build_info("test", "native", "streaming");
+    zkasper_witness_gen::metrics::prover_rate(Some(RATE_USD_PER_HOUR));
 
     let dir = tempfile::tempdir().unwrap();
     let chain = SyntheticChain::new(TEST_CONFIG, VALIDATORS, FIRST_EPOCH, LAST_EPOCH);
@@ -101,6 +113,13 @@ async fn metrics_expose_a_streamed_epoch() {
             "{metric} is not in the exposition:\n{rendered}",
         );
     }
+
+    // The rate is published as its own gauge, so a reader can price the prover
+    // seconds at their rate instead of taking this deployment's.
+    assert!(
+        rendered.contains(&format!("zkasper_prover_usd_per_hour {RATE_USD_PER_HOUR}")),
+        "the hourly rate is not exposed:\n{rendered}",
+    );
 
     // Base units and `_total` on counters, or a standard dashboard reads the
     // wrong scale. The manifest keeps its millisecond fields; these must not.
@@ -128,11 +147,40 @@ async fn metrics_expose_a_streamed_epoch() {
     for stage in EXPECTED_STAGES {
         assert!(
             rendered.contains(&format!(
-                "zkasper_stage_duration_seconds_count{{stage=\"{stage}\"}}"
+                "zkasper_proof_duration_seconds_count{{stage=\"{stage}\"}}"
             )),
             "no span measured the {stage} stage:\n{rendered}",
         );
     }
+
+    // The witness spans are a separate family, so a stage whose witness build
+    // is slow can be told from one whose prover is.
+    for stage in [
+        "bootstrap",
+        "epoch_diff",
+        "group",
+        "aggregate",
+        "stream_final",
+    ] {
+        assert!(
+            rendered.contains(&format!(
+                "zkasper_witness_duration_seconds_count{{stage=\"{stage}\"}}"
+            )),
+            "no span measured the {stage} witness:\n{rendered}",
+        );
+    }
+
+    // What replaced the count of late groups: how far each proof's start
+    // slipped from the schedule, per stage, with negative buckets so an early
+    // start is not rounded to on time.
+    assert!(
+        rendered.contains("zkasper_proof_start_delay_seconds_bucket{stage=\"group\",le=\"-30\"}"),
+        "the start delay has no negative buckets:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("zkasper_groups_late_total"),
+        "late_groups was replaced, not kept alongside",
+    );
 
     // The epoch advanced, which is the other thing worth alerting on.
     assert!(
@@ -153,6 +201,7 @@ async fn open(dir: &std::path::Path, mock: MockBeaconApi) -> Orchestrator<MockBe
             output_dir: dir.join("out"),
             poll_interval: Duration::ZERO,
             pipeline: Pipeline::Streaming,
+            prover_usd_per_hour: Some(RATE_USD_PER_HOUR),
             ..OrchestratorConfig::new(TEST_CONFIG, "test")
         },
         Box::new(NativeProver::new(TEST_CONFIG)),

@@ -23,6 +23,7 @@ use crate::state_diff::{
 /// O(n) validator roots and re-parsing the old SSZ state.
 ///
 /// Returns `(witness, new_epoch_state, new_total_active_balance, new_num_validators)`.
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "epoch_diff", slot_2))]
 pub async fn build(
     api: &impl BeaconApi,
     config: &ChainConfig,
@@ -33,7 +34,6 @@ pub async fn build(
 ) -> Result<(EpochDiffWitness, EpochState, u64, u64)> {
     let slot_1 = old_state.slot;
     let ssz_depth = config.validators_tree_depth;
-    let _span = info_span!("epoch_diff", slot_1, slot_2, ssz_depth).entered();
     let slot_2_str = slot_2.to_string();
     let epoch_1 = slot_1 / config.slots_per_epoch;
     let epoch_2 = slot_2 / config.slots_per_epoch;

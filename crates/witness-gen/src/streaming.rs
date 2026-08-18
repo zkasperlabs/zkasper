@@ -1195,6 +1195,7 @@ pub struct StreamContext {
 }
 
 /// Build the witness for one group proof.
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "group"))]
 pub fn group_witness(
     context: &StreamContext,
     tree: &AccTree,
@@ -1234,6 +1235,7 @@ fn committee_multi_proof(committees: &EpochCommittees, units: &[&SlotComplement]
 
 /// Build the witness that folds finished group proofs into the running aggregate.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "aggregate"))]
 pub fn aggregate_witness(
     context: &StreamContext,
     previous: Option<AggregateOutput>,
@@ -1281,6 +1283,7 @@ pub fn aggregate_witness(
 /// Everything here that is not the tail was already fixed before the last
 /// attestation arrived; the tail is the only part that could not have been.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "stream_final"))]
 pub fn final_witness(
     context: &StreamContext,
     tree: &AccTree,

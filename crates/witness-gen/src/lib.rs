@@ -20,6 +20,7 @@ pub mod ssz_state;
 pub mod state_diff;
 pub mod store;
 pub mod streaming;
+pub mod verify;
 pub mod witness_bootstrap;
 pub mod witness_epoch_diff;
 pub mod witness_justification;

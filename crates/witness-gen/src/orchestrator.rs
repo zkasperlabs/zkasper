@@ -98,6 +98,12 @@ use crate::{witness_bootstrap, witness_epoch_diff, witness_justification};
 /// How many stage timings the manifest keeps.
 const RECENT_STAGES: usize = 64;
 
+/// How far behind the head an epoch may be and still be called live, in epochs.
+///
+/// Two, because the daemon keeps looking for a checkpoint's attestations for
+/// `attestation_lookahead_epochs` past it. Anything older is a catch-up.
+const LIVE_EPOCHS: f64 = 2.0;
+
 /// How many epochs' measured `T2 - T` the manifest keeps.
 const RECENT_LATENCIES: usize = 16;
 
@@ -485,6 +491,9 @@ pub struct Orchestrator<A> {
     viewed: Option<Instant>,
     node_finalized: Option<Checkpoint>,
     genesis_validators_root: Option<[u8; 32]>,
+    /// Unix seconds of slot 0, asked for once. Without it a slot has no
+    /// wall-clock time and no proof can be called late.
+    genesis_time: Option<u64>,
     /// Prover time per epoch, accumulated as stages land. Keyed by epoch rather
     /// than reset at a boundary, because the committee proof of E+1 runs inside
     /// E and its cost belongs to E+1.
@@ -569,6 +578,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             head_slot: 0,
             viewed: None,
             node_finalized: None,
+            genesis_time: None,
             costs: HashMap::new(),
         }
     }
@@ -718,6 +728,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .await
             .context("fetch chain head")?
             .slot;
+
+        // The clock every schedule comparison is made against. Asked for once,
+        // and never fatal: without it the daemon simply records no start delays.
+        if self.genesis_time.is_none() {
+            match self.api.get_genesis_time().await {
+                Ok(genesis) => self.genesis_time = Some(genesis),
+                Err(e) => warn!(
+                    error = %e,
+                    "no genesis time from the node; proof start delays will not be recorded",
+                ),
+            }
+        }
 
         // Only used for the manifest, so a node that will not answer must not
         // stop the pipeline.
@@ -963,6 +985,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 slot = attestation_slot,
             )
             .entered();
+            self.observe_start_delay(Stage::SlotProof, target_epoch, attestation_slot);
             let started = Instant::now();
             self.begin(Stage::SlotProof, target_epoch, Some(attestation_slot), None);
             let witness = SlotProofWitness {
@@ -1124,6 +1147,13 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         target_epoch: u64,
         validators: &[ValidatorResponse],
     ) -> Result<(Arc<EpochCommittees>, CommitteeOutput, Proof)> {
+        // The schedule wants this finished before the epoch it serves opens, so
+        // the epoch's own first slot is the latest it should ever start.
+        self.observe_start_delay(
+            Stage::Committee,
+            target_epoch,
+            target_epoch * self.config.chain.slots_per_epoch,
+        );
         let started = Instant::now();
         self.begin(Stage::Committee, target_epoch, None, None);
         let committees = Arc::new(self.build_committees(target_epoch, validators).await?);
@@ -1737,6 +1767,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         self.begin(Stage::Group, target_epoch, None, Some(range.start));
         let units: Vec<&SlotComplement> = aggregator.units[range.clone()].iter().collect();
         let slots: Vec<u64> = units.iter().map(|u| u.slot).collect();
+        if let Some(&last) = slots.last() {
+            self.observe_start_delay(Stage::Group, target_epoch, last);
+        }
 
         let witness = streaming::group_witness(
             &aggregator.context,
@@ -1788,6 +1821,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     fn fold_group(&mut self, aggregator: &mut StreamAggregator, group: GroupProof) -> Result<()> {
         let started = Instant::now();
         let target_epoch = aggregator.context.target_epoch;
+        if let Some(last) = aggregator.units.last() {
+            self.observe_start_delay(Stage::Aggregate, target_epoch, last.slot);
+        }
         self.begin(
             Stage::Aggregate,
             target_epoch,
@@ -1898,6 +1934,17 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         let (output, proof) = self.prover.prove_stream_final(&witness)?;
         let proof_unix_millis = now_unix_millis();
 
+        // Everything from here is after `T2`, so none of it can inflate the
+        // latency this pipeline exists to minimise — including checking that
+        // the proof it just made actually verifies, which is the only place
+        // anyone has ever timed the verifier.
+        crate::verify::timed(
+            Stage::StreamFinal,
+            &proof,
+            &self.prover.program_vk(Stage::StreamFinal),
+            &output.public_bytes(),
+        );
+
         let artifact = self
             .sink
             .write_witness(target_epoch, "stream_final", &witness)?;
@@ -1913,7 +1960,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // The witnesses exist to debug the epoch that produced them. Once its
         // proof is out, the proof is the artifact, and an unbounded output
         // directory ends a long run whenever the disk happens to fill.
-        self.sink.prune_old_epochs();
+        let (epochs, bytes) = self.sink.prune_old_epochs();
+        crate::metrics::observe_output(epochs, bytes);
         self.record(
             StageTiming::new(
                 Stage::StreamFinal,
@@ -1965,6 +2013,10 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 folded_groups = latency.folded_groups,
                 late_groups = latency.late_groups,
                 "measured T2 - T",
+            );
+            crate::metrics::observe_proof_start(
+                Stage::StreamFinal,
+                latency.wait_millis as f64 / 1000.0,
             );
             crate::metrics::observe_latency(&latency);
             if self.latencies.len() == RECENT_LATENCIES {
@@ -2106,11 +2158,60 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     }
 
     // -----------------------------------------------------------------
+    // The schedule, against the clock
+    // -----------------------------------------------------------------
+
+    /// Unix millis at which `slot` began.
+    ///
+    /// `None` until the node has answered once. Every caller treats that as
+    /// "no expectation to compare against" rather than an error: a missing
+    /// metric is better than a wrong one, and nothing in the pipeline depends
+    /// on this.
+    fn slot_unix_millis(&self, slot: u64) -> Option<u64> {
+        let seconds_per_slot = self.config.stream_policy.seconds_per_slot;
+        self.genesis_time
+            .map(|genesis| genesis * 1000 + (slot as f64 * seconds_per_slot * 1000.0) as u64)
+    }
+
+    /// Record how far a proof's start slipped from where the schedule put it.
+    ///
+    /// The schedule prices a proof over slots ending at `last_slot` as startable
+    /// the moment that slot's attestations are in, which
+    /// [`streaming::schedule`] expresses as seconds from the epoch's first
+    /// attesting slot. Both sides are converted to that origin here, so what is
+    /// recorded is the same quantity the model plans against.
+    ///
+    /// Negative is early, and is kept: a proof that beat its slot is as much a
+    /// fact about the schedule as one that missed it.
+    fn observe_start_delay(&self, stage: Stage, target_epoch: u64, last_slot: u64) {
+        let spe = self.config.chain.slots_per_epoch;
+        let (Some(epoch_start), Some(expected)) = (
+            self.slot_unix_millis(target_epoch * spe),
+            self.slot_unix_millis(last_slot),
+        ) else {
+            return;
+        };
+        let elapsed = now_unix_millis().saturating_sub(epoch_start) as f64;
+        let expected = expected.saturating_sub(epoch_start) as f64;
+
+        // Only an epoch the daemon is following live has an expectation worth
+        // measuring. Proving one that ended an hour ago is a catch-up, and
+        // recording its age as a delay would swamp the distribution with the
+        // one case where being late was the point.
+        let epoch_millis =
+            spe as f64 * self.config.stream_policy.seconds_per_slot * 1000.0 * LIVE_EPOCHS;
+        if elapsed > epoch_millis {
+            return;
+        }
+        crate::metrics::observe_proof_start(stage, (elapsed - expected) / 1000.0);
+    }
+
+    // -----------------------------------------------------------------
     // Manifest
     // -----------------------------------------------------------------
 
     fn record(&mut self, timing: StageTiming) {
-        crate::metrics::observe_stage(&timing);
+        crate::metrics::observe_stage(&timing, self.config.prover_usd_per_hour);
         if let Some(publish) = &self.publish {
             publish.stage_finished(&timing);
         }
@@ -2128,6 +2229,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     fn take_cost(&mut self, epoch: u64) -> EpochCost {
         let cost = self.costs.remove(&epoch).unwrap_or_default();
         self.costs.retain(|&e, _| e > epoch);
+        crate::metrics::observe_epoch_cost(&cost, self.config.prover_usd_per_hour);
         cost
     }
 

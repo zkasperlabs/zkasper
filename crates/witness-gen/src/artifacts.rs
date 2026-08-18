@@ -396,9 +396,34 @@ impl ArtifactSink {
         })
     }
 
-    /// Drop the oldest epoch directories beyond the retention bound.
-    pub fn prune_old_epochs(&self) {
+    /// Drop the oldest epoch directories beyond the retention bound, and say
+    /// what is left.
+    ///
+    /// Returns `(epoch directories, bytes)`. Measured here rather than on a
+    /// timer because this is the one moment the directory is walked anyway, and
+    /// walking it on every tick would be the most expensive thing a tick did.
+    pub fn prune_old_epochs(&self) -> (usize, u64) {
         self.prune();
+        self.usage()
+    }
+
+    /// Epoch directories on disk and the bytes in them.
+    fn usage(&self) -> (usize, u64) {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return (0, 0);
+        };
+        let mut epochs = 0;
+        let mut bytes = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                epochs += 1;
+                bytes += dir_bytes(&path);
+            } else if let Ok(meta) = entry.metadata() {
+                bytes += meta.len();
+            }
+        }
+        (epochs, bytes)
     }
 
     /// Rewrite `status.json`.
@@ -432,6 +457,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bytes in a directory, one level deep, which is as deep as an epoch goes.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 pub fn hex0x(bytes: &[u8]) -> String {

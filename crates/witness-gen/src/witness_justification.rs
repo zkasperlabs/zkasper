@@ -9,6 +9,7 @@ use zkasper_common::types::{CommitteeOutput, JustificationWitness, SlotProofOutp
 /// `slot_proofs` carries the serialized Zisk proof words per slot, empty when
 /// running the circuit natively without a prover.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "justification"))]
 pub fn build(
     slot_proof_outputs: Vec<SlotProofOutput>,
     slot_proofs: Vec<Vec<u64>>,
