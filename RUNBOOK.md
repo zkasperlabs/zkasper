@@ -602,8 +602,8 @@ the epoch redone with no `recent_latencies` entry for it.
 
 | Resource | Measured | Notes |
 |---|---|---|
-| zkasperd RSS | **7.9 GB** | Dominated by the accumulator tree over 2.34M validator records. |
-| lighthouse RSS | **5.8 GB** | With `--subscribe-all-subnets` and multiplier 2000. |
+| zkasperd RSS | **4.7–7.9 GB**, 6.9 GB at rest | Dominated by the accumulator tree over 2.34M validator records. Sampled once a minute for 42 minutes: it sawtooths — it peaks while the epoch diff and committee proof run and falls back after — with **no upward trend**. That is evidence against a fast leak, not proof of stability over a day; nobody has watched it for hours yet. |
+| lighthouse RSS | **5.9–7.0 GB** | With `--subscribe-all-subnets` and multiplier 2000. Flat over the same window. |
 | Node datadir | **947 MB** after 15 minutes | Checkpoint-synced, backfill running. Budget 450+ GB for a month with default `--hierarchy-exponents`. |
 | `zkasperd.db` | **343 MB** | Rewritten whole twice an epoch. |
 | `out/` | **110–120 MB per epoch** | Witness files, of which `committee.bin` is 113 MB. At 225 epochs a day that is **~26 GB/day, ~780 GB/month** — larger than the beacon database. Prune or ship them; nothing re-reads a closed epoch's directory. |
