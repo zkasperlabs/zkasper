@@ -39,12 +39,13 @@
 //! proof. [`StreamAggregator::worth_waiting`] takes that trade, one trigger
 //! interval at a time.
 //!
-//! [`Pipeline`] picks what happens to the slots. [`Pipeline::Batch`] proves one
-//! slot proof each and folds them, a couple at a time as they finish, into a
+//! [`Pipeline`] picks what happens to the slots. [`Pipeline::Batch`] proves them
+//! in bounded groups and folds those, a couple at a time as they finish, into a
 //! chain of justification links — the same incremental shape the streaming
 //! aggregate has, and for the same reason: a proof that verified every slot of
 //! the epoch at once cost 1,221 s of an epoch's 1,452 on an RTX 5090, and no
-//! proof in this pipeline may grow with the epoch. [`Pipeline::Streaming`] proves a group
+//! proof in this pipeline may grow with the epoch.
+//! [`Pipeline::Streaming`] proves a group
 //! per tick, folds each into a running aggregate as it finishes, and collapses
 //! justification, finalization and the epoch's one final exponentiation into a
 //! single proof over the attestation that crossed the threshold — see

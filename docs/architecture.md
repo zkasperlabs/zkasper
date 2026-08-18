@@ -26,13 +26,19 @@ does that by proving before `T` everything that is known before `T`.
 | group proof | some slots of an epoch, as Miller loops that nothing has closed yet | as the slots arrive |
 | aggregation | a running aggregate absorbs a group proof | as groups finish |
 | stream final | the epoch justifies, and the epoch before it finalizes | once, after `T` |
-| slot proof | one slot attested, signatures included | batch pipeline only |
-| justification | folded slot proofs cross 2/3 | batch pipeline only |
+| slot proof | some slots attested, signatures included | batch pipeline only |
+| justification | a running justification absorbs slot proofs | batch pipeline only |
 | finalization | two consecutive justifications pair | batch pipeline only |
 
-The batch pipeline proves the same claim as the streaming pipeline. It proves
-each slot, then folds the epoch after the epoch ends. It is simple and it is
-slow. The streaming pipeline is the one that makes `T2 - T` small.
+The batch pipeline proves the same claim as the streaming pipeline, and since
+the justification became a fold chain it does it the same way: bounded groups of
+slots, absorbed a couple at a time into a running claim, and nothing whose size
+is the epoch's. What is left between the two is the deferred pairing — a batch
+slot proof finishes its own signatures, where the streaming path runs one final
+exponentiation for the whole epoch — and the close, which the streaming path
+collapses into the finalization. The streaming pipeline is still the one that
+makes `T2 - T` small; the batch pipeline exists because the first epoch of a run
+has nothing before it to finalize.
 
 ## What feeds what
 
