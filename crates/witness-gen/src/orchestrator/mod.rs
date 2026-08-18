@@ -57,13 +57,15 @@
 //! outputs and proofs and do not care which order they were produced in — so
 //! handing the prover to a pool of GPUs is a change to this file only.
 
+mod chain_view;
 mod config;
+mod engine;
 mod pipeline;
+mod reporter;
 
 pub use config::OrchestratorConfig;
 pub use pipeline::Pipeline;
 
-use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,32 +74,33 @@ use anyhow::{bail, Context, Result};
 use tracing::{info, info_span, instrument, warn};
 
 use zkasper_common::acc::Digest;
-use zkasper_common::bls::{compute_domain, fp12_mul, Fp12, DOMAIN_BEACON_ATTESTER, FP12_ONE};
+use zkasper_common::bls::{fp12_mul, Fp12, FP12_ONE};
 use zkasper_common::types::{
     AggregateOutput, BoundaryAnchor, Checkpoint, CommitteeOutput, FinalizationWitness,
-    GroupProofOutput, JustificationOutput, PreviousJustification, SlotProofOutput,
-    SlotProofWitness,
+    GroupProofOutput, PreviousJustification, SlotProofOutput, SlotProofWitness,
 };
 
 use crate::acc_tree::AccTree;
 use crate::artifacts::{
-    hex0x, hex_digest, now_unix, now_unix_millis, AccStatus, ArtifactRef, ArtifactSink,
-    CheckpointStatus, CurrentEpoch, EpochCost, EpochLatency, GossipStatus, PublishStatus,
-    StageTiming, Status,
+    hex_digest, now_unix_millis, ArtifactSink, CheckpointStatus, CurrentEpoch, EpochLatency,
+    StageTiming,
 };
 use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
 use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
-use crate::postings::PostingLog;
 use crate::prover::{Proof, Prover, Stage};
 use crate::publish::{self, ClosedEpoch, EpochProgress, Publisher};
 use crate::store::{
     EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState, StreamFinalRecord,
 };
+
 use crate::streaming::{self, Filling, StreamContext, StreamPolicy};
 use crate::{witness_bootstrap, witness_epoch_diff, witness_justification};
+use chain_view::ChainView;
+use engine::{write_proof, Engine};
+use reporter::{acc_status, justified_checkpoint, percent_of, Reporter};
 
 /// How many stage timings the manifest keeps.
 const RECENT_STAGES: usize = 64;
@@ -367,37 +370,11 @@ impl StreamAggregator {
 }
 
 pub struct Orchestrator<A> {
-    api: A,
-    config: OrchestratorConfig,
-    store: Store,
-    sink: ArtifactSink,
-    prover: Box<dyn Prover>,
-    snapshot: Snapshot,
+    /// The node, the prover, the accumulator, and where results go — the half
+    /// of the daemon that does not care which pipeline is running.
+    engine: Engine<A>,
     pending: Option<EpochAggregator>,
     streaming: Option<StreamAggregator>,
-    /// Attestation gossip, when the daemon was given a node to follow it from.
-    gossip: Option<Box<dyn AttestationSource>>,
-    /// Where stages are mirrored as they happen. `None` runs the pipeline with
-    /// no public surface but the manifest on disk.
-    publish: Option<Arc<Publisher>>,
-    /// Postings a submitter appended, when the daemon was given a file to read.
-    postings: Option<PostingLog>,
-    recent: VecDeque<StageTiming>,
-    latencies: VecDeque<EpochLatency>,
-    head_slot: u64,
-    /// When the chain view was last refreshed. The trigger runs several times a
-    /// second and the node's head does not move that fast, so the two are not
-    /// the same clock.
-    viewed: Option<Instant>,
-    node_finalized: Option<Checkpoint>,
-    genesis_validators_root: Option<[u8; 32]>,
-    /// Unix seconds of slot 0, asked for once. Without it a slot has no
-    /// wall-clock time and no proof can be called late.
-    genesis_time: Option<u64>,
-    /// Prover time per epoch, accumulated as stages land. Keyed by epoch rather
-    /// than reset at a boundary, because the committee proof of E+1 runs inside
-    /// E and its cost belongs to E+1.
-    costs: HashMap<u64, EpochCost>,
 }
 
 impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
@@ -437,13 +414,16 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 let (snapshot, timing) =
                     Self::bootstrap(&api, &config, &sink, &*prover, publish.as_ref()).await?;
                 let mut this = Self::assemble(api, config, store, sink, prover, snapshot, publish);
-                this.record(timing);
-                this.store.save(&this.snapshot)?;
+                this.engine.report.record(timing);
+                this.engine.store.save(&this.engine.snapshot)?;
                 this
             }
         };
 
-        this.refresh_chain_view().await?;
+        this.engine
+            .chain
+            .refresh(&this.engine.api, &this.engine.config)
+            .await?;
         this.publish_status()?;
         Ok(this)
     }
@@ -458,28 +438,21 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         publish: Option<Arc<Publisher>>,
     ) -> Self {
         Self {
-            publish,
-            postings: config.postings_path.as_ref().map(PostingLog::new),
-            genesis_validators_root: config.genesis_validators_root,
-            gossip: config
-                .gossip_url
-                .as_deref()
-                .map(|url| Box::new(EventStreamSource::connect(url)) as Box<dyn AttestationSource>),
-            api,
-            config,
-            store,
-            sink,
-            prover,
-            snapshot,
+            engine: Engine {
+                chain: ChainView::new(&config),
+                report: Reporter::new(&config, publish),
+                gossip: config.gossip_url.as_deref().map(|url| {
+                    Box::new(EventStreamSource::connect(url)) as Box<dyn AttestationSource>
+                }),
+                api,
+                config,
+                store,
+                sink,
+                prover,
+                snapshot,
+            },
             pending: None,
             streaming: None,
-            recent: VecDeque::new(),
-            latencies: VecDeque::new(),
-            head_slot: 0,
-            viewed: None,
-            node_finalized: None,
-            genesis_time: None,
-            costs: HashMap::new(),
         }
     }
 
@@ -489,16 +462,16 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// so this is where a forked node, an in-process feed or a test's own
     /// arrival schedule goes in.
     pub fn with_gossip(mut self, source: Box<dyn AttestationSource>) -> Self {
-        self.gossip = Some(source);
+        self.engine.gossip = Some(source);
         self
     }
 
     pub fn state(&self) -> &StoreState {
-        &self.snapshot.state
+        &self.engine.snapshot.state
     }
 
     pub fn tree(&self) -> &AccTree {
-        &self.snapshot.tree
+        &self.engine.snapshot.tree
     }
 
     // -----------------------------------------------------------------
@@ -514,8 +487,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         loop {
             self.catch_up().await?;
             tokio::time::sleep(match self.streaming {
-                Some(_) => self.config.trigger_interval,
-                None => self.config.poll_interval,
+                Some(_) => self.engine.config.trigger_interval,
+                None => self.engine.config.poll_interval,
             })
             .await;
         }
@@ -544,15 +517,15 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         match self.tick_once().await {
             Err(e) if is_pruned_state(&e) => {
                 warn!(
-                    epoch = self.snapshot.state.cursor_epoch,
+                    epoch = self.engine.snapshot.state.cursor_epoch,
                     error = %format!("{e:#}"),
                     "the node no longer serves the state this epoch needs; \
                      bootstrapping forward to one it does",
                 );
                 self.rebootstrap().await?;
                 Ok(Tick {
-                    head_slot: self.head_slot,
-                    advanced_to: Some(self.snapshot.state.cursor_epoch),
+                    head_slot: self.engine.chain.head_slot(),
+                    advanced_to: Some(self.engine.snapshot.state.cursor_epoch),
                     ..Tick::default()
                 })
             }
@@ -568,37 +541,40 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// more slowly and after several failed restarts.
     async fn rebootstrap(&mut self) -> Result<()> {
         let (snapshot, timing) = Self::bootstrap(
-            &self.api,
-            &self.config,
-            &self.sink,
-            &*self.prover,
-            self.publish.as_ref(),
+            &self.engine.api,
+            &self.engine.config,
+            &self.engine.sink,
+            &*self.engine.prover,
+            self.engine.report.publisher(),
         )
         .await?;
-        self.snapshot = snapshot;
+        self.engine.snapshot = snapshot;
         self.pending = None;
         self.streaming = None;
-        self.record(timing);
-        self.store.save(&self.snapshot)
+        self.engine.report.record(timing);
+        self.engine.store.save(&self.engine.snapshot)
     }
 
     async fn tick_once(&mut self) -> Result<Tick> {
-        self.refresh_chain_view().await?;
+        self.engine
+            .chain
+            .refresh(&self.engine.api, &self.engine.config)
+            .await?;
 
         let mut tick = Tick {
-            head_slot: self.head_slot,
+            head_slot: self.engine.chain.head_slot(),
             ..Tick::default()
         };
 
-        if self.snapshot.state.needs_justification() {
-            if self.config.pipeline == Pipeline::Streaming && self.can_stream() {
+        if self.engine.snapshot.state.needs_justification() {
+            if self.engine.config.pipeline == Pipeline::Streaming && self.can_stream() {
                 self.drive_stream(&mut tick).await?;
             } else {
                 self.drive_aggregation(&mut tick).await?;
             }
         } else {
-            let next = self.snapshot.state.cursor_epoch + 1;
-            if next <= self.head_slot / self.config.chain.slots_per_epoch {
+            let next = self.engine.snapshot.state.cursor_epoch + 1;
+            if next <= self.engine.chain.head_slot() / self.engine.config.chain.slots_per_epoch {
                 self.advance_accumulator(next).await?;
                 tick.advanced_to = Some(next);
             }
@@ -606,48 +582,6 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
         self.publish_status()?;
         Ok(tick)
-    }
-
-    /// Ask the node where it is, at most once a poll interval.
-    ///
-    /// The trigger ticks several times a second and the head moves once a slot,
-    /// so refreshing on every tick would be two round trips per evaluation to
-    /// learn nothing.
-    async fn refresh_chain_view(&mut self) -> Result<()> {
-        if self
-            .viewed
-            .is_some_and(|at| at.elapsed() < self.config.poll_interval)
-        {
-            return Ok(());
-        }
-        self.viewed = Some(Instant::now());
-
-        self.head_slot = self
-            .api
-            .get_header("head")
-            .await
-            .context("fetch chain head")?
-            .slot;
-
-        // The clock every schedule comparison is made against. Asked for once,
-        // and never fatal: without it the daemon simply records no start delays.
-        if self.genesis_time.is_none() {
-            match self.api.get_genesis_time().await {
-                Ok(genesis) => self.genesis_time = Some(genesis),
-                Err(e) => warn!(
-                    error = %e,
-                    "no genesis time from the node; proof start delays will not be recorded",
-                ),
-            }
-        }
-
-        // Only used for the manifest, so a node that will not answer must not
-        // stop the pipeline.
-        match self.api.get_finality_checkpoints("head").await {
-            Ok(checkpoints) => self.node_finalized = Some(checkpoints.finalized),
-            Err(e) => warn!(error = %e, "could not read the node's finality checkpoints"),
-        }
-        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -747,31 +681,34 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     #[instrument(name = "stage", skip_all, fields(stage = "epoch_diff", epoch = to_epoch))]
     async fn advance_accumulator(&mut self, to_epoch: u64) -> Result<()> {
         let started = Instant::now();
-        self.begin(Stage::EpochDiff, to_epoch, None, None);
+        self.engine
+            .report
+            .begin(Stage::EpochDiff, to_epoch, None, None);
 
-        let mut tree = self.snapshot.tree.clone();
+        let mut tree = self.engine.snapshot.tree.clone();
         let (witness, epoch_state, total_active_balance, num_validators) =
             witness_epoch_diff::build(
-                &self.api,
-                &self.config.chain,
+                &self.engine.api,
+                &self.engine.config.chain,
                 &mut tree,
-                &self.snapshot.epoch_state,
-                to_epoch * self.config.chain.slots_per_epoch,
-                self.snapshot.state.total_active_balance,
+                &self.engine.snapshot.epoch_state,
+                to_epoch * self.engine.config.chain.slots_per_epoch,
+                self.engine.snapshot.state.total_active_balance,
             )
             .await
             .context("build epoch diff witness")?;
 
-        if witness.epoch_1 != self.snapshot.state.cursor_epoch || witness.epoch_2 != to_epoch {
+        if witness.epoch_1 != self.engine.snapshot.state.cursor_epoch || witness.epoch_2 != to_epoch
+        {
             bail!(
                 "epoch diff spans {} -> {}, but the accumulator is at {} and must move to {to_epoch}",
                 witness.epoch_1,
                 witness.epoch_2,
-                self.snapshot.state.cursor_epoch,
+                self.engine.snapshot.state.cursor_epoch,
             );
         }
 
-        let (output, proof) = self.prover.prove_epoch_diff(&witness)?;
+        let (output, proof) = self.engine.prover.prove_epoch_diff(&witness)?;
         if output.acc_root != tree.root() {
             bail!(
                 "epoch diff circuit disagrees with the host accumulator tree at epoch {to_epoch}"
@@ -780,11 +717,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         if output.total_active_balance != total_active_balance {
             bail!("epoch diff circuit disagrees on the total active balance at epoch {to_epoch}");
         }
-        if output.prev_accumulator_commitment != self.snapshot.state.acc_commitment {
+        if output.prev_accumulator_commitment != self.engine.snapshot.state.acc_commitment {
             bail!("epoch diff does not start from the accumulator the cursor sits on");
         }
 
-        let mut state = self.snapshot.state.clone();
+        let mut state = self.engine.snapshot.state.clone();
         let acc_root = output.acc_root;
         let commitment = output.accumulator_commitment;
         state.advance(
@@ -799,19 +736,22 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             }),
         )?;
 
-        let artifact = self.sink.write_witness(to_epoch, "epoch_diff", &witness)?;
-        write_proof(&self.sink, to_epoch, "epoch_diff", &proof)?;
+        let artifact = self
+            .engine
+            .sink
+            .write_witness(to_epoch, "epoch_diff", &witness)?;
+        write_proof(&self.engine.sink, to_epoch, "epoch_diff", &proof)?;
 
         // Commit: in memory first, then to disk. A crash between the two is
         // harmless — the next start re-runs this epoch from the old cursor.
-        self.snapshot = Snapshot {
+        self.engine.snapshot = Snapshot {
             state,
             tree,
             epoch_state,
         };
         self.pending = None;
         self.streaming = None;
-        self.store.save(&self.snapshot)?;
+        self.engine.store.save(&self.engine.snapshot)?;
 
         let millis = started.elapsed().as_millis() as u64;
         info!(
@@ -822,12 +762,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             millis,
             "accumulator advanced",
         );
-        self.record(
+        self.engine.report.record(
             StageTiming::new(
                 Stage::EpochDiff,
                 to_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .with_proof(&proof),
@@ -840,8 +780,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     // -----------------------------------------------------------------
 
     async fn drive_aggregation(&mut self, tick: &mut Tick) -> Result<()> {
-        let target_epoch = self.snapshot.state.cursor_epoch;
-        let spe = self.config.chain.slots_per_epoch;
+        let target_epoch = self.engine.snapshot.state.cursor_epoch;
+        let spe = self.engine.config.chain.slots_per_epoch;
 
         let mut aggregator = match self.pending.take() {
             Some(aggregator) if aggregator.target_epoch == target_epoch => aggregator,
@@ -852,14 +792,19 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
         while !aggregator.threshold_reached()
             && !aggregator.exhausted()
-            && aggregator.next_slot <= self.head_slot
+            && aggregator.next_slot <= self.engine.chain.head_slot()
         {
             let slot = aggregator.next_slot;
             aggregator.next_slot += 1;
 
             // A slot with no block is not an error; neither is one whose
             // attestations all point somewhere else.
-            if let Ok(attestations) = self.api.get_block_attestations(&slot.to_string()).await {
+            if let Ok(attestations) = self
+                .engine
+                .api
+                .get_block_attestations(&slot.to_string())
+                .await
+            {
                 aggregator.stream.ingest(&attestations)?;
             }
 
@@ -885,7 +830,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 slot = attestation_slot,
             )
             .entered();
-            self.observe_start_delay(Stage::SlotProof, target_epoch, attestation_slot);
+            self.engine.chain.observe_start_delay(
+                &self.engine.config,
+                Stage::SlotProof,
+                target_epoch,
+                attestation_slot,
+            );
             let started = Instant::now();
             // Numbered as well as slotted. A slot proof is a repeat of a stage
             // inside one epoch, and a consumer that keys stages by
@@ -893,7 +843,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             // which lost 21 of an epoch's 22 slot proofs, and with them most of
             // what the epoch cost.
             let index = aggregator.slot_proofs.len();
-            self.begin(
+            self.engine.report.begin(
                 Stage::SlotProof,
                 target_epoch,
                 Some(attestation_slot),
@@ -908,6 +858,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 acc_root: aggregator.acc_root,
                 total_active_balance: aggregator.total_active_balance,
                 acc_multi_proof: self
+                    .engine
                     .snapshot
                     .tree
                     .build_multi_proof(&complement.named_indices),
@@ -917,18 +868,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 slots: vec![complement.witness],
             };
 
-            let (output, proof) = self
-                .prover
-                .prove_slot(&witness)
-                .with_context(|| format!("slot proof for attestation slot {attestation_slot}"))?;
+            let (output, proof) =
+                self.engine.prover.prove_slot(&witness).with_context(|| {
+                    format!("slot proof for attestation slot {attestation_slot}")
+                })?;
 
-            let artifact = self.sink.write_witness(
+            let artifact = self.engine.sink.write_witness(
                 target_epoch,
                 &format!("slot_proof_{attestation_slot}"),
                 &witness,
             )?;
             write_proof(
-                &self.sink,
+                &self.engine.sink,
                 target_epoch,
                 &format!("slot_proof_{attestation_slot}"),
                 &proof,
@@ -950,12 +901,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 millis,
                 "slot proof",
             );
-            self.record(
+            self.engine.report.record(
                 StageTiming::new(
                     Stage::SlotProof,
                     target_epoch,
                     started,
-                    self.prover.last_cost(),
+                    self.engine.prover.last_cost(),
                     artifact,
                 )
                 .at_slot(attestation_slot)
@@ -976,13 +927,13 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 total_active_balance = aggregator.total_active_balance,
                 "checkpoint never reached the 2/3 threshold; giving up on this epoch",
             );
-            if let Some(publish) = &self.publish {
+            if let Some(publish) = self.engine.report.publisher() {
                 publish.epoch_abandoned(target_epoch, "never reached the threshold");
             }
             crate::metrics::epoch_abandoned("threshold");
             self.pending = None;
-            self.snapshot.state.attempted_epoch = Some(target_epoch);
-            self.store.save(&self.snapshot)?;
+            self.engine.snapshot.state.attempted_epoch = Some(target_epoch);
+            self.engine.store.save(&self.engine.snapshot)?;
             tick.gave_up_on = Some(target_epoch);
         } else {
             // Waiting for the node to publish more blocks. Keep the partial
@@ -994,10 +945,19 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     /// Start a new epoch's aggregation against the accumulator as it stands.
     async fn open_epoch(&mut self, target_epoch: u64) -> Result<EpochAggregator> {
-        let spe = self.config.chain.slots_per_epoch;
-        let target_root = self.checkpoint_root(target_epoch).await?;
-        let signing_domain = self.signing_domain(target_epoch).await?;
+        let spe = self.engine.config.chain.slots_per_epoch;
+        let target_root = self
+            .engine
+            .chain
+            .checkpoint_root(&self.engine.api, &self.engine.config, target_epoch)
+            .await?;
+        let signing_domain = self
+            .engine
+            .chain
+            .signing_domain(&self.engine.api, &self.engine.config, target_epoch)
+            .await?;
         let validators = self
+            .engine
             .api
             .get_validators(&(target_epoch * spe).to_string())
             .await
@@ -1007,19 +967,19 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             self.prove_committee(target_epoch, &validators).await?;
 
         let stream = SlotStream::new(
-            &self.config.chain,
+            &self.engine.config.chain,
             committees.clone(),
             target_epoch,
             target_root,
         );
 
-        if let Some(publish) = &self.publish {
+        if let Some(publish) = self.engine.report.publisher() {
             publish.epoch_opened(
                 target_epoch,
                 &target_root,
                 target_epoch.saturating_sub(1),
-                self.snapshot.state.total_active_balance,
-                serde_json::to_value(self.acc_status())?,
+                self.engine.snapshot.state.total_active_balance,
+                serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
             );
         }
         info!(
@@ -1033,15 +993,15 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             target_epoch,
             target_root,
             signing_domain,
-            acc_root: self.snapshot.state.acc_root,
-            acc_commitment: self.snapshot.state.acc_commitment,
-            total_active_balance: self.snapshot.state.total_active_balance,
+            acc_root: self.engine.snapshot.state.acc_root,
+            acc_commitment: self.engine.snapshot.state.acc_commitment,
+            total_active_balance: self.engine.snapshot.state.total_active_balance,
             committees,
             committee_output,
             committee_proof,
             stream,
             next_slot: target_epoch * spe,
-            scan_end: (target_epoch + self.config.attestation_lookahead_epochs) * spe,
+            scan_end: (target_epoch + self.engine.config.attestation_lookahead_epochs) * spe,
             attesting_balance: 0,
             slot_outputs: Vec::new(),
             slot_proofs: Vec::new(),
@@ -1061,30 +1021,34 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     ) -> Result<(Arc<EpochCommittees>, CommitteeOutput, Proof)> {
         // The schedule wants this finished before the epoch it serves opens, so
         // the epoch's own first slot is the latest it should ever start.
-        self.observe_start_delay(
+        self.engine.chain.observe_start_delay(
+            &self.engine.config,
             Stage::Committee,
             target_epoch,
-            target_epoch * self.config.chain.slots_per_epoch,
+            target_epoch * self.engine.config.chain.slots_per_epoch,
         );
         let started = Instant::now();
-        self.begin(Stage::Committee, target_epoch, None, None);
+        self.engine
+            .report
+            .begin(Stage::Committee, target_epoch, None, None);
         let committees = Arc::new(self.build_committees(target_epoch, validators).await?);
-        let (output, proof) = self.prover.prove_committee(&committees.witness)?;
+        let (output, proof) = self.engine.prover.prove_committee(&committees.witness)?;
         if output != committees.output {
             bail!(
                 "committee circuit disagrees with the host committee tree at epoch {target_epoch}"
             );
         }
-        let artifact = self
-            .sink
-            .write_witness(target_epoch, "committee", &committees.witness)?;
-        write_proof(&self.sink, target_epoch, "committee", &proof)?;
-        self.record(
+        let artifact =
+            self.engine
+                .sink
+                .write_witness(target_epoch, "committee", &committees.witness)?;
+        write_proof(&self.engine.sink, target_epoch, "committee", &proof)?;
+        self.engine.report.record(
             StageTiming::new(
                 Stage::Committee,
                 target_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .with_proof(&proof),
@@ -1103,8 +1067,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         target_epoch: u64,
         validators: &[ValidatorResponse],
     ) -> Result<EpochCommittees> {
-        let spe = self.config.chain.slots_per_epoch;
+        let spe = self.engine.config.chain.slots_per_epoch;
         let committees = self
+            .engine
             .api
             .get_committees(&(target_epoch * spe).to_string(), target_epoch)
             .await
@@ -1113,11 +1078,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         crate::committee::build(
             &committees,
             validators,
-            &self.snapshot.tree,
-            &self.config.chain,
+            &self.engine.snapshot.tree,
+            &self.engine.config.chain,
             target_epoch,
             target_epoch,
-            self.snapshot.state.total_active_balance,
+            self.engine.snapshot.state.total_active_balance,
         )
     }
 
@@ -1131,14 +1096,16 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     async fn close_epoch(&mut self, aggregator: EpochAggregator, tick: &mut Tick) -> Result<()> {
         let target_epoch = aggregator.target_epoch;
         let started = Instant::now();
-        self.begin(Stage::Justification, target_epoch, None, None);
+        self.engine
+            .report
+            .begin(Stage::Justification, target_epoch, None, None);
 
         let witness = witness_justification::build(
             aggregator.slot_outputs,
             aggregator.slot_proofs,
             aggregator.acc_commitment,
-            self.prover.program_vk(Stage::SlotProof),
-            self.prover.program_vk(Stage::Committee),
+            self.engine.prover.program_vk(Stage::SlotProof),
+            self.engine.prover.program_vk(Stage::Committee),
             aggregator.committee_output,
             aggregator.committee_proof,
             target_epoch,
@@ -1148,11 +1115,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         );
 
         let slots = witness.slot_proof_outputs.len();
-        let (output, proof) = self.prover.prove_justification(&witness)?;
+        let (output, proof) = self.engine.prover.prove_justification(&witness)?;
         let artifact = self
+            .engine
             .sink
             .write_witness(target_epoch, "justification", &witness)?;
-        write_proof(&self.sink, target_epoch, "justification", &proof)?;
+        write_proof(&self.engine.sink, target_epoch, "justification", &proof)?;
 
         let millis = started.elapsed().as_millis() as u64;
         info!(
@@ -1162,12 +1130,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             millis,
             "justified",
         );
-        self.record(
+        self.engine.report.record(
             StageTiming::new(
                 Stage::Justification,
                 target_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .with_proof(&proof),
@@ -1183,9 +1151,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // justification is the only proof it will ever have. Publishing it as
         // the epoch's proof is what keeps that epoch from sitting open forever.
         if finalized.is_none() {
-            let cost = self.take_cost(target_epoch);
-            if let Some(publish) = &self.publish {
-                let vk = self.prover.program_vk(Stage::Justification);
+            let cost = self.engine.report.take_cost(target_epoch);
+            if let Some(publish) = self.engine.report.publisher() {
+                let vk = self.engine.prover.program_vk(Stage::Justification);
                 let publics = record.output.public_bytes();
                 let reference = publish::proof_ref(
                     target_epoch,
@@ -1193,7 +1161,10 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     &record.proof,
                     &vk,
                     &publics,
-                    self.prover.program_digest(Stage::Justification).as_deref(),
+                    self.engine
+                        .prover
+                        .program_digest(Stage::Justification)
+                        .as_deref(),
                 );
                 let inputs = publish::justification_public_inputs(&record.output);
                 publish.proof_bytes(
@@ -1211,7 +1182,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     finalizes_epoch: target_epoch,
                     justified: serde_json::to_value(justified_checkpoint(&record.output))?,
                     finalized: serde_json::Value::Null,
-                    accumulator: serde_json::to_value(self.acc_status())?,
+                    accumulator: serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
                     latency: None,
                     proof: reference,
                     public_inputs: inputs,
@@ -1220,13 +1191,13 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         }
 
         crate::metrics::epoch_justified();
-        self.snapshot.state.justified_through = Some(target_epoch);
-        self.snapshot.state.attempted_epoch = Some(target_epoch);
-        self.snapshot.state.last_justification = Some(record);
+        self.engine.snapshot.state.justified_through = Some(target_epoch);
+        self.engine.snapshot.state.attempted_epoch = Some(target_epoch);
+        self.engine.snapshot.state.last_justification = Some(record);
         if let Some(checkpoint) = &finalized {
-            self.snapshot.state.finalized = Some(checkpoint.clone());
+            self.engine.snapshot.state.finalized = Some(checkpoint.clone());
         }
-        self.store.save(&self.snapshot)?;
+        self.engine.store.save(&self.engine.snapshot)?;
 
         tick.justified = Some(target_epoch);
         tick.finalized = finalized;
@@ -1240,14 +1211,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// epoch diff that carries one to the other. That is the diff this daemon
     /// ran between the two justifications, kept in the store for exactly this.
     async fn try_finalize(&mut self, current: &JustificationRecord) -> Result<Option<Checkpoint>> {
-        let Some(previous) = self.snapshot.state.last_justification.clone() else {
+        let Some(previous) = self.engine.snapshot.state.last_justification.clone() else {
             return Ok(None);
         };
         let epoch = previous.output.target_epoch;
         if epoch + 1 != current.output.target_epoch {
             return Ok(None);
         }
-        let Some(epoch_diff) = self.snapshot.state.last_epoch_diff.clone() else {
+        let Some(epoch_diff) = self.engine.snapshot.state.last_epoch_diff.clone() else {
             warn!(
                 epoch,
                 "no epoch diff on record to link the two accumulators"
@@ -1270,13 +1241,13 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         }
 
         let boundary = crate::boundary::build(
-            &self.api,
-            &self.config.chain,
+            &self.engine.api,
+            &self.engine.config.chain,
             &current.output.target_root,
             epoch,
             &previous.output.target_root,
             &epoch_diff.output.state_root_1,
-            &self.snapshot.epoch_state,
+            &self.engine.snapshot.epoch_state,
         )
         .await
         .with_context(|| format!("open the boundary of epoch {epoch}"))?;
@@ -1288,10 +1259,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         )
         .entered();
         let started = Instant::now();
-        self.begin(Stage::Finalization, current.output.target_epoch, None, None);
+        self.engine
+            .report
+            .begin(Stage::Finalization, current.output.target_epoch, None, None);
         let witness = FinalizationWitness {
-            justification_program_vk: self.prover.program_vk(Stage::Justification),
-            epoch_diff_program_vk: self.prover.program_vk(Stage::EpochDiff),
+            justification_program_vk: self.engine.prover.program_vk(Stage::Justification),
+            epoch_diff_program_vk: self.engine.prover.program_vk(Stage::EpochDiff),
             boundary,
             justification_outputs: vec![previous.output.clone(), current.output.clone()],
             justification_proofs: vec![previous.proof.clone(), current.proof.clone()],
@@ -1299,12 +1272,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             epoch_diff_proof: epoch_diff.proof,
         };
 
-        let (output, proof) = self.prover.prove_finalization(&witness)?;
-        let artifact =
-            self.sink
-                .write_witness(current.output.target_epoch, "finalization", &witness)?;
+        let (output, proof) = self.engine.prover.prove_finalization(&witness)?;
+        let artifact = self.engine.sink.write_witness(
+            current.output.target_epoch,
+            "finalization",
+            &witness,
+        )?;
         write_proof(
-            &self.sink,
+            &self.engine.sink,
             current.output.target_epoch,
             "finalization",
             &proof,
@@ -1317,28 +1292,31 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             millis,
             "finalized",
         );
-        self.record(
+        self.engine.report.record(
             StageTiming::new(
                 Stage::Finalization,
                 current.output.target_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .with_proof(&proof),
         );
 
-        let cost = self.take_cost(current.output.target_epoch);
-        if let Some(publish) = &self.publish {
+        let cost = self.engine.report.take_cost(current.output.target_epoch);
+        if let Some(publish) = self.engine.report.publisher() {
             let epoch = current.output.target_epoch;
-            let vk = self.prover.program_vk(Stage::Finalization);
+            let vk = self.engine.prover.program_vk(Stage::Finalization);
             let reference = publish::proof_ref(
                 epoch,
                 Stage::Finalization,
                 &proof,
                 &vk,
                 &output.public_bytes(),
-                self.prover.program_digest(Stage::Finalization).as_deref(),
+                self.engine
+                    .prover
+                    .program_digest(Stage::Finalization)
+                    .as_deref(),
             );
             let inputs = publish::finalization_public_inputs(&output);
             publish.proof_bytes(
@@ -1359,7 +1337,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     "epoch": output.finalized_epoch,
                     "root": crate::artifacts::hex0x(&output.finalized_root),
                 }),
-                accumulator: serde_json::to_value(self.acc_status())?,
+                accumulator: serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
                 latency: None,
                 proof: reference,
                 public_inputs: inputs,
@@ -1384,16 +1362,17 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// the epoch, so an epoch with neither — the first after a bootstrap — has
     /// to go through the batch path, and the one after it streams.
     fn can_stream(&self) -> bool {
-        self.snapshot.state.last_epoch_diff.is_some()
+        self.engine.snapshot.state.last_epoch_diff.is_some()
             && self
+                .engine
                 .snapshot
                 .state
-                .previous_justification(self.snapshot.state.cursor_epoch)
+                .previous_justification(self.engine.snapshot.state.cursor_epoch)
                 .is_some()
     }
 
     async fn drive_stream(&mut self, tick: &mut Tick) -> Result<()> {
-        let target_epoch = self.snapshot.state.cursor_epoch;
+        let target_epoch = self.engine.snapshot.state.cursor_epoch;
 
         let mut aggregator = match self.streaming.take() {
             Some(aggregator) if aggregator.context.target_epoch == target_epoch => aggregator,
@@ -1401,11 +1380,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         };
 
         let _span = info_span!("stream", target_epoch).entered();
-        let spe = self.config.chain.slots_per_epoch;
+        let spe = self.engine.config.chain.slots_per_epoch;
 
         // Gossip is the source. Blocks repair what an outage swallowed, and are
         // the whole source when there is no stream — the fixture-replay tests.
-        match &self.gossip {
+        match &self.engine.gossip {
             Some(source) => {
                 aggregator.stream.ingest(&source.drain())?;
                 aggregator.reorged |= source.took_reorg();
@@ -1429,7 +1408,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // rather than proving the old one. Doing it here, off a node event,
         // keeps the round trip away from the critical path.
         if std::mem::take(&mut aggregator.reorged)
-            && self.checkpoint_root(target_epoch).await? != aggregator.context.target_root
+            && self
+                .engine
+                .chain
+                .checkpoint_root(&self.engine.api, &self.engine.config, target_epoch)
+                .await?
+                != aggregator.context.target_root
         {
             warn!(
                 target_epoch,
@@ -1438,9 +1422,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             return Ok(());
         }
 
-        let policy = self.config.stream_policy.clone();
+        let policy = self.engine.config.stream_policy.clone();
         let total = aggregator.context.total_active_balance;
-        let held = aggregator.held(spe, self.head_slot, &policy);
+        let held = aggregator.held(spe, self.engine.chain.head_slot(), &policy);
 
         // `T`: the first moment the daemon holds what the circuit would accept.
         // Everything after it is latency a consumer sees, the trigger's own wait
@@ -1450,7 +1434,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         {
             let crossed = now_unix_millis();
             aggregator.crossed_unix_millis = Some(crossed);
-            if let Some(publish) = &self.publish {
+            if let Some(publish) = self.engine.report.publisher() {
                 publish.threshold_crossed(target_epoch, crossed, held.balance, total);
             }
         }
@@ -1462,7 +1446,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .map(|(slot, named, aggregates)| (Instant::now(), slot, named, aggregates));
 
         if !fire {
-            if let Some(publish) = &self.publish {
+            if let Some(publish) = self.engine.report.publisher() {
                 publish.epoch_progress(&EpochProgress {
                     epoch: target_epoch,
                     attesting_balance: held.balance,
@@ -1470,7 +1454,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     threshold_pct: policy.threshold_pct(),
                     folded_groups: aggregator.folded_groups,
                     slots_held: aggregator.units.len(),
-                    head_slot: self.head_slot,
+                    head_slot: self.engine.chain.head_slot(),
                 });
             }
             // Slots gossip has finished with are proven and folded now, off the
@@ -1487,18 +1471,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     self.prove_group(&aggregator, aggregator.proved..aggregator.units.len(), tick)?;
                 self.fold_group(&mut aggregator, group)?;
             }
-            if aggregator.exhausted(self.head_slot) {
+            if aggregator.exhausted(self.engine.chain.head_slot()) {
                 warn!(
                     target_epoch,
                     attesting_balance = aggregator.attesting_balance,
                     total_active_balance = total,
                     "checkpoint never reached the threshold; giving up on this epoch",
                 );
-                if let Some(publish) = &self.publish {
+                if let Some(publish) = self.engine.report.publisher() {
                     publish.epoch_abandoned(target_epoch, "never reached the threshold");
                 }
-                self.snapshot.state.attempted_epoch = Some(target_epoch);
-                self.store.save(&self.snapshot)?;
+                self.engine.snapshot.state.attempted_epoch = Some(target_epoch);
+                self.engine.store.save(&self.engine.snapshot)?;
                 tick.gave_up_on = Some(target_epoch);
             } else {
                 self.streaming = Some(aggregator);
@@ -1531,13 +1515,20 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// a block and a gossip view of a slot is the gossip view, because the
     /// collector converges on an attester set rather than a list.
     async fn repair_from_blocks(&mut self, aggregator: &mut StreamAggregator) -> Result<()> {
-        while aggregator.next_slot <= self.head_slot && aggregator.next_slot < aggregator.scan_end {
+        while aggregator.next_slot <= self.engine.chain.head_slot()
+            && aggregator.next_slot < aggregator.scan_end
+        {
             let slot = aggregator.next_slot;
             aggregator.next_slot += 1;
 
             // A slot with no block is not an error; neither is one whose
             // attestations all point somewhere else.
-            if let Ok(attestations) = self.api.get_block_attestations(&slot.to_string()).await {
+            if let Ok(attestations) = self
+                .engine
+                .api
+                .get_block_attestations(&slot.to_string())
+                .await
+            {
                 aggregator.stream.ingest(&attestations)?;
             }
         }
@@ -1552,10 +1543,19 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// here, an epoch ahead of when it is used, so that no round trip to the
     /// beacon node lands between `T` and `T2`.
     async fn open_stream_epoch(&mut self, target_epoch: u64) -> Result<StreamAggregator> {
-        let spe = self.config.chain.slots_per_epoch;
-        let target_root = self.checkpoint_root(target_epoch).await?;
-        let signing_domain = self.signing_domain(target_epoch).await?;
+        let spe = self.engine.config.chain.slots_per_epoch;
+        let target_root = self
+            .engine
+            .chain
+            .checkpoint_root(&self.engine.api, &self.engine.config, target_epoch)
+            .await?;
+        let signing_domain = self
+            .engine
+            .chain
+            .signing_domain(&self.engine.api, &self.engine.config, target_epoch)
+            .await?;
         let validators = self
+            .engine
             .api
             .get_validators(&(target_epoch * spe).to_string())
             .await
@@ -1565,37 +1565,39 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             self.prove_committee(target_epoch, &validators).await?;
 
         let stream = SlotStream::new(
-            &self.config.chain,
+            &self.engine.config.chain,
             committees.clone(),
             target_epoch,
             target_root,
         );
 
         let epoch_diff = self
+            .engine
             .snapshot
             .state
             .last_epoch_diff
             .clone()
             .context("no epoch diff on record to open the epoch against")?;
-        let (previous, previous_proof) =
-            self.snapshot
-                .state
-                .previous_justification(target_epoch)
-                .context("no justification for the previous epoch to finalize")?;
+        let (previous, previous_proof) = self
+            .engine
+            .snapshot
+            .state
+            .previous_justification(target_epoch)
+            .context("no justification for the previous epoch to finalize")?;
 
         let boundary = crate::boundary::build(
-            &self.api,
-            &self.config.chain,
+            &self.engine.api,
+            &self.engine.config.chain,
             &target_root,
             previous.target_epoch(),
             &previous.target_root(),
             &epoch_diff.output.state_root_1,
-            &self.snapshot.epoch_state,
+            &self.engine.snapshot.epoch_state,
         )
         .await
         .context("open the boundary of the epoch being finalized")?;
 
-        let state = &self.snapshot.state;
+        let state = &self.engine.snapshot.state;
         let context = StreamContext {
             accumulator_commitment: state.acc_commitment,
             acc_root: state.acc_root,
@@ -1603,28 +1605,32 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             target_epoch,
             target_root,
             signing_domain,
-            group_program_vk: self.prover.program_vk(Stage::Group),
-            aggregate_program_vk: self.prover.program_vk(Stage::Aggregate),
+            group_program_vk: self.engine.prover.program_vk(Stage::Group),
+            aggregate_program_vk: self.engine.prover.program_vk(Stage::Aggregate),
             previous_program_vk: match previous {
-                PreviousJustification::Batch(_) => self.prover.program_vk(Stage::Justification),
-                PreviousJustification::Stream(_) => self.prover.program_vk(Stage::StreamFinal),
+                PreviousJustification::Batch(_) => {
+                    self.engine.prover.program_vk(Stage::Justification)
+                }
+                PreviousJustification::Stream(_) => {
+                    self.engine.prover.program_vk(Stage::StreamFinal)
+                }
             },
-            epoch_diff_program_vk: self.prover.program_vk(Stage::EpochDiff),
-            committee_program_vk: self.prover.program_vk(Stage::Committee),
+            epoch_diff_program_vk: self.engine.prover.program_vk(Stage::EpochDiff),
+            committee_program_vk: self.engine.prover.program_vk(Stage::Committee),
             epoch_diff: epoch_diff.output,
             epoch_diff_proof: epoch_diff.proof,
             committee: committee_output,
             committee_proof,
-            acc_depth: self.config.chain.acc_tree_depth,
+            acc_depth: self.engine.config.chain.acc_tree_depth,
         };
 
-        if let Some(publish) = &self.publish {
+        if let Some(publish) = self.engine.report.publisher() {
             publish.epoch_opened(
                 target_epoch,
                 &target_root,
                 previous.target_epoch(),
                 state.total_active_balance,
-                serde_json::to_value(self.acc_status())?,
+                serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
             );
         }
         info!(
@@ -1639,7 +1645,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             committees,
             stream,
             next_slot: target_epoch * spe,
-            scan_end: (target_epoch + self.config.attestation_lookahead_epochs) * spe,
+            scan_end: (target_epoch + self.engine.config.attestation_lookahead_epochs) * spe,
             // The epoch's earlier slots were gossiped before the daemon reached
             // it, so it starts by repairing them out of blocks.
             gap: true,
@@ -1676,27 +1682,38 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     ) -> Result<GroupProof> {
         let started = Instant::now();
         let target_epoch = aggregator.context.target_epoch;
-        self.begin(Stage::Group, target_epoch, None, Some(range.start));
+        self.engine
+            .report
+            .begin(Stage::Group, target_epoch, None, Some(range.start));
         let units: Vec<&SlotComplement> = aggregator.units[range.clone()].iter().collect();
         let slots: Vec<u64> = units.iter().map(|u| u.slot).collect();
         if let Some(&last) = slots.last() {
-            self.observe_start_delay(Stage::Group, target_epoch, last);
+            self.engine.chain.observe_start_delay(
+                &self.engine.config,
+                Stage::Group,
+                target_epoch,
+                last,
+            );
         }
 
         let witness = streaming::group_witness(
             &aggregator.context,
-            &self.snapshot.tree,
+            &self.engine.snapshot.tree,
             &aggregator.committees,
             &units,
         );
         let (output, miller, proof) = self
+            .engine
             .prover
             .prove_group(&witness)
             .with_context(|| format!("group proof over slots {slots:?}"))?;
 
         let name = format!("group_{}", range.start);
-        let artifact = self.sink.write_witness(target_epoch, &name, &witness)?;
-        write_proof(&self.sink, target_epoch, &name, &proof)?;
+        let artifact = self
+            .engine
+            .sink
+            .write_witness(target_epoch, &name, &witness)?;
+        write_proof(&self.engine.sink, target_epoch, &name, &proof)?;
 
         info!(
             slots = ?slots,
@@ -1704,12 +1721,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             millis = started.elapsed().as_millis() as u64,
             "group proof",
         );
-        self.record(
+        self.engine.report.record(
             StageTiming::new(
                 Stage::Group,
                 target_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .at_index(range.start)
@@ -1734,9 +1751,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         let started = Instant::now();
         let target_epoch = aggregator.context.target_epoch;
         if let Some(last) = aggregator.units.last() {
-            self.observe_start_delay(Stage::Aggregate, target_epoch, last.slot);
+            self.engine.chain.observe_start_delay(
+                &self.engine.config,
+                Stage::Aggregate,
+                target_epoch,
+                last.slot,
+            );
         }
-        self.begin(
+        self.engine.report.begin(
             Stage::Aggregate,
             target_epoch,
             None,
@@ -1752,11 +1774,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             vec![group.proof],
             vec![group.miller],
         );
-        let (output, proof) = self.prover.prove_aggregate(&witness)?;
+        let (output, proof) = self.engine.prover.prove_aggregate(&witness)?;
 
         let name = format!("aggregate_{}", aggregator.folded_groups);
-        let artifact = self.sink.write_witness(target_epoch, &name, &witness)?;
-        write_proof(&self.sink, target_epoch, &name, &proof)?;
+        let artifact = self
+            .engine
+            .sink
+            .write_witness(target_epoch, &name, &witness)?;
+        write_proof(&self.engine.sink, target_epoch, &name, &proof)?;
 
         aggregator.aggregate_miller = fp12_mul(&aggregator.aggregate_miller, &group.miller);
         aggregator.attesting_balance = output.attesting_balance;
@@ -1775,12 +1800,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             millis = started.elapsed().as_millis() as u64,
             "aggregate",
         );
-        self.record(
+        self.engine.report.record(
             StageTiming::new(
                 Stage::Aggregate,
                 target_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .at_index(aggregator.folded_groups - 1)
@@ -1814,7 +1839,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             None => (Vec::new(), Vec::new(), Vec::new()),
         };
         let late_groups = groups.len();
-        if let Some(publish) = &self.publish {
+        if let Some(publish) = self.engine.report.publisher() {
             publish.threshold_fired(
                 target_epoch,
                 fired_unix_millis,
@@ -1829,7 +1854,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
         let witness = streaming::final_witness(
             &aggregator.context,
-            &self.snapshot.tree,
+            &self.engine.snapshot.tree,
             &aggregator.committees,
             aggregator.aggregate.clone(),
             aggregator.aggregate_proof.clone(),
@@ -1843,7 +1868,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             aggregator.boundary.clone(),
         );
 
-        let (output, proof) = self.prover.prove_stream_final(&witness)?;
+        let (output, proof) = self.engine.prover.prove_stream_final(&witness)?;
         let proof_unix_millis = now_unix_millis();
 
         // Everything from here is after `T2`, so none of it can inflate the
@@ -1853,14 +1878,15 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         crate::verify::timed(
             Stage::StreamFinal,
             &proof,
-            &self.prover.program_vk(Stage::StreamFinal),
+            &self.engine.prover.program_vk(Stage::StreamFinal),
             &output.public_bytes(),
         );
 
         let artifact = self
+            .engine
             .sink
             .write_witness(target_epoch, "stream_final", &witness)?;
-        write_proof(&self.sink, target_epoch, "stream_final", &proof)?;
+        write_proof(&self.engine.sink, target_epoch, "stream_final", &proof)?;
 
         info!(
             justified_epoch = output.justified_epoch,
@@ -1872,14 +1898,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // The witnesses exist to debug the epoch that produced them. Once its
         // proof is out, the proof is the artifact, and an unbounded output
         // directory ends a long run whenever the disk happens to fill.
-        let (epochs, bytes) = self.sink.prune_old_epochs();
+        let (epochs, bytes) = self.engine.sink.prune_old_epochs();
         crate::metrics::observe_output(epochs, bytes);
-        self.record(
+        self.engine.report.record(
             StageTiming::new(
                 Stage::StreamFinal,
                 target_epoch,
                 started,
-                self.prover.last_cost(),
+                self.engine.prover.last_cost(),
                 artifact,
             )
             .with_proof(&proof),
@@ -1889,12 +1915,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // at all, so the root is re-resolved before anything is published. This
         // is after `T2` by construction — the proof exists — so it costs
         // publication latency and never a stale publication.
-        if self.checkpoint_root(target_epoch).await? != aggregator.context.target_root {
+        if self
+            .engine
+            .chain
+            .checkpoint_root(&self.engine.api, &self.engine.config, target_epoch)
+            .await?
+            != aggregator.context.target_root
+        {
             warn!(
                 target_epoch,
                 "the checkpoint reorged out while the final proof ran; discarding it",
             );
-            if let Some(publish) = &self.publish {
+            if let Some(publish) = self.engine.report.publisher() {
                 publish.epoch_abandoned(target_epoch, "the checkpoint reorged out");
             }
             crate::metrics::epoch_abandoned("reorg");
@@ -1926,24 +1958,16 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 late_groups = latency.late_groups,
                 "measured T2 - T",
             );
-            crate::metrics::observe_proof_start(
-                Stage::StreamFinal,
-                latency.wait_millis as f64 / 1000.0,
-            );
-            crate::metrics::observe_latency(&latency);
-            if self.latencies.len() == RECENT_LATENCIES {
-                self.latencies.pop_front();
-            }
-            self.latencies.push_back(latency);
+            self.engine.report.record_latency(latency);
         }
 
         let finalized = Checkpoint {
             epoch: output.finalized_epoch,
             root: output.finalized_root,
         };
-        let cost = self.take_cost(target_epoch);
-        if let Some(publish) = &self.publish {
-            let vk = self.prover.program_vk(Stage::StreamFinal);
+        let cost = self.engine.report.take_cost(target_epoch);
+        if let Some(publish) = self.engine.report.publisher() {
+            let vk = self.engine.prover.program_vk(Stage::StreamFinal);
             let publics = output.public_bytes();
             let reference = publish::proof_ref(
                 target_epoch,
@@ -1951,13 +1975,16 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 &proof,
                 &vk,
                 &publics,
-                self.prover.program_digest(Stage::StreamFinal).as_deref(),
+                self.engine
+                    .prover
+                    .program_digest(Stage::StreamFinal)
+                    .as_deref(),
             );
             let inputs = publish::stream_final_public_inputs(&output);
             let latency = self
-                .latencies
-                .back()
-                .filter(|l| l.epoch == target_epoch)
+                .engine
+                .report
+                .latency(target_epoch)
                 .map(serde_json::to_value)
                 .transpose()?;
             publish.proof_bytes(target_epoch, Stage::StreamFinal, &proof, &vk, &publics);
@@ -1977,7 +2004,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     "root": crate::artifacts::hex0x(&output.justified_root),
                 }),
                 finalized: serde_json::to_value(CheckpointStatus::from(&finalized))?,
-                accumulator: serde_json::to_value(self.acc_status())?,
+                accumulator: serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
                 latency,
                 proof: reference,
                 public_inputs: inputs,
@@ -1985,174 +2012,22 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         }
         crate::metrics::epoch_justified();
         crate::metrics::epoch_finalized();
-        self.snapshot.state.justified_through = Some(target_epoch);
-        self.snapshot.state.attempted_epoch = Some(target_epoch);
-        self.snapshot.state.last_stream_final = Some(StreamFinalRecord { output, proof });
-        self.snapshot.state.finalized = Some(finalized.clone());
+        self.engine.snapshot.state.justified_through = Some(target_epoch);
+        self.engine.snapshot.state.attempted_epoch = Some(target_epoch);
+        self.engine.snapshot.state.last_stream_final = Some(StreamFinalRecord { output, proof });
+        self.engine.snapshot.state.finalized = Some(finalized.clone());
         self.streaming = None;
-        self.store.save(&self.snapshot)?;
+        self.engine.store.save(&self.engine.snapshot)?;
 
         tick.justified = Some(target_epoch);
         tick.finalized = Some(finalized);
         Ok(())
     }
+}
 
-    // -----------------------------------------------------------------
-    // Chain queries
-    // -----------------------------------------------------------------
-
-    /// Block root of the checkpoint for `epoch`.
-    ///
-    /// The checkpoint root is the block at the epoch's first slot, or — when
-    /// that slot was skipped — the most recent block before it.
-    async fn checkpoint_root(&self, epoch: u64) -> Result<[u8; 32]> {
-        let spe = self.config.chain.slots_per_epoch;
-        let first = epoch * spe;
-        let floor = first.saturating_sub(spe);
-        for slot in (floor..=first).rev() {
-            if let Some(root) = self
-                .api
-                .get_block_root(&slot.to_string())
-                .await
-                .with_context(|| format!("fetch block root at slot {slot}"))?
-            {
-                return Ok(root);
-            }
-        }
-        bail!("no block found in the epoch before slot {first}; cannot resolve the checkpoint root")
-    }
-
-    /// Domain attestations for `epoch` were signed under.
-    async fn signing_domain(&mut self, epoch: u64) -> Result<[u8; 32]> {
-        if let Some(domain) = self.config.signing_domain {
-            return Ok(domain);
-        }
-        let state_id = (epoch * self.config.chain.slots_per_epoch).to_string();
-        let genesis_validators_root = match self.genesis_validators_root {
-            Some(root) => root,
-            None => {
-                let root = self
-                    .api
-                    .get_genesis_validators_root()
-                    .await
-                    .context("fetch genesis validators root")?;
-                self.genesis_validators_root = Some(root);
-                root
-            }
-        };
-        // A checkpoint-synced node keeps only the states after its anchor, so the
-        // first slot of an epoch it is still working through can be a 404 — which
-        // would wedge the daemon on that epoch for as long as it ran. The fork
-        // version is a property of the fork schedule rather than of the state, so
-        // head answers for any epoch in the same fork period, which every epoch a
-        // following daemon works on is. Pass `--signing-domain` to pin it across a
-        // fork boundary.
-        let fork_version = match self.api.get_fork_version(&state_id).await {
-            Ok(version) => version,
-            Err(e) => {
-                warn!(
-                    epoch,
-                    state_id,
-                    error = %e,
-                    "no state to read the fork version from; taking head's",
-                );
-                self.api
-                    .get_fork_version("head")
-                    .await
-                    .context("fetch fork version at head")?
-            }
-        };
-        Ok(compute_domain(
-            &DOMAIN_BEACON_ATTESTER,
-            &fork_version,
-            &genesis_validators_root,
-        ))
-    }
-
-    // -----------------------------------------------------------------
-    // The schedule, against the clock
-    // -----------------------------------------------------------------
-
-    /// Unix millis at which `slot` began.
-    ///
-    /// `None` until the node has answered once. Every caller treats that as
-    /// "no expectation to compare against" rather than an error: a missing
-    /// metric is better than a wrong one, and nothing in the pipeline depends
-    /// on this.
-    fn slot_unix_millis(&self, slot: u64) -> Option<u64> {
-        let seconds_per_slot = self.config.stream_policy.seconds_per_slot;
-        self.genesis_time
-            .map(|genesis| genesis * 1000 + (slot as f64 * seconds_per_slot * 1000.0) as u64)
-    }
-
-    /// Record how far a proof's start slipped from where the schedule put it.
-    ///
-    /// The schedule prices a proof over slots ending at `last_slot` as startable
-    /// the moment that slot's attestations are in, which
-    /// [`streaming::schedule`] expresses as seconds from the epoch's first
-    /// attesting slot. Both sides are converted to that origin here, so what is
-    /// recorded is the same quantity the model plans against.
-    ///
-    /// Negative is early, and is kept: a proof that beat its slot is as much a
-    /// fact about the schedule as one that missed it.
-    fn observe_start_delay(&self, stage: Stage, target_epoch: u64, last_slot: u64) {
-        let spe = self.config.chain.slots_per_epoch;
-        let (Some(epoch_start), Some(expected)) = (
-            self.slot_unix_millis(target_epoch * spe),
-            self.slot_unix_millis(last_slot),
-        ) else {
-            return;
-        };
-        let elapsed = now_unix_millis().saturating_sub(epoch_start) as f64;
-        let expected = expected.saturating_sub(epoch_start) as f64;
-
-        // Only an epoch the daemon is following live has an expectation worth
-        // measuring. Proving one that ended an hour ago is a catch-up, and
-        // recording its age as a delay would swamp the distribution with the
-        // one case where being late was the point.
-        let epoch_millis =
-            spe as f64 * self.config.stream_policy.seconds_per_slot * 1000.0 * LIVE_EPOCHS;
-        if elapsed > epoch_millis {
-            return;
-        }
-        crate::metrics::observe_proof_start(stage, (elapsed - expected) / 1000.0);
-    }
-
-    // -----------------------------------------------------------------
-    // Manifest
-    // -----------------------------------------------------------------
-
-    fn record(&mut self, timing: StageTiming) {
-        crate::metrics::observe_stage(&timing, self.config.prover_usd_per_hour);
-        if let Some(publish) = &self.publish {
-            publish.stage_finished(&timing);
-        }
-        self.costs.entry(timing.epoch).or_default().absorb(&timing);
-        if self.recent.len() == RECENT_STAGES {
-            self.recent.pop_front();
-        }
-        self.recent.push_back(timing);
-    }
-
-    /// What `epoch` has cost the prover so far, and forget everything older.
-    ///
-    /// Called once, as the epoch closes: an epoch that is finished can still be
-    /// followed by a stage of a later one, but never by another of its own.
-    fn take_cost(&mut self, epoch: u64) -> EpochCost {
-        let cost = self.costs.remove(&epoch).unwrap_or_default();
-        self.costs.retain(|&e, _| e > epoch);
-        crate::metrics::observe_epoch_cost(&cost, self.config.prover_usd_per_hour);
-        cost
-    }
-
-    /// Announce a stage before it runs, so a consumer can show it in flight
-    /// rather than only once it has landed.
-    fn begin(&self, stage: Stage, epoch: u64, slot: Option<u64>, index: Option<usize>) {
-        if let Some(publish) = &self.publish {
-            publish.stage_started(stage, epoch, slot, index);
-        }
-    }
-
+/// Present the accumulator's cached SSZ view, for callers that want to inspect
+/// what the next epoch diff will build on.
+impl<A> Orchestrator<A> {
     /// The epoch in flight, as the manifest reports it.
     fn current_epoch(&self) -> Option<CurrentEpoch> {
         let aggregator = self.streaming.as_ref()?;
@@ -2168,156 +2043,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             attesting_balance: aggregator.attesting_balance,
             total_active_balance: total,
             attesting_pct: percent_of(aggregator.attesting_balance, total),
-            threshold_pct: self.config.stream_policy.threshold_pct(),
+            threshold_pct: self.engine.config.stream_policy.threshold_pct(),
             folded_groups: aggregator.folded_groups,
             slots_held: aggregator.units.len(),
             finalizes_epoch: aggregator.previous.target_epoch(),
         })
     }
 
-    fn acc_status(&self) -> AccStatus {
-        let state = &self.snapshot.state;
-        AccStatus {
-            epoch: state.cursor_epoch,
-            root: hex_digest(&state.acc_root),
-            commitment: hex_digest(&state.acc_commitment),
-            chain_digest: hex_digest(&state.acc_chain_digest),
-            total_active_balance: state.total_active_balance,
-            num_validators: state.num_validators,
-        }
-    }
-
-    pub fn publish_status(&self) -> Result<()> {
-        self.drain_postings();
-        crate::metrics::observe_state(
-            &self.snapshot.state,
-            self.head_slot,
-            self.node_finalized.as_ref().map(|c| c.epoch),
-        );
-        if let Some(source) = &self.gossip {
-            crate::metrics::observe_gossip(source.counters());
-        }
-        if let Some(publish) = &self.publish {
-            crate::metrics::observe_publish(publish.counters());
-        }
-        let status = self.status();
-        if let Some(publish) = &self.publish {
-            publish.status(&status);
-        }
-        self.sink.write_status(&status)
-    }
-
-    /// Announce postings the submitter has written since the last look.
-    ///
-    /// The submitter is a separate process, so this is the daemon noticing
-    /// rather than the daemon doing. A posting that never arrives means nothing
-    /// posted it; it never means the proof was not made.
-    fn drain_postings(&self) {
-        let Some(log) = &self.postings else {
-            return;
-        };
-        for posting in log.refresh() {
-            info!(
-                chain = %posting.chain,
-                epoch = posting.epoch,
-                signature = %posting.signature,
-                compute_units = posting.compute_units,
-                lamports = posting.lamports_spent,
-                "a finalization proof was verified on another chain",
-            );
-            if let Some(publish) = &self.publish {
-                publish.posting_landed(&posting);
-            }
-        }
-    }
-
-    /// The manifest, as of now.
-    pub fn status(&self) -> Status {
-        let state = &self.snapshot.state;
-        Status {
-            version: 1,
-            chain: state.chain.clone(),
-            genesis_validators_root: self
-                .genesis_validators_root
-                .as_ref()
-                .map(|root| hex0x(root)),
-            prover_usd_per_hour: self.config.prover_usd_per_hour,
-            prover_health: self.prover.health(),
-            prover: self.prover.name().to_string(),
-            updated_unix: now_unix(),
-            head_slot: self.head_slot,
-            bootstrap_epoch: state.bootstrap_epoch,
-            accumulator: self.acc_status(),
-            justified_through: state.justified_through,
-            last_justified: state
-                .last_justification
-                .as_ref()
-                .map(|r| justified_checkpoint(&r.output)),
-            last_finalized: state.finalized.as_ref().map(CheckpointStatus::from),
-            node_finalized: self.node_finalized.as_ref().map(CheckpointStatus::from),
-            recent_stages: self.recent.iter().cloned().collect(),
-            recent_latencies: self.latencies.iter().cloned().collect(),
-            current_epoch: self.current_epoch(),
-            gossip: self.gossip.as_ref().map(|source| {
-                let counters = source.counters();
-                GossipStatus {
-                    attestations: counters.attestations,
-                    reconnects: counters.reconnects,
-                    dropped: counters.dropped,
-                }
-            }),
-            publish: self.publish.as_ref().map(|publish| {
-                let counters = publish.counters();
-                PublishStatus {
-                    posted: counters.posted,
-                    spooled: counters.spooled,
-                    dropped: counters.dropped,
-                    pending: counters.pending,
-                }
-            }),
-            postings: self
-                .postings
-                .as_ref()
-                .map(PostingLog::recent)
-                .unwrap_or_default(),
-        }
-    }
-}
-
-fn justified_checkpoint(output: &JustificationOutput) -> CheckpointStatus {
-    CheckpointStatus {
-        epoch: output.target_epoch,
-        root: crate::artifacts::hex0x(&output.target_root),
-    }
-}
-
-/// Persist a proof next to the witness it proves.
-///
-/// A witness-only run produces no proof words, so this writes nothing until a
-/// real prover is wired into [`Prover`].
-fn write_proof(sink: &ArtifactSink, epoch: u64, name: &str, proof: &Proof) -> Result<()> {
-    if proof.is_empty() {
-        return Ok(());
-    }
-    sink.write_witness(epoch, &format!("{name}_proof"), proof)
-        .map(|_: ArtifactRef| ())
-}
-
-fn percent_of(part: u64, whole: u64) -> f64 {
-    if whole == 0 {
-        return 0.0;
-    }
-    part as f64 * 100.0 / whole as f64
-}
-
-/// Present the accumulator's cached SSZ view, for callers that want to inspect
-/// what the next epoch diff will build on.
-impl<A> Orchestrator<A> {
     pub fn epoch_state(&self) -> &EpochState {
-        &self.snapshot.epoch_state
+        &self.engine.snapshot.epoch_state
     }
 
     pub fn api(&self) -> &A {
-        &self.api
+        &self.engine.api
     }
 }
