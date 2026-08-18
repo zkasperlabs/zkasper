@@ -1,6 +1,6 @@
 //! zkasperd — the continuous witness generator.
 //!
-//! Bootstraps an accumulator from a recent finalized state, then follows the
+//! Starts an accumulator from a trusted init point, then follows the
 //! chain: one epoch diff per epoch, slot proofs as attestations arrive, a
 //! justification the moment 2/3 is crossed, and a finalization when two
 //! consecutive epochs justify.
@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::BeaconApiClient;
+use zkasper_witness_gen::init_point::InitPoint;
 use zkasper_witness_gen::network;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
 use zkasper_witness_gen::prover::{NativeProver, Prover};
@@ -101,10 +102,15 @@ struct Cli {
     #[arg(long, default_value = "mainnet")]
     chain: Chain,
 
-    /// Slot to bootstrap from. Defaults to the node's finalized checkpoint.
-    /// Ignored when the state file already exists.
+    /// Init point JSON: where the accumulator chain starts. Take one with
+    /// `zkasper-init-point`. Required for a fresh run, ignored when the state
+    /// file already exists.
+    ///
+    /// The daemon walks the registry it names and refuses to start unless the
+    /// accumulator it builds is the one the file claims. See
+    /// `zkasper_witness_gen::init_point` for what this does and does not trust.
     #[arg(long)]
-    bootstrap_slot: Option<u64>,
+    init_point: Option<PathBuf>,
 
     /// Attestation signing domain (hex). Derived from the node's fork and
     /// genesis when not given.
@@ -383,6 +389,10 @@ async fn main() -> Result<()> {
         Mode::Batch => Pipeline::Batch,
         Mode::Streaming => Pipeline::Streaming,
     };
+    // Read and checked before anything else happens, because an init point whose
+    // commitment does not bind its own root and balance names an accumulator
+    // nobody holds, and finding that out after a registry walk helps no one.
+    let init_point = cli.init_point.as_deref().map(InitPoint::read).transpose()?;
     // Before the first beacon call, so that a daemon which cannot reach its node
     // is still a scrape target saying so rather than a silent absence.
     if !cli.no_metrics {
@@ -410,7 +420,7 @@ async fn main() -> Result<()> {
     let config = OrchestratorConfig {
         db_path: cli.db_path.clone(),
         output_dir: cli.output_dir.clone(),
-        bootstrap_slot: cli.bootstrap_slot,
+        init_point,
         signing_domain: cli
             .signing_domain
             .as_deref()
@@ -437,7 +447,7 @@ async fn main() -> Result<()> {
     };
 
     // Built before the first beacon call, so a missing ELF or proving key fails
-    // now rather than after a bootstrap has already been paid for.
+    // now rather than after the registry walk has already been paid for.
     let prover = cli.build_prover(cli.chain.config(), pipeline)?;
 
     info!(

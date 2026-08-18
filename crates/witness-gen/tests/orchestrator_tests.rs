@@ -1,6 +1,6 @@
 //! Continuous mode against a mock beacon node.
 //!
-//! Drives four epochs through the whole pipeline — bootstrap, epoch diff,
+//! Drives four epochs through the whole pipeline — init point, epoch diff,
 //! committee, slot proofs, justification, finalization — with real BLS
 //! signatures, then kills the daemon in the middle of an epoch and checks that
 //! a fresh one picks up exactly where it stopped.
@@ -59,8 +59,30 @@ fn config(dir: &Path) -> OrchestratorConfig {
     }
 }
 
+/// The config, with an init point taken from the node the daemon will follow.
+///
+/// Taken rather than written by hand on purpose: the generator and the daemon
+/// have to agree about what the accumulator at an epoch is, and a hard-coded
+/// tuple would keep passing on the day they stopped agreeing.
+async fn config_from(dir: &Path, mock: &MockBeaconApi) -> OrchestratorConfig {
+    OrchestratorConfig {
+        init_point: Some(
+            zkasper_witness_gen::init_point::generate(
+                mock,
+                &TEST_CONFIG,
+                "test",
+                FIRST_EPOCH * SPE,
+            )
+            .await
+            .expect("the node serves the epoch the run starts on"),
+        ),
+        ..config(dir)
+    }
+}
+
 async fn open(dir: &Path, mock: MockBeaconApi) -> Orchestrator<MockBeaconApi> {
-    Orchestrator::open(mock, config(dir), Box::new(NativeProver::new(TEST_CONFIG)))
+    let config = config_from(dir, &mock).await;
+    Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
         .await
         .expect("orchestrator opens")
 }
@@ -77,8 +99,8 @@ async fn test_follows_four_epochs_end_to_end() {
     let mut daemon = open(dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
     let ticks = daemon.catch_up().await.unwrap();
 
-    // Bootstrapped at the node's finalized checkpoint, then walked to the head.
-    assert_eq!(daemon.state().bootstrap_epoch, FIRST_EPOCH);
+    // Started at the init point's epoch, then walked to the head.
+    assert_eq!(daemon.state().init_epoch, FIRST_EPOCH);
     assert_eq!(daemon.state().cursor_epoch, LAST_EPOCH);
     assert_eq!(daemon.state().justified_through, Some(LAST_EPOCH));
 
@@ -131,9 +153,11 @@ async fn test_follows_four_epochs_end_to_end() {
         );
     }
 
-    // Artifacts.
+    // Artifacts. The epoch the run starts on has no witness of its own: it is
+    // configured, checked against the registry and never proved, so the first
+    // thing written for it is a stage that proves something.
     let out = dir.path().join("out");
-    assert!(out
+    assert!(!out
         .join(format!("epoch-{FIRST_EPOCH:09}"))
         .join("bootstrap.bin")
         .exists());
@@ -189,17 +213,14 @@ async fn test_streams_an_epoch_and_measures_its_latency() {
     let dir = tempfile::tempdir().unwrap();
     let chain = chain();
 
+    let mock = chain.mock((FIRST_EPOCH + 1) * SPE);
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
-        ..config(dir.path())
+        ..config_from(dir.path(), &mock).await
     };
-    let mut daemon = Orchestrator::open(
-        chain.mock((FIRST_EPOCH + 1) * SPE),
-        config,
-        Box::new(NativeProver::new(TEST_CONFIG)),
-    )
-    .await
-    .expect("orchestrator opens");
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens");
 
     // Epoch 10 justified the batch way, and the accumulator moved to 11.
     daemon.catch_up().await.unwrap();
@@ -266,19 +287,16 @@ async fn test_streams_an_epoch_from_gossip_without_reading_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let chain = chain();
 
+    let mock = chain.mock((FIRST_EPOCH + 1) * SPE);
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
-        ..config(dir.path())
+        ..config_from(dir.path(), &mock).await
     };
     let gossip = FakeGossip::default();
-    let mut daemon = Orchestrator::open(
-        chain.mock((FIRST_EPOCH + 1) * SPE),
-        config,
-        Box::new(NativeProver::new(TEST_CONFIG)),
-    )
-    .await
-    .expect("orchestrator opens")
-    .with_gossip(Box::new(gossip.clone()));
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens")
+        .with_gossip(Box::new(gossip.clone()));
     daemon.catch_up().await.unwrap();
 
     let stream_epoch = FIRST_EPOCH + 1;
@@ -325,17 +343,14 @@ async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
     let dir = tempfile::tempdir().unwrap();
     let chain = chain();
 
+    let mock = chain.mock((FIRST_EPOCH + 1) * SPE);
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
-        ..config(dir.path())
+        ..config_from(dir.path(), &mock).await
     };
-    let mut daemon = Orchestrator::open(
-        chain.mock((FIRST_EPOCH + 1) * SPE),
-        config,
-        Box::new(NativeProver::new(TEST_CONFIG)),
-    )
-    .await
-    .expect("orchestrator opens");
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens");
     daemon.catch_up().await.unwrap();
 
     let stream_epoch = FIRST_EPOCH + 1;
@@ -370,10 +385,14 @@ async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
 /// A checkpoint-synced node serves states from its finalized split forward and
 /// the split moves every epoch, so an accumulator that has fallen behind asks
 /// for a state that is gone. Restarting cannot bring it back — the window only
-/// moves further away — and the daemon used to exit, which is a crashloop.
-/// It bootstraps forward instead.
+/// moves further away.
+///
+/// The daemon used to start again from a fresh bootstrap here, which kept it
+/// alive at the cost of silently breaking the accumulator chain at the epoch it
+/// restarted on. It now stops and names the remedy, because a break a consumer
+/// cannot see is worse than an outage an operator can.
 #[tokio::test]
-async fn test_bootstraps_forward_when_the_node_has_thrown_the_state_away() {
+async fn test_stops_when_the_node_has_thrown_the_state_away() {
     let dir = tempfile::tempdir().unwrap();
     let chain = chain();
 
@@ -388,27 +407,26 @@ async fn test_bootstraps_forward_when_the_node_has_thrown_the_state_away() {
     // reports as finalized, as a node always does.
     let mut mock = chain.mock(LAST_EPOCH * SPE + 3);
     mock.unservable_states.insert((FIRST_EPOCH + 1) * SPE);
-    let mut daemon = Orchestrator::open(
-        mock,
-        config(dir.path()),
-        Box::new(NativeProver::new(TEST_CONFIG)),
-    )
-    .await
-    .unwrap();
+    let config = config_from(dir.path(), &mock).await;
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .unwrap();
 
-    // The tick reports progress rather than dying, and the accumulator restarts
-    // on an epoch the node can still serve.
-    let tick = daemon
+    let error = daemon
         .tick()
         .await
-        .expect("a pruned state is not a fatal error");
-    assert_eq!(tick.advanced_to, Some(FIRST_EPOCH));
-    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH);
-    assert_eq!(
-        daemon.state().bootstrap_epoch,
-        FIRST_EPOCH,
-        "it bootstrapped again rather than resuming a chain it cannot extend",
+        .err()
+        .expect("a pruned state has to stop the run, not be worked around");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("no longer serves the state") && error.contains("init point"),
+        "the operator has to be told what to do about it, got: {error}",
     );
+
+    // And nothing moved: the accumulator is where it was, on a chain that is
+    // still unbroken.
+    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
+    assert_eq!(daemon.state().init_epoch, FIRST_EPOCH);
 }
 
 #[tokio::test]
@@ -510,6 +528,8 @@ async fn test_damaged_store_is_rejected_rather_than_resumed() {
     .await
     .err()
     .expect("daemon must not start on a damaged store");
+    // No init point is offered, which is also the point: a damaged store is a
+    // damaged store, not an invitation to start a new chain over the top of it.
     assert!(format!("{error:#}").contains("damaged"));
 }
 
@@ -536,7 +556,7 @@ async fn test_truncated_store_is_rejected() {
 fn test_accumulator_cannot_skip_or_repeat_an_epoch() {
     let root = [7u64; 4];
     let balance = 4 * BALANCE_GWEI;
-    let mut state = StoreState::bootstrapped("test".into(), 100, root, balance, 4);
+    let mut state = StoreState::started("test".into(), 100, root, balance, 4);
     let commitment = zkasper_common::acc::commitment(&root, balance);
 
     assert!(state

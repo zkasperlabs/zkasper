@@ -270,7 +270,7 @@ pub fn observe_proof_start(stage: Stage, delay_s: f64) {
 pub fn observe_state(state: &StoreState, head_slot: u64, node_finalized: Option<u64>) {
     gauge!("zkasper_manifest_updated_timestamp_seconds").set(unix_seconds());
     gauge!("zkasper_accumulator_epoch").set(state.cursor_epoch as f64);
-    gauge!("zkasper_bootstrap_epoch").set(state.bootstrap_epoch as f64);
+    gauge!("zkasper_init_epoch").set(state.init_epoch as f64);
     gauge!("zkasper_head_slot").set(head_slot as f64);
     gauge!("zkasper_validators").set(state.num_validators as f64);
     gauge!("zkasper_total_active_balance_gwei").set(state.total_active_balance as f64);
@@ -408,8 +408,8 @@ fn describe() {
         "Epoch the accumulator represents."
     );
     describe_gauge!(
-        "zkasper_bootstrap_epoch",
-        "Epoch the accumulator was bootstrapped at."
+        "zkasper_init_epoch",
+        "Epoch the accumulator chain started at, from its init point."
     );
     describe_gauge!(
         "zkasper_head_slot",

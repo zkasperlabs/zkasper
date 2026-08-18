@@ -159,7 +159,7 @@ pub struct AccStatus {
     pub epoch: u64,
     pub root: String,
     pub commitment: String,
-    /// Running hash over every accumulator root since bootstrap.
+    /// Running hash over every accumulator root since the init point.
     pub chain_digest: String,
     /// A string, not a number: mainnet's total active balance in gwei passed
     /// 2^53 long ago, and a JSON reader that parses it as a double silently
@@ -236,7 +236,9 @@ pub struct Status {
     pub updated_unix: u64,
     /// Head slot as last reported by the beacon node.
     pub head_slot: u64,
-    pub bootstrap_epoch: u64,
+    /// Epoch the accumulator chain started at. A consumer that sees this move
+    /// is looking at a chain that broke and was restarted from a new init point.
+    pub init_epoch: u64,
     pub accumulator: AccStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub justified_through: Option<u64>,

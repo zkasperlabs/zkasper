@@ -69,10 +69,11 @@ const EXPECTED: &[&str] = &[
     "zkasper_output_bytes",
 ];
 
-/// Stages that must have been measured by their span. `bootstrap` and
-/// `epoch_diff` come from the batch path, the rest from streaming one epoch.
+/// Stages that must have been measured by their span. `epoch_diff` comes from
+/// the batch path, the rest from streaming one epoch. There is no init stage:
+/// the run starts from a checked tuple rather than a proof, so nothing is timed
+/// before the first diff.
 const EXPECTED_STAGES: &[&str] = &[
-    "bootstrap",
     "epoch_diff",
     "committee",
     "justification",
@@ -155,13 +156,7 @@ async fn metrics_expose_a_streamed_epoch() {
 
     // The witness spans are a separate family, so a stage whose witness build
     // is slow can be told from one whose prover is.
-    for stage in [
-        "bootstrap",
-        "epoch_diff",
-        "group",
-        "aggregate",
-        "stream_final",
-    ] {
+    for stage in ["epoch_diff", "group", "aggregate", "stream_final"] {
         assert!(
             rendered.contains(&format!(
                 "zkasper_witness_duration_seconds_count{{stage=\"{stage}\"}}"
@@ -194,6 +189,14 @@ async fn metrics_expose_a_streamed_epoch() {
 }
 
 async fn open(dir: &std::path::Path, mock: MockBeaconApi) -> Orchestrator<MockBeaconApi> {
+    let init_point = zkasper_witness_gen::init_point::generate(
+        &mock,
+        &TEST_CONFIG,
+        "test",
+        FIRST_EPOCH * TEST_CONFIG.slots_per_epoch,
+    )
+    .await
+    .expect("the node serves the epoch the run starts on");
     Orchestrator::open(
         mock,
         OrchestratorConfig {
@@ -202,6 +205,7 @@ async fn open(dir: &std::path::Path, mock: MockBeaconApi) -> Orchestrator<MockBe
             poll_interval: Duration::ZERO,
             pipeline: Pipeline::Streaming,
             prover_usd_per_hour: Some(RATE_USD_PER_HOUR),
+            init_point: Some(init_point),
             ..OrchestratorConfig::new(TEST_CONFIG, "test")
         },
         Box::new(NativeProver::new(TEST_CONFIG)),

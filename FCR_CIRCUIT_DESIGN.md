@@ -24,7 +24,7 @@ instead of waiting for full finality.
 
 ## What can be reused from zkasper
 
-- **Entire accumulator infrastructure**: bootstrap, epoch-diff, Poseidon tree — unchanged
+- **Entire accumulator infrastructure**: init point, epoch-diff, Poseidon tree — unchanged
 - **BLS aggregate signature verification**: identical
 - **Poseidon multi-proof**: same leaf format and multi-proof verification
 - **Cross-slot dedup**: `counted_validators_commitment` pattern
@@ -41,7 +41,7 @@ instead of waiting for full finality.
 
 ```
                   ┌─────────────────┐
-                  │   bootstrap     │  (existing, unchanged)
+                  │   init point    │  (existing, unchanged)
                   │   epoch-diff    │
                   └────────┬────────┘
                            │ accumulator_commitment
@@ -337,7 +337,7 @@ For 1-slot confirmation with ~200K attesting validators:
 ```solidity
 contract ZkasperFcrVerifier {
     bytes32 public accumulatorCommitment;
-    // ... (bootstrap + epoch-diff same as existing) ...
+    // ... (init point + epoch-diff same as existing) ...
 
     // NEW: submit FCR confirmation proof
     function submitFcrConfirmation(
