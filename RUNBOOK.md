@@ -104,7 +104,18 @@ zkasperd needs more from a node than a validator does. All three must hold.
 | 1 | `--subscribe-all-subnets` | The `single_attestation` topic only carries subnets the node joined. A default node joins **2 of 64** (`SUBNETS_PER_NODE: 2`), so its feed is 3.1% of gossip. |
 | 2 | `--http-sse-capacity-multiplier` **20000** | Lighthouse buffers each SSE topic in a broadcast ring of `multiplier × 16`. The default multiplier is 1, so **16 messages** against a slot's 28,130. 2000 gives 32,000 — only **1.1 slots** of headroom, so one stalled slot drops attestations. **20000 gives 320,000, about 11 slots, for roughly 128 MB of ring.** Overshoot deliberately: the ring is cheap and a drop is silent and unrecoverable. |
 | 3 | `/eth/v2/debug/beacon/states/{id}` enabled | **Every epoch diff** reads the whole `BeaconState` from it, and so does the boundary anchor a finalization opens. It is a continuous dependency, not a one-off. Startup does not need it: the init point carries its own branch to the `validators` field. |
-| 4 | `--epochs-per-migration` **16** | How far back the node still *has* the states requirement 3 serves. At the default of 1 this node served state only **64 to 95 slots back** (MEASURED 2026-08-18), two or three epochs, and a daemon that spends longer than that on one epoch asks for a state that has been migrated to the freezer and gets a 404. |
+| 4 | `--epochs-per-migration` **16** | How far back the node still *has* the states requirement 3 serves. At the default of 1 this node served state only **64 to 95 slots back** (MEASURED 2026-08-18), two or three epochs, and a daemon that spends longer than that on one epoch asks for a state that has been migrated to the freezer and gets a 404. **It buys less than it looks like it should:** at 16 the same node served **96 to 127 slots**, three or four epochs, not sixteen. It batches the migration; it does not pin the states. |
+
+**A run cannot start while the startup tax is larger than the window.**
+Measured 2026-08-19: the first epoch after an init point costs about 25 minutes
+— the committee proof, the slot proofs, and a justification that recursively
+verifies all 22 of them at **1,224 s** — and this node served state for **96 to
+127 slots, three or four epochs, about 25 minutes**, with the flag below already
+set. The state the first epoch diff needs is gone by the time the daemon asks
+for it, and the daemon says so and exits rather than looping. A fresher init
+point does not close the gap: the newest epoch boundary buys about 19 minutes.
+Fix the batch path or get a node that serves more history; tuning the flag below
+is not enough.
 
 **Requirement 4 is what a real prover makes binding.** A witness-only daemon
 never falls two epochs behind, so the default window is invisible. With proofs,
