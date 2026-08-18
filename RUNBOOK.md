@@ -100,6 +100,20 @@ zkasperd needs more from a node than a validator does. All three must hold.
 | 1 | `--subscribe-all-subnets` | The `single_attestation` topic only carries subnets the node joined. A default node joins **2 of 64** (`SUBNETS_PER_NODE: 2`), so its feed is 3.1% of gossip. |
 | 2 | `--http-sse-capacity-multiplier` **20000** | Lighthouse buffers each SSE topic in a broadcast ring of `multiplier × 16`. The default multiplier is 1, so **16 messages** against a slot's 28,130. 2000 gives 32,000 — only **1.1 slots** of headroom, so one stalled slot drops attestations. **20000 gives 320,000, about 11 slots, for roughly 128 MB of ring.** Overshoot deliberately: the ring is cheap and a drop is silent and unrecoverable. |
 | 3 | `/eth/v2/debug/beacon/states/{id}` enabled | Bootstrap reads the whole `BeaconState` from it, and **so does every epoch diff** — it is a continuous dependency, not a one-off. |
+| 4 | `--epochs-per-migration` **16** | How far back the node still *has* the states requirement 3 serves. At the default of 1 this node served state only **64 to 95 slots back** (MEASURED 2026-08-18), two or three epochs, and a daemon that spends longer than that on one epoch asks for a state that has been migrated to the freezer and gets a 404. |
+
+**Requirement 4 is what a real prover makes binding.** A witness-only daemon
+never falls two epochs behind, so the default window is invisible. With proofs,
+the first epoch after every bootstrap goes through the batch path, and its one
+justification recursively verifies every slot proof of the epoch: **over ten
+minutes** on an RTX 5090 over ~22 of them. That is longer than the default
+window, so the daemon fell behind its own startup, 404ed, and crashlooped — 74
+restarts in an hour on 2026-08-18. Sixteen epochs of hot states is about 1.7
+hours of slack, which absorbs it.
+
+The window only widens for states finalized *after* the node restarts. States
+already migrated stay migrated, so a daemon whose chain depends on one of them
+has to bootstrap forward; it does that by itself.
 
 **Subscribe to `single_attestation`, not `attestation`.** Since Electra,
 Lighthouse emits `EventKind::SingleAttestation` for unaggregated attestations and
