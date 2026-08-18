@@ -428,22 +428,28 @@ They are handled, they log a warning, and they resolve themselves:
   silently and produce no other symptom.
 - `no state to read the fork version from; taking head's`
 
-### A one-line health check
+### The health check
+
+`scripts/health.py` applies every threshold above and prints one line per check.
+It exits 0 when clear, 1 when something needs action and 2 when the manifest
+cannot be read, so it drives an alert directly.
 
 ```sh
-python3 - <<'PY'
-import json, time
-d = json.load(open('/mnt/ssd/zkasper-run/out/status.json'))
-age = int(time.time()) - d['updated_unix']
-g = d.get('gossip') or {}
-late = sum(l['late_groups'] for l in d.get('recent_latencies', []))
-ok = age < 120 and g.get('dropped', 1) == 0 and late == 0
-print(('OK  ' if ok else 'BAD '),
-      f"age={age}s epoch={d['accumulator']['epoch']} "
-      f"justified={d.get('justified_through')} "
-      f"dropped={g.get('dropped')} reconnects={g.get('reconnects')} late={late}")
-PY
+./scripts/health.py /mnt/ssd/zkasper-run/out/status.json
 ```
+
+```
+      updated 0 s ago
+      accumulator epoch 469375
+      justified through 469374
+      gossip 358402 attestations, 0 reconnects, 0 dropped
+      T2-T over 3 epochs: min 1177 median 5007 max 5118 ms
+OK
+```
+
+The counters are monotonic since process start and reset on restart, so a
+climbing `reconnects` only shows up by diffing scrapes. Store what step 10
+appends and read the trend from there.
 
 ---
 
@@ -523,7 +529,8 @@ the epoch redone with no `recent_latencies` entry for it.
 | lighthouse RSS | **5.8 GB** | With `--subscribe-all-subnets` and multiplier 2000. |
 | Node datadir | **947 MB** after 15 minutes | Checkpoint-synced, backfill running. Budget 450+ GB for a month with default `--hierarchy-exponents`. |
 | `zkasperd.db` | **343 MB** | Rewritten whole twice an epoch. |
-| `out/` | **110 MB per epoch** | Witness files. **7.7 GB/day, 232 GB/month.** Prune or ship them. |
+| `out/` | **110–120 MB per epoch** | Witness files, of which `committee.bin` is 113 MB. At 225 epochs a day that is **~26 GB/day, ~780 GB/month** — larger than the beacon database. Prune or ship them; nothing re-reads a closed epoch's directory. |
+| bootstrap epoch dir | **986 MB** | One-off, holds the bootstrap witness. |
 | SSE ingest | 28,033 events/slot | ~1.47 MB/s sustained, 3.8 TB/month if it crosses a network. |
 
 Machine: 8 cores, 32 GB RAM and 1 TB is the floor for daemon + node with a mock
@@ -581,9 +588,24 @@ the same one epoch a daemon restart costs — plus the prover's setup on the
 replacement box, which is the expensive part: **~16 min** for apt, rustup and the
 3.2 GB proving key, plus **~4.6 min** for the first ELF's one-time constant-tree
 regeneration and ~14 s for each ELF after. Call it **25 minutes to a warm prover**,
-about 4 epochs. At 55–60% of on-demand you break even on one interruption per
-~11 hours, so interruptible is the better buy for a day and a close call for a
-month.
+about 4 epochs.
+
+**On money, interruptible wins easily.** Take the midpoints: $0.43/hr on-demand
+against $0.24/hr interruptible, and 0.42 hr of paid-but-unproductive setup per
+interruption. Running H hours with N interruptions costs `0.24(H + 0.42N)`
+against `0.43H`, so interruptible is cheaper while `N < 1.9H` — about two
+interruptions an hour. No real interruption rate comes close, so **buy
+interruptible.**
+
+**The cost that matters is coverage, not dollars.** Each interruption is ~25
+minutes with no prover, which is **4 epochs of a day's 225, or 1.8%**. Ten
+interruptions in a day would still be under 20% of epochs missed and would save
+$4.60. Decide on how many epochs you need proven, not on the hourly rate.
+
+The daemon survives an interruption without doing anything: it holds the store,
+it keeps generating witnesses, and it is the prover connection that fails. That
+is only true once the prover is remote — see §1. Today, with the prover
+in-process, losing the box loses the daemon too.
 
 ---
 
@@ -596,38 +618,41 @@ machine, with `--prover native`. Chain: Fulu, epoch 469371–469373, head slot
 ### Gossip arrival curve
 
 **This is the measurement the scheduler's assumptions rest on, and it is the
-first time they have been checked against real traffic.** 1,771,307 events over
-79 slots; 67 steady-state slots (15,019,900–15,019,966) after discarding partial
-ones at each end. Times are milliseconds into the attestation's own slot.
+first time they have been checked against real traffic.** 113 steady-state slots
+(15,019,900–15,020,013), 23 minutes, after discarding the partial slots at each
+end. Times are milliseconds into the attestation's own slot.
 
-| topic | per slot | p05 | p10 | p25 | **p50** | p75 | p90 | p95 | p99 |
-|---|---|---|---|---|---|---|---|---|---|
-| `single_attestation` | **28,033** | 2,104 | 2,385 | 3,105 | **4,254** | 5,432 | 6,654 | 7,526 | 9,170 |
-| `attestation` (aggregates) | **83** | 8,014 | 8,049 | 8,074 | **8,107** | 8,134 | 8,171 | 8,264 | 8,609 |
+| topic | per slot | p05 | p25 | **p50** | p75 | p90 | p95 | p99 |
+|---|---|---|---|---|---|---|---|---|
+| `single_attestation` | **28,044** | 2,115 | 3,165 | **4,365** | 5,560 | 6,841 | 7,695 | 9,675 |
+| `attestation` (aggregates) | **85** | 8,017 | 8,072 | **8,099** | 8,130 | 8,184 | 8,305 | 9,142 |
 
 **All three design assumptions hold.**
 
 | Assumption | Assumed | Measured |
 |---|---|---|
-| Singles land about a third into the slot | 0.333 (4,000 ms) | **0.354** (4,254 ms) |
-| Aggregates land about two thirds in | 0.667 (8,000 ms) | **0.676** (8,107 ms) |
-| Singles buy four seconds over aggregates | 4,000 ms | **3,853 ms** |
+| Singles land about a third into the slot | 0.333 (4,000 ms) | **0.364** (4,365 ms) |
+| Aggregates land about two thirds in | 0.667 (8,000 ms) | **0.675** (8,099 ms) |
+| Singles buy four seconds over aggregates | 4,000 ms | **3,734 ms** |
 
 Cumulative share of a slot's singles in hand:
 
-| ms into slot | 2,000 | 3,000 | 4,000 | 5,000 | 6,000 | 7,000 | 8,000 | 9,000 |
-|---|---|---|---|---|---|---|---|---|
-| share | 3.5% | 22.7% | 44.9% | **66.8%** | 84.0% | 92.2% | 96.9% | 98.9% |
+| ms into slot | 2,000 | 3,000 | 4,000 | 5,000 | 6,000 | 7,000 | 8,000 |
+|---|---|---|---|---|---|---|---|
+| share | 3.4% | 21.6% | 42.6% | **64.3%** | 81.9% | 91.1% | 96.2% |
 
 The burst drains — last arrival before a gap of more than 500 ms — at a median
-of **7,445 ms** into the slot (p25 6,520, p75 8,016). The default
-`--max-trigger-wait-millis 6000` therefore expires slightly before the burst
-finishes draining on a typical slot, which is what the two `late_groups = 1`
-observations below reflect.
+of **7,326 ms** into the slot (p25 6,412, p75 8,330, p90 9,819). The default
+`--max-trigger-wait-millis 6000` therefore expires before the burst has finished
+draining on a typical slot. That is a deliberate trade rather than a fault, but
+it is the knob to reach for if `late_groups` will not go to zero.
 
-Note how tight the aggregate distribution is: p05 to p95 spans 250 ms, against
-5,400 ms for the singles. Aggregates are published on a schedule; singles arrive
-as validators produce them.
+Note how tight the aggregate distribution is: p05 to p95 spans 288 ms against
+5,580 ms for the singles. Aggregates are published on a schedule; singles arrive
+as validators produce them. That is also why the singles median moves by ~100 ms
+between samples while the aggregate median moves by ~10 ms.
+
+Per-slot counts are steady: min 27,841, median 28,053, max 28,071.
 
 ### Volume cross-check
 

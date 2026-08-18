@@ -86,7 +86,7 @@ use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
 use crate::prover::{Proof, Prover, Stage};
-use crate::publish::{self, ClosedEpoch, Publisher};
+use crate::publish::{self, ClosedEpoch, EpochProgress, Publisher};
 use crate::store::{
     EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState, StreamFinalRecord,
 };
@@ -1097,6 +1097,44 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         };
         let finalized = self.try_finalize(&record).await?;
 
+        // The first epoch of a run has nothing before it to finalize, so its
+        // justification is the only proof it will ever have. Publishing it as
+        // the epoch's proof is what keeps that epoch from sitting open forever.
+        if finalized.is_none() {
+            if let Some(publish) = &self.publish {
+                let vk = self.prover.program_vk(Stage::Justification);
+                let publics = record.output.public_bytes();
+                let reference = publish::proof_ref(
+                    target_epoch,
+                    Stage::Justification,
+                    &record.proof,
+                    &vk,
+                    &publics,
+                    self.prover.program_digest(Stage::Justification).as_deref(),
+                );
+                let inputs = publish::justification_public_inputs(&record.output);
+                publish.proof_bytes(
+                    target_epoch,
+                    Stage::Justification,
+                    &record.proof,
+                    &vk,
+                    &publics,
+                );
+                publish.proof_landed(target_epoch, reference.clone(), inputs.clone(), None);
+                publish.epoch_closed(&ClosedEpoch {
+                    epoch: target_epoch,
+                    target_root: crate::artifacts::hex0x(&record.output.target_root),
+                    finalizes_epoch: target_epoch,
+                    justified: serde_json::to_value(justified_checkpoint(&record.output))?,
+                    finalized: serde_json::Value::Null,
+                    accumulator: serde_json::to_value(self.acc_status())?,
+                    latency: None,
+                    proof: reference,
+                    public_inputs: inputs,
+                });
+            }
+        }
+
         self.snapshot.state.justified_through = Some(target_epoch);
         self.snapshot.state.attempted_epoch = Some(target_epoch);
         self.snapshot.state.last_justification = Some(record);
@@ -1328,15 +1366,15 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
         if !fire {
             if let Some(publish) = &self.publish {
-                publish.epoch_progress(
-                    target_epoch,
-                    held.balance,
-                    total,
-                    policy.threshold_pct(),
-                    aggregator.folded_groups,
-                    aggregator.units.len(),
-                    self.head_slot,
-                );
+                publish.epoch_progress(&EpochProgress {
+                    epoch: target_epoch,
+                    attesting_balance: held.balance,
+                    total_active_balance: total,
+                    threshold_pct: policy.threshold_pct(),
+                    folded_groups: aggregator.folded_groups,
+                    slots_held: aggregator.units.len(),
+                    head_slot: self.head_slot,
+                });
             }
             // Slots gossip has finished with are proven and folded now, off the
             // critical path. The one it is still filling is left open: closing it

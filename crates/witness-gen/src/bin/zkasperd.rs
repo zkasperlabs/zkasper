@@ -330,21 +330,44 @@ async fn main() -> Result<()> {
         BeaconApiClient::new(&cli.beacon_url),
         config,
         prover,
-        publisher,
+        publisher.clone(),
     )
     .await?;
 
-    if cli.once {
-        let ticks = orchestrator.catch_up().await?;
-        info!(
-            ticks = ticks.len(),
-            epoch = orchestrator.state().cursor_epoch,
-            "caught up",
-        );
-        return Ok(());
-    }
+    let result = if cli.once {
+        orchestrator.catch_up().await.map(|ticks| {
+            info!(
+                ticks = ticks.len(),
+                epoch = orchestrator.state().cursor_epoch,
+                "caught up",
+            );
+        })
+    } else {
+        tokio::select! {
+            result = orchestrator.run() => result,
+            () = stopped() => {
+                info!("stopping");
+                Ok(())
+            }
+        }
+    };
 
-    orchestrator.run().await
+    // The last epoch of a run is the one most worth publishing, and it is the
+    // one a dropped runtime would take with it.
+    if let Some(publisher) = &publisher {
+        publisher.flush().await;
+    }
+    result
+}
+
+/// Resolves when the process is asked to stop.
+async fn stopped() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install the SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }
 
 fn parse_hex_bytes32(s: &str) -> Result<[u8; 32]> {

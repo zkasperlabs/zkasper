@@ -17,15 +17,10 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{header_root, make_header, FakeGossip, MockBeaconApi};
+use common::{FakeGossip, MockBeaconApi, SyntheticChain, BALANCE_GWEI};
 
-use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
-use zkasper_common::constants::FAR_FUTURE_EPOCH;
-use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::ChainConfig;
 
-use zkasper_witness_gen::artifacts::hex0x;
-use zkasper_witness_gen::beacon_api::{AttestationResponse, HeaderResponse, ValidatorResponse};
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline, Tick};
 use zkasper_witness_gen::prover::NativeProver;
 use zkasper_witness_gen::store::{Store, StoreState};
@@ -40,12 +35,10 @@ const TEST_CONFIG: ChainConfig = ChainConfig {
     beacon_state_validators_field_index: 11,
     fulu_fork_epoch: 0,
 };
-const TEST_DEPTH: u32 = 2;
 const SPE: u64 = TEST_CONFIG.slots_per_epoch;
 
 const FIRST_EPOCH: u64 = 10;
 const LAST_EPOCH: u64 = 13;
-const BALANCE_GWEI: u64 = 32_000_000_000;
 const VALIDATORS: usize = 4;
 
 /// Cumulative balance crosses 2/3 of 128 ETH at the third attesting validator,
@@ -53,176 +46,8 @@ const VALIDATORS: usize = 4;
 /// slot.
 const SLOTS_TO_THRESHOLD: u64 = 3;
 
-// ---------------------------------------------------------------------------
-// Synthetic chain
-// ---------------------------------------------------------------------------
-
-type Key = (blst::min_pk::SecretKey, [u8; 48]);
-
-fn generate_keys(n: usize) -> Vec<Key> {
-    (0..n)
-        .map(|i| {
-            let mut ikm = [0u8; 32];
-            ikm[0] = i as u8;
-            ikm[1] = 0xAB;
-            let sk = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
-            let pk = sk.sk_to_pk().to_bytes();
-            (sk, pk)
-        })
-        .collect()
-}
-
-/// Validator set as of `epoch`.
-///
-/// Validator 0 loses 1 ETH of effective balance every epoch. That is a field
-/// the accumulator leaf commits to, so every epoch has a real mutation to diff
-/// *and* lands on a different accumulator — the case finalization has to work
-/// across.
-fn validators_at(epoch: u64, keys: &[Key]) -> Vec<ValidatorResponse> {
-    keys.iter()
-        .enumerate()
-        .map(|(i, (_, pubkey))| ValidatorResponse {
-            index: i as u64,
-            pubkey: *pubkey,
-            effective_balance: if i == 0 {
-                BALANCE_GWEI - epoch.saturating_sub(FIRST_EPOCH) * 1_000_000_000
-            } else {
-                BALANCE_GWEI
-            },
-            activation_epoch: 0,
-            exit_epoch: FAR_FUTURE_EPOCH,
-            withdrawal_credentials: {
-                let mut wc = [0u8; 32];
-                wc[0] = 0x01;
-                wc
-            },
-            slashed: false,
-            activation_eligibility_epoch: 0,
-            withdrawable_epoch: FAR_FUTURE_EPOCH,
-        })
-        .collect()
-}
-
-fn total_active_balance_at(epoch: u64, keys: &[Key]) -> u64 {
-    validators_at(epoch, keys)
-        .iter()
-        .map(|v| v.effective_balance)
-        .sum()
-}
-
-/// Header of the block at `epoch`'s first slot.
-fn header_at(epoch: u64, keys: &[Key]) -> HeaderResponse {
-    make_header(epoch * SPE, &validators_at(epoch, keys), TEST_DEPTH)
-}
-
-/// The checkpoint root for `epoch`: the root of the block at its first slot.
-///
-/// It has to be the real root of the header the mock serves, because the
-/// finalization circuit opens that header and checks it against the root the
-/// attesters signed over.
-fn checkpoint_root(epoch: u64, keys: &[Key]) -> [u8; 32] {
-    header_root(&header_at(epoch, keys))
-}
-
-/// One attestation from one validator, signed for real.
-fn attestation_from(
-    key: &Key,
-    slot: u64,
-    epoch: u64,
-    target_root: [u8; 32],
-    source_root: [u8; 32],
-    domain: [u8; 32],
-) -> AttestationResponse {
-    let beacon_block_root = [0u8; 32];
-    let data_root = attestation_data_root(
-        slot,
-        0,
-        &beacon_block_root,
-        epoch - 1,
-        &source_root,
-        epoch,
-        &target_root,
-    );
-    let signing_root = compute_signing_root(&data_root, &domain);
-    let signature = key
-        .0
-        .sign(
-            &signing_root,
-            b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
-            &[],
-        )
-        .to_bytes();
-
-    // One validator per committee, so the aggregation bitfield is a single bit.
-    AttestationResponse {
-        aggregation_bits: vec![0x01],
-        committee_bits: vec![],
-        data_slot: slot,
-        data_index: 0,
-        data_beacon_block_root: beacon_block_root,
-        data_source_epoch: epoch - 1,
-        data_source_root: source_root,
-        data_target_epoch: epoch,
-        data_target_root: target_root,
-        signature,
-        single_attester: None,
-    }
-}
-
-/// Build a mock chain covering `FIRST_EPOCH..=LAST_EPOCH` with the head at
-/// `head_slot`.
-fn build_chain(keys: &[Key], head_slot: u64) -> (MockBeaconApi, [u8; 32]) {
-    let mut mock = MockBeaconApi::new();
-    let domain = compute_domain(
-        &DOMAIN_BEACON_ATTESTER,
-        &mock.fork_version,
-        &mock.genesis_validators_root,
-    );
-
-    for epoch in FIRST_EPOCH..=LAST_EPOCH {
-        let boundary = epoch * SPE;
-        let responses = validators_at(epoch, keys);
-        let header = header_at(epoch, keys);
-        let target_root = header_root(&header);
-
-        mock.validators
-            .insert(boundary.to_string(), responses.clone());
-        mock.headers.insert(boundary.to_string(), header.clone());
-        // Finalization looks the checkpoint's header up by its root, the way it
-        // has to when the epoch's first slot holds no block.
-        mock.headers.insert(hex0x(&target_root), header);
-        mock.block_roots.insert(boundary.to_string(), target_root);
-
-        mock.set_committees(epoch, &responses, SPE);
-
-        // Validator i attests to slot boundary + i, and the next block carries
-        // it — the earliest one that can, and the block the aggregator waits for
-        // before it closes the slot.
-        let source_root = checkpoint_root(epoch - 1, keys);
-        for (i, key) in keys.iter().enumerate() {
-            let slot = boundary + i as u64;
-            mock.attestations.insert(
-                (slot + 1).to_string(),
-                vec![attestation_from(
-                    key,
-                    slot,
-                    epoch,
-                    target_root,
-                    source_root,
-                    domain,
-                )],
-            );
-        }
-    }
-
-    let head_validators = validators_at(head_slot / SPE, keys);
-    mock.headers.insert(
-        "head".to_string(),
-        make_header(head_slot, &head_validators, TEST_DEPTH),
-    );
-    mock.set_finality(FIRST_EPOCH, checkpoint_root(FIRST_EPOCH, keys));
-
-    (mock, domain)
+fn chain() -> SyntheticChain {
+    SyntheticChain::new(TEST_CONFIG, VALIDATORS, FIRST_EPOCH, LAST_EPOCH)
 }
 
 fn config(dir: &Path) -> OrchestratorConfig {
@@ -247,10 +72,9 @@ async fn open(dir: &Path, mock: MockBeaconApi) -> Orchestrator<MockBeaconApi> {
 #[tokio::test]
 async fn test_follows_four_epochs_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
-    let (mock, _) = build_chain(&keys, LAST_EPOCH * SPE + 3);
+    let chain = chain();
 
-    let mut daemon = open(dir.path(), mock).await;
+    let mut daemon = open(dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
     let ticks = daemon.catch_up().await.unwrap();
 
     // Bootstrapped at the node's finalized checkpoint, then walked to the head.
@@ -277,7 +101,7 @@ async fn test_follows_four_epochs_end_to_end() {
         .clone()
         .expect("finalized something");
     assert_eq!(last.epoch, LAST_EPOCH - 1);
-    assert_eq!(last.root, checkpoint_root(LAST_EPOCH - 1, &keys));
+    assert_eq!(last.root, chain.checkpoint_root(LAST_EPOCH - 1));
 
     // Streaming: each epoch stopped at the attestation slot that crossed 2/3,
     // and the block carrying the fourth slot's attestations was never fetched.
@@ -342,7 +166,7 @@ async fn test_follows_four_epochs_end_to_end() {
     assert_eq!(status["last_finalized"]["epoch"], LAST_EPOCH - 1);
     assert_eq!(
         status["accumulator"]["total_active_balance"],
-        total_active_balance_at(LAST_EPOCH, &keys),
+        chain.total_active_balance_at(LAST_EPOCH).to_string(),
     );
     assert!(status["recent_stages"]
         .as_array()
@@ -363,16 +187,19 @@ async fn test_follows_four_epochs_end_to_end() {
 #[tokio::test]
 async fn test_streams_an_epoch_and_measures_its_latency() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
-    let (mock, _) = build_chain(&keys, (FIRST_EPOCH + 1) * SPE);
+    let chain = chain();
 
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
         ..config(dir.path())
     };
-    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
-        .await
-        .expect("orchestrator opens");
+    let mut daemon = Orchestrator::open(
+        chain.mock((FIRST_EPOCH + 1) * SPE),
+        config,
+        Box::new(NativeProver::new(TEST_CONFIG)),
+    )
+    .await
+    .expect("orchestrator opens");
 
     // Epoch 10 justified the batch way, and the accumulator moved to 11.
     daemon.catch_up().await.unwrap();
@@ -386,11 +213,7 @@ async fn test_streams_an_epoch_and_measures_its_latency() {
     // close it.
     let mut ticks = Vec::new();
     for slot in boundary..=boundary + SLOTS_TO_THRESHOLD {
-        daemon.api().set_head(make_header(
-            slot,
-            &validators_at(stream_epoch, &keys),
-            TEST_DEPTH,
-        ));
+        daemon.api().set_head(chain.header_at(slot));
         ticks.extend(daemon.catch_up().await.unwrap());
     }
 
@@ -404,7 +227,7 @@ async fn test_streams_an_epoch_and_measures_its_latency() {
         .next_back()
         .expect("the final proof finalizes the epoch before it");
     assert_eq!(finalized.epoch, FIRST_EPOCH);
-    assert_eq!(finalized.root, checkpoint_root(FIRST_EPOCH, &keys));
+    assert_eq!(finalized.root, chain.checkpoint_root(FIRST_EPOCH));
     assert!(
         daemon.state().last_stream_final.is_some(),
         "the next epoch has to be able to consume this one",
@@ -441,43 +264,34 @@ async fn test_streams_an_epoch_and_measures_its_latency() {
 #[tokio::test]
 async fn test_streams_an_epoch_from_gossip_without_reading_blocks() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
-    let (mock, domain) = build_chain(&keys, (FIRST_EPOCH + 1) * SPE);
+    let chain = chain();
 
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
         ..config(dir.path())
     };
     let gossip = FakeGossip::default();
-    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
-        .await
-        .expect("orchestrator opens")
-        .with_gossip(Box::new(gossip.clone()));
+    let mut daemon = Orchestrator::open(
+        chain.mock((FIRST_EPOCH + 1) * SPE),
+        config,
+        Box::new(NativeProver::new(TEST_CONFIG)),
+    )
+    .await
+    .expect("orchestrator opens")
+    .with_gossip(Box::new(gossip.clone()));
     daemon.catch_up().await.unwrap();
 
     let stream_epoch = FIRST_EPOCH + 1;
     let boundary = stream_epoch * SPE;
-    let target_root = checkpoint_root(stream_epoch, &keys);
-    let source_root = checkpoint_root(stream_epoch - 1, &keys);
 
     // Validator i attests to slot boundary + i, and it is gossiped in that slot
     // rather than in the block after it.
     let mut ticks = Vec::new();
-    for (i, key) in keys.iter().enumerate().take(SLOTS_TO_THRESHOLD as usize) {
-        let slot = boundary + i as u64;
-        gossip.publish(vec![attestation_from(
-            key,
-            slot,
-            stream_epoch,
-            target_root,
-            source_root,
-            domain,
-        )]);
-        daemon.api().set_head(make_header(
-            slot,
-            &validators_at(stream_epoch, &keys),
-            TEST_DEPTH,
-        ));
+    for index in 0..SLOTS_TO_THRESHOLD as usize {
+        gossip.publish(vec![chain.attestation(stream_epoch, index)]);
+        daemon
+            .api()
+            .set_head(chain.header_at(boundary + index as u64));
         ticks.extend(daemon.catch_up().await.unwrap());
     }
 
@@ -509,16 +323,19 @@ async fn test_streams_an_epoch_from_gossip_without_reading_blocks() {
 #[tokio::test]
 async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
-    let (mock, _) = build_chain(&keys, (FIRST_EPOCH + 1) * SPE);
+    let chain = chain();
 
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
         ..config(dir.path())
     };
-    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
-        .await
-        .expect("orchestrator opens");
+    let mut daemon = Orchestrator::open(
+        chain.mock((FIRST_EPOCH + 1) * SPE),
+        config,
+        Box::new(NativeProver::new(TEST_CONFIG)),
+    )
+    .await
+    .expect("orchestrator opens");
     daemon.catch_up().await.unwrap();
 
     let stream_epoch = FIRST_EPOCH + 1;
@@ -529,11 +346,7 @@ async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
     daemon.api().set_reorg(Some([0xEE; 32]));
     let mut ticks = Vec::new();
     for slot in boundary..=boundary + SLOTS_TO_THRESHOLD {
-        daemon.api().set_head(make_header(
-            slot,
-            &validators_at(stream_epoch, &keys),
-            TEST_DEPTH,
-        ));
+        daemon.api().set_head(chain.header_at(slot));
         ticks.extend(daemon.catch_up().await.unwrap());
     }
 
@@ -555,22 +368,20 @@ async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
 #[tokio::test]
 async fn test_resumes_after_a_crash_mid_epoch() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
+    let chain = chain();
 
     // Reference: one uninterrupted run to the head.
     let reference = {
         let reference_dir = tempfile::tempdir().unwrap();
-        let (mock, _) = build_chain(&keys, LAST_EPOCH * SPE + 3);
-        let mut daemon = open(reference_dir.path(), mock).await;
+        let mut daemon = open(reference_dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
         daemon.catch_up().await.unwrap();
         daemon.state().clone()
     };
 
     // Head two slots into epoch 12: the accumulator reaches 12, but only two of
     // the three slots it takes to justify 12 have been closed yet.
-    let (mock, _) = build_chain(&keys, 12 * SPE + 2);
     let first_run = {
-        let mut daemon = open(dir.path(), mock).await;
+        let mut daemon = open(dir.path(), chain.mock(12 * SPE + 2)).await;
         daemon.catch_up().await.unwrap();
         daemon.state().clone()
     };
@@ -586,8 +397,7 @@ async fn test_resumes_after_a_crash_mid_epoch() {
     assert!(first_run.needs_justification());
 
     // Crash. Nothing of the partial epoch survives except what was committed.
-    let (mock, _) = build_chain(&keys, LAST_EPOCH * SPE + 3);
-    let mut daemon = open(dir.path(), mock).await;
+    let mut daemon = open(dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
     let ticks = daemon.catch_up().await.unwrap();
 
     // Epoch 12's accumulator advance was already durable, so it is not redone.
@@ -622,11 +432,10 @@ async fn test_resumes_after_a_crash_mid_epoch() {
 #[tokio::test]
 async fn test_damaged_store_is_rejected_rather_than_resumed() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
-    let (mock, _) = build_chain(&keys, FIRST_EPOCH * SPE + 3);
+    let chain = chain();
 
     let db_path = {
-        let mut daemon = open(dir.path(), mock).await;
+        let mut daemon = open(dir.path(), chain.mock(FIRST_EPOCH * SPE + 3)).await;
         daemon.catch_up().await.unwrap();
         config(dir.path()).db_path
     };
@@ -647,9 +456,8 @@ async fn test_damaged_store_is_rejected_rather_than_resumed() {
 
     // And the daemon refuses to start on it rather than rebuilding from a
     // damaged accumulator.
-    let (mock, _) = build_chain(&keys, FIRST_EPOCH * SPE + 3);
     let error = Orchestrator::open(
-        mock,
+        chain.mock(FIRST_EPOCH * SPE + 3),
         config(dir.path()),
         Box::new(NativeProver::new(TEST_CONFIG)),
     )
@@ -662,11 +470,8 @@ async fn test_damaged_store_is_rejected_rather_than_resumed() {
 #[tokio::test]
 async fn test_truncated_store_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let keys = generate_keys(VALIDATORS);
-    let (mock, _) = build_chain(&keys, FIRST_EPOCH * SPE + 3);
-
     let db_path = {
-        let mut daemon = open(dir.path(), mock).await;
+        let mut daemon = open(dir.path(), chain().mock(FIRST_EPOCH * SPE + 3)).await;
         daemon.catch_up().await.unwrap();
         config(dir.path()).db_path
     };

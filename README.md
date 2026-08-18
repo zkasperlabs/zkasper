@@ -85,9 +85,20 @@ cargo build --release --features zisk-prover
 zkasperd --beacon-url ... --mode streaming --prover zisk --gpu
 ```
 
+Given `--api-url`, the daemon also mirrors every stage to
+[the v1 API](docs/api-v1.md) as it happens, and uploads the proof bytes of each
+epoch. That is what drives the live view on zkasper.com. Publishing never holds
+proving up: a batch the API will not take is spooled to `<output-dir>/spool`.
+
+```sh
+ZKASPER_API_TOKEN=... ZKASPER_COMMIT=$(git rev-parse --short HEAD) \
+cargo run --release --bin zkasperd -- --beacon-url http://localhost:5052 \
+    --mode streaming --api-url https://api.zkasper.com
+```
+
 The beacon node needs specific flags. Read
 [docs/architecture.md](docs/architecture.md) before you point the daemon at a
-node.
+node, and [RUNBOOK.md](RUNBOOK.md) to operate one.
 
 For one step at a time, use the `zkasper-witness-gen` binary:
 
