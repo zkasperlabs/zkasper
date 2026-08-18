@@ -760,22 +760,36 @@ off the critical path.
 
 ### Measured `T2 - T`
 
-| epoch | `t2_minus_t_millis` | `wait_millis` | `tail_named` | `tail` | `folded_groups` | `late_groups` |
+| epoch | `T2-T` ms | `wait` ms | `tail_named` | `folded_groups` | `late_groups` | shape |
 |---|---|---|---|---|---|---|
-| 469372 | **5,007** | 4,919 | 110 | 1 | 0 | 1 |
-| 469373 | **5,118** | 4,964 | 93 | 1 | 0 | 1 |
+| 469372 | 5,007 | 4,919 | 110 | 0 | 1 | catch-up |
+| 469373 | 5,118 | 4,964 | 93 | 0 | 1 | catch-up |
+| 469374 | 1,177 | 1,095 | 75 | 2 | 0 | catch-up |
+| **469375** | **6,961** | **6,378** | **4,999** | **16** | **0** | **steady state** |
+| 469376 | 5,707 | 5,565 | 80 | 0 | 1 | catch-up |
 
-Read these carefully: **`wait_millis` is 98% of `T2 - T`.** The prover is not on
-the critical path here — the trigger deliberately holding for in-flight
-attestations is. That is the design working, but it also means these two numbers
-say almost nothing about proving cost, and a GPU run will report a very similar
-`T2 - T` for a completely different reason.
+**Only 469375 is a steady-state epoch** — the only one the daemon followed from
+near its first slot, folding a group per slot as gossip closed it, 16 in total.
+Every other row is an epoch the daemon opened already in progress after a
+bootstrap or a restart, which folds nothing before the trigger and therefore
+reports `folded_groups = 0` and `late_groups = 1`. Those rows say what a
+catch-up costs, not what the pipeline costs. **Do not quote them as a
+steady-state result**, and do not quote a single steady-state epoch as a
+distribution either — one epoch is a data point, not a measurement.
 
-`folded_groups = 0` with `late_groups = 1` on both epochs says no group proof was
-folded before the trigger fired. These are the first two streaming epochs after a
-bootstrap, so the daemon opened them already in progress; this is the shape a
-catch-up produces, not steady state. Do not quote them as a steady-state result
-until a run has produced epochs it followed from their first slot.
+Two things the steady-state epoch does establish:
+
+- **`wait_millis` is 92% of `T2 - T`.** The prover is not on the critical path
+  under `--prover native`; the trigger deliberately holding for in-flight
+  attestations is. A GPU run will report a similar `T2 - T` for an entirely
+  different reason, so these numbers are a baseline for the *trigger*, not for
+  proving.
+- **`tail_named` is the number that will hurt on a GPU**, and it is 4,999 on the
+  one epoch that ran in the intended shape against 75–110 on the catch-up
+  epochs. See the trigger-cap section above.
+
+Getting a real distribution needs a run that stays up. Sections above explain why
+this one did not: an empty epoch boundary ends it, roughly every hundred epochs.
 
 ### Two bugs the run found
 
