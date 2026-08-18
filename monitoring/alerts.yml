@@ -174,6 +174,11 @@ groups:
       # counterpart for the instance and job on the left — so the alert would
       # never fire, on the one condition it exists for. Checked against a live
       # Prometheus, not reasoned about.
+      # Deliberately derived from completed proofs, not from the provider's
+       # gpu_util. That field read 0% for four cards at once on 2026-08-18,
+       # including one demonstrably serving the live daemon and another that had
+       # read 100% twenty minutes earlier. An alert built on it would either
+       # never fire or destroy working hardware.
       - alert: ZkasperGpuIdle
         expr: >-
           zkasper_vast_instances_running > 0

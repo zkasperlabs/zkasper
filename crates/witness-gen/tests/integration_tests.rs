@@ -155,11 +155,14 @@ fn test_db_load_nonexistent() {
 }
 
 // -----------------------------------------------------------------------
-// Bootstrap round-trip test
+// Init point round-trip test
 // -----------------------------------------------------------------------
 
+/// Taking an init point and opening it again has to agree, because that is the
+/// whole of what replaced the bootstrap proof: `open` recomputes the
+/// accumulator from the registry and refuses anything that does not match.
 #[tokio::test]
-async fn test_bootstrap_round_trip() {
+async fn test_init_point_round_trip() {
     let slot = 3200u64; // epoch 100
     let epoch = slot / TEST_CONFIG.slots_per_epoch;
 
@@ -175,25 +178,54 @@ async fn test_bootstrap_round_trip() {
     mock.validators.insert(slot.to_string(), responses.clone());
     mock.headers.insert(slot.to_string(), header);
 
-    let (witness, tree, _epoch_state, total_active_balance, num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&mock, &TEST_CONFIG, slot)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&mock, &TEST_CONFIG, "test", slot)
+        .await
+        .unwrap();
 
-    assert_eq!(num_validators, 4);
-    assert_eq!(total_active_balance, 4 * 32_000_000_000);
-    assert_eq!(witness.epoch, epoch);
-    assert_eq!(witness.validators.len(), 4);
+    assert_eq!(init.num_validators, 4);
+    assert_eq!(init.total_active_balance, 4 * 32_000_000_000);
+    assert_eq!(init.epoch, epoch);
+    assert_eq!(init.acc_root, snapshot.tree.root());
+    assert_eq!(
+        init.accumulator_commitment,
+        acc::commitment(&init.acc_root, init.total_active_balance),
+    );
+    init.check().unwrap();
 
-    // Verify with bootstrap guest verification function
-    let (commitment, acc_root, balance) =
-        zkasper_bootstrap_guest::verify_bootstrap_with_depth(&witness, TEST_DEPTH, TEST_DEPTH);
+    let reopened = zkasper_witness_gen::init_point::open(&mock, &TEST_CONFIG, "test", &init)
+        .await
+        .expect("the init point describes the accumulator the registry builds");
+    assert_eq!(reopened.tree.root(), snapshot.tree.root());
+    assert_eq!(reopened.state.acc_commitment, init.accumulator_commitment);
+    assert_eq!(reopened.epoch_state.state_root, init.state_root);
 
-    assert_eq!(acc_root, tree.root());
-    assert_eq!(balance, total_active_balance);
-
-    let expected_commitment = acc::commitment(&acc_root, total_active_balance);
-    assert_eq!(commitment, expected_commitment);
+    // Every field `open` checks has to be load-bearing, or a wrong init point
+    // would start a run against an accumulator nobody holds.
+    for wrong in [
+        {
+            let mut w = init.clone();
+            w.num_validators += 1;
+            w
+        },
+        {
+            let mut w = init.clone();
+            w.acc_root[0] ^= 1;
+            w.accumulator_commitment = acc::commitment(&w.acc_root, w.total_active_balance);
+            w
+        },
+        {
+            let mut w = init.clone();
+            w.state_root[0] ^= 1;
+            w
+        },
+    ] {
+        assert!(
+            zkasper_witness_gen::init_point::open(&mock, &TEST_CONFIG, "test", &wrong)
+                .await
+                .is_err(),
+            "open accepted an init point that does not describe this registry",
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -231,11 +263,16 @@ async fn test_epoch_diff_round_trip() {
     mock.headers.insert(slot_1.to_string(), header_1);
     mock.headers.insert(slot_2.to_string(), header_2);
 
-    // First bootstrap to build the AccTree
-    let (_, mut tree, epoch_state, total_active_balance_1, _) =
-        zkasper_witness_gen::witness_bootstrap::build(&mock, &TEST_CONFIG, slot_1)
+    // The init point builds the AccTree the diff moves.
+    let (init, snapshot) =
+        zkasper_witness_gen::init_point::take(&mock, &TEST_CONFIG, "test", slot_1)
             .await
             .unwrap();
+    let (mut tree, epoch_state, total_active_balance_1) = (
+        snapshot.tree.clone(),
+        snapshot.epoch_state.clone(),
+        init.total_active_balance,
+    );
 
     let old_root = tree.root();
 
@@ -281,11 +318,11 @@ async fn test_epoch_diff_round_trip() {
 }
 
 // -----------------------------------------------------------------------
-// Full pipeline: bootstrap -> epoch diff
+// Full pipeline: init point -> epoch diff
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_full_pipeline_bootstrap_then_epoch_diff() {
+async fn test_full_pipeline_init_point_then_epoch_diff() {
     let slot_1 = 3200u64;
     let slot_2 = 3232u64;
 
@@ -316,21 +353,17 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
     mock.headers.insert(slot_1.to_string(), header_1);
     mock.headers.insert(slot_2.to_string(), header_2);
 
-    // Bootstrap
-    let (bootstrap_witness, tree, _epoch_state, total_active_balance, num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&mock, &TEST_CONFIG, slot_1)
+    // Start from an init point
+    let (init, snapshot) =
+        zkasper_witness_gen::init_point::take(&mock, &TEST_CONFIG, "test", slot_1)
             .await
             .unwrap();
-
-    // Verify bootstrap
-    let (_bootstrap_commitment, bootstrap_poseidon_root, bootstrap_balance) =
-        zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-            &bootstrap_witness,
-            TEST_DEPTH,
-            TEST_DEPTH,
-        );
-    assert_eq!(bootstrap_poseidon_root, tree.root());
-    assert_eq!(bootstrap_balance, total_active_balance);
+    let (tree, total_active_balance, num_validators) = (
+        snapshot.tree,
+        init.total_active_balance,
+        init.num_validators,
+    );
+    assert_eq!(init.acc_root, tree.root());
 
     // Save + load via DB
     let dir = tempfile::tempdir().unwrap();

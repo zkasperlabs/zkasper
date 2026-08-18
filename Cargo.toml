@@ -3,7 +3,6 @@ members = [
     "crates/common",
     "crates/witness-gen",
     "crates/epoch-diff-guest",
-    "crates/bootstrap-guest",
     "crates/slot-proof-guest",
     "crates/committee-proof-guest",
     "crates/justification-guest",

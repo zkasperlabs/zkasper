@@ -103,15 +103,15 @@ use tracing::{info, warn};
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::{verify_child, ProgramVk};
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
-    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    AggregateOutput, AggregateWitness, CommitteeOutput, CommitteeWitness, EpochDiffOutput,
+    EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
     JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
     StreamFinalOutput, StreamFinalWitness,
 };
 use zkasper_common::ChainConfig;
 
 use crate::artifacts::{now_unix_millis, write_atomic};
-use crate::prover::{AccOutput, NativeProver, Proof, ProveCost, Prover, Stage};
+use crate::prover::{NativeProver, Proof, ProveCost, Prover, Stage};
 
 /// Bumped when a frame changes meaning. A client and a server that disagree are
 /// turned away at the handshake rather than at the first proof.
@@ -364,7 +364,6 @@ fn prove_stage(prover: &dyn Prover, stage: Stage, witness: &[u8]) -> Result<Proo
             .with_context(|| format!("deserialize a {} witness", stage.as_str()))
     }
     Ok(match stage {
-        Stage::Bootstrap => prover.prove_bootstrap(&decode(stage, witness)?)?.1,
         Stage::EpochDiff => prover.prove_epoch_diff(&decode(stage, witness)?)?.1,
         Stage::Committee => prover.prove_committee(&decode(stage, witness)?)?.1,
         Stage::SlotProof => prover.prove_slot(&decode(stage, witness)?)?.1,
@@ -1043,18 +1042,6 @@ impl Prover for RemoteProver {
 
     fn last_cost(&self) -> Option<ProveCost> {
         *self.inner.last_cost.lock().unwrap()
-    }
-
-    fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)> {
-        let (output, _) = self.native.prove_bootstrap(witness)?;
-        let publics = zkasper_bootstrap_guest::public_bytes(
-            witness,
-            &output.commitment,
-            &output.acc_root,
-            output.total_active_balance,
-        );
-        let proof = self.inner.prove(Stage::Bootstrap, witness, &publics)?;
-        Ok((output, proof))
     }
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {

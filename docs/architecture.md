@@ -21,7 +21,6 @@ does that by proving before `T` everything that is known before `T`.
 
 | stage | proves | runs |
 |---|---|---|
-| bootstrap | the accumulator tree matches a trusted beacon state | once, at start |
 | epoch diff | the accumulator moves from epoch E-1 to epoch E | once per epoch |
 | committee proof | each slot bucket of epoch E sums to one public key and one balance | once per epoch, an epoch ahead |
 | group proof | some slots of an epoch, as Miller loops that nothing has closed yet | as the slots arrive |
@@ -38,7 +37,7 @@ slow. The streaming pipeline is the one that makes `T2 - T` small.
 ## What feeds what
 
 ```
-  bootstrap ──► accumulator (once, when the service starts)
+  init point ──► accumulator (configuration, checked at start, not proved)
       │
       ▼
   epoch-diff (E-1 -> E) ─────────┐  the fold that opens the epoch verifies it,
@@ -172,8 +171,8 @@ The daemon re-resolves the checkpoint root when the node reports a reorg.
 
 The stable machine runs the beacon node and `zkasperd`. The GPU machine runs a
 prover server and nothing else. [RUNBOOK.md](../RUNBOOK.md) is the operational
-version of this half: how to provision, install, bootstrap, monitor and recover
-a mainnet deployment.
+version of this half: how to provision, install, start, monitor and recover a
+mainnet deployment.
 
 ## The GPU machine runs a prover and nothing else
 
@@ -242,9 +241,13 @@ the node on the stable machine, and send witnesses over the network instead.
   `--http-sse-capacity-multiplier 2000`. That is a whole slot of messages for
   about 24 MB of node memory. `zkasperd` counts the comments and publishes them
   as `gossip.dropped`. Anything but zero there means the node is misconfigured.
-- **`/eth/v2/debug/beacon/states/{id}`.** Bootstrap reads the whole
-  `BeaconState` as SSZ from it. Hosted providers usually disable it, because the
-  response is several hundred megabytes.
+- **`/eth/v2/debug/beacon/states/{id}`.** Every epoch diff reads the whole
+  `BeaconState` as SSZ from it, and so does the boundary anchor a finalization
+  opens out of the justified checkpoint's `state_roots`. It is a continuous
+  dependency, not a one-off. Hosted providers usually disable it, because the
+  response is several hundred megabytes — 335 MB on mainnet, measured. Startup
+  itself does not need it: the init point carries the branch from its state root
+  to the validators field, so a fresh run walks the registry and nothing else.
 - **`/eth/v1/events?topics=attestation,single_attestation,chain_reorg`.** This
   is the streaming source. `--no-gossip` falls back to reading attestations out
   of blocks, which is a slot behind the chain by construction.
@@ -285,9 +288,34 @@ R2 object storage as soon as the R2 binding is enabled. The site and every
 other consumer read that API, which stores what the daemon posted and never
 recomputes it. The contract is in [api-v1.md](api-v1.md).
 
+## Where the accumulator starts
+
+`zkasperd` does not prove its own starting accumulator. It is given one, as an
+init point: a JSON tuple naming the epoch, the beacon state root the registry
+was read from, the accumulator root, the commitment, the total active balance
+and the branch from the state root down to the `validators` field. On a fresh
+run the daemon checks the tuple binds itself, walks the registry at that epoch,
+and refuses to start unless everything it rebuilds matches. `zkasper-init-point`
+takes one from a beacon node, so a third party can regenerate a deployment's and
+compare. See [assumptions.md](assumptions.md) for what this trusts and what it
+does not, and `crates/witness-gen/src/init_point.rs` for the code.
+
+This replaced a bootstrap proof that took about two minutes over a 2.3M-validator
+state. That mattered operationally rather than cryptographically: the state a
+run starts from is the oldest one a checkpoint-synced node still serves, so a
+two-minute startup routinely lost its own state to the node's advancing split
+and crashlooped. Startup is now a registry walk with no proving and no 335 MB
+state download.
+
 ## Restart safety
 
 The accumulator is a chain, so a corrupt or skipped step must not survive a
 restart. The store writes atomically, checksums what it writes, rehashes the
 tree on load, and compares the result against the recorded root. It refuses any
 epoch diff that is not exactly one epoch forward.
+
+If the node has thrown away a state the run still needs, the daemon stops and
+says so rather than starting a new accumulator over the top of the old one.
+Recovering means taking a fresh init point and publishing it, because the
+accumulator chain genuinely breaks at that epoch and a consumer has to be able
+to see that it did.

@@ -31,13 +31,16 @@ path = "src/bin/prover_server.rs"
 name = "recursion-bench"
 path = "src/bin/recursion_bench.rs"
 
+[[bin]]
+name = "zkasper-init-point"
+path = "src/bin/gen_init_point.rs"
+
 [dependencies]
 ziskos = { workspace = true }
 zkasper-common = { path = "../common", features = ["test-utils"] }
 # The guest crates are the circuits. The orchestrator runs them natively behind
 # the `Prover` hook, so every witness it writes has already been checked by the
 # same logic that will later prove it.
-zkasper-bootstrap-guest = { path = "../bootstrap-guest" }
 zkasper-epoch-diff-guest = { path = "../epoch-diff-guest" }
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }
@@ -76,7 +79,6 @@ count-ops = ["zkasper-common/count-ops"]
 zisk-prover = ["dep:zisk-sdk"]
 
 [dev-dependencies]
-zkasper-bootstrap-guest = { path = "../bootstrap-guest", features = ["count-ops"] }
 zkasper-epoch-diff-guest = { path = "../epoch-diff-guest", features = ["count-ops"] }
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }

@@ -117,7 +117,7 @@ const COST_BUCKETS: &[f64] = &[
 /// Measured between 1.2 s and 7 s following live, with the low end packed.
 ///
 /// The ladder runs to five minutes because a catch-up epoch is a different
-/// animal — 185 s measured on the first epoch after a bootstrap — and a sample
+/// animal — 185 s measured on the first epoch of a run — and a sample
 /// that lands in `+Inf` cannot be quantified at all. Catch-ups are separated by
 /// the `follow` label rather than by being thrown away; see [`observe_latency`].
 const LATENCY_BUCKETS: &[f64] = &[
@@ -274,7 +274,7 @@ pub fn observe_proof_start(stage: Stage, delay_s: f64) {
 pub fn observe_state(state: &StoreState, head_slot: u64, node_finalized: Option<u64>) {
     gauge!("zkasper_manifest_updated_timestamp_seconds").set(unix_seconds());
     gauge!("zkasper_accumulator_epoch").set(state.cursor_epoch as f64);
-    gauge!("zkasper_bootstrap_epoch").set(state.bootstrap_epoch as f64);
+    gauge!("zkasper_init_epoch").set(state.init_epoch as f64);
     gauge!("zkasper_head_slot").set(head_slot as f64);
     gauge!("zkasper_validators").set(state.num_validators as f64);
     gauge!("zkasper_total_active_balance_gwei").set(state.total_active_balance as f64);
@@ -355,7 +355,7 @@ pub fn observe_epoch_cost(cost: &EpochCost, usd_per_hour: Option<f64>) {
 /// One epoch's measured latency, the moment it is known.
 ///
 /// Split by `follow`, and that label is the whole point. An epoch the daemon
-/// opened mid-flight — the first one after a bootstrap or a restart — folds
+/// opened mid-flight — the first of a run, or the first after a restart — folds
 /// nothing before the trigger, so its final proof carries the entire epoch
 /// inline and takes minutes rather than seconds. Mixed into one histogram those
 /// samples move every quantile and there is no way to get them back out.
@@ -429,8 +429,8 @@ fn describe() {
         "Epoch the accumulator represents."
     );
     describe_gauge!(
-        "zkasper_bootstrap_epoch",
-        "Epoch the accumulator was bootstrapped at."
+        "zkasper_init_epoch",
+        "Epoch the accumulator chain started at, from its init point."
     );
     describe_gauge!(
         "zkasper_head_slot",

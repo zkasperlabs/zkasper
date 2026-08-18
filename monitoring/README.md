@@ -141,7 +141,7 @@ It records nothing on a witness-only run — an empty proof is not a verificatio
 
 ### Why the latency is split by `follow`
 
-The first epoch after a bootstrap or a restart is opened mid-flight. It folds
+The first epoch of a run, or the first after a restart, is opened mid-flight. It folds
 nothing before the trigger, so its final proof carries the whole epoch inline —
 the first one this pipeline measured took **185 s against a steady-state 1.2 to
 7 s**. Mixed into one histogram those samples move every quantile and cannot be

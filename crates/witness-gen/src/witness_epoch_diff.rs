@@ -19,7 +19,7 @@ use crate::state_diff::{
 
 /// Build an EpochDiffWitness and update the AccTree in place.
 ///
-/// Uses `old_state` (from bootstrap or previous epoch diff) to avoid recomputing
+/// Uses `old_state` (from the init point or the previous epoch diff) to avoid recomputing
 /// O(n) validator roots and re-parsing the old SSZ state.
 ///
 /// Returns `(witness, new_epoch_state, new_total_active_balance, new_num_validators)`.

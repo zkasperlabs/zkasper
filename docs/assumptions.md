@@ -56,12 +56,51 @@ publishes it beside the attesting balance in the proof's public inputs.
 The same holds for the streaming path without a flag: `stream-final-guest`
 asserts the supermajority itself, and only ever exists above it.
 
-### The bootstrap state is the root of trust
+### The init point is the root of trust
 
-Bootstrap builds the accumulator from one beacon state that the operator chose.
-The verifier contract accepts the first bootstrap unconditionally. There is no
-weak-subjectivity logic anywhere in the repository. Whoever deploys picks the
-root of trust, and every later proof chains back to it.
+The accumulator chain starts from an **init point**: a small JSON tuple of
+`(chain, epoch, state_root, num_validators, total_active_balance, acc_root,
+accumulator_commitment, state_to_validators_siblings)` that an operator gives
+`zkasperd` on a fresh run. Whoever deploys picks it, the verifier contract
+accepts the first commitment unconditionally, and there is no weak-subjectivity
+logic anywhere in the repository. Every later proof chains back to that choice.
+
+**This used to be a proof, and deleting the proof moved less than it looks.**
+Bootstrap rebuilt Ethereum's depth-40 validators tree and the depth-22
+accumulator over every validator in a beacon state and proved in-circuit that
+the two agreed under a claimed `state_root`. It never proved the root was
+canonical Ethereum — that was the operator's choice then, exactly as it is now,
+and this section has always said so. What the proof gave a consumer was a way to
+check the accumulator against the state root without redoing the work. Removing
+it moves accumulator-correctness from *verify this proof* to *recompute it
+yourself*, which anyone can do, because the accumulator is a deterministic
+function of the validator list at that state. `zkasper-init-point` is that
+recomputation, and it is the same code path the daemon runs.
+
+Two things make the delta narrower still. On mainnet the bootstrap proof did not
+exist: the witness over 2,338,764 validators serialized to 916 MB against a
+512 MB frame cap, so the stage produced the empty proof of a witness-only run and
+carried on. And nothing downstream ever verified it — the accumulator chain
+begins at the operator's declared root of trust either way.
+
+**What the daemon still checks, and refuses to start without.** `--init-point`
+is read before the first beacon call and rejected unless
+`acc::commitment(acc_root, total_active_balance)` equals
+`accumulator_commitment`; a tuple that fails this names an accumulator nobody
+holds. It then walks the registry at that epoch and refuses unless the validator
+count, the total active balance, the accumulator root it rebuilds, and the state
+root the supplied branch opens to all match the file. A wrong init point stops
+the run at startup rather than producing proofs against an accumulator that does
+not exist.
+
+**What a consumer should do about it.** Take the deployment's published init
+point, run `zkasper-init-point` against your own node at the same slot, and
+compare the files byte for byte. Then apply the rule above: require every state
+root the accumulator passed through — starting with the init point's — to be
+named by a later finalization proof. That rule is what makes a trusted start
+recoverable, and it matters more now than it did, because it is the only thing
+that ties the declared starting state to the chain the validators actually
+attested to.
 
 ---
 

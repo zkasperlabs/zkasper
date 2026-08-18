@@ -1,7 +1,7 @@
 //! Generate test witness binary files for Zisk proof testing.
 //!
 //! Usage: cargo run --bin gen-test-witness -- <proof-type> <output-path>
-//!   proof-type: bootstrap | epoch-diff | slot-proof | justification | finalization
+//!   proof-type: epoch-diff | slot-proof | justification | finalization
 
 use std::collections::HashMap;
 
@@ -104,42 +104,6 @@ impl BeaconApi for MockBeaconApi {
 }
 
 // ---------------------------------------------------------------------------
-// Bootstrap
-// ---------------------------------------------------------------------------
-
-fn gen_bootstrap(output_path: &str) {
-    let slot = 3200u64;
-    let validators: Vec<ValidatorData> = (0..4).map(|i| make_validator(i, 32)).collect();
-    let responses: Vec<ValidatorResponse> = validators
-        .iter()
-        .enumerate()
-        .map(|(i, v)| validator_data_to_response(v, i as u64))
-        .collect();
-
-    let mut mock = MockBeaconApi {
-        validators: HashMap::new(),
-        headers: HashMap::new(),
-    };
-    let header = make_header(slot, &responses);
-    mock.validators.insert(slot.to_string(), responses);
-    mock.headers.insert(slot.to_string(), header);
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let (witness, _, _, _, _) = rt
-        .block_on(zkasper_witness_gen::witness_bootstrap::build(
-            &mock, &CONFIG, slot,
-        ))
-        .unwrap();
-
-    let bytes = bincode::serialize(&witness).unwrap();
-    std::fs::write(output_path, &bytes).unwrap();
-    eprintln!(
-        "wrote bootstrap witness: {} bytes -> {output_path}",
-        bytes.len()
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Epoch diff
 // ---------------------------------------------------------------------------
 
@@ -175,9 +139,9 @@ fn gen_epoch_diff(output_path: &str) {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let (_, mut tree, epoch_state, total_active_balance_1, _) = rt
-        .block_on(zkasper_witness_gen::witness_bootstrap::build(
-            &mock, &CONFIG, slot_1,
+    let (init, mut snapshot) = rt
+        .block_on(zkasper_witness_gen::init_point::take(
+            &mock, &CONFIG, "test", slot_1,
         ))
         .unwrap();
 
@@ -185,10 +149,10 @@ fn gen_epoch_diff(output_path: &str) {
         .block_on(zkasper_witness_gen::witness_epoch_diff::build(
             &mock,
             &CONFIG,
-            &mut tree,
-            &epoch_state,
+            &mut snapshot.tree,
+            &snapshot.epoch_state,
             slot_2,
-            total_active_balance_1,
+            init.total_active_balance,
         ))
         .unwrap();
 
@@ -460,14 +424,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 && args.len() != 4 {
         eprintln!(
-            "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|committee|justification|\
+            "usage: gen-test-witness <epoch-diff|slot-proof|committee|justification|\
              finalization|group-proof|aggregation|stream-final> <output-path> [n-validators]"
         );
         std::process::exit(1);
     }
 
     match args[1].as_str() {
-        "bootstrap" => gen_bootstrap(&args[2]),
         "epoch-diff" => gen_epoch_diff(&args[2]),
         "slot-proof" => gen_slot_proof(&args[2]),
         "committee" => gen_committee(
