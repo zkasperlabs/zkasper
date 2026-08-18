@@ -37,6 +37,32 @@ set -euo pipefail
 # Run it under `setsid nohup ./scripts/gpu_bench.sh > gpu_bench.log 2>&1 &` and
 # tail the log. Setup plus two proofs takes tens of minutes, and an ssh session
 # that drops takes a foreground run with it.
+#
+# Timings on a fresh RTX 5090 box, for planning a rental:
+#   apt + rustup + ziskup --provingkey   ~16 min  (3.2 GB download)
+#   cargo-zisk setup, per ELF             ~6.4 min for the first one
+#   first prove                            ~99 s  (INITIALIZING_PROOFMAN 71.7 s)
+#   warm prove, small workload             ~19 s wall
+# Disk: 3.2 GB compressed -> 34 GB unpacked -> 72 GB after the first setup.
+#
+# MEASUREMENT PROTOCOL. `time cargo-zisk prove` measures three things at once
+# and the pipeline pays for one of them. The prover brackets its own phases:
+#   >>> INITIALIZING_PROOFMAN ... <<< INITIALIZING_PROOFMAN (Nms)
+#   Proof generated in X s
+# Read `Proof generated in`, and treat wall-minus-that as process start plus GPU
+# allocation. Fitting wall clock instead puts ~13.6 s of startup into the
+# intercept and calls it a per-proof floor, which is how the old 19.52 s
+# "fixed cost" and the 293.6 M "BASE" came to be quoted as if they were the
+# same kind of thing. They are not.
+#
+# GPU MEMORY. The prover does not allocate what the witness needs, it allocates
+# what the card has: it reads *free* VRAM and fills it. Every prove in this
+# campaign logged
+#   Minimum free memory available for GPU usage: 30.609253 GB
+#   GPU 0: Allocated 30.135334 GB (28.413327 GB unified + 1.722007 GB const pols)
+# on a 32.61 GB card, for workloads spanning 40x in cost. Two provers therefore
+# do not fit on one card; see BENCHMARKS.md. `cargo-zisk prove` does expose
+# `-m/--minimal-memory` and `-x/--max-witness-stored <bytes>` if you want to try.
 
 ZISK_VERSION="1.0.0-alpha"
 SLOT_ELF=target/elf/riscv64ima-zisk-zkvm-elf/release/zkasper-slot-proof-guest
@@ -54,10 +80,15 @@ echo "=== 1. System dependencies ==="
 # package in the list is unresolvable on this image, apt installs *nothing* and
 # every other dependency silently goes missing.
 #
-# libssl-dev is deliberately absent. On the CUDA base images it hits an
-# unresolvable version conflict against the preinstalled libssl. It is only
-# needed by the host-side `witness-gen` crate, never by the guest ELFs, so this
-# script builds guests only and consumes pre-staged inputs (see step 4).
+# libssl-dev is not installed here because the guest ELFs never need it, and
+# this script builds guests only and consumes pre-staged inputs (see step 4).
+#
+# It is NOT unresolvable, despite what this comment used to claim: on
+# nvidia/cuda:12.8.1-devel-ubuntu24.04 `apt-get install -y libssl-dev` succeeds
+# (verified 2026-08-18, it pulls openssl 3.0.13-0ubuntu3.12 over 3.0.13-0ubuntu3.5).
+# Install it if you want the host `witness-gen` crate on the box, which you do
+# for `cargo test --features zisk-prover` — the warm in-process prover is the
+# only way to measure per-proof latency without process startup in the number.
 sudo apt-get update -qq
 for pkg in \
   build-essential curl git jq xz-utils nasm python3 ca-certificates \
