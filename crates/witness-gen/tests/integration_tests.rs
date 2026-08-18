@@ -16,8 +16,8 @@ const TEST_DEPTH: u32 = 2;
 use zkasper_common::acc;
 use zkasper_common::test_utils::make_validator;
 use zkasper_common::types::{
-    EpochDiffOutput, FinalizationWitness, JustificationOutput, JustificationWitness,
-    SlotProofOutput, ValidatorData,
+    CommitteeOutput, EpochDiffOutput, FinalizationWitness, JustificationOutput,
+    JustificationWitness, SlotProofOutput, ValidatorData,
 };
 
 use zkasper_witness_gen::beacon_api::ValidatorResponse;
@@ -373,102 +373,64 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
 }
 
 // -----------------------------------------------------------------------
-// counted_validators_commitment unit tests
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_counted_validators_commitment_deterministic() {
-    use zkasper_common::acc;
-
-    let indices = vec![0, 1, 2, 3];
-    let a = acc::commit_indices(&indices);
-    let b = acc::commit_indices(&indices);
-    assert_eq!(a, b);
-    assert_ne!(a, zkasper_common::acc::ZERO);
-}
-
-#[test]
-fn test_counted_validators_commitment_empty() {
-    use zkasper_common::acc;
-
-    // An empty list still absorbs its length, so it must not collide with a
-    // list that happens to contain a zero index.
-    assert_eq!(acc::commit_indices(&[]), acc::commit_indices(&[]));
-    assert_ne!(acc::commit_indices(&[]), acc::commit_indices(&[0]));
-}
-
-#[test]
-fn test_counted_validators_commitment_order_matters() {
-    use zkasper_common::acc;
-
-    let a = acc::commit_indices(&[0, 1, 2]);
-    let b = acc::commit_indices(&[2, 1, 0]);
-    assert_ne!(a, b);
-}
-
-#[test]
-fn test_counted_validators_commitment_different_lengths() {
-    use zkasper_common::acc;
-
-    let a = acc::commit_indices(&[0, 1]);
-    let b = acc::commit_indices(&[0, 1, 2]);
-    assert_ne!(a, b);
-}
-
-// -----------------------------------------------------------------------
 // Justification round-trip test (directly constructed slot proof outputs)
 // -----------------------------------------------------------------------
 
+/// Root of the committee tree these hand-built slot proofs counted against.
+///
+/// The value is arbitrary; what the circuit checks is that every slot proof and
+/// the committee proof name the same one, so that the slot masks below
+/// deduplicate against a single partition of the validator set.
+const COMMITTEE_ROOT: acc::Digest = [3u64; 4];
+
+fn committee_output(accumulator_commitment: acc::Digest, target_epoch: u64) -> CommitteeOutput {
+    CommitteeOutput {
+        accumulator_commitment,
+        target_epoch,
+        committee_root: COMMITTEE_ROOT,
+    }
+}
+
 #[test]
 fn test_justification_round_trip() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{JustificationWitness, SlotProofOutput};
-
     let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
     let commitment = acc::commitment(&acc_root, total_active_balance);
     let target_epoch = 100u64;
     let target_root = [7u8; 32];
 
-    // Simulate 2 slot proofs with disjoint validator sets.
-    // Slot 0: validators [0, 1] — each 32 ETH
-    // Slot 1: validators [2, 3] — each 32 ETH
-    // Total attesting: 128 ETH = total_active_balance → supermajority
-
-    let slot0_indices = vec![0u64, 1];
-    let slot1_indices = vec![2u64, 3];
-
-    let slot0_commitment = acc::commit_indices(&slot0_indices);
-    let slot1_commitment = acc::commit_indices(&slot1_indices);
-
+    // Two slot proofs over disjoint slots of one committee proof, each covering
+    // half the validator set: 128 ETH in all, a supermajority.
     let slot_proof_outputs = vec![
         SlotProofOutput {
             accumulator_commitment: commitment,
+            committee_root: COMMITTEE_ROOT,
             target_epoch,
             target_root,
             attesting_balance: 2 * 32_000_000_000,
-            counted_validators_commitment: slot0_commitment,
-            num_counted_validators: 2,
+            slots_mask: 0b01,
         },
         SlotProofOutput {
             accumulator_commitment: commitment,
+            committee_root: COMMITTEE_ROOT,
             target_epoch,
             target_root,
             attesting_balance: 2 * 32_000_000_000,
-            counted_validators_commitment: slot1_commitment,
-            num_counted_validators: 2,
+            slots_mask: 0b10,
         },
     ];
 
     let witness = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch,
         target_root,
         total_active_balance,
+        committee: committee_output(commitment, target_epoch),
+        committee_proof: vec![],
         slot_proof_outputs,
         slot_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
-        counted_indices_per_slot: vec![slot0_indices, slot1_indices],
     };
 
     let output = zkasper_justification_guest::verify_justification(&witness);
@@ -479,92 +441,79 @@ fn test_justification_round_trip() {
 }
 
 #[test]
-#[should_panic(expected = "cross-slot duplicate validator")]
-fn test_justification_rejects_cross_slot_duplicate() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{JustificationWitness, SlotProofOutput};
-
+#[should_panic(expected = "counts a slot that was already counted")]
+fn test_justification_rejects_a_slot_counted_twice() {
     let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000;
     let commitment = acc::commitment(&acc_root, total_active_balance);
     let target_epoch = 100u64;
     let target_root = [7u8; 32];
 
-    // Both slots count validator 1 — should be rejected
-    let slot0_indices = vec![0u64, 1];
-    let slot1_indices = vec![1u64, 2]; // validator 1 duplicated!
-
-    let slot0_commitment = acc::commit_indices(&slot0_indices);
-    let slot1_commitment = acc::commit_indices(&slot1_indices);
-
+    // Both proofs count slot 1. The committee proof puts every validator in
+    // exactly one slot, so a slot counted twice is a validator counted twice.
     let slot_proof_outputs = vec![
         SlotProofOutput {
             accumulator_commitment: commitment,
+            committee_root: COMMITTEE_ROOT,
             target_epoch,
             target_root,
             attesting_balance: 2 * 32_000_000_000,
-            counted_validators_commitment: slot0_commitment,
-            num_counted_validators: 2,
+            slots_mask: 0b011,
         },
         SlotProofOutput {
             accumulator_commitment: commitment,
+            committee_root: COMMITTEE_ROOT,
             target_epoch,
             target_root,
             attesting_balance: 2 * 32_000_000_000,
-            counted_validators_commitment: slot1_commitment,
-            num_counted_validators: 2,
+            slots_mask: 0b110,
         },
     ];
 
     let witness = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch,
         target_root,
         total_active_balance,
+        committee: committee_output(commitment, target_epoch),
+        committee_proof: vec![],
         slot_proof_outputs,
         slot_proofs: vec![vec![], vec![]],
-        counted_indices_per_slot: vec![slot0_indices, slot1_indices],
     };
 
-    // This should panic due to cross-slot duplicate
     zkasper_justification_guest::verify_justification(&witness);
 }
 
 #[test]
 #[should_panic(expected = "insufficient attesting balance")]
 fn test_justification_rejects_insufficient_balance() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{JustificationWitness, SlotProofOutput};
-
     let acc_root = [42u64; 4];
     let total_active_balance: u64 = 4 * 32_000_000_000; // 128 ETH total
     let commitment = acc::commitment(&acc_root, total_active_balance);
     let target_epoch = 100u64;
     let target_root = [7u8; 32];
 
-    // Only 1 slot with 1 validator (32 ETH) — not enough for 2/3 of 128 ETH
-    let indices = vec![0u64];
-    let slot_commitment = acc::commit_indices(&indices);
-
-    let slot_proof_outputs = vec![SlotProofOutput {
-        accumulator_commitment: commitment,
-        target_epoch,
-        target_root,
-        attesting_balance: 32_000_000_000,
-        counted_validators_commitment: slot_commitment,
-        num_counted_validators: 1,
-    }];
-
+    // One slot carrying one validator (32 ETH) — not enough for 2/3 of 128 ETH
     let witness = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
         accumulator_commitment: commitment,
         target_epoch,
         target_root,
         total_active_balance,
-        slot_proof_outputs,
+        committee: committee_output(commitment, target_epoch),
+        committee_proof: vec![],
+        slot_proof_outputs: vec![SlotProofOutput {
+            accumulator_commitment: commitment,
+            committee_root: COMMITTEE_ROOT,
+            target_epoch,
+            target_root,
+            attesting_balance: 32_000_000_000,
+            slots_mask: 0b1,
+        }],
         slot_proofs: vec![vec![]],
-        counted_indices_per_slot: vec![indices],
     };
 
     zkasper_justification_guest::verify_justification(&witness);
@@ -754,25 +703,24 @@ fn test_full_justification_to_finalization_pipeline() {
 
     // Build justification for epoch 100
     let epoch_100_root = fin_root();
-    let indices_100 = vec![0u64, 1, 2, 3]; // all 4 validators
-    let commitment_100 = acc::commit_indices(&indices_100);
-
     let just_witness_100 = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
         accumulator_commitment: commitment_e,
         target_epoch: 100,
         target_root: epoch_100_root,
         total_active_balance: diff.total_active_balance + 1_000_000_000,
+        committee: committee_output(commitment_e, 100),
+        committee_proof: vec![],
         slot_proof_outputs: vec![SlotProofOutput {
             accumulator_commitment: commitment_e,
+            committee_root: COMMITTEE_ROOT,
             target_epoch: 100,
             target_root: epoch_100_root,
             attesting_balance: diff.total_active_balance + 1_000_000_000,
-            counted_validators_commitment: commitment_100,
-            num_counted_validators: 4,
+            slots_mask: 0b1111, // one proof covering the epoch's four slots
         }],
         slot_proofs: vec![vec![]],
-        counted_indices_per_slot: vec![indices_100],
     };
 
     let output_100 = zkasper_justification_guest::verify_justification(&just_witness_100);
@@ -781,25 +729,24 @@ fn test_full_justification_to_finalization_pipeline() {
     // Build justification for epoch 101, against the accumulator the diff
     // produced rather than the one epoch 100 used.
     let epoch_101_root = [8u8; 32];
-    let indices_101 = vec![0u64, 1, 2, 3];
-    let commitment_101 = acc::commit_indices(&indices_101);
-
     let just_witness_101 = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
         accumulator_commitment: commitment_e1,
         target_epoch: 101,
         target_root: epoch_101_root,
         total_active_balance: diff.total_active_balance,
+        committee: committee_output(commitment_e1, 101),
+        committee_proof: vec![],
         slot_proof_outputs: vec![SlotProofOutput {
             accumulator_commitment: commitment_e1,
+            committee_root: COMMITTEE_ROOT,
             target_epoch: 101,
             target_root: epoch_101_root,
             attesting_balance: diff.total_active_balance,
-            counted_validators_commitment: commitment_101,
-            num_counted_validators: 4,
+            slots_mask: 0b1111,
         }],
         slot_proofs: vec![vec![]],
-        counted_indices_per_slot: vec![indices_101],
     };
 
     let output_101 = zkasper_justification_guest::verify_justification(&just_witness_101);

@@ -2,8 +2,10 @@ pub mod acc_tree;
 pub mod artifacts;
 pub mod attestation_collector;
 pub mod beacon_api;
+pub mod committee;
 pub mod db;
 pub mod epoch_state;
+pub mod fixture;
 pub mod orchestrator;
 pub mod prover;
 pub mod pubkey;
@@ -15,5 +17,7 @@ pub mod witness_bootstrap;
 pub mod witness_epoch_diff;
 pub mod witness_justification;
 pub mod witness_slot_proof;
+#[cfg(feature = "zisk-prover")]
+pub mod zisk_prover;
 
 pub use epoch_state::EpochState;

@@ -1,4 +1,6 @@
-//! Assemble SlotProofWitness values — one per block slot.
+//! Assemble SlotProofWitness values — one per attestation slot.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::{info, info_span};
@@ -9,20 +11,23 @@ use zkasper_common::ChainConfig;
 
 use crate::acc_tree::AccTree;
 use crate::beacon_api::BeaconApi;
+use crate::committee::EpochCommittees;
 
-/// Per-slot witness with metadata needed by the justification witness builder.
+/// Per-slot witness with what the justification witness builder needs.
 pub struct SlotWitnessData {
     pub slot: u64,
     pub witness: SlotProofWitness,
-    /// Sorted counted validator indices (for justification dedup witness).
-    pub counted_indices: Vec<u64>,
+    /// Committee balance minus absentees: what this slot adds to the epoch.
+    pub marginal_balance: u64,
 }
 
-/// Build one SlotProofWitness per block slot that contains matching attestations.
+/// Build one SlotProofWitness per attestation slot that has attestations.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_per_slot(
     api: &impl BeaconApi,
     config: &ChainConfig,
     acc_tree: &AccTree,
+    committees: Arc<EpochCommittees>,
     target_epoch: u64,
     target_root: [u8; 32],
     total_active_balance: u64,
@@ -30,60 +35,49 @@ pub async fn build_per_slot(
 ) -> Result<Vec<SlotWitnessData>> {
     let _span = info_span!("slot_proofs", target_epoch).entered();
 
-    // Fetch validators at the epoch boundary
-    let slot_str = (target_epoch * config.slots_per_epoch).to_string();
-    let validators = api
-        .get_validators(&slot_str)
-        .await
-        .context("fetch validators for slot proofs")?;
-
     let acc_root = acc_tree.root();
     let commitment = acc::commitment(&acc_root, total_active_balance);
+    let committee_root = committees.root();
 
-    // Collect attestations grouped by block slot
     let per_slot = crate::attestation_collector::collect_per_slot_for_checkpoint(
         api,
         config,
+        committees.clone(),
         target_epoch,
         &target_root,
-        &validators,
-        target_epoch,
     )
     .await
-    .context("collect per-slot attestations")?;
+    .context("collect per-slot complements")?;
 
     let mut result = Vec::with_capacity(per_slot.len());
 
-    for slot_data in per_slot {
-        let _span = info_span!("slot", slot = slot_data.slot).entered();
+    for complement in per_slot {
+        let _span = info_span!("slot", slot = complement.slot).entered();
 
-        // Build Poseidon multi-proof for this slot's unique validators
-        let multi_proof_indices: Vec<u64> = slot_data.all_validator_indices.clone();
-        let acc_multi_proof = acc_tree.build_multi_proof(&multi_proof_indices);
+        let acc_multi_proof = acc_tree.build_multi_proof(&complement.named_indices);
 
         info!(
-            attestations = slot_data.attestations.len(),
-            validators = multi_proof_indices.len(),
-            counted = slot_data.counted_indices.len(),
+            absentees = complement.witness.absentees.len(),
+            named = complement.named_indices.len(),
             auxiliaries = acc_multi_proof.auxiliaries.len(),
             "slot proof witness built",
         );
 
-        let witness = SlotProofWitness {
-            accumulator_commitment: commitment,
-            target_epoch,
-            target_root,
-            signing_domain,
-            acc_root,
-            total_active_balance,
-            attestations: slot_data.attestations,
-            acc_multi_proof,
-        };
-
         result.push(SlotWitnessData {
-            slot: slot_data.slot,
-            witness,
-            counted_indices: slot_data.counted_indices,
+            slot: complement.slot,
+            marginal_balance: complement.marginal_balance,
+            witness: SlotProofWitness {
+                accumulator_commitment: commitment,
+                committee_root,
+                target_epoch,
+                target_root,
+                signing_domain,
+                acc_root,
+                total_active_balance,
+                acc_multi_proof,
+                committee_multi_proof: committees.multi_proof(&[complement.witness.slot_in_epoch]),
+                slots: vec![complement.witness],
+            },
         });
     }
 

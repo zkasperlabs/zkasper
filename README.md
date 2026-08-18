@@ -6,7 +6,7 @@ ZK proof of Ethereum beacon chain finality for trustless bridges, targeting the 
 
 ## Overview
 
-zkasper proves that an Ethereum Casper FFG checkpoint has been finalized, without requiring the verifier to process the full beacon chain. It works in five stages:
+zkasper proves that an Ethereum Casper FFG checkpoint has been finalized, without requiring the verifier to process the full beacon chain. It works in six stages:
 
 1. **Bootstrap** — one-time, builds the accumulator tree from a trusted beacon state.
 
@@ -15,13 +15,19 @@ zkasper proves that an Ethereum Casper FFG checkpoint has been finalized, withou
    proof covers ~200 mutations (churn plus balance updates) and outputs the new
    accumulator root and total active balance.
 
-3. **Slot Proof** — one per block slot. Checks that slot's attestations against
-   the accumulator and verifies every signature in a single multi-pairing.
+3. **Committee** — one per epoch, and the reason a slot proof is cheap. Sums
+   each slot's committee out of the accumulator into a `(public key, effective
+   balance)` pair, so that a slot can be proven by naming the validators that
+   did *not* attest.
 
-4. **Justification** — folds a slot's proofs recursively, dedupes attesters
-   across slots, and checks the 2/3 threshold.
+4. **Slot Proof** — one per attestation slot. Subtracts that slot's absentees
+   from its committee aggregate, and verifies every signature in a single
+   multi-pairing.
 
-5. **Finalization** — pairs two consecutive justifications, together with the
+5. **Justification** — folds a slot's proofs recursively, checks that no slot is
+   counted twice, and checks the 2/3 threshold.
+
+6. **Finalization** — pairs two consecutive justifications, together with the
    epoch diff that carries the accumulator from the first epoch to the second.
    Effective balances are rewritten at every epoch transition, so the two
    justifications are never proved against the same accumulator; verifying the
@@ -31,7 +37,7 @@ zkasper proves that an Ethereum Casper FFG checkpoint has been finalized, withou
    accumulator entered the finalized epoch with, so a consumer can compare the
    two directly.
 
-Stages 3 to 5 compose through `verify_zisk_proof`, so slot proofs can be produced
+Stages 4 to 6 compose through `verify_zisk_proof`, so slot proofs can be produced
 independently and in parallel.
 
 ## Architecture
@@ -41,7 +47,8 @@ crates/
   common/              # shared types, SSZ, accumulator, Merkle, BLS, recursion
   bootstrap-guest/     # Zisk guest: one-time tree construction
   epoch-diff-guest/    # Zisk guest: validator set diff
-  slot-proof-guest/    # Zisk guest: one slot's attestations
+  committee-proof-guest/ # Zisk guest: one epoch's committee aggregates
+  slot-proof-guest/    # Zisk guest: one slot's attestations, by complement
   group-proof-guest/   # Zisk guest: several slots, no final exponentiation
   aggregation-guest/   # Zisk guest: folds group proofs into a running aggregate
   justification-guest/ # Zisk guest: folds slot proofs, checks 2/3
@@ -51,6 +58,25 @@ crates/
   witness-gen/         # host-side witness generator (beacon API, tree management)
   onchain-verifier/    # Solidity verifier contract
 ```
+
+### Complement proving
+
+A mainnet slot committee is about 30,000 validators and roughly 99.7% of them
+attest. Opening a Merkle path for every attester proves the overwhelmingly
+common case tens of thousands of times over; naming the ~90 absentees instead is
+**167x** less accumulator work per slot, and it is what makes the marginal proof
+of an epoch small. The per-epoch committee proof that pays for it costs 14.5B,
+which is *less* than the 26.8B the slot proofs were spending, and it can run a
+whole epoch ahead of the attestations it serves.
+
+It works because the aggregate signature pins the absentee set exactly: the
+derived aggregate public key is the committee minus whoever the witness names, so
+omitting a genuine absentee, naming an attester, or naming a stranger all leave a
+key that no signature closes against. The balance side is *not* pinned by the
+signature, and is bound instead by the accumulator leaf — one Poseidon2 hash over
+`(public key, effective balance)` together — so a committee's two totals cannot
+be moved apart. `crates/common/src/committee.rs` carries the full argument,
+including why the swap-or-not shuffle never has to enter a circuit.
 
 ### Why a second tree?
 
@@ -76,7 +102,7 @@ cost of whatever still depends on the *last* attestation. The pipeline is built
 to leave one proof there.
 
 ```
-    slots 0..12      13..18   19..21  22  23   the aggregate that crosses 2/3
+    slots 0..12      13..18   19..21  22  23   the slot that crosses 2/3
     +-----------+    +-----+  +---+  +-+ +-+   +-------------------------+
     | group     |    |group|  |grp|  |g| |g|   |  proven inline, in the  |
     | proof     |    |     |  |   |  | | | |   |  final proof itself     |
@@ -98,18 +124,20 @@ the schedule:
   it asserts *nothing* about the signatures. The final proof multiplies every
   group's accumulator and runs one final exponentiation for the epoch.
 - **Groups shrink geometrically** toward the threshold, so the last one is a
-  single aggregate rather than a fixed eight slots.
+  single slot rather than a fixed eight.
 - **The epoch stops at the threshold**, measured by accumulated weight. On the
   real mainnet epoch in the test suite that skips 39% of the aggregates.
 - **The tail is collapsed**: one proof verifies the aggregate, does the marginal
-  aggregate inline, settles every signature, checks 2/3, and emits the
-  finalization — instead of four proofs in series.
+  slot inline, settles every signature, checks 2/3, and emits the finalization —
+  instead of four proofs in series.
 
-Measured on epoch 430529, `T2 - T` is **1.418B cost units**: 22.2s on an RTX 5090
-that keeps its allocation open, against 129.6s for fixed groups of eight with a
-four-stage tail. The warm path is the product — a cold `cargo-zisk` invocation is
-19.52s of startup before it proves anything, which is why
-`crates/witness-gen/src/prover.rs` requires a long-running prover. See
+Modelled at mainnet scale, `T2 - T` is **0.57B cost units**: 9.6s on an RTX 5090
+that keeps its allocation open, against 1.418B — 22.2s — for the same pipeline
+enumerating the marginal aggregate's attesters, and 129.6s for fixed groups of
+eight with a four-stage tail. Three quarters of what is left is the per-proof
+floor and the one final exponentiation. The warm path is the product — a cold
+`cargo-zisk` invocation is 19.52s of startup before it proves anything, which is
+why `crates/witness-gen/src/prover.rs` requires a long-running prover. See
 [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Building
@@ -184,34 +212,53 @@ cargo run --release --bin zkasperd -- --beacon-url http://localhost:5052 \
     --db-path zkasperd.db --output-dir zkasper-out
 ```
 
-Per epoch it runs one epoch diff to advance the accumulator, then streams slot
-proofs as blocks arrive and fires the justification the moment the counted
-balance crosses 2/3 — around slot 22 of a mainnet epoch, not at the epoch
-boundary. Blocks past that point are never fetched. A finalization follows
-whenever two consecutive epochs justify.
+Per epoch it runs one epoch diff to advance the accumulator and one committee
+proof to sum that epoch's committees, then streams slot proofs as blocks arrive
+— closing an attestation slot once the next block has been scanned — and fires
+the justification the moment the counted balance crosses 2/3, around slot 22 of a
+mainnet epoch rather than at the epoch boundary. Blocks past that point are never
+fetched. A finalization follows whenever two consecutive epochs justify.
 
 Output:
 
 ```
 zkasper-out/
-  status.json              # accumulator, checkpoints, per-stage timings
+  status.json              # accumulator, checkpoints, per-stage and per-epoch timings
   epoch-000123456/
     epoch_diff.bin
-    slot_proof_<slot>.bin
+    committee.bin
+    slot_proof_<slot>.bin  # --mode batch
     justification.bin
     finalization.bin
+    group_<n>.bin          # --mode streaming
+    aggregate_<n>.bin
+    stream_final.bin
 ```
 
 `--once` catches up to the node's head and exits. `--bootstrap-slot` picks a
 different starting state. `--signing-domain` overrides the domain otherwise
 derived from the node's fork and genesis.
 
-**It generates witnesses, it does not prove.** Proving is behind the `Prover`
-trait in `crates/witness-gen/src/prover.rs` — witness in, `(public output,
-proof)` out. The default implementation runs each guest's logic natively and
-returns an empty proof, so every witness written has been checked by the same
-circuit that will later prove it. A prover that drives `cargo-zisk` implements
-the same trait; nothing else changes.
+Proving is behind the `Prover` trait in `crates/witness-gen/src/prover.rs` —
+witness in, `(public output, proof)` out — and there are two implementations.
+`--prover native`, the default, runs each guest's logic natively and returns an
+empty proof, so every witness written has been checked by the same circuit that
+will later prove it, and no proving hardware is needed. `--prover zisk` produces
+real proofs from one embedded `zisk-sdk` client that is initialised once and kept
+warm for the life of the process; add `--gpu` to prove on a GPU. It is behind a
+cargo feature because it pulls in the whole Zisk proving stack:
+
+```sh
+./scripts/build_guests.sh
+cargo build --release --features zisk-prover
+zkasperd --beacon-url ... --mode streaming --prover zisk --gpu
+```
+
+`--mode streaming` proves the epoch as attestations arrive — a group per poll,
+folded into a running aggregate, closed by one proof over the attestation that
+crossed the threshold — and records the measured `T2 - T` per epoch in
+`status.json` under `recent_latencies`. `--mode batch`, the default, proves each
+slot and folds the epoch once it is over.
 
 Restarts are safe. The accumulator is a chain, so `crates/witness-gen/src/store.rs`
 writes atomically, checksums what it writes, rehashes the tree on load and
@@ -221,7 +268,8 @@ exactly one epoch forward.
 ## Status
 
 - [x] Core library (SSZ, accumulator, Merkle, types)
-- [x] Bootstrap, epoch-diff, slot-proof, justification and finalization circuits
+- [x] Bootstrap, epoch-diff, committee, slot-proof, justification and
+      finalization circuits
 - [x] Poseidon2-Goldilocks accumulator on `syscall_poseidon2`
 - [x] SSZ hashing on `syscall_sha256_f`
 - [x] BLS12-381 aggregate signature verification via zisklib, batched into one
@@ -238,16 +286,17 @@ exactly one epoch forward.
 - [x] Streaming proof pipeline: Miller loops split from the final
       exponentiation, geometric groups, threshold trigger, collapsed tail
       (`T2 - T` 6.1x shorter, measured on epoch 430529)
-- [x] Counted-set bitmap tree, so cross-epoch deduplication costs what is added
-      rather than what has accumulated
+- [x] Complement proving: slot proofs name absentees against a per-epoch
+      committee aggregate, 167x less accumulator work per slot and an epoch
+      47.9% cheaper overall
 - [ ] Finalizing an epoch whose first slot was empty. The accumulator is built
       from the state at the epoch boundary, and the finalized header only names
       that state when a block sits on the boundary slot. Covering the empty case
       needs the boundary state root proved out of the finalized state's
       `state_roots` list.
-- [ ] Accumulator membership for the marginal aggregate, which is now half of
-      `T2 - T`. Proving a superset before `T` and selecting from it inside the
-      final proof is the next real win.
+- [ ] Splitting the committee proof across validator index ranges. Bucket sums
+      add and a validator lands in one range, so a fold that adds aggregates is
+      all it needs — and it is half the epoch's cost.
 - [ ] Projective or batched-inversion G1 aggregation
 - [ ] Solidity verifier integration with the Zisk proof format
 - [ ] Bootstrap chunking across recursive proofs

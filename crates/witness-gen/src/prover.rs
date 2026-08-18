@@ -21,11 +21,17 @@
 //! acceptable implementation of this trait, and the trait is shaped so that it
 //! does not have to be: `&self`, `Send + Sync`, no per-call setup hook.
 //!
-//! Until there is a GPU to run it on, [`NativeProver`] implements the trait by
-//! running the guest's verification logic natively and returning an empty proof.
-//! An empty proof is what `recursion::verify_child` accepts on a native target,
-//! so justification and finalization still compose exactly as they will with
-//! real proofs — the only thing missing is the cryptography.
+//! [`crate::zisk_prover::ZiskProver`] is that implementation — one embedded
+//! `zisk-sdk` client, initialised once, proving for the life of the process. It
+//! is behind the `zisk-prover` feature because it drags in the whole Zisk
+//! proving stack, which needs a C++ toolchain and 47 GB of proving key.
+//!
+//! [`NativeProver`] implements the same trait by running the guest's
+//! verification logic natively and returning an empty proof. An empty proof is
+//! what `recursion::verify_child` accepts on a native target, so justification
+//! and finalization still compose exactly as they will with real proofs — the
+//! only thing missing is the cryptography. It is what the tests run against, and
+//! what a witness-only deployment runs.
 //!
 //! Running the circuit is not a formality. Every witness the daemon writes has
 //! been through the guest logic that will later prove it, so a witness that
@@ -40,9 +46,10 @@ use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, EpochDiffOutput, EpochDiffWitness,
-    FinalizationOutput, FinalizationWitness, GroupProofOutput, JustificationOutput,
-    JustificationWitness, SlotProofOutput, SlotProofWitness, StreamFinalOutput, StreamFinalWitness,
+    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
+    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
+    StreamFinalOutput, StreamFinalWitness,
 };
 use zkasper_common::ChainConfig;
 
@@ -59,6 +66,7 @@ pub type Proof = Vec<u64>;
 pub enum Stage {
     Bootstrap,
     EpochDiff,
+    Committee,
     SlotProof,
     Justification,
     Finalization,
@@ -72,6 +80,7 @@ impl Stage {
         match self {
             Stage::Bootstrap => "bootstrap",
             Stage::EpochDiff => "epoch_diff",
+            Stage::Committee => "committee",
             Stage::SlotProof => "slot_proof",
             Stage::Justification => "justification",
             Stage::Finalization => "finalization",
@@ -80,6 +89,21 @@ impl Stage {
             Stage::StreamFinal => "stream_final",
         }
     }
+}
+
+/// What a proof cost inside the prover.
+///
+/// The orchestrator times the whole stage, witness generation included; this is
+/// the part of it that was cryptography. The two are published apart because a
+/// `T2 - T` that folds them together cannot be checked against anything.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProveCost {
+    /// Producing the VADCOP final proof.
+    pub prove_millis: u64,
+    /// Compressing it. Nearly all of a cold `cargo-zisk wrap --minimal` is
+    /// startup and device allocation; held warm, what is left is the 0.192 s of
+    /// compression itself.
+    pub wrap_millis: u64,
 }
 
 /// Public output of the bootstrap stage.
@@ -105,8 +129,14 @@ pub trait Prover: Send + Sync {
     /// different program cannot be substituted.
     fn program_vk(&self, stage: Stage) -> ProgramVk;
 
+    /// What the last proof cost, for a prover that produces proofs.
+    fn last_cost(&self) -> Option<ProveCost> {
+        None
+    }
+
     fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)>;
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)>;
+    fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)>;
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)>;
     fn prove_justification(
         &self,
@@ -135,8 +165,8 @@ pub trait Prover: Send + Sync {
 /// Runs the guest logic natively and returns an empty proof.
 ///
 /// This is the default: witness generation with a validity check, no
-/// cryptography. Swap in a prover that shells out to `cargo-zisk` and the
-/// orchestrator does not change.
+/// cryptography. Swap in [`crate::zisk_prover::ZiskProver`] and the orchestrator
+/// does not change.
 pub struct NativeProver {
     config: ChainConfig,
 }
@@ -188,6 +218,13 @@ impl Prover for NativeProver {
         Ok((output, Proof::new()))
     }
 
+    fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
+        let output = run_circuit(Stage::Committee, || {
+            zkasper_common::committee::verify(witness, self.config.acc_tree_depth)
+        })?;
+        Ok((output, Proof::new()))
+    }
+
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)> {
         let output = run_circuit(Stage::SlotProof, || {
             zkasper_slot_proof_guest::verify_slot_proof_with_depth(
@@ -233,10 +270,7 @@ impl Prover for NativeProver {
 
     fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)> {
         let output = run_circuit(Stage::Aggregate, || {
-            zkasper_aggregation_guest::verify_aggregate_with_depth(
-                witness,
-                zkasper_common::dedup::tree_depth(self.config.acc_tree_depth),
-            )
+            zkasper_aggregation_guest::verify_aggregate(witness)
         })?;
         Ok((output, Proof::new()))
     }
@@ -260,7 +294,7 @@ impl Prover for NativeProver {
 /// The guests assert rather than return, because inside a zkVM a failed
 /// assertion is the only way to reject. A daemon cannot take that literally: an
 /// unprovable witness for one epoch must not end the process.
-fn run_circuit<T>(stage: Stage, f: impl FnOnce() -> T) -> Result<T> {
+pub(crate) fn run_circuit<T>(stage: Stage, f: impl FnOnce() -> T) -> Result<T> {
     catch_unwind(AssertUnwindSafe(f)).map_err(|panic| {
         let reason = panic
             .downcast_ref::<String>()

@@ -5,6 +5,7 @@ members = [
     "crates/epoch-diff-guest",
     "crates/bootstrap-guest",
     "crates/slot-proof-guest",
+    "crates/committee-proof-guest",
     "crates/justification-guest",
     "crates/finalization-guest",
     "crates/group-proof-guest",
@@ -31,3 +32,7 @@ bincode = "1.3"
 # (aggregate verify) and hash_to_curve, and zisk_verifier.rs (recursion) all
 # land in different releases, and only v1.0.0-alpha has all of them.
 ziskos = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v1.0.0-alpha" }
+
+# The host half of the same release: the embedded prover client. Same tag, so a
+# proof is produced and recursively verified by one version of Zisk.
+zisk-sdk = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v1.0.0-alpha" }
