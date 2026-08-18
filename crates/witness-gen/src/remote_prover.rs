@@ -593,7 +593,11 @@ impl RemoteProver {
     ///
     /// This fails when the server is not there, on purpose: a daemon that cannot
     /// reach its prover at startup has been misconfigured, and learning that
-    /// before the first beacon call is cheaper than learning it at `T`.
+    /// before the first beacon call is cheaper than learning it at `T`. The
+    /// asymmetry is deliberate — a prover lost mid-run costs proofs and not the
+    /// daemon, but one that was never there is a fault to report. The cost is
+    /// that a daemon restarted *during* an outage cannot start until the server
+    /// is back; its supervisor retries, and the store is untouched.
     pub fn connect(config: RemoteProverConfig) -> Result<Self> {
         let (stream, server, programs) = handshake(&config)?;
         for &stage in &config.stages {
