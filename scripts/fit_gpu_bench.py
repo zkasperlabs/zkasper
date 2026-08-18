@@ -29,9 +29,11 @@ import math
 import os
 import statistics as st
 
+# The three superseded constants this script exists to disprove. Nothing in the
+# repo uses them any more; `scripts/time_model.py` is what replaced them.
 CLAIMED_BASE_COST = 293_601_280   # zisk emulator/src/emu_costs.rs
-CLAIMED_RATE = 67_452_592         # units/s, BENCHMARKS.md
-CLAIMED_COLD_FIXED_S = 19.52      # scripts/streaming_cost.py
+CLAIMED_RATE = 67_452_592         # units/s, the pre-campaign BENCHMARKS.md
+CLAIMED_COLD_FIXED_S = 19.52      # the pre-campaign scripts/streaming_cost.py
 
 
 def read_costs(path):
