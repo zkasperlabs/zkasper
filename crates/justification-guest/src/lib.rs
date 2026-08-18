@@ -33,6 +33,12 @@
 //!   chain, checked with an `AND` against zero. Because the committee proof puts
 //!   each validator in exactly one slot, a slot counted once is a validator
 //!   counted once.
+//! - **Every child comes from a named program.** The slot-proof and committee
+//!   keys are constants this guest was compiled with, so a prover cannot hand
+//!   the fold a proof of a guest of their own. The chain's own key is the one
+//!   that cannot be a constant — a program cannot contain its own key — so it is
+//!   published in [`zkasper_common::types::JustificationOutput::program_vk`] and
+//!   pinned by whichever circuit consumes the finished chain.
 //!
 //! # `justified` is computed, and the consumer checks it
 //!
@@ -44,11 +50,13 @@
 
 extern crate alloc;
 
+pub mod child_vks;
+
 use zkasper_common::types::{JustificationOutput, JustificationWitness};
 
 /// Fold slot proofs into a running justification.
 pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutput {
-    use zkasper_common::recursion::verify_child;
+    use zkasper_common::recursion::{verify_baked_child, verify_child};
 
     assert!(
         !witness.slot_proof_outputs.is_empty(),
@@ -76,7 +84,6 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
         None => zkasper_aggregation_guest::committee_link(
             witness.committee.as_ref(),
             &witness.committee_proof,
-            &witness.committee_program_vk,
             &witness.accumulator_commitment,
             witness.target_epoch,
         ),
@@ -91,6 +98,15 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
                     &previous.public_bytes(),
                 ),
                 "previous justification failed recursive verification",
+            );
+            // The one key a program cannot bake is its own, so the chain agrees
+            // on one instead and publishes it. Both consumers of a
+            // justification bake this key and compare the published value
+            // against it, which is what ties the agreed key to the real
+            // program.
+            assert_eq!(
+                previous.program_vk, witness.justification_program_vk,
+                "previous justification was produced by a different program",
             );
             assert_eq!(
                 previous.accumulator_commitment, witness.accumulator_commitment,
@@ -111,11 +127,14 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
 
     for (i, slot_output) in witness.slot_proof_outputs.iter().enumerate() {
         // Verify the slot proof, and bind it to this exact program and these
-        // exact outputs — a proof of a different slot must not be accepted.
+        // exact outputs — a proof of a different slot must not be accepted, and
+        // neither must a proof of a different program. The key is the constant
+        // this guest was compiled with, so it names `slot-proof-guest` and
+        // nothing a prover could have written instead.
         assert!(
-            verify_child(
+            verify_baked_child(
                 &witness.slot_proofs[i],
-                &witness.slot_program_vk,
+                &child_vks::SLOT_PROGRAM_VK,
                 &slot_output.public_bytes(),
             ),
             "slot proof {} failed recursive verification",
@@ -166,5 +185,6 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
         attesting_balance: total_attesting_balance,
         slots_mask,
         justified: total_attesting_balance as u128 * 3 >= witness.total_active_balance as u128 * 2,
+        program_vk: witness.justification_program_vk,
     }
 }

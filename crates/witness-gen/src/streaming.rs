@@ -1225,11 +1225,12 @@ pub struct StreamContext {
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub signing_domain: [u8; 32],
-    pub group_program_vk: ProgramVk,
+    /// The key an aggregate chain's links verify each other under.
     pub aggregate_program_vk: ProgramVk,
-    pub previous_program_vk: ProgramVk,
-    pub epoch_diff_program_vk: ProgramVk,
-    pub committee_program_vk: ProgramVk,
+    /// The same for the chain of epochs: a stream final proof verifies the
+    /// previous epoch's under this. Both are here because a program cannot
+    /// contain its own key; every other child key is a constant of the guest.
+    pub stream_program_vk: ProgramVk,
     /// The diff that carried the accumulator into this epoch, with its proof.
     ///
     /// Verified by the fold that opens the epoch, which is as early as it can
@@ -1303,10 +1304,7 @@ pub fn aggregate_witness(
         accumulator_commitment: context.accumulator_commitment,
         target_epoch: context.target_epoch,
         target_root: context.target_root,
-        group_program_vk: context.group_program_vk,
         aggregate_program_vk: context.aggregate_program_vk,
-        epoch_diff_program_vk: context.epoch_diff_program_vk,
-        committee_program_vk: context.committee_program_vk,
         epoch_diff: opens_the_epoch.then(|| context.epoch_diff.clone()),
         epoch_diff_proof: if opens_the_epoch {
             context.epoch_diff_proof.clone()
@@ -1356,11 +1354,7 @@ pub fn final_witness(
         signing_domain: context.signing_domain,
         acc_root: context.acc_root,
         total_active_balance: context.total_active_balance,
-        group_program_vk: context.group_program_vk,
-        aggregate_program_vk: context.aggregate_program_vk,
-        previous_program_vk: context.previous_program_vk,
-        epoch_diff_program_vk: context.epoch_diff_program_vk,
-        committee_program_vk: context.committee_program_vk,
+        stream_program_vk: context.stream_program_vk,
         // Needed only when there is no aggregate to inherit the links from.
         epoch_diff: aggregate.is_none().then(|| context.epoch_diff.clone()),
         epoch_diff_proof: if aggregate.is_none() {

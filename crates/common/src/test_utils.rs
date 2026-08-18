@@ -322,7 +322,12 @@ pub fn build_acc_tree(acc_leaves: &[Digest], depth: u32) -> (Digest, Vec<Vec<Dig
 ///
 /// The closing link of a real chain publishes the balance and mask it counted;
 /// nothing downstream reads either, so a fixture only has to set the flag.
+///
+/// `program_vk` is not decoration: a consumer requires it to be the key of the
+/// program it was built to verify, so a fixture that names the wrong one is
+/// refused exactly as an attacker's chain would be.
 pub fn justified_output(
+    program_vk: crate::recursion::ProgramVk,
     accumulator_commitment: Digest,
     target_epoch: u64,
     target_root: [u8; 32],
@@ -335,5 +340,6 @@ pub fn justified_output(
         attesting_balance: 0,
         slots_mask: 0,
         justified: true,
+        program_vk,
     }
 }

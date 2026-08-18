@@ -488,9 +488,15 @@ fn refuses_a_server_without_the_stages_this_run_needs() {
 /// an old peer reads a plausible lie again. `JustificationWitness` gaining a
 /// previous link, and `JustificationOutput` gaining its running state, is why
 /// this is 3.
+///
+/// 4 is the child-key change: every witness lost the program keys it used to
+/// name, because the guests bake them now, and the three fold chains gained a
+/// published `program_vk` for the one key a program cannot bake — its own. Four
+/// witness types and three output types moved at once, which is exactly the
+/// shape of frame an old peer would read as a plausible lie.
 #[test]
 fn the_protocol_version_is_checked() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
 }
 
 /// Against a real prover server, holding a real warm prover.

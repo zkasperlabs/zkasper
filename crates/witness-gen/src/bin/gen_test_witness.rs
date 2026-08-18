@@ -12,6 +12,7 @@ use zkasper_common::types::*;
 use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::beacon_api::{BeaconApi, HeaderResponse, ValidatorResponse};
+use zkasper_witness_gen::child_vks;
 use zkasper_witness_gen::fixture::Epoch;
 use zkasper_witness_gen::state_diff::{
     build_validator_roots, build_validators_ssz_tree, make_state_proof,
@@ -255,9 +256,7 @@ fn gen_justification(output_path: &str) {
         target_epoch: fixture.epoch,
         target_root: fixture.target_root,
         total_active_balance: fixture.total_active_balance,
-        slot_program_vk: [0; 4],
-        committee_program_vk: [0; 4],
-        justification_program_vk: [0; 4],
+        justification_program_vk: child_vks::JUSTIFICATION,
         committee: Some(fixture.committees.output.clone()),
         committee_proof: Vec::new(),
         // The link that opens an epoch, which is the only one whose witness can
@@ -306,16 +305,19 @@ fn gen_finalization(output_path: &str) {
     };
 
     let just_e = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
         data.accumulator_commitment,
         epoch_e,
         target_root_e,
     );
-    let just_e1 =
-        zkasper_common::test_utils::justified_output(commitment_e1, epoch_e1, target_root_e1);
+    let just_e1 = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
+        commitment_e1,
+        epoch_e1,
+        target_root_e1,
+    );
 
     let witness = FinalizationWitness {
-        justification_program_vk: [0; 4],
-        epoch_diff_program_vk: [0; 4],
         boundary: data.boundary,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]], // stub proofs
@@ -362,11 +364,8 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
         target_epoch: epoch,
         target_root,
         signing_domain: data.signing_domain,
-        group_program_vk: [0; 4],
-        aggregate_program_vk: [0; 4],
-        previous_program_vk: [0; 4],
-        epoch_diff_program_vk: [0; 4],
-        committee_program_vk: [0; 4],
+        aggregate_program_vk: child_vks::AGGREGATE,
+        stream_program_vk: zkasper_common::recursion::UNSET_VK,
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_commitment,
             state_root_1: data.previous_state_root,
@@ -396,6 +395,7 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
         &units,
         &plan,
         PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            child_vks::JUSTIFICATION,
             previous_commitment,
             epoch - 1,
             data.previous_root,

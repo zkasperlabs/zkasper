@@ -36,9 +36,11 @@
 
 extern crate alloc;
 
+pub mod child_vks;
+
 use zkasper_common::acc;
 use zkasper_common::bls::{fp12_mul, Fp12, FP12_ONE};
-use zkasper_common::recursion::verify_child;
+use zkasper_common::recursion::{verify_baked_child, verify_child};
 use zkasper_common::types::{
     AggregateOutput, AggregateWitness, CommitteeOutput, EpochDiffOutput, GroupProofOutput,
 };
@@ -74,7 +76,6 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
                 let (previous_accumulator_commitment, anchor_state_root) = epoch_link(
                     witness.epoch_diff.as_ref(),
                     &witness.epoch_diff_proof,
-                    &witness.epoch_diff_program_vk,
                     &witness.accumulator_commitment,
                     witness.target_epoch,
                 );
@@ -84,7 +85,6 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
                     committee_link(
                         witness.committee.as_ref(),
                         &witness.committee_proof,
-                        &witness.committee_program_vk,
                         &witness.accumulator_commitment,
                         witness.target_epoch,
                     ),
@@ -101,6 +101,14 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
                     &previous.public_bytes(),
                 ),
                 "previous aggregate failed recursive verification",
+            );
+            // The one key a program cannot bake is its own, so the chain agrees
+            // on one instead and publishes it. `stream-final-guest` bakes this
+            // key and compares the published value against it, which is what
+            // ties the agreed key to the real program.
+            assert_eq!(
+                previous.program_vk, witness.aggregate_program_vk,
+                "previous aggregate was produced by a different program",
             );
             assert_eq!(
                 previous.accumulator_commitment, witness.accumulator_commitment,
@@ -134,7 +142,6 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
         verify_group(
             group,
             &witness.group_proofs[i],
-            &witness.group_program_vk,
             witness.accumulator_commitment,
             committee_root,
             witness.target_epoch,
@@ -168,6 +175,7 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
         attesting_balance,
         slots_mask,
         miller_commitment: acc::commit_fp12(&miller),
+        program_vk: witness.aggregate_program_vk,
     }
 }
 
@@ -179,7 +187,6 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
 pub fn verify_group(
     group: &GroupProofOutput,
     proof: &[u64],
-    program_vk: &zkasper_common::recursion::ProgramVk,
     accumulator_commitment: acc::Digest,
     committee_root: acc::Digest,
     target_epoch: u64,
@@ -188,7 +195,7 @@ pub fn verify_group(
     position: usize,
 ) {
     assert!(
-        verify_child(proof, program_vk, &group.public_bytes()),
+        verify_baked_child(proof, &child_vks::GROUP_PROGRAM_VK, &group.public_bytes(),),
         "group proof {position} failed recursive verification",
     );
     assert_eq!(
@@ -236,14 +243,17 @@ pub fn verify_group(
 pub fn epoch_link(
     diff: Option<&EpochDiffOutput>,
     proof: &[u64],
-    program_vk: &zkasper_common::recursion::ProgramVk,
     accumulator_commitment: &acc::Digest,
     target_epoch: u64,
 ) -> (acc::Digest, [u8; 32]) {
     let diff = diff.expect("an epoch's first aggregation must carry the epoch diff");
 
     assert!(
-        verify_child(proof, program_vk, &diff.public_bytes()),
+        verify_baked_child(
+            proof,
+            &child_vks::EPOCH_DIFF_PROGRAM_VK,
+            &diff.public_bytes(),
+        ),
         "epoch diff proof failed recursive verification",
     );
     assert_eq!(
@@ -284,14 +294,17 @@ pub fn epoch_link(
 pub fn committee_link(
     committee: Option<&CommitteeOutput>,
     proof: &[u64],
-    program_vk: &zkasper_common::recursion::ProgramVk,
     accumulator_commitment: &acc::Digest,
     target_epoch: u64,
 ) -> acc::Digest {
     let committee = committee.expect("an epoch's first aggregation must carry the committee proof");
 
     assert!(
-        verify_child(proof, program_vk, &committee.public_bytes()),
+        verify_baked_child(
+            proof,
+            &child_vks::COMMITTEE_PROGRAM_VK,
+            &committee.public_bytes(),
+        ),
         "committee proof failed recursive verification",
     );
     assert_eq!(

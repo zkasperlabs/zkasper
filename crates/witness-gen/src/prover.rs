@@ -195,8 +195,11 @@ pub trait Prover: Send + Sync {
 
     /// Verification key of the program that produces `stage`'s proofs.
     ///
-    /// Aggregating stages bind their children to this, so a proof of a
-    /// different program cannot be substituted.
+    /// A guest bakes the keys of the children it verifies, so this is not what
+    /// binds them any more — [`crate::child_vks::check`] compares the two and
+    /// refuses a prover holding different ELFs. What still reads it is the fold
+    /// chains, which publish the key they verify each other under because a
+    /// program cannot contain its own key.
     fn program_vk(&self, stage: Stage) -> ProgramVk;
 
     /// What the last proof cost, for a prover that produces proofs.
@@ -267,11 +270,13 @@ impl Prover for NativeProver {
         "native (witness only, no proofs)"
     }
 
-    fn program_vk(&self, _stage: Stage) -> ProgramVk {
-        // No ELF was built, so there is no verification key to bind to. The
-        // native `verify_child` short-circuits on an empty proof before it looks
-        // at the key.
-        [0; 4]
+    fn program_vk(&self, stage: Stage) -> ProgramVk {
+        // No ELF was built, so there is nothing to derive a key from. The keys
+        // the guests bake are still the right answer: the native `verify_child`
+        // short-circuits on an empty proof before it looks at one, but the
+        // circuits compare the key a fold chain publishes against the constant
+        // whether or not there is a proof behind it.
+        crate::child_vks::baked(stage).unwrap_or(zkasper_common::recursion::UNSET_VK)
     }
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {

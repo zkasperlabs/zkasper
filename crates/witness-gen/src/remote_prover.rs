@@ -135,7 +135,7 @@ use crate::prover::{NativeProver, Proof, ProveCost, Prover, Stage};
 /// previous link and `JustificationOutput` gained the running state and the
 /// supermajority flag. **Bump this whenever a type that crosses the wire changes
 /// shape**, not only when `Stage` does.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Cap on one frame. The committee witness is about 115 MB; nothing else is
 /// close, and a length that claims more is a bad peer rather than a big proof.
@@ -650,6 +650,13 @@ impl RemoteProver {
                     stage.as_str(),
                 );
             }
+        }
+        // A server that holds different ELFs is a server whose proofs no parent
+        // circuit here can verify. The handshake is where that is cheap to find
+        // out.
+        for program in &programs {
+            crate::child_vks::check(program.stage, &program.vk)
+                .with_context(|| format!("the prover at {}", config.addr))?;
         }
         info!(
             addr = %config.addr,

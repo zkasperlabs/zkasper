@@ -14,6 +14,9 @@
 //! [`zkasper_common::recursion::verify_child`] accepts, and that it is only
 //! accepted under its own program's key — without which a parent proof would
 //! take a proof of any stage for a proof of the stage it wanted.
+//!
+//! The second of those is checked twice: once on the key directly, and once in
+//! the child position of a real parent circuit, which is where it has to hold.
 
 #![cfg(feature = "zisk-prover")]
 
@@ -28,6 +31,7 @@ use zkasper_common::recursion::verify_child;
 use zkasper_common::types::SlotProofWitness;
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
+use zkasper_witness_gen::child_vks;
 use zkasper_witness_gen::prover::{Prover, Stage, DEFAULT_ELF_DIR};
 use zkasper_witness_gen::streaming;
 use zkasper_witness_gen::zisk_prover::{ZiskProver, ZiskProverConfig};
@@ -110,6 +114,104 @@ fn one_warm_prover_serves_two_programs() {
     assert!(!verify_child(&group_proof, &slot_vk, &group.public_bytes()));
     assert!(!verify_child(&slot_proof, &group_vk, &slot.public_bytes()));
     assert!(!verify_child(&group_proof, &group_vk, &slot.public_bytes()));
+
+    // The key a parent binds is a constant it was compiled with, so the ELF the
+    // prover loaded has to be the program the guests were baked against. This
+    // is the same comparison `ZiskProver::new` makes; asserting it here says
+    // which guest is out of date rather than which stage failed to set up.
+    assert_eq!(
+        slot_vk,
+        child_vks::SLOT,
+        "the slot-proof ELF is not the one the justification guest was baked against; \
+         run scripts/bake_child_vks.sh",
+    );
+    assert_eq!(group_vk, child_vks::GROUP);
+}
+
+/// A real proof of the wrong program, in the child position of a real parent.
+///
+/// The test above is about the predicate; this is about the circuit that
+/// applies it. `justification-guest` verifies its slot children against a key it
+/// was compiled with, so a group proof — an honest proof of a real program, with
+/// a real prover behind it — cannot stand in for a slot proof however the
+/// witness is arranged. There is no longer a field to arrange: the key the fold
+/// binds is not in the witness at all.
+///
+/// ```text
+/// ./scripts/bake_child_vks.sh
+/// ZKASPER_GPU=1 cargo test --release --features zisk-prover \
+///   --test zisk_proof_tests -- --ignored --nocapture a_child_proof
+/// ```
+#[test]
+#[ignore = "needs a Zisk proving key and minutes of proving"]
+fn a_child_proof_from_another_program_is_refused() {
+    let chain = ChainConfig::MAINNET;
+    let epoch = zkasper_witness_gen::fixture::Epoch::new(chain.clone(), 100, 1, 2);
+    let prover = ZiskProver::new(ZiskProverConfig {
+        elf_dir: elf_dir(),
+        gpu: std::env::var_os("ZKASPER_GPU").is_some(),
+        ..ZiskProverConfig::new(
+            chain.clone(),
+            &[Stage::Committee, Stage::SlotProof, Stage::Group],
+        )
+    })
+    .expect("build a prover");
+
+    let complement = epoch.complement(0, &[]);
+    let witness = SlotProofWitness {
+        accumulator_commitment: epoch.accumulator_commitment,
+        committee_root: epoch.committees.root(),
+        target_epoch: epoch.epoch,
+        target_root: epoch.target_root,
+        signing_domain: epoch.signing_domain,
+        acc_root: epoch.acc_root,
+        total_active_balance: epoch.total_active_balance,
+        acc_multi_proof: epoch.tree.build_multi_proof(&complement.named_indices),
+        committee_multi_proof: epoch.committees.multi_proof(&[0]),
+        slots: vec![complement.witness],
+    };
+
+    let (committee_output, committee_proof) = prover
+        .prove_committee(&epoch.committees.witness)
+        .expect("committee proof");
+    let (slot, slot_proof) = prover.prove_slot(&witness).expect("slot proof");
+    let (_group, _miller, group_proof) = prover.prove_group(&witness).expect("group proof");
+
+    let context = zkasper_witness_gen::witness_justification::Context {
+        accumulator_commitment: epoch.accumulator_commitment,
+        acc_root: epoch.acc_root,
+        target_epoch: epoch.epoch,
+        target_root: epoch.target_root,
+        total_active_balance: epoch.total_active_balance,
+        justification_program_vk: prover.program_vk(Stage::Justification),
+    };
+    let link = |proof: Vec<u64>| {
+        zkasper_witness_gen::witness_justification::build(
+            &context,
+            Some(committee_output.clone()),
+            committee_proof.clone(),
+            None,
+            Vec::new(),
+            vec![slot.clone()],
+            vec![proof],
+        )
+    };
+
+    // The real slot proof folds.
+    zkasper_justification_guest::verify_justification(&link(slot_proof));
+
+    // The group proof does not, and the fold has no way to be told otherwise.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let refused = std::panic::catch_unwind(|| {
+        zkasper_justification_guest::verify_justification(&link(group_proof));
+    })
+    .is_err();
+    std::panic::set_hook(previous);
+    assert!(
+        refused,
+        "a proof of the group program was folded as a slot proof",
+    );
 }
 
 /// Per-stage cost, warm, with repeats.
@@ -266,8 +368,6 @@ fn recursion_cost_curve() {
         target_epoch: epoch.epoch,
         target_root: epoch.target_root,
         total_active_balance: epoch.total_active_balance,
-        slot_program_vk: prover.program_vk(Stage::SlotProof),
-        committee_program_vk: prover.program_vk(Stage::Committee),
         justification_program_vk: prover.program_vk(Stage::Justification),
     };
 

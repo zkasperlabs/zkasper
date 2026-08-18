@@ -24,6 +24,7 @@ use zkasper_witness_gen::beacon_api::{
     AttestationResponse, BeaconApi, ChainStatusApi, CommitteeResponse, FinalityCheckpoints,
     HeaderResponse, ValidatorResponse,
 };
+use zkasper_witness_gen::child_vks;
 use zkasper_witness_gen::fixture::Epoch;
 use zkasper_witness_gen::gossip::AttestationSource;
 use zkasper_witness_gen::state_diff::SlotHistory;
@@ -623,11 +624,8 @@ fn stream_fixture_from(epoch: Epoch) -> StreamFixture {
         target_epoch: STREAM_EPOCH,
         target_root: epoch.target_root,
         signing_domain: epoch.signing_domain,
-        group_program_vk: [1; 4],
-        aggregate_program_vk: [2; 4],
-        previous_program_vk: [3; 4],
-        epoch_diff_program_vk: [4; 4],
-        committee_program_vk: [5; 4],
+        aggregate_program_vk: child_vks::AGGREGATE,
+        stream_program_vk: [3; 4],
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_accumulator_commitment,
             state_root_1: epoch.previous_state_root,
@@ -650,6 +648,7 @@ fn stream_fixture_from(epoch: Epoch) -> StreamFixture {
             .collect(),
         context,
         previous: PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            child_vks::JUSTIFICATION,
             previous_accumulator_commitment,
             STREAM_EPOCH - 1,
             epoch.previous_root,

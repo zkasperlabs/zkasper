@@ -267,6 +267,12 @@ impl StageProgram {
             )
         })?;
 
+        // The guests bind their children to keys they were compiled with, so an
+        // ELF that is not the one they were baked against would fail every
+        // recursive verification downstream, one proof and several minutes at a
+        // time. It fails here instead.
+        crate::child_vks::check(stage, &vk)?;
+
         info!(
             stage = stage.as_str(),
             elf = %path.display(),

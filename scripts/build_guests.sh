@@ -12,6 +12,13 @@ set -euo pipefail
 # `--elf-dir`, and a guest's verification key is derived from its ELF, so a
 # rebuilt guest is a different program to every proof that binds it — rebuild all
 # of them together rather than one at a time.
+#
+# This builds the ELFs and nothing else. A guest verifies its children against
+# keys it was compiled with, so a set of ELFs built here is only usable once
+# `./scripts/bake_child_vks.sh` has derived those keys and written them back;
+# that script builds the guests too, in the order the keys require. Use this one
+# for a single guest whose keys have not moved — a benchmark guest, or a rebuild
+# after a change that cannot reach a circuit.
 
 cd "$(dirname "$0")/.."
 export PATH="${ZISK_BIN:-$HOME/.zisk/bin}:$PATH"

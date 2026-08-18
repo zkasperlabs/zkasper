@@ -10,6 +10,12 @@
 //! program verification key and committed public bytes so the aggregator can
 //! bind both.
 //!
+//! Which key it binds them to is the other half again. [`verify_child`] checks
+//! the proof against whatever key it is handed, so a key read out of the witness
+//! binds the child to a program the prover chose. [`verify_baked_child`] takes
+//! one the guest was compiled with instead, and that is what every recursive
+//! edge in this pipeline uses except the two a program cannot bake — its own.
+//!
 //! Serialized proof layout, in u64 words:
 //! `[minimal][n_publics][program_vk(4)][publics(64)][proof..][vadcop_vk(4)]`
 
@@ -30,6 +36,10 @@ const MIN_PROOF_WORDS: usize = PUBLICS_OFFSET + ZISK_PUBLICS;
 
 /// Identifies which guest program produced a proof.
 pub type ProgramVk = [u64; PROGRAM_VK_LEN];
+
+/// A child key a guest was built without. No program has it, so a guest holding
+/// one cannot verify anything; `scripts/bake_child_vks.sh` is what fills it in.
+pub const UNSET_VK: ProgramVk = [0; PROGRAM_VK_LEN];
 
 /// The program verification key a proof commits to.
 pub fn child_program_vk(proof: &[u64]) -> Option<ProgramVk> {
@@ -98,6 +108,24 @@ pub fn verify_child(proof: &[u64], expected_vk: &ProgramVk, expected_publics: &[
     ziskos::zisklib::verify_zisk_proof(proof)
 }
 
+/// [`verify_child`] against a key the parent was compiled with rather than one
+/// it was handed.
+///
+/// This is the whole difference between binding a child and binding nothing: a
+/// witness field names any program the prover likes, a constant names the
+/// program this guest was built against. An unbaked guest says so rather than
+/// failing as an ordinary key mismatch, because the two want different fixes.
+pub fn verify_baked_child(proof: &[u64], baked: &ProgramVk, expected_publics: &[u8]) -> bool {
+    if proof.is_empty() {
+        return cfg!(not(target_os = "zkvm"));
+    }
+    assert_ne!(
+        *baked, UNSET_VK,
+        "this guest was built before its children had keys; run scripts/bake_child_vks.sh",
+    );
+    verify_child(proof, baked, expected_publics)
+}
+
 /// Fixed-width little-endian encoding of a proof's public outputs.
 ///
 /// Both the guest that commits the outputs and the aggregator that checks them
@@ -123,6 +151,13 @@ impl PublicWriter {
     }
 
     pub fn digest(&mut self, v: &crate::acc::Digest) -> &mut Self {
+        for w in v {
+            self.bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        self
+    }
+
+    pub fn program_vk(&mut self, v: &ProgramVk) -> &mut Self {
         for w in v {
             self.bytes.extend_from_slice(&w.to_le_bytes());
         }

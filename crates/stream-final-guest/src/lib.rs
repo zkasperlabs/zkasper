@@ -32,10 +32,12 @@
 
 extern crate alloc;
 
+pub mod child_vks;
+
 use zkasper_common::acc;
 use zkasper_common::bls::{fp12_mul, FP12_ONE};
-use zkasper_common::recursion::verify_child;
-use zkasper_common::types::{StreamFinalOutput, StreamFinalWitness};
+use zkasper_common::recursion::{verify_baked_child, verify_child};
+use zkasper_common::types::{PreviousJustification, StreamFinalOutput, StreamFinalWitness};
 
 /// Verify the final proof of an epoch.
 pub fn verify_stream_final(witness: &StreamFinalWitness) -> StreamFinalOutput {
@@ -86,7 +88,6 @@ pub fn verify_stream_final_with(
                     zkasper_aggregation_guest::epoch_link(
                         witness.epoch_diff.as_ref(),
                         &witness.epoch_diff_proof,
-                        &witness.epoch_diff_program_vk,
                         &witness.accumulator_commitment,
                         witness.target_epoch,
                     );
@@ -96,7 +97,6 @@ pub fn verify_stream_final_with(
                     zkasper_aggregation_guest::committee_link(
                         witness.committee.as_ref(),
                         &witness.committee_proof,
-                        &witness.committee_program_vk,
                         &witness.accumulator_commitment,
                         witness.target_epoch,
                     ),
@@ -107,12 +107,21 @@ pub fn verify_stream_final_with(
     let (mut attesting_balance, mut slots_mask, mut miller) = match &witness.aggregate {
         Some(aggregate) => {
             assert!(
-                verify_child(
+                verify_baked_child(
                     &witness.aggregate_proof,
-                    &witness.aggregate_program_vk,
+                    &child_vks::AGGREGATE_PROGRAM_VK,
                     &aggregate.public_bytes(),
                 ),
                 "aggregate failed recursive verification",
+            );
+            // The aggregate is itself the head of a fold chain that verified
+            // its own links under a key it carries. Requiring that key to be
+            // the constant this guest was compiled with is what pins every fold
+            // below it to `aggregation-guest`.
+            assert_eq!(
+                aggregate.program_vk,
+                child_vks::AGGREGATE_PROGRAM_VK,
+                "the aggregate folds a chain pinned to a different program",
             );
             assert_eq!(
                 aggregate.accumulator_commitment, witness.accumulator_commitment,
@@ -158,7 +167,6 @@ pub fn verify_stream_final_with(
         zkasper_aggregation_guest::verify_group(
             group,
             &witness.group_proofs[i],
-            &witness.group_program_vk,
             witness.accumulator_commitment,
             committee_root,
             witness.target_epoch,
@@ -237,15 +245,45 @@ pub fn verify_stream_final_with(
     );
 
     // -- and the previous epoch turns it into a finalization ------------------
+    //
+    // Which program proved the previous epoch depends on which pipeline ran it.
+    // A batch justification is another guest, so its key is a constant here. A
+    // stream final proof is *this* guest, and a program cannot contain its own
+    // key, so that one key is still read from the witness — and published, so
+    // that a verifier holding this program's key can require the two to agree.
+    // See [`StreamFinalOutput::program_vk`].
     let previous = &witness.previous_justification;
-    assert!(
-        verify_child(
-            &witness.previous_justification_proof,
-            &witness.previous_program_vk,
-            &previous.public_bytes(),
-        ),
-        "previous justification failed recursive verification",
-    );
+    match previous {
+        PreviousJustification::Batch(batch) => {
+            assert!(
+                verify_baked_child(
+                    &witness.previous_justification_proof,
+                    &child_vks::JUSTIFICATION_PROGRAM_VK,
+                    &previous.public_bytes(),
+                ),
+                "previous justification failed recursive verification",
+            );
+            assert_eq!(
+                batch.program_vk,
+                child_vks::JUSTIFICATION_PROGRAM_VK,
+                "the previous justification folds a chain pinned to a different program",
+            );
+        }
+        PreviousJustification::Stream(stream) => {
+            assert!(
+                verify_child(
+                    &witness.previous_justification_proof,
+                    &witness.stream_program_vk,
+                    &previous.public_bytes(),
+                ),
+                "previous justification failed recursive verification",
+            );
+            assert_eq!(
+                stream.program_vk, witness.stream_program_vk,
+                "the previous epoch's final proof names a different program",
+            );
+        }
+    }
     // A batch justification is a link in a fold chain, and the partial links are
     // valid proofs of a partial count. Only a link that says two thirds is
     // behind it justifies anything.
@@ -296,5 +334,6 @@ pub fn verify_stream_final_with(
         finalized_state_root: anchor_state_root,
         justified_epoch: witness.target_epoch,
         justified_root: witness.target_root,
+        program_vk: witness.stream_program_vk,
     }
 }

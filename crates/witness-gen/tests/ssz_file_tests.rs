@@ -22,6 +22,7 @@ use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::{
     self, AttestationResponse, BeaconApi, CommitteeResponse, HeaderResponse, ValidatorResponse,
 };
+use zkasper_witness_gen::child_vks;
 use zkasper_witness_gen::ssz_state;
 
 // ---------------------------------------------------------------------------
@@ -803,9 +804,7 @@ async fn test_ssz_file_finality() {
         target_epoch,
         target_root,
         total_active_balance,
-        slot_program_vk: [0; 4],
-        committee_program_vk: [0; 4],
-        justification_program_vk: [0; 4],
+        justification_program_vk: child_vks::JUSTIFICATION,
     };
 
     // Fold two slot proofs at a time, the way the daemon does while the epoch
@@ -961,10 +960,8 @@ async fn test_ssz_file_streaming_finality() {
         target_epoch,
         target_root,
         signing_domain,
-        group_program_vk: [1; 4],
-        aggregate_program_vk: [2; 4],
-        previous_program_vk: [3; 4],
-        epoch_diff_program_vk: [4; 4],
+        aggregate_program_vk: child_vks::AGGREGATE,
+        stream_program_vk: [3; 4],
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_commitment,
             state_root_1: opened.boundary_state_root,
@@ -976,7 +973,6 @@ async fn test_ssz_file_streaming_finality() {
             epoch_2: target_epoch,
         },
         epoch_diff_proof: Vec::new(),
-        committee_program_vk: [5; 4],
         committee: committees.output.clone(),
         committee_proof: Vec::new(),
         acc_depth: CONFIG.acc_tree_depth,
@@ -1015,6 +1011,7 @@ async fn test_ssz_file_streaming_finality() {
         &units,
         &plan,
         PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            child_vks::JUSTIFICATION,
             previous_commitment,
             target_epoch - 1,
             previous_root,
