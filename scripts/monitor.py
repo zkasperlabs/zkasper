@@ -38,7 +38,10 @@ def status_path():
     satisfies.
     """
     try:
-        pids = subprocess.run(["pgrep", "-f", "release/zkasperd"],
+        # Not a path fragment: "release/zkasperd" went blind the moment
+        # production moved to a pinned binary at bin/zkasperd, reporting a
+        # healthy daemon as dead. Match the name, let /proc/PID/exe judge.
+        pids = subprocess.run(["pgrep", "-x", "zkasperd"],
                               capture_output=True, text=True, timeout=15).stdout.split()
         for pid in pids:
             try:
