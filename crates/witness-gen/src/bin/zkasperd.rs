@@ -15,6 +15,7 @@
 //! else. It needs no CUDA here, so a witness-only build can drive a real GPU.
 //! See `crate::remote_prover`.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use zkasper_common::ChainConfig;
@@ -219,6 +222,18 @@ struct Cli {
     /// `<output-dir>/prover-spool`.
     #[arg(long)]
     prover_spool: Option<PathBuf>,
+
+    /// Address to serve Prometheus metrics on, at `/metrics`.
+    ///
+    /// Localhost by default: this is a scrape target for an agent on the same
+    /// box, not a public surface, and it says where the accumulator is before
+    /// the daemon has published anything.
+    #[arg(long, default_value = "127.0.0.1:9464")]
+    metrics_addr: SocketAddr,
+
+    /// Serve no metrics at all.
+    #[arg(long)]
+    no_metrics: bool,
 }
 
 impl Cli {
@@ -318,18 +333,35 @@ impl Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    // The stage spans are the benchmark instrument: `fmt` logs each one's
+    // busy/idle when it closes, and the metrics layer records the same
+    // measurement as a histogram. One instrumentation, two consumers.
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(FmtSpan::CLOSE)
+                .with_target(false),
         )
-        .with_span_events(FmtSpan::CLOSE)
-        .with_target(false)
+        .with(zkasper_witness_gen::metrics::StageMetrics)
         .init();
 
     let pipeline = match cli.mode {
         Mode::Batch => Pipeline::Batch,
         Mode::Streaming => Pipeline::Streaming,
     };
+    if !cli.no_metrics {
+        zkasper_witness_gen::metrics::install(cli.metrics_addr)?;
+        zkasper_witness_gen::metrics::build_info(
+            cli.chain.name(),
+            cli.prover_name(),
+            match pipeline {
+                Pipeline::Batch => "batch",
+                Pipeline::Streaming => "streaming",
+            },
+        );
+        info!(addr = %cli.metrics_addr, "serving Prometheus metrics");
+    }
     let config = OrchestratorConfig {
         db_path: cli.db_path.clone(),
         output_dir: cli.output_dir.clone(),

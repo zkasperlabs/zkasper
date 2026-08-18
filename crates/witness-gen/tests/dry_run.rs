@@ -154,7 +154,10 @@ fn daemon(node: &MockNode, dir: &std::path::Path) -> tokio::process::Command {
         .args(["--chain", "mainnet"])
         .args(["--prover", "native"])
         .args(["--mode", "streaming"])
-        .args(["--no-gossip", "--once"]);
+        .args(["--no-gossip", "--once"])
+        // A port the kernel picks, because both runs in this file happen at
+        // once and a fixed one would be a race between them.
+        .args(["--metrics-addr", "127.0.0.1:0"]);
     command
 }
 

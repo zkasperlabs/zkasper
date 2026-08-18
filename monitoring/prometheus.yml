@@ -1,0 +1,39 @@
+# The agent on the zkasper box.
+#
+# It scrapes, evaluates the rules, and ships everything to Grafana Cloud. It
+# keeps a local copy too, which is what makes "what did it look like an hour
+# ago" answerable from a shell without an account.
+#
+# Installed by monitoring/install.sh to /etc/prometheus/prometheus.yml. The
+# remote_write block is appended by monitoring/grafana_cloud.sh once there are
+# credentials to append; until then this is a local-only Prometheus and the
+# alerts still evaluate.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # Attached to every series that leaves this box, so a second daemon on a
+  # second machine is a different series rather than a fight over the same one.
+  external_labels:
+    host: clawdia
+    service: zkasper
+
+rule_files:
+  - /etc/prometheus/zkasper-alerts.yml
+
+scrape_configs:
+  # The daemon's own exporter. Not a sidecar and not a file being parsed —
+  # zkasperd serves this itself, and the histograms come from its tracing spans.
+  - job_name: zkasperd
+    static_configs:
+      - targets: ['localhost:9464']
+
+  # The host, and with it the GPU cost exporter, which writes into
+  # node_exporter's textfile collector rather than running a server of its own.
+  - job_name: node
+    static_configs:
+      - targets: ['localhost:9100']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
