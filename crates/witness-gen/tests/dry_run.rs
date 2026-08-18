@@ -32,9 +32,20 @@ const FIRST_EPOCH: u64 = 10;
 const LAST_EPOCH: u64 = 13;
 const SPE: u64 = ChainConfig::MAINNET.slots_per_epoch;
 
+/// What a node on mainnet reports at `/eth/v1/beacon/genesis`. Twelve
+/// validators and mainnet parameters do not make a run mainnet; this does.
+const MAINNET_GENESIS_VALIDATORS_ROOT: [u8; 32] = [
+    0x4b, 0x36, 0x3d, 0xb9, 0x4e, 0x28, 0x61, 0x20, 0xd7, 0x6e, 0xb9, 0x05, 0x34, 0x0f, 0xdd, 0x4e,
+    0x54, 0xbf, 0xe9, 0xf0, 0x6b, 0xf3, 0x3f, 0xf6, 0xcf, 0x5a, 0xd2, 0x7f, 0x51, 0x1b, 0xfe, 0x95,
+];
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_the_daemon_follows_four_epochs_over_http() {
-    let chain = SyntheticChain::new(ChainConfig::MAINNET, VALIDATORS, FIRST_EPOCH, LAST_EPOCH);
+    // On mainnet's own genesis validators root, so this run is the one that is
+    // allowed to publish `mainnet`. The companion test below is the same chain
+    // on a root nothing recognises.
+    let chain = SyntheticChain::new(ChainConfig::MAINNET, VALIDATORS, FIRST_EPOCH, LAST_EPOCH)
+        .on_network(MAINNET_GENESIS_VALIDATORS_ROOT);
     let crossing = chain.slots_to_threshold(FIRST_EPOCH);
     assert!(
         crossing < VALIDATORS as u64,
@@ -74,6 +85,11 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     // Bootstrapped where the node said it was finalized, and the accumulator
     // walked from there to the head one epoch diff at a time.
     assert_eq!(status["chain"], "mainnet", "{}", transcript(&run));
+    assert_eq!(
+        status["genesis_validators_root"],
+        zkasper_witness_gen::artifacts::hex0x(&MAINNET_GENESIS_VALIDATORS_ROOT),
+        "the label has to be published beside the root it was resolved from",
+    );
     assert!(status["prover"]
         .as_str()
         .is_some_and(|prover| prover.starts_with("native")));
@@ -179,6 +195,9 @@ fn transcript(run: &std::process::Output) -> String {
 /// the real publishing path rather than by a test calling it directly.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_the_daemon_publishes_the_whole_run() {
+    // Left on the synthetic genesis validators root, which is the case this
+    // test exists to pin: mainnet parameters and twelve validators publish as
+    // `unrecognised`, because a flag cannot make a node mainnet.
     let chain = SyntheticChain::new(ChainConfig::MAINNET, VALIDATORS, FIRST_EPOCH, LAST_EPOCH);
     let node = MockNode::spawn(
         &chain,
@@ -292,7 +311,14 @@ async fn test_the_daemon_publishes_the_whole_run() {
         .filter_map(|r| r.json().get("status").cloned())
         .rfind(|status| status.is_object())
         .expect("a status snapshot");
-    assert_eq!(status["chain"], "mainnet");
+    assert_eq!(
+        status["chain"], "unrecognised",
+        "a synthetic node running mainnet parameters is not mainnet",
+    );
+    assert_eq!(
+        status["genesis_validators_root"],
+        zkasper_witness_gen::artifacts::hex0x(&chain.genesis_validators_root),
+    );
     assert_eq!(status["accumulator"]["epoch"], LAST_EPOCH);
     assert!(
         status["accumulator"]["total_active_balance"].is_string(),
@@ -359,7 +385,10 @@ async fn test_the_daemon_publishes_to_a_live_api() {
         .json()
         .await
         .expect("status is JSON");
-    assert_eq!(status["chain"], "mainnet");
+    assert_eq!(
+        status["chain"], "unrecognised",
+        "this run's node is synthetic, and the public API has to say so",
+    );
     assert_eq!(status["accumulator"]["epoch"], LAST_EPOCH);
     assert_eq!(status["last_finalized"]["epoch"], LAST_EPOCH - 1);
     assert_eq!(status["service"]["stale"], false, "{status}");

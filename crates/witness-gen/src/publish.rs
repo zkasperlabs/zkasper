@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use zkasper_common::types::{FinalizationOutput, JustificationOutput, StreamFinalOutput};
 
 use crate::artifacts::{hex0x, hex_digest, now_unix_millis, write_atomic, StageTiming, Status};
+use crate::postings::Posting;
 use crate::prover::Stage;
 
 /// Zisk release the guests are built against. Pinned in the workspace manifest;
@@ -273,6 +274,19 @@ impl Publisher {
                 "head_slot": progress.head_slot,
             }),
         );
+    }
+
+    /// A finalization proof was verified on another chain.
+    ///
+    /// The daemon did not do this and does not vouch for it: the fields are
+    /// exactly what the submitter reported, forwarded so a dashboard can show
+    /// the transaction rather than assert that one exists.
+    pub fn posting_landed(&self, posting: &Posting) {
+        let epoch = posting.epoch;
+        match serde_json::to_value(posting) {
+            Ok(value) => self.event("posting.landed", epoch, json!({ "posting": value })),
+            Err(e) => warn!(error = %e, "a posting could not be serialized"),
+        }
     }
 
     pub fn stage_started(&self, stage: Stage, epoch: u64, slot: Option<u64>, index: Option<usize>) {

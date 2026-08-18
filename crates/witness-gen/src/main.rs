@@ -1,6 +1,6 @@
 use zkasper_witness_gen::{
-    beacon_api, db, epoch_state, orchestrator, prover, witness_bootstrap, witness_epoch_diff,
-    witness_slot_proof,
+    beacon_api, db, epoch_state, network, orchestrator, prover, witness_bootstrap,
+    witness_epoch_diff, witness_slot_proof,
 };
 
 use anyhow::{Context, Result};
@@ -217,13 +217,15 @@ async fn main() -> Result<()> {
         Command::Run => {
             // Continuous mode lives in the `zkasperd` binary; this is the same
             // orchestrator with this command's flags, so the two cannot drift.
-            let chain_name = match cli.chain {
+            let parameters = match cli.chain {
                 Chain::Mainnet => "mainnet",
                 Chain::Gnosis => "gnosis",
             };
+            let (chain_name, genesis_validators_root) = network::resolve(&api, parameters).await?;
             let orchestrator_config = orchestrator::OrchestratorConfig {
                 db_path: cli.db_path.into(),
                 output_dir: cli.output_dir.into(),
+                genesis_validators_root: Some(genesis_validators_root),
                 ..orchestrator::OrchestratorConfig::new(config.clone(), chain_name)
             };
             orchestrator::Orchestrator::open(

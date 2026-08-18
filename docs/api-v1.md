@@ -179,6 +179,44 @@ See "Verifying a proof" at the end.
 }
 ```
 
+### `posting`
+
+One finalization proof, verified on another chain. The daemon proves; something
+else submits, and reports back. Every field is what the submitter measured from
+the transaction receipt, forwarded unchanged.
+
+```json
+{
+  "chain": "solana-mainnet-beta",
+  "program": "Cuarryex9DFpVm6HNdCFvpS3EEeArSuTXDMNTk9hpKja",
+  "epoch": 469367,
+  "finalized_root": "0x8f...c1",
+  "signature": "4Jr...oGF",
+  "slot": 351019776,
+  "compute_units": 99150,
+  "fee_lamports": 5000,
+  "rent_lamports": 2867520,
+  "lamports_spent": 2872520,
+  "status": "confirmed",
+  "explorer": "https://explorer.solana.com/tx/4Jr...oGF",
+  "unix_millis": 1755525141900
+}
+```
+
+- `chain` is the chain it was posted **to**, not the one the proof is about:
+  `solana-mainnet-beta`, `solana-devnet`, `solana-testnet` or `solana-localnet`.
+  It is derived from the cluster's genesis hash, so a posting cannot claim a
+  chain it did not land on.
+- `epoch` and `finalized_root` are the Ethereum checkpoint the proof finalized,
+  and match the `public_inputs` of the epoch with the same number.
+- `slot` is the Solana slot the transaction landed in.
+- `fee_lamports` is the transaction fee. `rent_lamports` is what the submitter
+  left behind as the rent-exempt balance of the two accounts the program creates
+  per finalization, which is the larger number and is not refundable — the
+  program has no instruction that closes an account. `lamports_spent` is both,
+  and is what the submission actually cost.
+- `status` is `confirmed` or `failed`, as the submitter observed it.
+
 ## `GET /v1/status`
 
 Where the daemon is, now. Polled by anything that cannot hold an SSE connection;
@@ -201,6 +239,7 @@ everything here also arrives on `/v1/live` as a `status` event.
   "gossip": { "attestations": 4210233, "reconnects": 0, "dropped": 0 },
   "recent_stages": [ { "...": "stage" } ],
   "recent_latencies": [ { "...": "latency" } ],
+  "postings": [ { "...": "posting" } ],
   "current_epoch": {
     "epoch": 469369,
     "target_root": "0x2e...5c",
@@ -233,6 +272,11 @@ everything here also arrives on `/v1/live` as a `status` event.
   threshold), `firing` (threshold crossed, final proof running) or `catching_up`
   (the epoch opened already past the threshold, so there is no honest `T` to
   report).
+- `postings` is the recent postings, oldest last, and is **absent** when nothing
+  is submitting these proofs to a chain. It is not a claim the daemon makes: the
+  daemon forwards what a submitter told it. An epoch with a proof and no posting
+  was proven and not submitted, which is the normal state of a run with no
+  submitter attached.
 - `service.stale` is true when nothing has arrived from the daemon for 120 s.
   The dashboard should say so rather than show a frozen number as live.
 - Cache: `public, max-age=2`.
@@ -365,6 +409,7 @@ Every `data` object carries `seq` and `unix_millis`.
 | `threshold.crossed` | `T` | `{seq, unix_millis, epoch, threshold_unix_millis, attesting_balance, total_active_balance, attesting_pct}` |
 | `threshold.fired` | the trigger fires | `{seq, unix_millis, epoch, fired_unix_millis, wait_millis, tail, tail_named, late_groups}` |
 | `proof.landed` | `T2` | `{seq, unix_millis, epoch, proof, public_inputs, latency}` |
+| `posting.landed` | a proof is verified on another chain | `{seq, unix_millis, epoch, posting}` |
 | `epoch.closed` | epoch finished | `{seq, unix_millis, epoch, summary}` — `summary` is the `/v1/epochs` entry |
 | `epoch.abandoned` | epoch given up | `{seq, unix_millis, epoch, reason}` |
 
@@ -566,7 +611,10 @@ differs from it. Nothing here renames or removes a field.
     concurrent SSE readers), `401 unauthorized`.
 13. **`access-control-allow-methods` is `GET, HEAD, OPTIONS`.** The write path is
     deliberately not reachable from a browser.
-14. **Balances are strings everywhere, including in `status.json` on disk.**
+14. **`postings` and `posting.landed` carry proofs that reached another chain.**
+    Both are absent until something submits. The API stores and fans them out
+    without interpreting them; the only field it reads is `epoch`.
+15. **Balances are strings everywhere, including in `status.json` on disk.**
     Mainnet's total active balance in gwei passed 2^53 long ago, so a JSON reader
     that parses it as a double rounds it. A u64 sent as a JSON number would be
     corrupted before the API ever saw it.

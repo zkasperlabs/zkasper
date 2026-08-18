@@ -186,7 +186,14 @@ impl From<&Checkpoint> for CheckpointStatus {
 #[derive(Clone, Debug, Serialize)]
 pub struct Status {
     pub version: u32,
+    /// What network this daemon is on, resolved from the node's genesis
+    /// validators root rather than from a flag. `unrecognised` means no known
+    /// network claims that root, and the run is not claiming one either.
     pub chain: String,
+    /// The root `chain` was resolved from, so a reader can check the label
+    /// instead of trusting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genesis_validators_root: Option<String>,
     /// Which prover produced the artifacts. Says so when there are none.
     pub prover: String,
     pub updated_unix: u64,
@@ -219,6 +226,11 @@ pub struct Status {
     /// was not given one to publish to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish: Option<PublishStatus>,
+    /// Finalization proofs that reached another chain, oldest first. Written by
+    /// whatever submitted them, not by the prover. Empty when the daemon was
+    /// not given a postings file to read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub postings: Vec<crate::postings::Posting>,
 }
 
 /// What publishing to the API has cost.

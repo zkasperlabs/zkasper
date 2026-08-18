@@ -77,14 +77,15 @@ use zkasper_common::ChainConfig;
 
 use crate::acc_tree::AccTree;
 use crate::artifacts::{
-    hex_digest, now_unix, now_unix_millis, AccStatus, ArtifactRef, ArtifactSink, CheckpointStatus,
-    CurrentEpoch, EpochLatency, GossipStatus, PublishStatus, StageTiming, Status,
+    hex0x, hex_digest, now_unix, now_unix_millis, AccStatus, ArtifactRef, ArtifactSink,
+    CheckpointStatus, CurrentEpoch, EpochLatency, GossipStatus, PublishStatus, StageTiming, Status,
 };
 use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
 use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
+use crate::postings::PostingLog;
 use crate::prover::{Proof, Prover, Stage};
 use crate::publish::{self, ClosedEpoch, EpochProgress, Publisher};
 use crate::store::{
@@ -168,6 +169,13 @@ pub struct OrchestratorConfig {
     /// attestations from blocks instead, which is a slot later and is only what
     /// the fixture-replay tests want.
     pub gossip_url: Option<String>,
+    /// File a submitter appends postings to, as JSON lines. `None` means
+    /// nothing is posting these proofs to a chain, which is the default.
+    pub postings_path: Option<PathBuf>,
+    /// The root the caller resolved `chain_name` from, published beside it so a
+    /// reader can check the label rather than take it. `None` leaves the
+    /// orchestrator to fetch it when a signing domain first needs it.
+    pub genesis_validators_root: Option<[u8; 32]>,
 }
 
 impl OrchestratorConfig {
@@ -185,6 +193,8 @@ impl OrchestratorConfig {
             pipeline: Pipeline::default(),
             stream_policy: StreamPolicy::default(),
             gossip_url: None,
+            postings_path: None,
+            genesis_validators_root: None,
         }
     }
 }
@@ -443,6 +453,8 @@ pub struct Orchestrator<A> {
     /// Where stages are mirrored as they happen. `None` runs the pipeline with
     /// no public surface but the manifest on disk.
     publish: Option<Arc<Publisher>>,
+    /// Postings a submitter appended, when the daemon was given a file to read.
+    postings: Option<PostingLog>,
     recent: VecDeque<StageTiming>,
     latencies: VecDeque<EpochLatency>,
     head_slot: u64,
@@ -513,6 +525,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     ) -> Self {
         Self {
             publish,
+            postings: config.postings_path.as_ref().map(PostingLog::new),
+            genesis_validators_root: config.genesis_validators_root,
             gossip: config
                 .gossip_url
                 .as_deref()
@@ -530,7 +544,6 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             head_slot: 0,
             viewed: None,
             node_finalized: None,
-            genesis_validators_root: None,
         }
     }
 
@@ -2068,6 +2081,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     }
 
     pub fn publish_status(&self) -> Result<()> {
+        self.drain_postings();
         crate::metrics::observe_state(
             &self.snapshot.state,
             self.head_slot,
@@ -2086,12 +2100,40 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         self.sink.write_status(&status)
     }
 
+    /// Announce postings the submitter has written since the last look.
+    ///
+    /// The submitter is a separate process, so this is the daemon noticing
+    /// rather than the daemon doing. A posting that never arrives means nothing
+    /// posted it; it never means the proof was not made.
+    fn drain_postings(&self) {
+        let Some(log) = &self.postings else {
+            return;
+        };
+        for posting in log.refresh() {
+            info!(
+                chain = %posting.chain,
+                epoch = posting.epoch,
+                signature = %posting.signature,
+                compute_units = posting.compute_units,
+                lamports = posting.lamports_spent,
+                "a finalization proof was verified on another chain",
+            );
+            if let Some(publish) = &self.publish {
+                publish.posting_landed(&posting);
+            }
+        }
+    }
+
     /// The manifest, as of now.
     pub fn status(&self) -> Status {
         let state = &self.snapshot.state;
         Status {
             version: 1,
             chain: state.chain.clone(),
+            genesis_validators_root: self
+                .genesis_validators_root
+                .as_ref()
+                .map(|root| hex0x(root)),
             prover: self.prover.name().to_string(),
             updated_unix: now_unix(),
             head_slot: self.head_slot,
@@ -2124,6 +2166,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     pending: counters.pending,
                 }
             }),
+            postings: self
+                .postings
+                .as_ref()
+                .map(PostingLog::recent)
+                .unwrap_or_default(),
         }
     }
 }
