@@ -5,8 +5,7 @@
 //! where that is available:
 //!
 //! ```text
-//! cargo-zisk build --release -p zkasper-slot-proof-guest
-//! cargo-zisk build --release -p zkasper-group-proof-guest
+//! ./scripts/build_guests.sh slot-proof-guest group-proof-guest
 //! cargo test --release --features zisk-prover --test zisk_proof_tests -- --ignored --nocapture
 //! ```
 //!
@@ -74,8 +73,11 @@ fn one_warm_prover_serves_two_programs() {
 
     let started = Instant::now();
     let (group, _miller, group_proof) = prover.prove_group(&witness).expect("group proof");
-    let group_elapsed = started.elapsed();
-    println!("group proof: {group_elapsed:?}, {:?}", prover.last_cost());
+    println!(
+        "group proof: {:?}, {:?}",
+        started.elapsed(),
+        prover.last_cost()
+    );
 
     // Second program on the same prover. Whatever this costs beyond the proof
     // itself is what switching guests costs.
