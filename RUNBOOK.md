@@ -27,8 +27,9 @@ The three arrival-timing assumptions the design rests on are confirmed (§8).
 2. **The warm prover has never run on a GPU.** Everything here is
    `--prover native`, so no measurement in this document is a proving
    measurement.
-3. **The trigger cap is mistuned**, leaving ~5,000 named absentees worth ~9 s of
-   proving on the critical path. Free today, dominant on a GPU (§8).
+3. **The trigger cap is mistuned**, leaving 5,000–8,200 named absentees worth
+   8.9–14.6 s of proving on the critical path across three steady-state epochs.
+   Free today under `--prover native`, dominant on a GPU (§8).
 
 **Fixed during the run**: a slot could be proved twice; an empty boundary wedged
 the epoch diff; a 404 was reported as a parse error; a pruned bootstrap state
