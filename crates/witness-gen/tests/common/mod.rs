@@ -15,9 +15,7 @@ use zkasper_common::acc;
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
 use zkasper_common::ssz::attestation_data_root;
-use zkasper_common::types::{
-    Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification, ValidatorData,
-};
+use zkasper_common::types::{Checkpoint, EpochDiffOutput, PreviousJustification, ValidatorData};
 use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::artifacts::hex0x;
@@ -651,11 +649,11 @@ fn stream_fixture_from(epoch: Epoch) -> StreamFixture {
             .map(|slot| epoch.complement(slot, &[]))
             .collect(),
         context,
-        previous: PreviousJustification::Batch(JustificationOutput {
-            accumulator_commitment: previous_accumulator_commitment,
-            target_epoch: STREAM_EPOCH - 1,
-            target_root: epoch.previous_root,
-        }),
+        previous: PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            previous_accumulator_commitment,
+            STREAM_EPOCH - 1,
+            epoch.previous_root,
+        )),
         epoch,
     }
 }

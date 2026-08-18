@@ -296,15 +296,44 @@ pub struct SlotProofWitness {
     pub committee_multi_proof: AccMultiProof,
 }
 
-/// Public outputs of a justification proof.
+/// Public outputs of a justification proof: the running state of one epoch.
+///
+/// A justification is a chain of folds rather than one proof over the whole
+/// epoch, so this is what every link publishes — the partial ones included. The
+/// checkpoint it is about, the weight counted for it so far, and whether that
+/// weight has passed two thirds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JustificationOutput {
     pub accumulator_commitment: Digest,
+    /// Committee tree every folded slot proof counted against.
+    ///
+    /// Carried for the reason [`AggregateOutput`] carries it: the slot mask
+    /// deduplicates *validators* only because one committee proof puts each
+    /// validator in exactly one slot, so a chain that mixed two partitions of
+    /// the same epoch could count a validator twice.
+    pub committee_root: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
+    /// Deduplicated attesting balance folded in so far.
+    pub attesting_balance: u64,
+    /// Which slots of the epoch have been counted, one bit each.
+    pub slots_mask: u64,
+    /// Whether `attesting_balance` has passed two thirds of the active balance
+    /// the accumulator commits to.
+    ///
+    /// **Computed, never asserted, and a consumer must check it.** The guest
+    /// derives it from a balance it bound to the accumulator commitment, so a
+    /// proof whose flag is set claims exactly what the old whole-epoch assert
+    /// claimed. What changed is that a *partial* fold is now a valid proof —
+    /// it has to be, or the chain could not have a middle — so "a justification
+    /// proof exists" no longer means "the epoch is justified". Every consumer of
+    /// a [`JustificationOutput`] therefore requires this flag: both finalization
+    /// circuits do, and so does the daemon before it publishes one.
+    pub justified: bool,
 }
 
-/// Witness for a justification proof (aggregates slot proofs).
+/// Witness for a justification proof: extend a running justification with
+/// finished slot proofs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JustificationWitness {
     // -- public inputs --
@@ -326,10 +355,21 @@ pub struct JustificationWitness {
     pub slot_program_vk: crate::recursion::ProgramVk,
     /// Verification key of the committee program.
     pub committee_program_vk: crate::recursion::ProgramVk,
+    /// Verification key of this program, so a justification can extend a
+    /// justification.
+    pub justification_program_vk: crate::recursion::ProgramVk,
 
-    /// The committee proof every slot proof counted against.
-    pub committee: CommitteeOutput,
+    /// The committee proof every slot proof counted against. Required when
+    /// `previous` is absent — the fold that opens the epoch is the one that
+    /// establishes the partition — and ignored afterwards, since later folds
+    /// inherit the root it published.
+    pub committee: Option<CommitteeOutput>,
     pub committee_proof: Vec<u64>,
+
+    /// The justification being extended. `None` opens the epoch: nothing
+    /// counted and an empty slot mask.
+    pub previous: Option<JustificationOutput>,
+    pub previous_proof: Vec<u64>,
 
     // -- slot proof outputs, verified recursively --
     pub slot_proof_outputs: Vec<SlotProofOutput>,
@@ -474,8 +514,12 @@ impl JustificationOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
+            .digest(&self.committee_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
+            .u64(self.attesting_balance)
+            .u64(self.slots_mask)
+            .u64(self.justified as u64)
             .finish()
     }
 }
@@ -632,6 +676,18 @@ impl PreviousJustification {
         match self {
             Self::Batch(o) => o.target_root,
             Self::Stream(o) => o.justified_root,
+        }
+    }
+
+    /// Whether the epoch this carries actually crossed two thirds.
+    ///
+    /// A batch justification is a fold in a chain and the partial links are
+    /// valid proofs, so the flag has to be read. A stream final proof asserts
+    /// the supermajority itself and only exists above it.
+    pub fn is_justified(&self) -> bool {
+        match self {
+            Self::Batch(o) => o.justified,
+            Self::Stream(_) => true,
         }
     }
 

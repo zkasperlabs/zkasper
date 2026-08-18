@@ -317,3 +317,23 @@ pub fn build_acc_tree(acc_leaves: &[Digest], depth: u32) -> (Digest, Vec<Vec<Dig
 
     (root, all_siblings)
 }
+
+/// A justification of `target_epoch` that says the supermajority is behind it.
+///
+/// The closing link of a real chain publishes the balance and mask it counted;
+/// nothing downstream reads either, so a fixture only has to set the flag.
+pub fn justified_output(
+    accumulator_commitment: Digest,
+    target_epoch: u64,
+    target_root: [u8; 32],
+) -> JustificationOutput {
+    JustificationOutput {
+        accumulator_commitment,
+        committee_root: ZERO,
+        target_epoch,
+        target_root,
+        attesting_balance: 0,
+        slots_mask: 0,
+        justified: true,
+    }
+}

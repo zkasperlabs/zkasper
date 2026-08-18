@@ -164,8 +164,11 @@ async fn test_follows_four_epochs_end_to_end() {
     for epoch in FIRST_EPOCH..=LAST_EPOCH {
         let epoch_dir = out.join(format!("epoch-{epoch:09}"));
         assert!(epoch_dir.join("committee.bin").exists(), "epoch {epoch}");
+        // A justification is a chain of folds, and each link writes its own
+        // witness. The link that opens the epoch is always there; how many
+        // follow it depends on how many slots the epoch took.
         assert!(
-            epoch_dir.join("justification.bin").exists(),
+            epoch_dir.join("justification_0.bin").exists(),
             "epoch {epoch}"
         );
         for i in 0..SLOTS_TO_THRESHOLD {
