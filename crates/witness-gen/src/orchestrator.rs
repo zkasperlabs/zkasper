@@ -31,6 +31,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -39,7 +40,8 @@ use tracing::{info, info_span, warn};
 use zkasper_common::acc::Digest;
 use zkasper_common::bls::{compute_domain, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::types::{
-    Checkpoint, FinalizationWitness, JustificationOutput, SlotProofOutput, SlotProofWitness,
+    Checkpoint, CommitteeOutput, FinalizationWitness, JustificationOutput, SlotProofOutput,
+    SlotProofWitness,
 };
 use zkasper_common::ChainConfig;
 
@@ -50,6 +52,7 @@ use crate::artifacts::{
 };
 use crate::attestation_collector::SlotStream;
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
+use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
 use crate::prover::{Proof, Prover, Stage};
 use crate::store::{EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState};
@@ -124,7 +127,10 @@ struct EpochAggregator {
     acc_root: Digest,
     acc_commitment: Digest,
     total_active_balance: u64,
-    validators: Vec<ValidatorResponse>,
+    /// This epoch's committee proof, which every slot proof counts against.
+    committees: Arc<EpochCommittees>,
+    committee_output: CommitteeOutput,
+    committee_proof: Proof,
     stream: SlotStream,
     /// Next slot to ask the node for.
     next_slot: u64,
@@ -133,7 +139,6 @@ struct EpochAggregator {
     attesting_balance: u64,
     slot_outputs: Vec<SlotProofOutput>,
     slot_proofs: Vec<Proof>,
-    counted_per_slot: Vec<Vec<u64>>,
 }
 
 impl EpochAggregator {
@@ -469,6 +474,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     async fn drive_aggregation(&mut self, tick: &mut Tick) -> Result<()> {
         let target_epoch = self.snapshot.state.cursor_epoch;
+        let spe = self.config.chain.slots_per_epoch;
 
         let mut aggregator = match self.pending.take() {
             Some(aggregator) if aggregator.target_epoch == target_epoch => aggregator,
@@ -486,56 +492,69 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
             // A slot with no block is not an error; neither is one whose
             // attestations all point somewhere else.
-            let Ok(attestations) = self.api.get_block_attestations(&slot.to_string()).await else {
+            if let Ok(attestations) = self.api.get_block_attestations(&slot.to_string()).await {
+                aggregator.stream.ingest(&attestations)?;
+            }
+
+            // Attestations for slot `s` are included from block `s+1` onwards,
+            // so closing `s` once `s+1` has been scanned keeps the schedule one
+            // slot behind the chain. A straggler included later becomes an
+            // absentee, which costs a little weight and no soundness.
+            let Some(attestation_slot) = slot.checked_sub(1) else {
                 continue;
             };
-            let Some(collected) =
-                aggregator
-                    .stream
-                    .ingest(slot, &attestations, &aggregator.validators)?
-            else {
+            if attestation_slot < target_epoch * spe || attestation_slot >= (target_epoch + 1) * spe
+            {
+                continue;
+            }
+            let Some(complement) = aggregator.stream.close(attestation_slot) else {
                 continue;
             };
 
             let started = Instant::now();
             let witness = SlotProofWitness {
                 accumulator_commitment: aggregator.acc_commitment,
+                committee_root: aggregator.committee_output.committee_root,
                 target_epoch,
                 target_root: aggregator.target_root,
                 signing_domain: aggregator.signing_domain,
                 acc_root: aggregator.acc_root,
                 total_active_balance: aggregator.total_active_balance,
-                attestations: collected.attestations,
                 acc_multi_proof: self
                     .snapshot
                     .tree
-                    .build_multi_proof(&collected.all_validator_indices),
+                    .build_multi_proof(&complement.named_indices),
+                committee_multi_proof: aggregator
+                    .committees
+                    .multi_proof(&[complement.witness.slot_in_epoch]),
+                slots: vec![complement.witness],
             };
 
             let (output, proof) = self
                 .prover
                 .prove_slot(&witness)
-                .with_context(|| format!("slot proof for slot {slot}"))?;
+                .with_context(|| format!("slot proof for attestation slot {attestation_slot}"))?;
 
-            let artifact =
-                self.sink
-                    .write_witness(target_epoch, &format!("slot_proof_{slot}"), &witness)?;
+            let artifact = self.sink.write_witness(
+                target_epoch,
+                &format!("slot_proof_{attestation_slot}"),
+                &witness,
+            )?;
             write_proof(
                 &self.sink,
                 target_epoch,
-                &format!("slot_proof_{slot}"),
+                &format!("slot_proof_{attestation_slot}"),
                 &proof,
             )?;
 
             aggregator.attesting_balance += output.attesting_balance;
             aggregator.slot_outputs.push(output);
             aggregator.slot_proofs.push(proof);
-            aggregator.counted_per_slot.push(collected.counted_indices);
 
             let millis = started.elapsed().as_millis() as u64;
             info!(
-                slot,
-                counted = aggregator.counted_per_slot.last().map_or(0, Vec::len),
+                slot = attestation_slot,
+                absentees = witness.slots[0].absentees.len(),
                 attesting_balance = aggregator.attesting_balance,
                 pct = percent_of(
                     aggregator.attesting_balance,
@@ -547,11 +566,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             self.record(StageTiming {
                 stage: Stage::SlotProof.as_str().to_string(),
                 epoch: target_epoch,
-                slot: Some(slot),
+                slot: Some(attestation_slot),
                 millis,
                 artifact: Some(artifact),
             });
-            tick.slots_proved.push(slot);
+            tick.slots_proved.push(attestation_slot);
         }
 
         if aggregator.threshold_reached() {
@@ -588,18 +607,29 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .await
             .context("fetch validators for the target epoch")?;
 
-        let stream = SlotStream::open(
-            &self.api,
+        let committees = Arc::new(self.build_committees(target_epoch, &validators).await?);
+        let (committee_output, committee_proof) =
+            self.prover.prove_committee(&committees.witness)?;
+        if committee_output != committees.output {
+            bail!(
+                "committee circuit disagrees with the host committee tree at epoch {target_epoch}"
+            );
+        }
+        self.sink
+            .write_witness(target_epoch, "committee", &committees.witness)?;
+        write_proof(&self.sink, target_epoch, "committee", &committee_proof)?;
+
+        let stream = SlotStream::new(
             &self.config.chain,
+            committees.clone(),
             target_epoch,
             target_root,
-            target_epoch,
-        )
-        .await?;
+        );
 
         info!(
             target_epoch,
             target_root = %crate::artifacts::hex0x(&target_root),
+            committee_root = %hex_digest(&committee_output.committee_root),
             "opened epoch",
         );
 
@@ -610,15 +640,45 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             acc_root: self.snapshot.state.acc_root,
             acc_commitment: self.snapshot.state.acc_commitment,
             total_active_balance: self.snapshot.state.total_active_balance,
-            validators,
+            committees,
+            committee_output,
+            committee_proof,
             stream,
             next_slot: target_epoch * spe,
             scan_end: (target_epoch + self.config.attestation_lookahead_epochs) * spe,
             attesting_balance: 0,
             slot_outputs: Vec::new(),
             slot_proofs: Vec::new(),
-            counted_per_slot: Vec::new(),
         })
+    }
+
+    /// Sum this epoch's committees out of the accumulator.
+    ///
+    /// The shuffle that produced them is the node's; nothing here or in the
+    /// circuit recomputes it, because a wrong assignment cannot be proven
+    /// against the signatures it would have to match. See
+    /// [`zkasper_common::committee`].
+    async fn build_committees(
+        &self,
+        target_epoch: u64,
+        validators: &[ValidatorResponse],
+    ) -> Result<EpochCommittees> {
+        let spe = self.config.chain.slots_per_epoch;
+        let committees = self
+            .api
+            .get_committees(&(target_epoch * spe).to_string(), target_epoch)
+            .await
+            .context("fetch committees")?;
+
+        crate::committee::build(
+            &committees,
+            validators,
+            &self.snapshot.tree,
+            &self.config.chain,
+            target_epoch,
+            target_epoch,
+            self.snapshot.state.total_active_balance,
+        )
     }
 
     /// Fold the epoch's slot proofs into a justification, and pair it with the
@@ -630,9 +690,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         let witness = witness_justification::build(
             aggregator.slot_outputs,
             aggregator.slot_proofs,
-            aggregator.counted_per_slot,
             aggregator.acc_commitment,
             self.prover.program_vk(Stage::SlotProof),
+            self.prover.program_vk(Stage::Committee),
+            aggregator.committee_output,
+            aggregator.committee_proof,
             target_epoch,
             aggregator.target_root,
             aggregator.total_active_balance,

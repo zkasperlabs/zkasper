@@ -5,16 +5,14 @@
 
 use std::collections::HashMap;
 
-use zkasper_common::acc::{self, Digest};
-use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
+use zkasper_common::acc;
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
-use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::test_utils::make_validator;
 use zkasper_common::types::*;
 use zkasper_common::ChainConfig;
 
-use zkasper_witness_gen::acc_tree::AccTree;
 use zkasper_witness_gen::beacon_api::{BeaconApi, HeaderResponse, ValidatorResponse};
+use zkasper_witness_gen::fixture::Epoch;
 use zkasper_witness_gen::state_diff::{
     build_validator_roots, build_validators_ssz_tree, make_state_proof,
 };
@@ -94,43 +92,6 @@ impl BeaconApi for MockBeaconApi {
     async fn get_state_ssz(&self, _state_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(None)
     }
-}
-
-// ---------------------------------------------------------------------------
-// BLS key generation and signing helpers
-// ---------------------------------------------------------------------------
-
-fn generate_test_keys(n: usize) -> Vec<(blst::min_pk::SecretKey, [u8; 48])> {
-    (0..n)
-        .map(|i| {
-            let mut ikm = [0u8; 32];
-            ikm[0] = i as u8;
-            ikm[1] = 0xAB;
-            let sk = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
-            let pk = sk.sk_to_pk();
-            let pk_bytes: [u8; 48] = pk.to_bytes();
-            (sk, pk_bytes)
-        })
-        .collect()
-}
-
-fn sign_message(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
-    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    let sigs: Vec<blst::min_pk::Signature> = sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
-    let sig_refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
-    let agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true).unwrap();
-    agg.to_signature().to_bytes()
-}
-
-/// Synthetic signing domain for tests.
-fn test_signing_domain() -> [u8; 32] {
-    let fork_version = [0x04, 0x00, 0x00, 0x00];
-    let genesis_validators_root = [0xAA; 32];
-    compute_domain(
-        &DOMAIN_BEACON_ATTESTER,
-        &fork_version,
-        &genesis_validators_root,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -234,167 +195,34 @@ fn gen_epoch_diff(output_path: &str) {
 // Slot proof
 // ---------------------------------------------------------------------------
 
-/// Build test data shared between slot-proof, justification, and finalization generators.
-struct SlotTestData {
-    keys: Vec<(blst::min_pk::SecretKey, [u8; 48])>,
-    validators: Vec<ValidatorData>,
-    tree: AccTree,
-    acc_root: Digest,
-    total_active_balance: u64,
-    commitment: Digest,
-    signing_domain: [u8; 32],
+/// Two slots of two validators each.
+///
+/// Small, but the shape is the real one: a committee summed out of the
+/// accumulator, a derived aggregate key, and an absentee opened against a leaf.
+fn fixture() -> Epoch {
+    Epoch::new(CONFIG, 100, 2, 2)
 }
 
-fn build_slot_test_data() -> SlotTestData {
-    let epoch = 100u64;
-    let balance_gwei = 32_000_000_000u64;
-
-    let keys = generate_test_keys(4);
-    let validators: Vec<ValidatorData> = keys
-        .iter()
-        .map(|(_, pk)| ValidatorData {
-            pubkey: BlsPubkey(*pk),
-            effective_balance: balance_gwei,
-            activation_epoch: 0,
-            exit_epoch: u64::MAX,
-        })
-        .collect();
-
-    let total_active_balance = 4 * balance_gwei;
-    let tree = AccTree::build(&validators, epoch, CONFIG.acc_tree_depth);
-    let acc_root = tree.root();
-    let commitment = acc::commitment(&acc_root, total_active_balance);
-    let signing_domain = test_signing_domain();
-
-    SlotTestData {
-        keys,
-        validators,
-        tree,
-        acc_root,
-        total_active_balance,
-        commitment,
-        signing_domain,
-    }
-}
-
-/// Build a SlotProofWitness for a single attestation where `validator_indices` all sign.
-fn build_slot_witness(
-    data: &SlotTestData,
-    epoch: u64,
-    target_root: [u8; 32],
-    data_slot: u64,
-    validator_indices: &[usize],
-    seen: &mut std::collections::BTreeSet<u64>,
-) -> SlotProofWitness {
-    let source_root = [0x01u8; 32];
-    let beacon_block_root = [0u8; 32];
-
-    let data_root = attestation_data_root(
-        data_slot,
-        0,
-        &beacon_block_root,
-        epoch.saturating_sub(1),
-        &source_root,
-        epoch,
-        &target_root,
-    );
-    let sig_root = compute_signing_root(&data_root, &data.signing_domain);
-
-    let sks: Vec<&blst::min_pk::SecretKey> =
-        validator_indices.iter().map(|&i| &data.keys[i].0).collect();
-    let signature = sign_message(&sks, &sig_root);
-
-    let attesting_validators: Vec<AttestingValidator> = validator_indices
-        .iter()
-        .map(|&i| {
-            let v = &data.validators[i];
-            let count_balance = seen.insert(i as u64);
-            AttestingValidator {
-                validator_index: i as u64,
-                pubkey: zkasper_witness_gen::pubkey::decompress(&v.pubkey.0).unwrap(),
-                active_effective_balance: v.active_effective_balance(epoch),
-                count_balance,
-            }
-        })
-        .collect();
-
-    let attestation = AttestationWitness {
-        data_slot,
-        data_index: 0,
-        data_beacon_block_root: beacon_block_root,
-        data_source_epoch: epoch.saturating_sub(1),
-        data_source_root: source_root,
-        data_target_epoch: epoch,
-        data_target_root: target_root,
-        signature: BlsSignature(signature),
-        attesting_validators,
-    };
-
-    // Collect leaf indices that have count_balance=true for the multi-proof
-    let counted_leaf_indices: Vec<u64> = validator_indices
-        .iter()
-        .filter(|&&i| {
-            attestation
-                .attesting_validators
-                .iter()
-                .any(|v| v.validator_index == i as u64 && v.count_balance)
-        })
-        .map(|&i| i as u64)
-        .collect();
-
-    let multi_proof = data.tree.build_multi_proof(&counted_leaf_indices);
-
+/// Build the witness for one slot's complement.
+fn slot_witness(fixture: &Epoch, slot_in_epoch: u64, absent: &[u64]) -> SlotProofWitness {
+    let complement = fixture.complement(slot_in_epoch, absent);
     SlotProofWitness {
-        accumulator_commitment: data.commitment,
-        target_epoch: epoch,
-        target_root,
-        signing_domain: data.signing_domain,
-        acc_root: data.acc_root,
-        total_active_balance: data.total_active_balance,
-        attestations: vec![attestation],
-        acc_multi_proof: multi_proof,
+        accumulator_commitment: fixture.accumulator_commitment,
+        committee_root: fixture.committees.root(),
+        target_epoch: fixture.epoch,
+        target_root: fixture.target_root,
+        signing_domain: fixture.signing_domain,
+        acc_root: fixture.acc_root,
+        total_active_balance: fixture.total_active_balance,
+        acc_multi_proof: fixture.tree.build_multi_proof(&complement.named_indices),
+        committee_multi_proof: fixture.committees.multi_proof(&[slot_in_epoch]),
+        slots: vec![complement.witness],
     }
-}
-
-/// Compute the expected SlotProofOutput without calling guest code.
-fn compute_slot_output(
-    data: &SlotTestData,
-    epoch: u64,
-    target_root: [u8; 32],
-    validator_indices: &[usize],
-) -> (SlotProofOutput, Vec<u64>) {
-    let balance_per = data.validators[0].effective_balance;
-    let attesting_balance = validator_indices.len() as u64 * balance_per;
-    let mut sorted_indices: Vec<u64> = validator_indices.iter().map(|&i| i as u64).collect();
-    sorted_indices.sort_unstable();
-    let commitment = acc::commit_indices(&sorted_indices);
-
-    let output = SlotProofOutput {
-        accumulator_commitment: data.commitment,
-        target_epoch: epoch,
-        target_root,
-        attesting_balance,
-        counted_validators_commitment: commitment,
-        num_counted_validators: sorted_indices.len() as u64,
-    };
-    (output, sorted_indices)
 }
 
 fn gen_slot_proof(output_path: &str) {
-    let data = build_slot_test_data();
-    let epoch = 100u64;
-    let target_root = [0x07u8; 32];
-    let data_slot = epoch * CONFIG.slots_per_epoch;
-
-    let mut seen = std::collections::BTreeSet::new();
-    let witness = build_slot_witness(
-        &data,
-        epoch,
-        target_root,
-        data_slot,
-        &[0, 1, 2, 3],
-        &mut seen,
-    );
+    let fixture = fixture();
+    let witness = slot_witness(&fixture, 0, &[1]);
 
     let bytes = bincode::serialize(&witness).unwrap();
     std::fs::write(output_path, &bytes).unwrap();
@@ -409,23 +237,28 @@ fn gen_slot_proof(output_path: &str) {
 // ---------------------------------------------------------------------------
 
 fn gen_justification(output_path: &str) {
-    let data = build_slot_test_data();
-    let epoch = 100u64;
-    let target_root = [0x07u8; 32];
+    let fixture = fixture();
 
-    // Two slots: validators [0,1] in slot 0, validators [2,3] in slot 1
-    let (output_0, indices_0) = compute_slot_output(&data, epoch, target_root, &[0, 1]);
-    let (output_1, indices_1) = compute_slot_output(&data, epoch, target_root, &[2, 3]);
+    let outputs: Vec<SlotProofOutput> = (0..2)
+        .map(|slot| {
+            zkasper_slot_proof_guest::verify_slot_proof_with_depth(
+                &slot_witness(&fixture, slot, &[]),
+                CONFIG.acc_tree_depth,
+            )
+        })
+        .collect();
 
     let witness = JustificationWitness {
-        accumulator_commitment: data.commitment,
-        target_epoch: epoch,
-        target_root,
-        total_active_balance: data.total_active_balance,
-        slot_proof_outputs: vec![output_0, output_1],
+        accumulator_commitment: fixture.accumulator_commitment,
+        target_epoch: fixture.epoch,
+        target_root: fixture.target_root,
+        total_active_balance: fixture.total_active_balance,
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
+        committee: fixture.committees.output.clone(),
+        committee_proof: Vec::new(),
+        slot_proof_outputs: outputs,
         slot_proofs: vec![vec![], vec![]], // native mode: no real child proofs
-        counted_indices_per_slot: vec![indices_0, indices_1],
     };
 
     let bytes = bincode::serialize(&witness).unwrap();
@@ -441,7 +274,7 @@ fn gen_justification(output_path: &str) {
 // ---------------------------------------------------------------------------
 
 fn gen_finalization(output_path: &str) {
-    let data = build_slot_test_data();
+    let data = fixture();
     let epoch_e = 100u64;
     let epoch_e1 = 101u64;
     // The finalized root must be the header's own root, since the circuit now
@@ -468,7 +301,7 @@ fn gen_finalization(output_path: &str) {
     // case on a live chain. The epoch diff below is what ties the two together.
     let commitment_e1 = acc::commitment(&data.acc_root, data.total_active_balance - 1_000_000_000);
     let epoch_diff_output = EpochDiffOutput {
-        prev_accumulator_commitment: data.commitment,
+        prev_accumulator_commitment: data.accumulator_commitment,
         state_root_1: finalized_header.state_root,
         epoch_1: epoch_e,
         accumulator_commitment: commitment_e1,
@@ -479,7 +312,7 @@ fn gen_finalization(output_path: &str) {
     };
 
     let just_e = JustificationOutput {
-        accumulator_commitment: data.commitment,
+        accumulator_commitment: data.accumulator_commitment,
         target_epoch: epoch_e,
         target_root: target_root_e,
     };
@@ -520,11 +353,11 @@ fn gen_finalization(output_path: &str) {
 /// generated from one run rather than assembled separately.
 fn gen_stream(output_path: &str, stage: &str) {
     use zkasper_common::types::{EpochDiffOutput, PreviousJustification};
-    use zkasper_witness_gen::streaming::{self, StreamPolicy, StreamUnit};
+    use zkasper_witness_gen::streaming::{self, StreamPolicy};
 
-    let data = build_slot_test_data();
-    let epoch = 100u64;
-    let target_root = [0x07u8; 32];
+    let data = fixture();
+    let epoch = data.epoch;
+    let target_root = data.target_root;
 
     // The epoch this one finalizes, and the diff that carried the accumulator
     // from there to here.
@@ -546,7 +379,7 @@ fn gen_stream(output_path: &str, stage: &str) {
         acc::commitment(&data.acc_root, data.total_active_balance - 1_000_000_000);
 
     let context = streaming::StreamContext {
-        accumulator_commitment: data.commitment,
+        accumulator_commitment: data.accumulator_commitment,
         acc_root: data.acc_root,
         total_active_balance: data.total_active_balance,
         target_epoch: epoch,
@@ -556,43 +389,33 @@ fn gen_stream(output_path: &str, stage: &str) {
         aggregate_program_vk: [0; 4],
         previous_program_vk: [0; 4],
         epoch_diff_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_commitment,
             state_root_1: finalized_header.state_root,
             epoch_1: epoch - 1,
-            accumulator_commitment: data.commitment,
+            accumulator_commitment: data.accumulator_commitment,
             acc_root: data.acc_root,
             total_active_balance: data.total_active_balance,
             state_root_2: [0xCDu8; 32],
             epoch_2: epoch,
         },
         epoch_diff_proof: Vec::new(),
+        committee: data.committees.output.clone(),
+        committee_proof: Vec::new(),
         acc_depth: CONFIG.acc_tree_depth,
     };
 
-    // Two aggregates, half the validators each: the first is a group, the second
+    // Two slots, half the validators each: the first is a group, the second
     // carries the epoch over the threshold and is proven inline by the final
     // proof.
-    let mut seen = std::collections::BTreeSet::new();
-    let units: Vec<StreamUnit> = [(0u64, [0usize, 1]), (1, [2, 3])]
-        .into_iter()
-        .map(|(slot, members)| {
-            let witness = build_slot_witness(
-                &data,
-                epoch,
-                target_root,
-                epoch * CONFIG.slots_per_epoch + slot,
-                &members,
-                &mut seen,
-            );
-            StreamUnit::new(slot, witness.attestations.into_iter().next().unwrap())
-        })
-        .collect();
+    let units: Vec<_> = (0..2).map(|slot| data.complement(slot, &[])).collect();
 
     let plan = streaming::plan(&units, data.total_active_balance, &StreamPolicy::default());
     let run = streaming::run_native(
         &context,
         &data.tree,
+        &data.committees,
         &units,
         &plan,
         PreviousJustification::Batch(JustificationOutput {

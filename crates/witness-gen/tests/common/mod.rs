@@ -59,6 +59,39 @@ impl MockBeaconApi {
         self.attestation_requests.lock().unwrap().clone()
     }
 
+    /// Serve committees for `epoch` that partition `validators` across the
+    /// epoch's slots, one validator each.
+    ///
+    /// A committee proof only needs the slot buckets to be disjoint and to cover
+    /// everyone it opens — who sits where is the node's shuffle, and getting it
+    /// wrong costs liveness rather than soundness — so validator `i` attests at
+    /// the epoch's slot `i`.
+    pub fn set_committees(
+        &mut self,
+        epoch: u64,
+        validators: &[ValidatorResponse],
+        slots_per_epoch: u64,
+    ) {
+        assert!(
+            validators.len() as u64 <= slots_per_epoch,
+            "{} validators do not fit one per slot in {slots_per_epoch} slots",
+            validators.len(),
+        );
+        let boundary = epoch * slots_per_epoch;
+        self.committees.insert(
+            (boundary.to_string(), epoch),
+            validators
+                .iter()
+                .enumerate()
+                .map(|(i, v)| CommitteeResponse {
+                    slot: boundary + i as u64,
+                    index: 0,
+                    validators: vec![v.index],
+                })
+                .collect(),
+        );
+    }
+
     /// Report the same finality checkpoints for every state id.
     pub fn set_finality(&mut self, finalized_epoch: u64, root: [u8; 32]) {
         let checkpoint = Checkpoint {

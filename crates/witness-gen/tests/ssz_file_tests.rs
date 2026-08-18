@@ -8,7 +8,7 @@
 //! cargo test --release --test ssz_file_tests -- --ignored --nocapture
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use zkasper_common::constants::VALIDATORS_TREE_DEPTH;
+use zkasper_common::types::SlotProofWitness;
 use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::beacon_api::{
@@ -582,6 +583,24 @@ async fn bench_epoch_diff_guest_ops() {
 
 const FINALITY_DATA: &str = "finality_epoch_430529.json.gz";
 
+/// Validators a slot proof opens: absentees plus whatever minority-message
+/// signers it enumerates, counted once each.
+fn named_count(witness: &SlotProofWitness) -> usize {
+    let mut named: BTreeSet<u64> = BTreeSet::new();
+    for slot in &witness.slots {
+        named.extend(slot.absentees.iter().map(|v| v.validator_index));
+        for attestation in &slot.secondary {
+            named.extend(
+                attestation
+                    .attesting_validators
+                    .iter()
+                    .map(|v| v.validator_index),
+            );
+        }
+    }
+    named.len()
+}
+
 #[tokio::test]
 #[ignore = "downloads ~320MB, takes ~3min"]
 async fn test_ssz_file_finality() {
@@ -628,11 +647,29 @@ async fn test_ssz_file_finality() {
     );
     eprintln!("signing_domain=0x{}", hex::encode(signing_domain));
 
-    // Build one slot-proof witness per block slot, then aggregate.
+    // Sum the epoch's committees out of the accumulator: the universe each
+    // slot's attesters are the complement of.
+    let committees = Arc::new(
+        zkasper_witness_gen::committee::build(
+            &api.get_committees(&slot.to_string(), target_epoch)
+                .await
+                .unwrap(),
+            &api.get_validators(&slot.to_string()).await.unwrap(),
+            &tree,
+            &CONFIG,
+            target_epoch,
+            target_epoch,
+            total_active_balance,
+        )
+        .unwrap(),
+    );
+
+    // Build one slot-proof witness per attestation slot, then aggregate.
     let slots = zkasper_witness_gen::witness_slot_proof::build_per_slot(
         &api,
         &CONFIG,
         &tree,
+        committees.clone(),
         target_epoch,
         target_root,
         total_active_balance,
@@ -641,25 +678,26 @@ async fn test_ssz_file_finality() {
     .await
     .unwrap();
 
-    let num_attestations: usize = slots.iter().map(|s| s.witness.attestations.len()).sum();
-    let unique_counted: usize = slots.iter().map(|s| s.counted_indices.len()).sum();
+    let absentees: usize = slots
+        .iter()
+        .map(|s| s.witness.slots[0].absentees.len())
+        .sum();
+    let named: usize = slots.iter().map(|s| named_count(&s.witness)).sum();
     let auxiliaries: usize = slots
         .iter()
         .map(|s| s.witness.acc_multi_proof.auxiliaries.len())
         .sum();
     eprintln!(
-        "slots={}, attestations={num_attestations}, unique_counted={unique_counted}, \
+        "slots={}, absentees={absentees}, named={named}, \
          multi_proof_auxiliaries={auxiliaries}",
         slots.len(),
     );
 
     // Run each slot proof, then fold them with the justification circuit.
-    let mut outputs = Vec::with_capacity(slots.len());
-    let mut counted_per_slot = Vec::with_capacity(slots.len());
-    for s in &slots {
-        outputs.push(zkasper_slot_proof_guest::verify_slot_proof(&s.witness));
-        counted_per_slot.push(s.counted_indices.clone());
-    }
+    let outputs: Vec<_> = slots
+        .iter()
+        .map(|s| zkasper_slot_proof_guest::verify_slot_proof(&s.witness))
+        .collect();
 
     let attesting_balance: u64 = outputs.iter().map(|o| o.attesting_balance).sum();
     eprintln!(
@@ -672,9 +710,11 @@ async fn test_ssz_file_finality() {
         &zkasper_witness_gen::witness_justification::build(
             outputs,
             vec![Vec::new(); slots.len()],
-            counted_per_slot,
             commitment,
             [0; 4],
+            [0; 4],
+            committees.output.clone(),
+            Vec::new(),
             target_epoch,
             target_root,
             total_active_balance,
@@ -716,16 +756,15 @@ async fn test_ssz_file_gnosis_state_root() {
 /// aggregate inline and runs the epoch's single final exponentiation.
 ///
 /// What it is here to catch is everything the synthetic fixtures cannot — real
-/// aggregate shapes, real duplicate attesters across slots, real participation
-/// — and to print what the schedule chose, which is the number the cost model
-/// is about.
+/// aggregate shapes, real minority head votes, real absentee counts — and to
+/// print what the schedule chose, which is the number the cost model is about.
 #[tokio::test]
 #[ignore = "downloads ~320MB"]
 async fn test_ssz_file_streaming_finality() {
     use zkasper_common::types::{
         BlockHeaderFields, EpochDiffOutput, JustificationOutput, PreviousJustification,
     };
-    use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy, StreamUnit};
+    use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy};
 
     init_tracing();
     const CONFIG: ChainConfig = ChainConfig::MAINNET;
@@ -751,28 +790,32 @@ async fn test_ssz_file_streaming_finality() {
         &ssz_state::extract_genesis_validators_root(raw_ssz),
     );
 
-    let slots = zkasper_witness_gen::witness_slot_proof::build_per_slot(
+    let committees = Arc::new(
+        zkasper_witness_gen::committee::build(
+            &api.get_committees(&slot.to_string(), target_epoch)
+                .await
+                .unwrap(),
+            &api.get_validators(&slot.to_string()).await.unwrap(),
+            &tree,
+            &CONFIG,
+            target_epoch,
+            target_epoch,
+            total_active_balance,
+        )
+        .unwrap(),
+    );
+
+    // One unit per attestation slot, in the order the chain attested them: a
+    // complement is per-slot, so a slot is the smallest thing a proof can carry.
+    let units = zkasper_witness_gen::attestation_collector::collect_per_slot_for_checkpoint(
         &api,
         &CONFIG,
-        &tree,
+        committees.clone(),
         target_epoch,
-        target_root,
-        total_active_balance,
-        signing_domain,
+        &target_root,
     )
     .await
     .unwrap();
-
-    // One unit per aggregate attestation, in the order the chain published them.
-    let units: Vec<StreamUnit> = slots
-        .iter()
-        .flat_map(|s| {
-            s.witness
-                .attestations
-                .iter()
-                .map(move |a| StreamUnit::new(s.slot, a.clone()))
-        })
-        .collect();
 
     // The previous epoch's justification, and the diff that carried the
     // accumulator into this one. Their proofs are empty, which is what native
@@ -816,6 +859,9 @@ async fn test_ssz_file_streaming_finality() {
             epoch_2: target_epoch,
         },
         epoch_diff_proof: Vec::new(),
+        committee_program_vk: [5; 4],
+        committee: committees.output.clone(),
+        committee_proof: Vec::new(),
         acc_depth: CONFIG.acc_tree_depth,
     };
 
@@ -827,13 +873,13 @@ async fn test_ssz_file_streaming_finality() {
     );
 
     let proven_units = plan.groups.concat().len() + plan.tail.len();
-    let tail_attesters: usize = plan
+    let tail_absentees: usize = plan
         .tail
         .iter()
-        .map(|&i| units[i].attestation.attesting_validators.len())
+        .map(|&i| units[i].witness.absentees.len())
         .sum();
     eprintln!(
-        "units={} proven={} ({:.0}% skipped), groups={:?}, tail attesters={tail_attesters}",
+        "units={} proven={} ({:.0}% skipped), groups={:?}, tail absentees={tail_absentees}",
         units.len(),
         proven_units,
         (1.0 - proven_units as f64 / units.len() as f64) * 100.0,
@@ -848,6 +894,7 @@ async fn test_ssz_file_streaming_finality() {
     let run = streaming::run_native(
         &context,
         &tree,
+        &committees,
         &units,
         &plan,
         PreviousJustification::Batch(JustificationOutput {
@@ -868,7 +915,7 @@ async fn test_ssz_file_streaming_finality() {
         finalized_header.state_root,
     );
 
-    // The critical path: one proof, one aggregate's worth of attestation work.
+    // The critical path: one proof, one slot's worth of complement work.
     assert_eq!(run.final_witness.tail.len(), plan.tail.len());
     assert!(run.final_witness.groups.is_empty());
     eprintln!(

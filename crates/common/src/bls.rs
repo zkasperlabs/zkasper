@@ -96,20 +96,51 @@ pub fn compute_domain(
 /// negation — a discrete-log problem, not something a prover can arrange. It is
 /// still checked, and rejected rather than assumed away.
 pub fn aggregate_points(points: &[G1Point]) -> Option<G1Point> {
-    #[cfg(feature = "count-ops")]
-    crate::op_counter::inc_pubkey_aggregate(points.len() as u64);
+    let mut sum = PointSum::default();
+    for point in points {
+        sum.add(point)?;
+    }
+    sum.get()
+}
 
-    let (first, rest) = points.split_first()?;
+/// A running sum of public keys, addition and subtraction both.
+///
+/// Complement proving needs the subtraction: a slot's attesters are its
+/// committee aggregate minus the keys of everyone who did not sign the primary
+/// message, so the sum walks downwards from a value it never enumerates.
+/// Negating a G1 point is a field negation of `y`, so a subtraction costs the
+/// same as an addition.
+///
+/// See [`aggregate_points`] for why the raw precompile is safe here and what its
+/// preconditions are.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PointSum(Option<G1Point>);
 
-    let mut acc = SyscallPoint384 {
-        x: first[0..6].try_into().ok()?,
-        y: first[6..12].try_into().ok()?,
-    };
+impl PointSum {
+    /// Start from a point that is already a sum — a committee aggregate, say.
+    pub fn from_point(point: G1Point) -> Self {
+        Self(Some(point))
+    }
 
-    for point in rest {
-        if acc.x[..] == point[0..6] {
+    pub fn add(&mut self, point: &G1Point) -> Option<()> {
+        #[cfg(feature = "count-ops")]
+        crate::op_counter::inc_pubkey_aggregate(1);
+
+        let Some(current) = self.0.as_mut() else {
+            self.0 = Some(*point);
+            return Some(());
+        };
+
+        // A shared x-coordinate is either `p1 == p2` or `p1 == -p2`, and the
+        // precompile is undefined on both.
+        if current[0..6] == point[0..6] {
             return None;
         }
+
+        let mut acc = SyscallPoint384 {
+            x: current[0..6].try_into().ok()?,
+            y: current[6..12].try_into().ok()?,
+        };
         let addend = SyscallPoint384 {
             x: point[0..6].try_into().ok()?,
             y: point[6..12].try_into().ok()?,
@@ -118,12 +149,20 @@ pub fn aggregate_points(points: &[G1Point]) -> Option<G1Point> {
             p1: &mut acc,
             p2: &addend,
         });
+
+        current[0..6].copy_from_slice(&acc.x);
+        current[6..12].copy_from_slice(&acc.y);
+        Some(())
     }
 
-    let mut out = [0u64; 12];
-    out[0..6].copy_from_slice(&acc.x);
-    out[6..12].copy_from_slice(&acc.y);
-    Some(out)
+    pub fn sub(&mut self, point: &G1Point) -> Option<()> {
+        self.add(&neg_bls12_381(point))
+    }
+
+    /// The sum so far, or `None` if nothing was ever added.
+    pub fn get(&self) -> Option<G1Point> {
+        self.0
+    }
 }
 
 /// Decompress a 48-byte public key into the form the accumulator leaf commits to.
@@ -147,13 +186,21 @@ const G2_IDENTITY: [u64; 24] = [0; 24];
 /// Identity element of G1.
 const G1_IDENTITY: [u64; 12] = [0; 12];
 
-/// One attestation's signature check: a committee, the message they signed, and
-/// their aggregate signature.
+/// One message's signature check: who signed it, what they signed, and the
+/// aggregate signatures over it.
+///
+/// `signatures` is a list rather than one value because a slot's attesters
+/// routinely arrive as several aggregates carrying byte-identical
+/// `AttestationData`. Their signer sets are disjoint, so summing the signatures
+/// and pairing them against one aggregate public key is both correct and one
+/// Miller loop instead of several — and under complement proving that key is
+/// derived from the committee, so it could not be split across aggregates
+/// anyway.
 pub struct SignedMessage<'a> {
     /// Decompressed public keys, as committed by the accumulator leaves.
     pub pubkeys: &'a [G1Point],
     pub signing_root: &'a [u8; 32],
-    pub signature: &'a [u8; 96],
+    pub signatures: &'a [[u8; 96]],
 }
 
 // ---------------------------------------------------------------------------
@@ -264,16 +311,21 @@ pub fn miller_accumulator(messages: &[SignedMessage]) -> Option<Fp12> {
             return None;
         }
         let agg = aggregate_points(m.pubkeys)?;
-        let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(m.signature) else {
-            return None;
-        };
-        if sig_is_infinity {
+        if m.signatures.is_empty() {
             return None;
         }
-        let Ok(sum) = add_complete_safe_twist_bls12_381(&signature_sum, &sig) else {
-            return None;
-        };
-        signature_sum = sum;
+        for signature in m.signatures {
+            let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(signature) else {
+                return None;
+            };
+            if sig_is_infinity {
+                return None;
+            }
+            let Ok(sum) = add_complete_safe_twist_bls12_381(&signature_sum, &sig) else {
+                return None;
+            };
+            signature_sum = sum;
+        }
 
         match roots.iter().position(|r| r == m.signing_root) {
             Some(i) => {
@@ -358,7 +410,7 @@ pub fn fast_aggregate_verify(
     verify_attestation_batch(&[SignedMessage {
         pubkeys,
         signing_root,
-        signature,
+        signatures: core::slice::from_ref(signature),
     }])
 }
 

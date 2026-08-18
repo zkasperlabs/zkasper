@@ -40,9 +40,10 @@ use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, EpochDiffOutput, EpochDiffWitness,
-    FinalizationOutput, FinalizationWitness, GroupProofOutput, JustificationOutput,
-    JustificationWitness, SlotProofOutput, SlotProofWitness, StreamFinalOutput, StreamFinalWitness,
+    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
+    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
+    StreamFinalOutput, StreamFinalWitness,
 };
 use zkasper_common::ChainConfig;
 
@@ -59,6 +60,7 @@ pub type Proof = Vec<u64>;
 pub enum Stage {
     Bootstrap,
     EpochDiff,
+    Committee,
     SlotProof,
     Justification,
     Finalization,
@@ -72,6 +74,7 @@ impl Stage {
         match self {
             Stage::Bootstrap => "bootstrap",
             Stage::EpochDiff => "epoch_diff",
+            Stage::Committee => "committee",
             Stage::SlotProof => "slot_proof",
             Stage::Justification => "justification",
             Stage::Finalization => "finalization",
@@ -107,6 +110,7 @@ pub trait Prover: Send + Sync {
 
     fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)>;
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)>;
+    fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)>;
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)>;
     fn prove_justification(
         &self,
@@ -188,6 +192,13 @@ impl Prover for NativeProver {
         Ok((output, Proof::new()))
     }
 
+    fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
+        let output = run_circuit(Stage::Committee, || {
+            zkasper_common::committee::verify(witness, self.config.acc_tree_depth)
+        })?;
+        Ok((output, Proof::new()))
+    }
+
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)> {
         let output = run_circuit(Stage::SlotProof, || {
             zkasper_slot_proof_guest::verify_slot_proof_with_depth(
@@ -233,10 +244,7 @@ impl Prover for NativeProver {
 
     fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)> {
         let output = run_circuit(Stage::Aggregate, || {
-            zkasper_aggregation_guest::verify_aggregate_with_depth(
-                witness,
-                zkasper_common::dedup::tree_depth(self.config.acc_tree_depth),
-            )
+            zkasper_aggregation_guest::verify_aggregate(witness)
         })?;
         Ok((output, Proof::new()))
     }
