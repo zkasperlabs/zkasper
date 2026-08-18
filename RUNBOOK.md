@@ -105,11 +105,12 @@ zkasperd needs more from a node than a validator does. All three must hold.
 **Requirement 4 is what a real prover makes binding.** A witness-only daemon
 never falls two epochs behind, so the default window is invisible. With proofs,
 the first epoch after every bootstrap goes through the batch path, and its one
-justification recursively verifies every slot proof of the epoch: **over ten
-minutes** on an RTX 5090 over ~22 of them. That is longer than the default
-window, so the daemon fell behind its own startup, 404ed, and crashlooped — 74
-restarts in an hour on 2026-08-18. Sixteen epochs of hot states is about 1.7
-hours of slack, which absorbs it.
+justification recursively verifies every slot proof of the epoch: **1,224 s over
+22 of them** on an RTX 5090 (MEASURED 2026-08-18, mainnet epoch 469424). A run
+therefore starts about 25 minutes behind the chain and spends the next 20
+catching up. That is far longer than the default window, so the daemon fell
+behind its own startup, 404ed, and crashlooped — 74 restarts in an hour.
+Sixteen epochs of hot states is about 1.7 hours of slack, which absorbs it.
 
 The window only widens for states finalized *after* the node restarts. States
 already migrated stay migrated, so a daemon whose chain depends on one of them

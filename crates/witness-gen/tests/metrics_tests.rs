@@ -136,11 +136,11 @@ async fn metrics_expose_a_streamed_epoch() {
     // exporter was given buckets; without them it would render a summary and
     // nothing could be aggregated across daemons.
     assert!(
-        rendered.contains("zkasper_t2_minus_t_seconds_bucket{le="),
+        rendered.contains("zkasper_t2_minus_t_seconds_bucket{follow=\"live\",le=\""),
         "T2 - T is not a bucketed histogram:\n{rendered}",
     );
     assert!(
-        rendered.contains("zkasper_tail_named_bucket{le="),
+        rendered.contains("zkasper_tail_named_bucket{follow=\"live\",le=\""),
         "tail_named is not a bucketed histogram:\n{rendered}",
     );
 
