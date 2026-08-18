@@ -409,6 +409,10 @@ pub struct RemoteProverConfig {
     pub backfill_quiet: Duration,
     /// How often the backfill looks at the spool.
     pub backfill_interval: Duration,
+    /// Largest witness that can be sent. A larger one is not spooled, because a
+    /// retry of it fails identically for ever. Defaults to [`MAX_FRAME_BYTES`],
+    /// which is what the far end will read.
+    pub max_request_bytes: usize,
 }
 
 impl RemoteProverConfig {
@@ -430,6 +434,7 @@ impl RemoteProverConfig {
             spool_capacity: 256,
             backfill_quiet: Duration::from_secs(30),
             backfill_interval: Duration::from_secs(5),
+            max_request_bytes: MAX_FRAME_BYTES,
         }
     }
 }
@@ -792,6 +797,26 @@ impl Inner {
     }
 
     fn prove_bytes(&self, stage: Stage, witness: Vec<u8>, publics: &[u8]) -> Result<Proof> {
+        // A witness that cannot be framed can never be sent, so spooling it
+        // would queue a retry that fails identically for ever -- and re-sending
+        // it costs the link its whole bandwidth each time. Measured on mainnet
+        // 2026-08-18: a bootstrap witness over 2,338,764 validators serializes
+        // to 916 MB against this 512 MB cap.
+        //
+        // The empty proof is the same answer an outage gives, and the same one
+        // a witness-only run gives: the daemon holds the outputs its own
+        // circuits computed, so it keeps following the chain and the epoch is
+        // published without a proof for this stage.
+        if witness.len() > self.config.max_request_bytes {
+            self.counters.unproven.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                stage = stage.as_str(),
+                witness_bytes = witness.len(),
+                cap_bytes = self.config.max_request_bytes,
+                "this witness is larger than one frame and cannot be proven remotely",
+            );
+            return Ok(Vec::new());
+        }
         self.last_foreground
             .store(now_unix_millis(), Ordering::Relaxed);
         let started = Instant::now();

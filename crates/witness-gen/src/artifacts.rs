@@ -52,6 +52,37 @@ pub struct StageTiming {
     pub proof_bytes: u64,
 }
 
+/// What an epoch cost the prover, summed as its stages land.
+///
+/// Prover time is the only quantity a price can be built from, and the two
+/// halves are kept apart because they are different work: `prove_millis` is the
+/// VADCOP proof and `wrap_millis` is the compression after it. `prover_millis`
+/// is what a rate per hour multiplies.
+///
+/// This is published rather than derived downstream, because the stages of two
+/// epochs interleave — the committee proof of E+1 runs inside E — and only the
+/// daemon knows which epoch a stage was for.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct EpochCost {
+    /// Stages that produced a proof for this epoch.
+    pub stage_count: u64,
+    pub prove_millis: u64,
+    pub wrap_millis: u64,
+}
+
+impl EpochCost {
+    /// Prover time this epoch bought, proving and wrapping together.
+    pub fn prover_millis(&self) -> u64 {
+        self.prove_millis + self.wrap_millis
+    }
+
+    pub fn absorb(&mut self, timing: &StageTiming) {
+        self.stage_count += 1;
+        self.prove_millis += timing.prove_millis.unwrap_or(0);
+        self.wrap_millis += timing.wrap_millis.unwrap_or(0);
+    }
+}
+
 impl StageTiming {
     pub fn new(
         stage: Stage,
@@ -194,6 +225,12 @@ pub struct Status {
     /// instead of trusting it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub genesis_validators_root: Option<String>,
+    /// What an hour of the proving hardware costs, as the operator gave it. The
+    /// daemon cannot know this and never multiplies by it — it is published so
+    /// a reader can price `prover_millis` for themselves, at this rate or at
+    /// their own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prover_usd_per_hour: Option<f64>,
     /// Which prover produced the artifacts. Says so when there are none.
     pub prover: String,
     pub updated_unix: u64,

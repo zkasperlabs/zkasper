@@ -1,0 +1,178 @@
+# What is worth waking someone for, and what is only worth a note.
+#
+# Loaded by the Prometheus on this box (see monitoring/prometheus.yml) and, once
+# the account exists, by Grafana Cloud's ruler. Both, deliberately: a rule about
+# whether this machine is alive cannot be evaluated only on this machine.
+#
+#   promtool check rules monitoring/alerts.yml
+groups:
+  - name: zkasper-liveness
+    interval: 30s
+    rules:
+      # The first one. Every other number here is meaningless if the daemon
+      # stopped producing them, and a stale manifest is the one symptom that
+      # covers every way it can stop: a crash, a wedge, a beacon node that will
+      # not answer, an OOM. The daemon rewrites the manifest at the end of every
+      # tick, which is at most four seconds apart.
+      - alert: ZkasperDaemonStale
+        expr: time() - zkasper_manifest_updated_timestamp_seconds > 120
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: zkasperd has not finished a tick in over two minutes
+          description: >-
+            Last tick {{ $value | humanizeDuration }} ago. The supervisor
+            restarts the process on exit, so this firing for more than a few
+            minutes means it is crash-looping or wedged rather than restarting.
+            Read /mnt/ssd/zkasper-run/zkasperd.log.
+
+      # The exporter is inside the daemon, so a target that will not answer is
+      # a daemon that is not running. `for` is eight scrapes, because one failed
+      # scrape is not an outage.
+      - alert: ZkasperDaemonDown
+        expr: up{job="zkasperd"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: zkasperd is not answering on /metrics
+          description: The process is gone, or it never bound {{ $labels.instance }}.
+
+      # An epoch is 6.4 minutes on mainnet. Half an hour without the accumulator
+      # moving is the daemon alive and not making progress, which the heartbeat
+      # alone cannot see.
+      #
+      # The uptime clause is not a nicety. Without it a freshly started daemon
+      # trips this immediately, because a series with two minutes of history has
+      # trivially not changed in thirty — and an alert that fires on every
+      # restart is one nobody reads.
+      - alert: ZkasperEpochNotAdvancing
+        expr: >-
+          changes(zkasper_accumulator_epoch[30m]) == 0
+          and (time() - process_start_time_seconds{job="zkasperd"}) > 1800
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: the accumulator has not advanced in 30 minutes
+          description: >-
+            The daemon is running — otherwise ZkasperDaemonStale would be firing
+            instead — so it is failing the same stage over and over, or the node
+            is not serving what it needs.
+
+  - name: zkasper-gossip
+    interval: 30s
+    rules:
+      # The nastiest failure this daemon has. The node threw attestations away
+      # because its own SSE channel overflowed; the epoch is quietly short of
+      # weight and it looks exactly like a slow chain. It never self-heals, and
+      # the fix is on the node, not here. Any increase at all.
+      - alert: ZkasperGossipDropped
+        expr: increase(zkasper_gossip_dropped_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: the beacon node is dropping attestation events
+          description: >-
+            {{ $value }} drops in ten minutes. Raise
+            --http-sse-capacity-multiplier on the beacon node and restart it.
+            Until then every epoch is being proven on less weight than the chain
+            actually had.
+
+      # A reconnect is a hole in gossip that blocks had to repair. One is
+      # ordinary; a stream that will not stay up is not.
+      - alert: ZkasperGossipFlapping
+        expr: increase(zkasper_gossip_reconnects_total[1h]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: the attestation event stream keeps dropping
+          description: "{{ $value }} reconnections in an hour."
+
+  - name: zkasper-pipeline
+    interval: 1m
+    rules:
+      # A single late group marks a catch-up epoch, not a fault, so this needs a
+      # run of them. Sustained non-zero says the trigger rule is too patient —
+      # the daemon is falling behind the chain it is proving.
+      - alert: ZkasperFallingBehind
+        expr: increase(zkasper_groups_late_total[1h]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: the daemon is closing epochs with groups it could not fold in time
+          description: >-
+            {{ $value }} late groups in an hour. Each one is a group proof the
+            final proof had to verify itself, on the critical path.
+
+      # A hole in the published record. The daemon rides out an API outage by
+      # spooling; this is the outage having outlasted the spool.
+      - alert: ZkasperPublishDropped
+        expr: increase(zkasper_publish_dropped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: the published record has a hole in it
+          description: "{{ $value }} batches lost in fifteen minutes."
+
+  - name: zkasper-cost
+    interval: 1m
+    rules:
+      # The expensive failure: a card is rented and nothing is proving on it.
+      # Deliberately not conditioned on the daemon being up, because a daemon
+      # that died overnight while a card kept billing is exactly this alert.
+      #
+      # `on()` is load-bearing. The right-hand side falls back to `vector(0)`,
+      # which carries no labels, and the default matching would then find no
+      # counterpart for the instance and job on the left — so the alert would
+      # never fire, on the one condition it exists for. Checked against a live
+      # Prometheus, not reasoned about.
+      - alert: ZkasperGpuIdle
+        expr: >-
+          zkasper_vast_instances_running > 0
+          and on() (sum(rate(zkasper_prove_duration_seconds_count[30m])) or vector(0)) == 0
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: a rented GPU has had no work for half an hour
+          description: >-
+            {{ $value }} instance(s) running and no proof has come back in
+            thirty minutes. Either point a daemon at it or destroy it:
+            vastai destroy instance <id>.
+
+      # Credit that cannot cover another day at the current burn. With nothing
+      # rented the burn is zero, so the second clause is what catches an account
+      # that is simply nearly empty.
+      - alert: ZkasperCreditLow
+        expr: >-
+          (zkasper_vast_credit_usd / clamp_min(zkasper_vast_burn_usd_per_hour, 0.001) < 24)
+          or (zkasper_vast_credit_usd < 5)
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: the GPU account is nearly out of credit
+          description: >-
+            A run that stops halfway through an epoch because the card was
+            reclaimed costs the epoch, and the accumulator has to catch up.
+
+      # The provider exporter is a cron job, so it fails silently by simply not
+      # writing. Without this, every cost alert above would go quiet rather than
+      # firing.
+      - alert: ZkasperVastExporterStale
+        expr: time() - node_textfile_mtime_seconds{file=~".*/zkasper_vast.prom"} > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: the GPU cost exporter has stopped writing
+          description: >-
+            Last write {{ $value | humanizeDuration }} ago. The cost alerts are
+            blind until it runs again. Check the cron entry and
+            /var/log/zkasper-vast-exporter.log.

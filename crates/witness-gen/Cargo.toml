@@ -50,6 +50,12 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# Prometheus, the standard Rust stack for it. The exporter serves /metrics from
+# the daemon itself; `push-gateway` is off because nothing here pushes, and it
+# would pull in a second TLS implementation to do it.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+metrics-process = "2"
 rayon = "1"
 hex = "0.4"
 async-trait = "0.1"

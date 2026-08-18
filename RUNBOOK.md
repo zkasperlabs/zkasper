@@ -492,7 +492,18 @@ setsid nohup /mnt/ssd/zkasper-run/scrape.sh > /dev/null 2>&1 < /dev/null &
 
 ## 5. Monitoring: what to alert on
 
-Everything below is read from `<output_dir>/status.json`. The daemon rewrites it
+There are two ways to read this daemon, and they answer different questions.
+
+**Prometheus, for the trend and the page.** `zkasperd` serves `/metrics` itself
+on `127.0.0.1:9464`; the stage timings come from its `tracing` spans and
+`T2 - T` is a histogram, so the distribution over hundreds of epochs is
+readable rather than the last value. The box ships it to Grafana Cloud, which
+evaluates the same alert rules off-box — a rule about this machine being alive
+cannot be evaluated on this machine. Set it up with `monitoring/install.sh`;
+the metrics and the alerts are listed in [monitoring/README.md](monitoring/README.md).
+
+**The manifest, for right now.** Everything below is read from
+`<output_dir>/status.json`. The daemon rewrites it
 after every stage, which during a streaming epoch is about **5 times a second**.
 Each rewrite is a temp file, an fsync, a rename and a directory fsync — keep the
 output directory on local disk, not on network storage.

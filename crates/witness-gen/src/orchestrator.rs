@@ -57,14 +57,14 @@
 //! outputs and proofs and do not care which order they were produced in — so
 //! handing the prover to a pool of GPUs is a change to this file only.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tracing::{info, info_span, warn};
+use tracing::{info, info_span, instrument, warn};
 
 use zkasper_common::acc::Digest;
 use zkasper_common::bls::{compute_domain, fp12_mul, Fp12, DOMAIN_BEACON_ATTESTER, FP12_ONE};
@@ -78,7 +78,8 @@ use zkasper_common::ChainConfig;
 use crate::acc_tree::AccTree;
 use crate::artifacts::{
     hex0x, hex_digest, now_unix, now_unix_millis, AccStatus, ArtifactRef, ArtifactSink,
-    CheckpointStatus, CurrentEpoch, EpochLatency, GossipStatus, PublishStatus, StageTiming, Status,
+    CheckpointStatus, CurrentEpoch, EpochCost, EpochLatency, GossipStatus, PublishStatus,
+    StageTiming, Status,
 };
 use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
@@ -176,6 +177,10 @@ pub struct OrchestratorConfig {
     /// reader can check the label rather than take it. `None` leaves the
     /// orchestrator to fetch it when a signing domain first needs it.
     pub genesis_validators_root: Option<[u8; 32]>,
+    /// What an hour of this deployment's proving hardware costs. A deployment
+    /// fact the daemon cannot observe, published so a reader can price the
+    /// prover milliseconds it does measure. Nothing here multiplies by it.
+    pub prover_usd_per_hour: Option<f64>,
 }
 
 impl OrchestratorConfig {
@@ -195,6 +200,7 @@ impl OrchestratorConfig {
             gossip_url: None,
             postings_path: None,
             genesis_validators_root: None,
+            prover_usd_per_hour: None,
         }
     }
 }
@@ -464,6 +470,10 @@ pub struct Orchestrator<A> {
     viewed: Option<Instant>,
     node_finalized: Option<Checkpoint>,
     genesis_validators_root: Option<[u8; 32]>,
+    /// Prover time per epoch, accumulated as stages land. Keyed by epoch rather
+    /// than reset at a boundary, because the committee proof of E+1 runs inside
+    /// E and its cost belongs to E+1.
+    costs: HashMap<u64, EpochCost>,
 }
 
 impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
@@ -544,6 +554,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             head_slot: 0,
             viewed: None,
             node_finalized: None,
+            costs: HashMap::new(),
         }
     }
 
@@ -660,6 +671,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     // Stage: bootstrap
     // -----------------------------------------------------------------
 
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "bootstrap", epoch = tracing::field::Empty, slot = tracing::field::Empty),
+    )]
     async fn bootstrap(
         api: &A,
         config: &OrchestratorConfig,
@@ -678,7 +694,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             }
         };
         let epoch = slot / config.chain.slots_per_epoch;
-        let _span = info_span!("bootstrap", epoch, slot).entered();
+        let span = tracing::Span::current();
+        span.record("epoch", epoch);
+        span.record("slot", slot);
         let started = Instant::now();
         if let Some(publish) = publish {
             publish.stage_started(Stage::Bootstrap, epoch, Some(slot), None);
@@ -743,8 +761,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// confirmed the new root. The host tree is advanced on a clone, so a build
     /// that fails halfway leaves the in-memory accumulator untouched, and the
     /// clone is only adopted once the circuit agrees with it.
+    #[instrument(name = "stage", skip_all, fields(stage = "epoch_diff", epoch = to_epoch))]
     async fn advance_accumulator(&mut self, to_epoch: u64) -> Result<()> {
-        let _span = info_span!("epoch_diff", to_epoch).entered();
         let started = Instant::now();
         self.begin(Stage::EpochDiff, to_epoch, None, None);
 
@@ -877,6 +895,13 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 continue;
             };
 
+            let _span = info_span!(
+                "stage",
+                stage = "slot_proof",
+                epoch = target_epoch,
+                slot = attestation_slot,
+            )
+            .entered();
             let started = Instant::now();
             self.begin(Stage::SlotProof, target_epoch, Some(attestation_slot), None);
             let witness = SlotProofWitness {
@@ -958,6 +983,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             if let Some(publish) = &self.publish {
                 publish.epoch_abandoned(target_epoch, "never reached the threshold");
             }
+            crate::metrics::epoch_abandoned("threshold");
             self.pending = None;
             self.snapshot.state.attempted_epoch = Some(target_epoch);
             self.store.save(&self.snapshot)?;
@@ -1027,6 +1053,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     }
 
     /// Prove the epoch's committees, and time it like every other stage.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "committee", epoch = target_epoch),
+    )]
     async fn prove_committee(
         &mut self,
         target_epoch: u64,
@@ -1089,6 +1120,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     /// Fold the epoch's slot proofs into a justification, and pair it with the
     /// previous one into a finalization when the two are consecutive.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "justification", epoch = aggregator.target_epoch),
+    )]
     async fn close_epoch(&mut self, aggregator: EpochAggregator, tick: &mut Tick) -> Result<()> {
         let target_epoch = aggregator.target_epoch;
         let started = Instant::now();
@@ -1144,6 +1180,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // justification is the only proof it will ever have. Publishing it as
         // the epoch's proof is what keeps that epoch from sitting open forever.
         if finalized.is_none() {
+            let cost = self.take_cost(target_epoch);
             if let Some(publish) = &self.publish {
                 let vk = self.prover.program_vk(Stage::Justification);
                 let publics = record.output.public_bytes();
@@ -1166,6 +1203,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 publish.proof_landed(target_epoch, reference.clone(), inputs.clone(), None);
                 publish.epoch_closed(&ClosedEpoch {
                     epoch: target_epoch,
+                    cost,
                     target_root: crate::artifacts::hex0x(&record.output.target_root),
                     finalizes_epoch: target_epoch,
                     justified: serde_json::to_value(justified_checkpoint(&record.output))?,
@@ -1178,6 +1216,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             }
         }
 
+        crate::metrics::epoch_justified();
         self.snapshot.state.justified_through = Some(target_epoch);
         self.snapshot.state.attempted_epoch = Some(target_epoch);
         self.snapshot.state.last_justification = Some(record);
@@ -1239,6 +1278,12 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         .await
         .with_context(|| format!("open the boundary of epoch {epoch}"))?;
 
+        let _span = info_span!(
+            "stage",
+            stage = "finalization",
+            epoch = current.output.target_epoch,
+        )
+        .entered();
         let started = Instant::now();
         self.begin(Stage::Finalization, current.output.target_epoch, None, None);
         let witness = FinalizationWitness {
@@ -1280,6 +1325,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .with_proof(&proof),
         );
 
+        let cost = self.take_cost(current.output.target_epoch);
         if let Some(publish) = &self.publish {
             let epoch = current.output.target_epoch;
             let vk = self.prover.program_vk(Stage::Finalization);
@@ -1302,6 +1348,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             publish.proof_landed(epoch, reference.clone(), inputs.clone(), None);
             publish.epoch_closed(&ClosedEpoch {
                 epoch,
+                cost,
                 target_root: crate::artifacts::hex0x(&current.output.target_root),
                 finalizes_epoch: output.finalized_epoch,
                 justified: serde_json::to_value(justified_checkpoint(&current.output))?,
@@ -1316,6 +1363,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             });
         }
 
+        crate::metrics::epoch_finalized();
         Ok(Some(Checkpoint {
             epoch: output.finalized_epoch,
             root: output.finalized_root,
@@ -1612,6 +1660,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     /// Prove one group of units. Nothing about the epoch changes until it is
     /// either folded or handed to the final proof.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "group", epoch = aggregator.context.target_epoch, index = range.start),
+    )]
     fn prove_group(
         &mut self,
         aggregator: &StreamAggregator,
@@ -1666,6 +1719,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     }
 
     /// Fold a finished group into the running aggregate.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "aggregate", epoch = aggregator.context.target_epoch),
+    )]
     fn fold_group(&mut self, aggregator: &mut StreamAggregator, group: GroupProof) -> Result<()> {
         let started = Instant::now();
         let target_epoch = aggregator.context.target_epoch;
@@ -1724,6 +1782,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     /// The only proof on the critical path: the marginal attestation, the one
     /// final exponentiation, and the previous epoch's justification, at once.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "stream_final", epoch = aggregator.context.target_epoch),
+    )]
     async fn close_stream_epoch(
         &mut self,
         aggregator: StreamAggregator,
@@ -1809,6 +1872,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             if let Some(publish) = &self.publish {
                 publish.epoch_abandoned(target_epoch, "the checkpoint reorged out");
             }
+            crate::metrics::epoch_abandoned("reorg");
             self.streaming = None;
             return Ok(());
         }
@@ -1837,6 +1901,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 late_groups = latency.late_groups,
                 "measured T2 - T",
             );
+            crate::metrics::observe_latency(&latency);
             if self.latencies.len() == RECENT_LATENCIES {
                 self.latencies.pop_front();
             }
@@ -1847,6 +1912,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             epoch: output.finalized_epoch,
             root: output.finalized_root,
         };
+        let cost = self.take_cost(target_epoch);
         if let Some(publish) = &self.publish {
             let vk = self.prover.program_vk(Stage::StreamFinal);
             let publics = output.public_bytes();
@@ -1874,6 +1940,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             );
             publish.epoch_closed(&ClosedEpoch {
                 epoch: target_epoch,
+                cost,
                 target_root: crate::artifacts::hex0x(&aggregator.context.target_root),
                 finalizes_epoch: output.finalized_epoch,
                 justified: serde_json::json!({
@@ -1887,6 +1954,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 public_inputs: inputs,
             });
         }
+        crate::metrics::epoch_justified();
+        crate::metrics::epoch_finalized();
         self.snapshot.state.justified_through = Some(target_epoch);
         self.snapshot.state.attempted_epoch = Some(target_epoch);
         self.snapshot.state.last_stream_final = Some(StreamFinalRecord { output, proof });
@@ -1976,13 +2045,25 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     // -----------------------------------------------------------------
 
     fn record(&mut self, timing: StageTiming) {
+        crate::metrics::observe_stage(&timing);
         if let Some(publish) = &self.publish {
             publish.stage_finished(&timing);
         }
+        self.costs.entry(timing.epoch).or_default().absorb(&timing);
         if self.recent.len() == RECENT_STAGES {
             self.recent.pop_front();
         }
         self.recent.push_back(timing);
+    }
+
+    /// What `epoch` has cost the prover so far, and forget everything older.
+    ///
+    /// Called once, as the epoch closes: an epoch that is finished can still be
+    /// followed by a stage of a later one, but never by another of its own.
+    fn take_cost(&mut self, epoch: u64) -> EpochCost {
+        let cost = self.costs.remove(&epoch).unwrap_or_default();
+        self.costs.retain(|&e, _| e > epoch);
+        cost
     }
 
     /// Announce a stage before it runs, so a consumer can show it in flight
@@ -2029,6 +2110,17 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     pub fn publish_status(&self) -> Result<()> {
         self.drain_postings();
+        crate::metrics::observe_state(
+            &self.snapshot.state,
+            self.head_slot,
+            self.node_finalized.as_ref().map(|c| c.epoch),
+        );
+        if let Some(source) = &self.gossip {
+            crate::metrics::observe_gossip(source.counters());
+        }
+        if let Some(publish) = &self.publish {
+            crate::metrics::observe_publish(publish.counters());
+        }
         let status = self.status();
         if let Some(publish) = &self.publish {
             publish.status(&status);
@@ -2070,6 +2162,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 .genesis_validators_root
                 .as_ref()
                 .map(|root| hex0x(root)),
+            prover_usd_per_hour: self.config.prover_usd_per_hour,
             prover: self.prover.name().to_string(),
             updated_unix: now_unix(),
             head_slot: self.head_slot,

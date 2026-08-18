@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 
 use zkasper_common::types::{FinalizationOutput, JustificationOutput, StreamFinalOutput};
 
-use crate::artifacts::{hex0x, hex_digest, now_unix_millis, write_atomic, StageTiming, Status};
+use crate::artifacts::{
+    hex0x, hex_digest, now_unix_millis, write_atomic, EpochCost, StageTiming, Status,
+};
 use crate::postings::Posting;
 use crate::prover::Stage;
 
@@ -393,6 +395,10 @@ impl Publisher {
                     "latency": closed.latency,
                     "proof": closed.proof,
                     "public_inputs": closed.public_inputs,
+                    "stage_count": closed.cost.stage_count,
+                    "prove_millis_total": closed.cost.prove_millis,
+                    "wrap_millis_total": closed.cost.wrap_millis,
+                    "prover_millis_total": closed.cost.prover_millis(),
                 },
             }),
         );
@@ -482,6 +488,9 @@ pub struct EpochProgress {
 /// An epoch that finished, as the API stores it.
 pub struct ClosedEpoch {
     pub epoch: u64,
+    /// What the prover spent on this epoch. Published as three numbers rather
+    /// than a price: a reader multiplies by whatever an hour costs them.
+    pub cost: EpochCost,
     pub target_root: String,
     pub finalizes_epoch: u64,
     pub justified: Value,
