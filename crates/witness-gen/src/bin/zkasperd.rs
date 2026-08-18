@@ -384,6 +384,7 @@ async fn main() -> Result<()> {
     let api = BeaconApiClient::new(&cli.beacon_url);
     let (chain_name, genesis_validators_root) = network::resolve(&api, cli.chain.name()).await?;
     if !cli.no_metrics {
+        zkasper_witness_gen::metrics::prover_rate(cli.prover_usd_per_hour);
         zkasper_witness_gen::metrics::build_info(
             &chain_name,
             cli.prover_name(),

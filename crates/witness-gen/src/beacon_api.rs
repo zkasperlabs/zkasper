@@ -58,6 +58,11 @@ pub trait ChainStatusApi {
     /// Genesis validators root, one of the two inputs to the signing domain.
     async fn get_genesis_validators_root(&self) -> Result<[u8; 32]>;
 
+    /// Unix seconds at which slot 0 began. What turns a slot into a wall-clock
+    /// time, and therefore what lets "when should this proof have started" be
+    /// compared against when it did.
+    async fn get_genesis_time(&self) -> Result<u64>;
+
     /// Fork version in effect at `state_id`, the other input to the domain.
     async fn get_fork_version(&self, state_id: &str) -> Result<[u8; 4]>;
 
@@ -205,6 +210,16 @@ impl ChainStatusApi for BeaconApiClient {
         let url = format!("{}/eth/v1/beacon/genesis", self.base_url);
         let resp = checked_json(self.client.get(&url).send().await?).await?;
         parse_hex_bytes32(&resp["data"], "genesis_validators_root")
+    }
+
+    async fn get_genesis_time(&self) -> Result<u64> {
+        let url = format!("{}/eth/v1/beacon/genesis", self.base_url);
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
+        resp["data"]["genesis_time"]
+            .as_str()
+            .context("genesis response has no genesis_time")?
+            .parse()
+            .context("genesis_time is not a number")
     }
 
     async fn get_fork_version(&self, state_id: &str) -> Result<[u8; 4]> {

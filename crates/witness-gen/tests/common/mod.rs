@@ -126,6 +126,10 @@ impl ChainStatusApi for MockBeaconApi {
         Ok(self.genesis_validators_root)
     }
 
+    async fn get_genesis_time(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     async fn get_fork_version(&self, _state_id: &str) -> Result<[u8; 4]> {
         Ok(self.fork_version)
     }

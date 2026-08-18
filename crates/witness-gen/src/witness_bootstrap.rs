@@ -21,6 +21,7 @@ use crate::state_diff::{
 /// `ssz_depth`: depth of the SSZ validators data tree (40 per spec).
 /// `acc_depth`: depth of the Poseidon accumulator tree (22 for mainnet).
 /// Returns `(witness, tree, epoch_state, total_active_balance, num_validators)`.
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "bootstrap", slot))]
 pub async fn build(
     api: &impl BeaconApi,
     config: &ChainConfig,
@@ -28,7 +29,6 @@ pub async fn build(
 ) -> Result<(BootstrapWitness, AccTree, EpochState, u64, u64)> {
     let ssz_depth = config.validators_tree_depth;
     let acc_depth = config.acc_tree_depth;
-    let _span = info_span!("bootstrap", slot, ssz_depth, acc_depth).entered();
     let slot_str = slot.to_string();
 
     // Fetch header to get the state_root

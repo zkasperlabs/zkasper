@@ -46,7 +46,9 @@ histogram wherever the distribution is the point.
 
 | Metric | |
 |---|---|
-| `zkasper_manifest_updated_timestamp_seconds` | When the last tick finished. **Alert on this first**: every other number is meaningless if it has stopped moving. |
+| `zkasper_heartbeat_timestamp_seconds` | Written once a second by a task of its own. **Alert on this first**: it is the only thing that separates a wedged process from a busy one. |
+| `zkasper_manifest_updated_timestamp_seconds` | When the last tick finished. Stops when the *pipeline* stops — which a committee proof legitimately does for over two minutes, so this needs a much longer threshold than the heartbeat. |
+| `process_start_time_seconds` | Uptime, and — via `changes(...[1h])` — the restart count. A restart is a failure to debug, not an event to absorb: it costs the epoch in flight, its committee proof and the gossip collected for it. |
 | `zkasper_accumulator_epoch` | Epoch the accumulator represents. |
 | `zkasper_head_slot` | Head slot, as the node last reported it. |
 | `zkasper_justified_epoch`, `zkasper_finalized_epoch` | What this daemon has proven. |
@@ -58,7 +60,7 @@ histogram wherever the distribution is the point.
 
 | Metric | |
 |---|---|
-| `zkasper_gossip_dropped_total` | The node threw attestation events away because its own SSE channel overflowed. **The nastiest failure here**: the epoch is quietly short of weight and it looks exactly like a slow chain. It never self-heals — raise `--http-sse-capacity-multiplier` on the node. |
+| `zkasper_gossip_dropped_total` | The node threw attestation events away because its own SSE channel overflowed. **The nastiest failure here**: the epoch is quietly short of weight and it looks exactly like a slow chain. It never self-heals. With the SSE ring sized for slots of stall rather than one, this is not a knob to tune — it must simply always be zero, and any increase is a page. |
 | `zkasper_gossip_reconnects_total` | Each one is a hole gossip did not deliver and blocks had to repair. |
 | `zkasper_gossip_attestations_total` | Delivered. |
 
@@ -69,28 +71,79 @@ histogram wherever the distribution is the point.
 | `zkasper_t2_minus_t_seconds` | From holding the attestation that crossed 2/3 to holding a proof of it. **A histogram, because the distribution over hundreds of epochs is the whole point** — a gauge of the last epoch is exactly what a point-in-time check already gives. |
 | `zkasper_trigger_wait_seconds` | The part of that which was the trigger holding back rather than the prover working. |
 | `zkasper_tail_named` | Absentees the final proof opened inline. What makes `T2 − T` large, and what moves when the trigger rule is retuned. Read against `trigger_wait`: the wait is only paying for itself if this falls. |
-| `zkasper_groups_late_total` | Groups the final proof had to verify itself. Not page-worthy for one epoch — that marks a catch-up — but a run of them says the rule is too patient. |
 | `zkasper_groups_folded_total` | Groups folded before the threshold, the shape the design aims at. |
 
 ### Where the time goes
 
+Every one of these is a histogram labelled by stage. None is a gauge holding the
+last value — that is the question `scripts/monitor.py` already answers from a
+shell, and it is exactly the shape that makes a distribution unrecoverable.
+
 | Metric | |
 |---|---|
-| `zkasper_stage_duration_seconds{stage}` | Wall-clock, from the stage's `tracing` span. |
-| `zkasper_stage_busy_seconds{stage}` | The part of it the span was entered. The difference is what the stage spent awaiting the node or the prover. |
+| `zkasper_proof_start_delay_seconds{stage}` | **Actual start minus the start the schedule expected.** The scheduler prices a proof as startable once the slots it covers have arrived; this is how far off that the daemon actually was. Negative buckets are deliberate — a proof that ran early is information, and clamping at zero throws it away. This replaced a count of groups that missed the fold, which said something was wrong without saying how badly or where. |
+| `zkasper_proof_duration_seconds{stage}` | How long making one proof took, witness generation included. |
+| `zkasper_proof_busy_seconds{stage}` | The part of that not spent awaiting the node or the prover. |
+| `zkasper_witness_duration_seconds{stage}` | The witness half on its own, so a slow witness build is told from a slow prover. |
+| `zkasper_witness_busy_seconds{stage}` | The same, minus the beacon-node round trips. |
 | `zkasper_prove_duration_seconds{stage}` | What the prover charged. The only source when the prover is on another machine. |
 | `zkasper_wrap_duration_seconds{stage}` | What compressing it charged. |
-| `zkasper_proof_bytes_total{stage}` | Zero on a witness-only run. |
+| `zkasper_verify_duration_seconds{stage}` | **Checking a proof: pure Rust, no GPU, no proving key.** See below. |
 
-The two `stage_*` families come from the spans and nothing else. Every stage in
-the orchestrator runs inside `#[instrument(name = "stage", fields(stage = …))]`,
-`tracing_subscriber`'s `fmt` layer logs each one's `time.busy`/`time.idle` when
-it closes, and `metrics::StageMetrics` records the same measurement as a
-histogram. One instrumentation, two consumers; no stopwatch beside it.
+Four bucket ladders, because one cannot serve a 2 ms fold and a 132 s committee
+proof at the same resolution: a wide work ladder, a narrow one for the wrap, a
+very fine one for verification, and one with negative edges for the start delay.
+
+The duration families come from spans and nothing else. Every stage runs inside
+`#[instrument(name = "stage", fields(stage = …))]` and every witness build inside
+`#[instrument(name = "witness", …)]`; `tracing_subscriber`'s `fmt` layer logs
+each span's `time.busy`/`time.idle` when it closes and `metrics::StageMetrics`
+records the same measurement as a histogram. One instrumentation, two consumers;
+no stopwatch beside it.
 
 `stage` is one of nine values and nothing else — the layer maps the field
 through `Stage::from_str` and drops what it does not recognise, which is the
 cardinality guard. Epoch numbers are span fields for the log, never labels.
+
+### What a proof costs, and what it weighs
+
+| Metric | |
+|---|---|
+| `zkasper_proof_size_bytes{stage}` | Proof size. A wrapped proof measured 249 KB once, from one stage on one card; a histogram is what turns that one sample into a distribution. |
+| `zkasper_proof_cost_usd{stage}` | Prover seconds for that stage, priced at the rate below. **Labelled by stage because 92% of an epoch's bill is the committee proof** — an unlabelled total hides the only interesting thing about it. |
+| `zkasper_epoch_cost_usd` | The whole epoch. This is the number the project quotes: $0.0203 measured, at $0.51/hr. |
+| `zkasper_epoch_prover_seconds` | The prover time that price is built from. |
+| `zkasper_prover_usd_per_hour` | The rate itself, so a reader can price the seconds at *their* rate rather than take this deployment's. |
+
+The API stores the same thing without multiplying: `/v1/epochs/{epoch}` carries
+`prover_millis_total` and each stage's `prove_millis`, `wrap_millis` and
+`proof_bytes`, and `/v1/status` carries `prover_usd_per_hour`. That is
+deliberate — an hourly rate is a fact about a rental contract, not about the
+pipeline — so the stored record keeps the two factors and the metrics do the
+arithmetic.
+
+### How long does it take to verify a proof?
+
+`zkasper_verify_duration_seconds{stage}`, and it is the number a light-client
+integrator asks for first. `zkasper_common::recursion::verify_child` runs the
+Zisk STARK verifier in pure Rust with no GPU and no proving key, and that
+property is the entire reason verifying a zkasper proof inside Helios is
+possible. The tests assert it returns true; nothing had ever timed it.
+
+The instrumentation lives in `crates/witness-gen/src/verify.rs` rather than in
+`zkasper-common`, because that crate is compiled into every guest where
+`tracing` has no business. The daemon checks each epoch's own final proof
+*after* `T2` has been stamped, so what this measures can never inflate the
+latency the project quotes.
+
+It records nothing on a witness-only run — an empty proof is not a verification
+— so the histogram stays empty until a real proof exists to time.
+
+### What is on disk
+
+`zkasper_retained_epochs` and `zkasper_output_bytes`, read at the moment the
+retention bound is applied rather than on a timer, because that is the one point
+the directory is walked anyway.
 
 ### Publishing
 
@@ -123,8 +176,10 @@ In `alerts.yml`. Page-worthy:
 
 | Alert | |
 |---|---|
-| `ZkasperDaemonStale` | No tick in two minutes. |
+| `ZkasperDaemonStale` | No heartbeat in two minutes. |
+| `ZkasperPipelineStalled` | Breathing, but no tick in ten minutes. |
 | `ZkasperDaemonDown` | `/metrics` not answering for two minutes — eight scrapes, because one failed scrape is not an outage. |
+| `ZkasperRestarting` | More than two restarts in an hour. |
 | `ZkasperEpochNotAdvancing` | Alive, not progressing, for half an hour. An epoch is 6.4 minutes. |
 | `ZkasperGossipDropped` | Any increase at all. |
 | `ZkasperGpuIdle` | A card running with no proof reaching the daemon for half an hour. It measures work arriving *here*, so a card rented for a benchmark trips it — deliberately, because an unattended benchmark card is the same bill. |
@@ -132,9 +187,16 @@ In `alerts.yml`. Page-worthy:
 
 Warnings, which is where a single late epoch belongs:
 
-`ZkasperFallingBehind` (more than five late groups in an hour),
-`ZkasperGossipFlapping`, `ZkasperPublishDropped`,
+`ZkasperProofsStartingLate` (p90 start delay over a slot, for a quarter of an
+hour), `ZkasperGossipFlapping`, `ZkasperPublishDropped`,
 `ZkasperVastExporterStale`.
+
+**One of these was wrong, and the alert firing is how we found out.**
+`ZkasperDaemonStale` originally watched the manifest, which is only rewritten
+when a tick finishes — and a committee proof holds a tick for over two minutes
+by design. It fired on a perfectly healthy daemon within twenty minutes of being
+armed. The heartbeat exists because of that, and the split between "the process
+is breathing" and "the pipeline is moving" is the thing the incident taught.
 
 ```sh
 promtool check rules monitoring/alerts.yml
