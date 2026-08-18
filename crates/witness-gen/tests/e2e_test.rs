@@ -322,6 +322,7 @@ fn test_e2e_full_pipeline() {
         committee: committees_e.output.clone(),
         committee_proof: vec![], // stub proof
         accumulator_commitment: commitment,
+        acc_root,
         target_epoch: epoch_e,
         target_root: target_root_e,
         total_active_balance,
@@ -466,6 +467,7 @@ fn test_e2e_full_pipeline() {
         committee: committees_e1.output.clone(),
         committee_proof: vec![],
         accumulator_commitment: commitment_e1,
+        acc_root: acc_root_e1,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         total_active_balance: new_balance,

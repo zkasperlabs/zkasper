@@ -278,6 +278,7 @@ fn gen_justification(output_path: &str) {
 
     let witness = JustificationWitness {
         accumulator_commitment: fixture.accumulator_commitment,
+        acc_root: fixture.acc_root,
         target_epoch: fixture.epoch,
         target_root: fixture.target_root,
         total_active_balance: fixture.total_active_balance,

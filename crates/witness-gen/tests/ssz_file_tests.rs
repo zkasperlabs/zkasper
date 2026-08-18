@@ -718,6 +718,7 @@ async fn test_ssz_file_finality() {
             target_epoch,
             target_root,
             total_active_balance,
+            tree.root(),
         ),
     );
 
