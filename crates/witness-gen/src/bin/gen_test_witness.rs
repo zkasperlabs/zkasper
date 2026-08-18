@@ -245,11 +245,11 @@ struct SlotTestData {
     signing_domain: [u8; 32],
 }
 
-fn build_slot_test_data() -> SlotTestData {
+fn build_slot_test_data(n_validators: usize) -> SlotTestData {
     let epoch = 100u64;
     let balance_gwei = 32_000_000_000u64;
 
-    let keys = generate_test_keys(4);
+    let keys = generate_test_keys(n_validators);
     let validators: Vec<ValidatorData> = keys
         .iter()
         .map(|(_, pk)| ValidatorData {
@@ -260,7 +260,7 @@ fn build_slot_test_data() -> SlotTestData {
         })
         .collect();
 
-    let total_active_balance = 4 * balance_gwei;
+    let total_active_balance = n_validators as u64 * balance_gwei;
     let tree = AccTree::build(&validators, epoch, CONFIG.acc_tree_depth);
     let acc_root = tree.root();
     let commitment = acc::commitment(&acc_root, total_active_balance);
@@ -381,7 +381,7 @@ fn compute_slot_output(
 }
 
 fn gen_slot_proof(output_path: &str) {
-    let data = build_slot_test_data();
+    let data = build_slot_test_data(4);
     let epoch = 100u64;
     let target_root = [0x07u8; 32];
     let data_slot = epoch * CONFIG.slots_per_epoch;
@@ -409,7 +409,7 @@ fn gen_slot_proof(output_path: &str) {
 // ---------------------------------------------------------------------------
 
 fn gen_justification(output_path: &str) {
-    let data = build_slot_test_data();
+    let data = build_slot_test_data(4);
     let epoch = 100u64;
     let target_root = [0x07u8; 32];
 
@@ -441,7 +441,7 @@ fn gen_justification(output_path: &str) {
 // ---------------------------------------------------------------------------
 
 fn gen_finalization(output_path: &str) {
-    let data = build_slot_test_data();
+    let data = build_slot_test_data(4);
     let epoch_e = 100u64;
     let epoch_e1 = 101u64;
     // The finalized root must be the header's own root, since the circuit now
@@ -518,11 +518,11 @@ fn gen_finalization(output_path: &str) {
 /// Miller accumulator is bound by the aggregate that folds it, and the
 /// aggregate's counted-set root by the proof that closes the epoch — so they are
 /// generated from one run rather than assembled separately.
-fn gen_stream(output_path: &str, stage: &str) {
+fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
     use zkasper_common::types::{EpochDiffOutput, PreviousJustification};
     use zkasper_witness_gen::streaming::{self, StreamPolicy, StreamUnit};
 
-    let data = build_slot_test_data();
+    let data = build_slot_test_data(n_validators);
     let epoch = 100u64;
     let target_root = [0x07u8; 32];
 
@@ -574,7 +574,10 @@ fn gen_stream(output_path: &str, stage: &str) {
     // carries the epoch over the threshold and is proven inline by the final
     // proof.
     let mut seen = std::collections::BTreeSet::new();
-    let units: Vec<StreamUnit> = [(0u64, [0usize, 1]), (1, [2, 3])]
+    let half = n_validators / 2;
+    let first: Vec<usize> = (0..half).collect();
+    let second: Vec<usize> = (half..n_validators).collect();
+    let units: Vec<StreamUnit> = [(0u64, first), (1, second)]
         .into_iter()
         .map(|(slot, members)| {
             let witness = build_slot_witness(
@@ -622,10 +625,10 @@ fn gen_stream(output_path: &str, stage: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
+    if args.len() != 3 && args.len() != 4 {
         eprintln!(
             "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|justification|finalization|\
-             group-proof|aggregation|stream-final> <output-path>"
+             group-proof|aggregation|stream-final> <output-path> [n-validators]"
         );
         std::process::exit(1);
     }
@@ -636,7 +639,13 @@ fn main() {
         "slot-proof" => gen_slot_proof(&args[2]),
         "justification" => gen_justification(&args[2]),
         "finalization" => gen_finalization(&args[2]),
-        stage @ ("group-proof" | "aggregation" | "stream-final") => gen_stream(&args[2], stage),
+        stage @ ("group-proof" | "aggregation" | "stream-final") => {
+            let n = args
+                .get(3)
+                .map(|a| a.parse().expect("n-validators must be an integer"))
+                .unwrap_or(4);
+            gen_stream(&args[2], stage, n)
+        }
         other => {
             eprintln!("unknown proof type: {other}");
             std::process::exit(1);
