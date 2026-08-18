@@ -28,7 +28,7 @@ use zkasper_witness_gen::artifacts::hex0x;
 use zkasper_witness_gen::beacon_api::{
     AttestationResponse, CommitteeResponse, HeaderResponse, ValidatorResponse,
 };
-use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Tick};
+use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline, Tick};
 use zkasper_witness_gen::prover::NativeProver;
 use zkasper_witness_gen::store::{Store, StoreState};
 
@@ -351,6 +351,82 @@ async fn test_follows_four_epochs_end_to_end() {
         .unwrap()
         .iter()
         .any(|s| s["stage"] == "slot_proof" && s["slot"].is_number()));
+}
+
+/// The streaming pipeline, driven one slot at a time the way a live node feeds
+/// it.
+///
+/// Epoch 10 has nothing to finalize, so it goes through the batch path; epoch 11
+/// streams. The head is moved a slot per tick, which is the whole point: each
+/// slot's attestation is proven and folded when it arrives, so when the third
+/// one crosses the threshold the only thing left is one attestation and one
+/// proof. Anything else — a group left unfolded, more than one unit in the tail
+/// — shows up in the manifest, which is why the assertions read it back.
+#[tokio::test]
+async fn test_streams_an_epoch_and_measures_its_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = generate_keys(VALIDATORS);
+    let (mock, _) = build_chain(&keys, (FIRST_EPOCH + 1) * SPE);
+
+    let config = OrchestratorConfig {
+        pipeline: Pipeline::Streaming,
+        ..config(dir.path())
+    };
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens");
+
+    // Epoch 10 justified the batch way, and the accumulator moved to 11.
+    daemon.catch_up().await.unwrap();
+    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
+    assert_eq!(daemon.state().justified_through, Some(FIRST_EPOCH));
+
+    let stream_epoch = FIRST_EPOCH + 1;
+    let boundary = stream_epoch * SPE;
+    let mut ticks = Vec::new();
+    for slot in boundary..boundary + SLOTS_TO_THRESHOLD {
+        daemon.api().set_head(make_header(
+            slot,
+            &validators_at(stream_epoch, &keys),
+            TEST_DEPTH,
+        ));
+        ticks.extend(daemon.catch_up().await.unwrap());
+    }
+
+    assert_eq!(
+        ticks.iter().filter_map(|t| t.justified).collect::<Vec<_>>(),
+        vec![stream_epoch],
+    );
+    let finalized = ticks
+        .iter()
+        .filter_map(|t| t.finalized.as_ref())
+        .next_back()
+        .expect("the final proof finalizes the epoch before it");
+    assert_eq!(finalized.epoch, FIRST_EPOCH);
+    assert_eq!(finalized.root, checkpoint_root(FIRST_EPOCH, &keys));
+    assert!(
+        daemon.state().last_stream_final.is_some(),
+        "the next epoch has to be able to consume this one",
+    );
+
+    let out = dir.path().join("out");
+    let epoch_dir = out.join(format!("epoch-{stream_epoch:09}"));
+    for name in ["group_0", "group_1", "aggregate_0", "aggregate_1"] {
+        assert!(epoch_dir.join(format!("{name}.bin")).exists(), "{name}");
+    }
+    assert!(epoch_dir.join("stream_final.bin").exists());
+
+    let status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("status.json")).unwrap()).unwrap();
+    let latency = &status["recent_latencies"][0];
+    assert_eq!(latency["epoch"], stream_epoch);
+    assert_eq!(latency["folded_groups"], 2);
+    assert_eq!(
+        latency["late_groups"], 0,
+        "a daemon at the head has nothing left to fold when the threshold crosses",
+    );
+    assert_eq!(latency["tail"], 1, "one attestation on the critical path");
+    assert!(latency["t2_minus_t_millis"].is_number());
 }
 
 #[tokio::test]

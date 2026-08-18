@@ -8,13 +8,15 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use zkasper_common::acc::{self, Digest};
 use zkasper_common::types::Checkpoint;
+
+use crate::prover::{ProveCost, Stage};
 
 /// A witness file that was written.
 #[derive(Clone, Debug, Serialize)]
@@ -24,6 +26,11 @@ pub struct ArtifactRef {
 }
 
 /// One stage that ran, with what it cost.
+///
+/// `millis` is the whole stage, witness generation included; `prove_millis` and
+/// `wrap_millis` are the part of it the prover charged for. Publishing them
+/// apart is what makes the pipeline's latency claim checkable rather than
+/// modelled; a witness-only run reports the first and omits the other two.
 #[derive(Clone, Debug, Serialize)]
 pub struct StageTiming {
     pub stage: String,
@@ -32,7 +39,57 @@ pub struct StageTiming {
     pub slot: Option<u64>,
     pub millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prove_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
+}
+
+impl StageTiming {
+    pub fn new(
+        stage: Stage,
+        epoch: u64,
+        started: Instant,
+        cost: Option<ProveCost>,
+        artifact: ArtifactRef,
+    ) -> Self {
+        Self {
+            stage: stage.as_str().to_string(),
+            epoch,
+            slot: None,
+            millis: started.elapsed().as_millis() as u64,
+            prove_millis: cost.map(|c| c.prove_millis),
+            wrap_millis: cost.map(|c| c.wrap_millis),
+            artifact: Some(artifact),
+        }
+    }
+
+    pub fn at_slot(mut self, slot: u64) -> Self {
+        self.slot = Some(slot);
+        self
+    }
+}
+
+/// What the streaming pipeline's only latency actually was.
+///
+/// `T` is when the daemon held the attestation that carried the epoch over the
+/// threshold; `T2` is when a proof of it existed. Everything else the pipeline
+/// does happens before `T`, so this is the whole of what a consumer waits for.
+#[derive(Clone, Debug, Serialize)]
+pub struct EpochLatency {
+    pub epoch: u64,
+    pub threshold_unix_millis: u64,
+    pub proof_unix_millis: u64,
+    pub t2_minus_t_millis: u64,
+    /// Group proofs folded into the running aggregate before `T`.
+    pub folded_groups: usize,
+    /// Groups the final proof had to verify itself, because they arrived too
+    /// late to fold. Zero is the shape the design aims at, and anything else
+    /// says the daemon was behind the chain.
+    pub late_groups: usize,
+    /// Attestations the final proof verified inline.
+    pub tail: usize,
 }
 
 /// The accumulator, as published in the manifest.
@@ -87,6 +144,8 @@ pub struct Status {
     pub node_finalized: Option<CheckpointStatus>,
     /// Most recent stages, newest last.
     pub recent_stages: Vec<StageTiming>,
+    /// Measured `T2 - T` for the epochs this daemon streamed, newest last.
+    pub recent_latencies: Vec<EpochLatency>,
 }
 
 /// Writes artifacts under an output directory.
@@ -178,5 +237,12 @@ pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+pub fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
 }

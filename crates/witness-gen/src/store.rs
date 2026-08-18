@@ -30,14 +30,16 @@ use sha2::{Digest as _, Sha256};
 use tracing::info;
 
 use zkasper_common::acc::{self, Digest};
-use zkasper_common::types::{Checkpoint, EpochDiffOutput, JustificationOutput};
+use zkasper_common::types::{
+    Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification, StreamFinalOutput,
+};
 
 use crate::acc_tree::AccTree;
 use crate::epoch_state::EpochState;
 use crate::prover::Proof;
 
 const MAGIC: &[u8; 8] = b"ZKASPRD\x01";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Everything the daemon needs to pick up exactly where it stopped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +68,10 @@ pub struct StoreState {
     /// The most recent justification, kept so that the next one can be paired
     /// with it into a finalization across a restart.
     pub last_justification: Option<JustificationRecord>,
+    /// The most recent streaming final proof, which justifies one epoch and
+    /// finalizes the one before it. The next epoch's final proof consumes it in
+    /// place of a batch justification, so it is kept for the same reason.
+    pub last_stream_final: Option<StreamFinalRecord>,
     /// The epoch diff that produced the accumulator the cursor sits on.
     ///
     /// Finalization pairs two justifications proved against two different
@@ -81,6 +87,13 @@ pub struct StoreState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JustificationRecord {
     pub output: JustificationOutput,
+    pub proof: Proof,
+}
+
+/// A streaming final output and the proof that backs it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamFinalRecord {
+    pub output: StreamFinalOutput,
     pub proof: Proof,
 }
 
@@ -112,6 +125,7 @@ impl StoreState {
             justified_through: None,
             attempted_epoch: None,
             last_justification: None,
+            last_stream_final: None,
             last_epoch_diff: None,
             finalized: None,
         }
@@ -156,6 +170,30 @@ impl StoreState {
     /// Whether the epoch the accumulator sits on still needs a justification.
     pub fn needs_justification(&self) -> bool {
         self.attempted_epoch != Some(self.cursor_epoch)
+    }
+
+    /// The justification a streaming final proof for `for_epoch` turns into a
+    /// finalization, if the epoch before it produced one.
+    ///
+    /// A streaming run consumes its own previous final proof; the first epoch
+    /// after a bootstrap or a batch run consumes that run's justification, which
+    /// is why the circuit takes an enum rather than one type.
+    pub fn previous_justification(&self, for_epoch: u64) -> Option<(PreviousJustification, Proof)> {
+        if let Some(record) = &self.last_stream_final {
+            if record.output.justified_epoch + 1 == for_epoch {
+                return Some((
+                    PreviousJustification::Stream(Box::new(record.output.clone())),
+                    record.proof.clone(),
+                ));
+            }
+        }
+        let record = self.last_justification.as_ref()?;
+        (record.output.target_epoch + 1 == for_epoch).then(|| {
+            (
+                PreviousJustification::Batch(record.output.clone()),
+                record.proof.clone(),
+            )
+        })
     }
 }
 

@@ -46,10 +46,16 @@ rayon = "1"
 hex = "0.4"
 async-trait = "0.1"
 blst = "0.3"
+# The proving stack, for the `zisk-prover` feature. Optional because it pulls in
+# proofman, the pil2-stark C++ library and an MPI toolchain, none of which a
+# witness-only run or `cargo test` needs. Whether it can drive a GPU is decided
+# when it is built, by whether CUDA is visible; `--gpu` is a runtime flag on top.
+zisk-sdk = { workspace = true, optional = true }
 
 [features]
 default = []
 count-ops = ["zkasper-common/count-ops"]
+zisk-prover = ["dep:zisk-sdk"]
 
 [dev-dependencies]
 zkasper-bootstrap-guest = { path = "../bootstrap-guest", features = ["count-ops"] }

@@ -92,7 +92,15 @@ jobs:
       matrix:
         # The aggregation and stream-final guests are left out deliberately:
         # their test witnesses carry stub child proofs, which a guest rejects,
-        # and a panicking guest does not return from ziskemu.
+        # and a panicking guest does not return from ziskemu — reproduced here,
+        # the aggregation guest was still running after 120 s on a witness the
+        # host rejects in microseconds.
+        #
+        # Fixing it needs real child proofs in the fixture, which needs the 47 GB
+        # proving key that a hosted runner does not have. The coverage lives in
+        # `tests/zisk_proof_tests.rs` instead, which proves for real and checks
+        # what the emulator cannot: that a proof is accepted only under its own
+        # program's verification key.
         proof-type: [bootstrap, epoch-diff, slot-proof, group-proof, justification, finalization]
     steps:
       - uses: actions/checkout@v4

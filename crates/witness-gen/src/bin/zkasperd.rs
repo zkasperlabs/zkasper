@@ -5,8 +5,10 @@
 //! justification the moment 2/3 is crossed, and a finalization when two
 //! consecutive epochs justify.
 //!
-//! It produces witnesses, not proofs. See `--help` and `crate::prover` for where
-//! a real prover attaches.
+//! Built without `--features zisk-prover` it produces witnesses and no proofs;
+//! with it, and `--prover zisk`, it produces real ones from a prover that is
+//! initialised once and kept warm for the life of the process. See
+//! `crate::prover` and `crate::zisk_prover`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,13 +21,30 @@ use tracing_subscriber::EnvFilter;
 
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::BeaconApiClient;
-use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig};
-use zkasper_witness_gen::prover::NativeProver;
+use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
+use zkasper_witness_gen::prover::{NativeProver, Prover};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Chain {
     Mainnet,
     Gnosis,
+}
+
+/// Which pipeline to prove epochs with.
+#[derive(Clone, Copy, ValueEnum)]
+enum Mode {
+    Batch,
+    Streaming,
+}
+
+/// What produces the proofs.
+#[derive(Clone, Copy, ValueEnum)]
+enum Backend {
+    /// Run the circuits, produce no proofs. Every witness is still checked by
+    /// the logic that would prove it.
+    Native,
+    /// Real Zisk proofs, from one prover held open for the whole run.
+    Zisk,
 }
 
 impl Chain {
@@ -85,6 +104,57 @@ struct Cli {
     /// Catch up to the node's head and exit, instead of following the chain
     #[arg(long)]
     once: bool,
+
+    /// Pipeline to prove epochs with
+    #[arg(long, default_value = "batch")]
+    mode: Mode,
+
+    /// What produces the proofs
+    #[arg(long, default_value = "native")]
+    prover: Backend,
+
+    /// Directory holding the guest ELFs, for `--prover zisk`
+    #[arg(long, default_value = zkasper_witness_gen::zisk_prover::DEFAULT_ELF_DIR)]
+    #[cfg(feature = "zisk-prover")]
+    elf_dir: PathBuf,
+
+    /// Prove on the GPU. Without it the run measures the CPU.
+    #[arg(long)]
+    #[cfg(feature = "zisk-prover")]
+    gpu: bool,
+
+    /// Proving key directory. Defaults to Zisk's own, `~/.zisk/provingKey`.
+    #[arg(long)]
+    #[cfg(feature = "zisk-prover")]
+    proving_key: Option<PathBuf>,
+}
+
+impl Cli {
+    /// Build the prover this run was asked for.
+    ///
+    /// One prover, for the life of the process: see `crate::prover` on why that
+    /// is the only shape worth measuring.
+    #[cfg_attr(not(feature = "zisk-prover"), allow(unused_variables))]
+    fn build_prover(&self, chain: ChainConfig, pipeline: Pipeline) -> Result<Box<dyn Prover>> {
+        match self.prover {
+            Backend::Native => Ok(Box::new(NativeProver::new(chain))),
+            #[cfg(feature = "zisk-prover")]
+            Backend::Zisk => {
+                use zkasper_witness_gen::zisk_prover::{ZiskProver, ZiskProverConfig};
+                Ok(Box::new(ZiskProver::new(ZiskProverConfig {
+                    elf_dir: self.elf_dir.clone(),
+                    gpu: self.gpu,
+                    proving_key: self.proving_key.clone(),
+                    ..ZiskProverConfig::new(chain, pipeline.stages())
+                })?))
+            }
+            #[cfg(not(feature = "zisk-prover"))]
+            Backend::Zisk => anyhow::bail!(
+                "this binary was built without the `zisk-prover` feature; \
+                 rebuild with `cargo build --release --features zisk-prover`",
+            ),
+        }
+    }
 }
 
 #[tokio::main]
@@ -99,9 +169,13 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    let pipeline = match cli.mode {
+        Mode::Batch => Pipeline::Batch,
+        Mode::Streaming => Pipeline::Streaming,
+    };
     let config = OrchestratorConfig {
-        db_path: cli.db_path,
-        output_dir: cli.output_dir,
+        db_path: cli.db_path.clone(),
+        output_dir: cli.output_dir.clone(),
         bootstrap_slot: cli.bootstrap_slot,
         signing_domain: cli
             .signing_domain
@@ -110,17 +184,22 @@ async fn main() -> Result<()> {
             .transpose()?,
         poll_interval: Duration::from_secs(cli.poll_seconds),
         attestation_lookahead_epochs: cli.attestation_lookahead_epochs,
+        pipeline,
         ..OrchestratorConfig::new(cli.chain.config(), cli.chain.name())
     };
+
+    // Built before the first beacon call, so a missing ELF or proving key fails
+    // now rather than after a bootstrap has already been paid for.
+    let prover = cli.build_prover(cli.chain.config(), pipeline)?;
 
     info!(
         chain = %config.chain_name,
         db = %config.db_path.display(),
         out = %config.output_dir.display(),
+        prover = prover.name(),
         "zkasperd starting",
     );
 
-    let prover = Box::new(NativeProver::new(cli.chain.config()));
     let mut orchestrator =
         Orchestrator::open(BeaconApiClient::new(&cli.beacon_url), config, prover).await?;
 
