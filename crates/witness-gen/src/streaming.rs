@@ -412,7 +412,8 @@ pub struct StreamPolicy {
     pub threshold_denominator: u64,
     /// How long the trigger may hold past the threshold while in-flight
     /// attestations are still shortening the proof. See
-    /// [`StreamPolicy::worth_waiting`]; this is the guard on it, not the rule.
+    /// [`StreamPolicy::worth_waiting`]; this is the guard on it, not the rule,
+    /// and it is set above the whole useful range so that it stays one.
     pub max_wait_s: f64,
     /// Wall-clock between block arrivals. What turns a partition into a
     /// schedule: a group cannot start before the last slot it covers closed.
@@ -436,7 +437,7 @@ impl Default for StreamPolicy {
         Self {
             threshold_numerator: 2,
             threshold_denominator: 3,
-            max_wait_s: 6.0,
+            max_wait_s: 10.0,
             seconds_per_slot: 12.0,
             slots_per_epoch: 32,
             lanes: 3,
@@ -481,6 +482,14 @@ impl StreamPolicy {
     /// Nothing here models when attestations arrive. The rule reads the rate off
     /// the last interval, so a chain that gossips earlier or later than mainnet
     /// moves the firing instant without moving this code.
+    ///
+    /// `max_wait_s` is 10 s because a smaller one decides the firing instant
+    /// itself. Mainnet arrivals stay above break-even until 8–9 s into a slot
+    /// and the burst drains at a p90 of 9.8 s, both from the start of the slot;
+    /// the wait is counted from the threshold crossing, which lands anywhere in
+    /// it. A live run at 6 s fired every steady-state epoch with 5,000 to 8,200
+    /// attesters still in flight — 9 to 15 s of absentee opening bought back for
+    /// at most 4 s of waiting.
     pub fn worth_waiting(&self, removed: usize, interval_s: f64, waited_s: f64) -> bool {
         waited_s < self.max_wait_s && removed as f64 * self.prover.per_named_s() > interval_s
     }

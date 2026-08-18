@@ -19,20 +19,22 @@ The three arrival-timing assumptions the design rests on are confirmed (§8).
 
 **Does not work yet, in order of how much it matters.**
 
-1. **An empty epoch boundary slot ends the run.** The finalization circuit
-   rejects an accumulator built from a skipped boundary, permanently. Roughly one
-   epoch in a hundred — two to three times a day. Circuit work, already on the
-   README's list. **A month-long run is not possible until this is done**; a day
-   needs the supervisor workaround in §4.
-2. **The warm prover has never run on a GPU.** Everything here is
+1. **The warm prover has never run on a GPU.** Everything here is
    `--prover native`, so no measurement in this document is a proving
    measurement.
-3. **The trigger cap is mistuned**, leaving ~5,000 named absentees worth ~9 s of
-   proving on the critical path. Free today, dominant on a GPU (§8).
+2. **The trigger's rate rule can fire on a quiet 200 ms window** in the middle of
+   the burst. Two of the three steady-state epochs fired at 924 ms and 1,355 ms
+   of wait, nowhere near the cap, with 8,159 and 6,822 attesters still in flight.
+   Raising the cap does not reach those two (§8).
 
 **Fixed during the run**: a slot could be proved twice; an empty boundary wedged
 the epoch diff; a 404 was reported as a parse error; a pruned bootstrap state
 wedged startup. See §8 and §6.
+
+**Fixed after it**: an empty epoch boundary slot no longer ends the run — the
+boundary state root is proven out of the justified checkpoint's `state_roots`
+rather than read off a header that does not exist — and the trigger cap is
+10,000 ms, above the range in which waiting still pays (§8).
 
 ## Contents
 
@@ -375,18 +377,9 @@ while true; do
   rc=$?
   echo "=== zkasperd exited rc=$rc at $(date -Is) ===" >> "$RUN/zkasperd.log"
 
-  # Two failures are NOT fixed by restarting, and both need the store deleted so
-  # the daemon re-bootstraps. Each costs the accumulator chain a break; drop
-  # these blocks if an unbroken chain matters more than uninterrupted epochs.
-
-  # An epoch whose first slot was empty cannot be finalized by the current
-  # circuits, and the slot will never gain a block.
-  if tail -n 40 "$RUN/zkasperd.log" \
-       | grep -q "different state than its block produced"; then
-    echo "=== empty epoch boundary; re-bootstrapping at $(date -Is) ===" \
-      >> "$RUN/zkasperd.log"
-    rm -f "$RUN/zkasperd.db"
-  fi
+  # One failure is NOT fixed by restarting, and needs the store deleted so the
+  # daemon re-bootstraps. It costs the accumulator chain a break; drop the block
+  # if an unbroken chain matters more than uninterrupted epochs.
 
   # The node's state window slid past the bootstrap epoch mid-bootstrap.
   if tail -n 40 "$RUN/zkasperd.log" \
@@ -719,10 +712,9 @@ Cumulative share of a slot's singles in hand:
 | share | 3.4% | 21.6% | 42.6% | **64.3%** | 81.9% | 91.1% | 96.2% |
 
 The burst drains — last arrival before a gap of more than 500 ms — at a median
-of **7,326 ms** into the slot (p25 6,412, p75 8,330, p90 9,819). The default
-`--max-trigger-wait-millis 6000` therefore expires before the burst has finished
-draining on a typical slot. That is a deliberate trade rather than a fault, but
-it is the knob to reach for if `late_groups` will not go to zero.
+of **7,326 ms** into the slot (p25 6,412, p75 8,330, p90 9,819). The old
+`--max-trigger-wait-millis 6000` expired before the burst had finished draining
+on a typical slot; the section below is how the default became 10,000.
 
 Note how tight the aggregate distribution is: p05 to p95 spans 288 ms against
 5,580 ms for the singles. Aggregates are published on a schedule; singles arrive
@@ -747,19 +739,46 @@ slot:
 | arrivals/s | 4,849 | 2,554 | 1,384 | **555** | 259 | 128 |
 
 So the 558/s constant is well chosen — it lands exactly where the curve flattens.
-The cap is not. On epoch 469375 the daemon waited **6,378 ms**, i.e. it ran past
-the 6,000 ms cap at the 200 ms evaluation interval and was cut off while the
-adaptive rule still wanted to wait, and the final proof carried **4,999 named
-absentees — 8.95 s of proving** at 1.79 ms each.
+The cap was not, and **it is now 10,000 ms**. The arithmetic:
 
-Under `--prover native` that costs nothing and does not show up in `T2 - T`.
-**On a GPU it would dominate the critical path.** Before any GPU run, raise
-`--max-trigger-wait-millis` toward 9,000–10,000 so the adaptive rule fires on its
-own criterion instead of being truncated, and confirm `tail_named` falls. The
-trade is up to ~3 s more wait against up to ~9 s less proving.
+- Waiting pays while arrivals exceed break-even, which the table above puts
+  between **8,000 and 9,000 ms** into the slot.
+- The burst drains at a median of 7,326 ms and a **p90 of 9,819 ms**.
+- Both are measured from the start of the slot. The cap is measured from the
+  **threshold crossing**, which lands anywhere in it: back out the crossing from
+  the three steady-state epochs below — `tail_named` against the cumulative
+  share of a slot's singles — and it fell at about 4.4 s into the filling slot
+  twice and at the slot boundary once. Reaching 9,000 ms into the slot therefore
+  needs a wait of ~4.6 s in the first case and ~9 s in the second.
+- One slot is 12,000 ms, and past that the slot being waited for is no longer the
+  one filling.
 
-This is the single most actionable thing the local run found, and it was only
-visible because the arrival curve and `tail_named` were measured together.
+**10,000 ms** is the smallest round number above the p90 drain and below a slot.
+At it the cap should never bind: the rate rule fires first, 8–9 s into the slot,
+where 96.2% of the slot's singles are in hand. Expect **`tail_named` of order
+1,000** — 3.8% of a 28,044-validator slot — against the 4,999 to 8,159 measured
+at 6,000 ms. That is ~1.9 s of absentee opening in place of 8.9 to 14.6 s, for at
+most ~3.6 s more waiting, and usually none.
+
+A cap that never binds in normal operation is the right shape for it. It is a
+backstop against a source that trickles for ever, and it should not be what
+decides when the epoch closes.
+
+Under `--prover native` none of this shows up in `T2 - T`. **On a GPU it would
+dominate the critical path**, which is why it is worth the change before a GPU
+run rather than after one.
+
+**The cap is not the whole story, and the other half is open.** Only epoch 469375
+was cut off by it. The other two steady-state epochs fired at **924 ms and
+1,355 ms** of wait, on the rate rule, with 8,159 and 6,822 attesters still in
+flight — a single 200 ms evaluation window with fewer than ~112 removals ends the
+wait, and the burst is noisy enough at that resolution to produce one. Raising
+the cap does not reach those two. Whether the rule should read a longer window,
+or hysteresis, is not something three epochs can answer; it needs a run that
+stays up for hours.
+
+This was only visible because the arrival curve and `tail_named` were measured
+together.
 
 ### Volume cross-check
 
@@ -798,14 +817,23 @@ off the critical path.
 | 469380 | 4,276 | 4,204 | 89 | 0 | 1 | catch-up |
 | **469381** | **1,642** | **1,355** | **6,822** | **21** | **0** | **steady state** |
 
-**Only 469375 and 469381 are steady-state epochs** — the only two the daemon
+**Only the marked rows are steady-state epochs** — the only ones the daemon
 followed from near their first slot, folding a group per slot as gossip closed
-it, 16 and 21 in total. Every other row is an epoch opened already in progress
-after a bootstrap or a restart, which folds nothing before the trigger and so
-reports `folded_groups = 0` and `late_groups = 1`. Those rows say what a
-catch-up costs, not what the pipeline costs. **Do not quote them as a
-steady-state result.** Two epochs are not a distribution either; what follows is
-what two epochs can support.
+it. Every other row is an epoch opened already in progress after a bootstrap or a
+restart, which folds nothing before the trigger and so reports
+`folded_groups = 0` and `late_groups = 1`. Those rows say what a catch-up costs,
+not what the pipeline costs. **Do not quote them as a steady-state result.**
+Three epochs are not a distribution either; what follows is what three epochs can
+support.
+
+The three of them line up in the direction the design predicts — a longer wait is
+a smaller tail — and nothing stronger than a direction should be read into three
+points with three different arrival patterns:
+
+| `wait` ms | 924 | 1,355 | 6,378 |
+|---|---:|---:|---:|
+| `tail_named` | 8,159 | 6,822 | 4,999 |
+| at 1.79 ms a leaf | 14.6 s | 12.2 s | 8.9 s |
 
 - **`late_groups = 0` on both steady-state epochs, and 1 on every catch-up.**
   The alert is meaningful and the daemon keeps up with the chain once it is on
@@ -815,11 +843,15 @@ what two epochs can support.
   GPU run will report a similar `T2 - T` for an entirely different reason, so
   these are a baseline for the *trigger*, not for proving.
 - **`tail_named` is the number that will hurt on a GPU, and it is two orders of
-  magnitude larger in steady state**: 4,999 and 6,822, against 75–111 on every
-  catch-up. At the README's 1.79 ms per named leaf that is **8.9 s and 12.2 s of
-  proving** on the critical path, against a `T2 - T` of 1.6–7.0 s today. Read
-  with the trigger-cap section above: the two steady-state epochs waited 6,378 ms
-  and 1,355 ms and neither got the burst, which drains at a median of 7,326 ms.
+  magnitude larger in steady state**: 4,999 to 8,159, against 75–111 on every
+  catch-up. At the README's 1.79 ms per named leaf that is **8.9 to 14.6 s of
+  proving** on the critical path, against a `T2 - T` of 1.6–7.0 s today. On a GPU
+  it does not add to the critical path — it becomes it, dwarfing the 3.640 s
+  stage floor and the ~0.87 s of BLS, and the modelled `T2 - T` of 5.5 s does not
+  survive it. The correction is configuration, not circuit: see the trigger-cap
+  section above. The fixture epoch's tail of ~113 is small by construction — a
+  replay has the whole epoch available at once — and is not a steady-state
+  number.
 
 The catch-up rows are not noise, incidentally — they are what every epoch after
 a restart looks like, and §6 explains why restarts happen.
@@ -856,11 +888,12 @@ pushed. They are recorded because they say what a readiness run is for.
    logged `accumulator advanced ... millis=23128` where the previous build had
    logged nothing but `Error: build epoch diff witness` on a five-second loop.
 
-### The blocker the run found, which is not fixed
+### The blocker the run found, and how it was closed
 
-**An empty epoch boundary slot still stops the streaming pipeline, permanently.**
-Fixing the epoch diff (bug 2 above) moved the failure one stage later rather than
-removing it. Two epochs on, the final proof for the *next* epoch rejects:
+**An empty epoch boundary slot used to stop the streaming pipeline,
+permanently.** Fixing the epoch diff (bug 2 above) moved the failure one stage
+later rather than removing it. Two epochs on, the final proof for the *next*
+epoch rejected:
 
 ```
 stream_final circuit rejected the witness: assertion `left == right` failed:
@@ -868,39 +901,42 @@ the finalized epoch's accumulator was built from a different state than its
 block produced
 ```
 
-`crates/stream-final-guest/src/lib.rs:274`. Observed 26 times in a row on epoch
-469377, which finalizes 469376, whose first slot 15,020,032 has no block. The
-supervisor restarting the daemon does not help, because the slot will never gain
-a block. The daemon makes no further progress until it is re-bootstrapped past
-the affected epoch, which restarts the accumulator chain.
+Observed 26 times in a row on epoch 469377, which finalizes 469376, whose first
+slot 15,020,032 has no block. The supervisor restarting the daemon did not help,
+because the slot will never gain a block. About 1% of mainnet slots are missed,
+so an epoch boundary is empty roughly once in a hundred epochs — **two to three
+times a day, and about eighty times a month.** Each one ended the run.
 
-This is exactly the item the README already lists as unfinished:
+**The fix.** The circuit no longer reads the boundary state root off the
+finalized block's header. A checkpoint root is the last block at or *before* the
+epoch's first slot, so an empty first slot leaves the boundary state with no
+header naming it. What does name it is the next state that passes the slot:
+`state_roots[n % 8192]` is the state at the end of slot `n`, and
+`block_roots[n % 8192]` is the last block at or before it. Both are defined for a
+skipped slot.
 
-> Finalizing an epoch whose first slot was empty. The accumulator is built from
-> the state at the epoch boundary, and the finalized header only names that
-> state when a block sits on the boundary slot. Covering the empty case needs
-> the boundary state root proved out of the finalized state's `state_roots`
-> list.
+Both are opened out of the **justified checkpoint's** state, which is the one
+state after the boundary the proof already trusts — 2/3 of the stake signed its
+root as their target, which is the same assumption the rest of the system rests
+on. Opening the checkpoint root as well as the state root is what keeps the pair
+together: without it the finalized root would come from one chain and the state
+root from another.
 
-**What it means for a long run.** About 1% of mainnet slots are missed, so an
-epoch boundary is empty roughly once in a hundred epochs — **two to three times
-in a day, and about eighty times in a month.** Each one ends the run. So:
+The anchor is not weakened by this. It still names the state the accumulator was
+built from, and it now names the *right* one when the boundary is empty, where
+before it named a state the accumulator never used or — correctly — refused to
+prove at all.
 
-- **A day-long run needs an operator or a supervisor that re-bootstraps on this
-  error**, and each occurrence breaks the accumulator chain at that point.
-- **A month-long run is not possible** until the circuit work above is done.
-  This is the single largest gap between the current daemon and continuous
-  operation, and it is circuit work rather than daemon work.
-
-A crude mitigation, if a day of data matters more than an unbroken chain: have
-the supervisor match `different state than its block produced` in the log,
-delete the store and let the daemon re-bootstrap from the node's current
-finalized checkpoint. That keeps epochs flowing at the cost of a chain break and
-one bootstrap (about 2 minutes) per occurrence.
+Verified against the real chain rather than only in a fixture: the state at slot
+13,776,928 carries eight empty epoch boundaries in its 8192 slots of history, and
+`cargo test --release --test ssz_file_tests -- --ignored` opens one of them
+(13,776,864) through the circuit. The same test checks that
+`state_roots[13,776,608 % 8192]` is the state root of the state this repository
+ships separately, which pins the semantics against two independent files.
 
 The two bugs above, and this blocker, are the reason a day-long run needed
-rehearsing rather than launching: nothing in a fixture-backed test suite produces
-a skipped epoch boundary.
+rehearsing rather than launching: nothing in a fixture-backed test suite produced
+a skipped epoch boundary, and now something does.
 
 ### Health at the end of the window
 

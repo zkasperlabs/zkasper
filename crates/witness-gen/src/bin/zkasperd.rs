@@ -119,7 +119,15 @@ struct Cli {
 
     /// Longest the trigger may hold past the threshold while in-flight
     /// attestations are still making the final proof shorter.
-    #[arg(long, default_value_t = 6000)]
+    ///
+    /// A backstop against a source that trickles for ever, not the rule. It has
+    /// to sit above the whole useful range or it truncates the rule instead:
+    /// arrivals fall below the break-even rate 8–9 s into a slot and the burst
+    /// drains at a p90 of 9.8 s, both measured from the start of the slot, while
+    /// this is measured from the threshold crossing — which lands anywhere in
+    /// the slot. Below one slot, because past that the slot being waited for is
+    /// no longer the one filling.
+    #[arg(long, default_value_t = 10_000)]
     max_trigger_wait_millis: u64,
 
     /// Read attestations from blocks rather than from the node's event stream.
