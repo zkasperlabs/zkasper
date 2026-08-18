@@ -59,6 +59,9 @@ fn one_warm_prover_serves_two_programs() {
     let started = Instant::now();
     let prover = ZiskProver::new(ZiskProverConfig {
         elf_dir: elf_dir(),
+        // So the same test measures the GPU on a box that has one, without a
+        // code change: `ZKASPER_GPU=1 cargo test ...`.
+        gpu: std::env::var_os("ZKASPER_GPU").is_some(),
         ..ZiskProverConfig::new(ChainConfig::MAINNET, &[Stage::Group, Stage::SlotProof])
     })
     .expect("build a prover; is the proving key installed and are the guests built?");

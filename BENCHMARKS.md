@@ -333,3 +333,40 @@ inside a guest, so they panic — and a panicking guest does not return from
 `ziskemu`. The justification and finalization guests have always had this
 property; it is a property of the fixture, not of the circuits, and it goes away
 with real child proofs.
+
+## The warm prover, measured
+
+Everything above is trace area, which is hardware-independent. This is the other
+half: what a proof costs when the prover is a long-lived process rather than a
+`cargo-zisk` invocation. Measured through `crates/witness-gen/src/zisk_prover.rs`
+on a 20-core CPU box with no GPU, against the standard proving key, by
+`tests/zisk_proof_tests.rs`:
+
+```
+initialise + ROM setup for two guests            31.25 s   (once, per process)
+group proof   428,784,600 units    811.97 s  =  805.91 prove +  5.89 wrap
+slot proof    575,610,460 units    850.08 s  =  841.78 prove +  8.22 wrap
+switch from the group ELF to the slot ELF         0.36 s   (263 ms of it the guest)
+```
+
+Two things in that table are the point.
+
+**The second proof used a different guest and paid nothing for it.** The client
+keeps a map of set-up programs, so changing guest is an `Arc` swap of a cached
+ROM plus a 32-byte read of that ROM's Merkle root. Subtract the guest's own
+263 ms execution and the switch is under a tenth of a second. A pipeline of eight
+stages therefore needs one prover, not eight — a fleet is sized by how many
+proofs must be in flight at once, never by how many programs there are.
+
+**The wrap never pays for a process.** `cargo-zisk wrap --minimal` measures 18.4 s
+on a GPU of which 0.192 s is the compression; the rest is startup and device
+allocation. In-process there is no startup, and what is left is the compression
+itself — 5.89 s here, because compressing on a CPU really does cost seconds.
+
+Do not fit a line to these two points. The box was shared with other work while
+they were taken, and `scripts/gpu_bench.sh` explains why two points a few seconds
+apart is not a measurement. They are here to show the shape, not the slope.
+
+What they do not show is a streaming epoch proven end to end. That needs a GPU
+and is what `scripts/gpu_bench.sh` is for; until it is run, the 22.2 s in
+"Streaming: what `T2 - T` costs" is a model.

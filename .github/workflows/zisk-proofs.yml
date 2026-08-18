@@ -2,6 +2,11 @@ name: Zisk Proofs
 
 # Full ZK proof generation + verification. Needs ~11GB RAM and ~8 min per proof.
 # Runs nightly and on manual trigger. Requires a self-hosted runner with enough resources.
+#
+# This is a correctness check, not the product path: it shells out to `cargo-zisk`
+# once per proof, so every proof here pays a cold start. The pipeline itself proves
+# through `crates/witness-gen/src/zisk_prover.rs`, which initialises once and stays
+# warm — see `crates/witness-gen/src/prover.rs` on why the difference is the claim.
 on:
   workflow_dispatch:
   schedule:
