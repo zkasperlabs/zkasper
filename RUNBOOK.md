@@ -7,6 +7,33 @@ Every number here is labelled MEASURED (with where and when) or MODELLED.
 `scripts/gpu_bench.sh` is the companion document for the proving box; this one
 covers the daemon and the chain it follows.
 
+## State of play, 2026-08-18
+
+Written from a live mainnet run on this machine: Lighthouse v8.2.1 checkpoint-
+synced with a mock execution layer, `zkasperd --mode streaming --prover native`.
+
+**Works.** Bootstrap from a real 2.34M-validator state; all-subnets gossip at
+28,033 attestations a slot with zero drops; the singles-first collector; the
+schedule; the 2/3 trigger; reorg handling; the status manifest; restart recovery.
+The three arrival-timing assumptions the design rests on are confirmed (§8).
+
+**Does not work yet, in order of how much it matters.**
+
+1. **An empty epoch boundary slot ends the run.** The finalization circuit
+   rejects an accumulator built from a skipped boundary, permanently. Roughly one
+   epoch in a hundred — two to three times a day. Circuit work, already on the
+   README's list. **A month-long run is not possible until this is done**; a day
+   needs the supervisor workaround in §4.
+2. **The warm prover has never run on a GPU.** Everything here is
+   `--prover native`, so no measurement in this document is a proving
+   measurement.
+3. **The trigger cap is mistuned**, leaving ~5,000 named absentees worth ~9 s of
+   proving on the critical path. Free today, dominant on a GPU (§8).
+
+**Fixed during the run**: a slot could be proved twice; an empty boundary wedged
+the epoch diff; a 404 was reported as a parse error; a pruned bootstrap state
+wedged startup. See §8 and §6.
+
 ## Contents
 
 1. [Topology, and why the beacon node is not on the GPU box](#1-topology)
