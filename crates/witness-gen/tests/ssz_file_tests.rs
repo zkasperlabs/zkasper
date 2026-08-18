@@ -915,9 +915,11 @@ async fn test_ssz_file_streaming_finality() {
         finalized_header.state_root,
     );
 
-    // The critical path: one proof, one slot's worth of complement work.
+    // The critical path: one proof, and only the tail's complement work done
+    // inline. Groups the scheduler could not fold in time are absorbed here as
+    // child proofs, which is a recursion each and not attestation work.
     assert_eq!(run.final_witness.tail.len(), plan.tail.len());
-    assert!(run.final_witness.groups.is_empty());
+    assert_eq!(run.final_witness.groups.len(), plan.absorbed.len());
     eprintln!(
         "streaming finality proven: {} group proofs, {} folds, 1 final proof",
         run.group_outputs.len(),
@@ -953,7 +955,7 @@ async fn test_ssz_file_streaming_schedule() {
     let (target_epoch, target_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
 
-    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, num_validators) =
+    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
         zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
             .await
             .unwrap();
@@ -983,7 +985,12 @@ async fn test_ssz_file_streaming_schedule() {
     .await
     .unwrap();
 
-    eprintln!("\nepoch {epoch}: {} slot complements", units.len());
+    eprintln!(
+        "\nepoch {epoch}: {} slot complements, {} committee members of {} registered",
+        units.len(),
+        committees.witness.members.len(),
+        api.get_validators(&slot.to_string()).await.unwrap().len(),
+    );
     eprintln!(
         "{:>4} {:>6} {:>8} {:>7} {:>6}",
         "slot", "named", "absent", "messages", "cum%",
@@ -1001,12 +1008,15 @@ async fn test_ssz_file_streaming_schedule() {
         );
     }
 
-    let policy = |proof_base: f64, lanes: usize, lane_pool: LanePool| StreamPolicy {
+    let policy = |stage_floor_s: f64, lanes: usize, lane_pool: LanePool| StreamPolicy {
         lanes,
         lane_pool,
-        validators: num_validators as f64,
+        // The committee proof opens the validators the committees are formed
+        // from, which is the active set. Charging it the whole registry
+        // overstated it by 2.3x.
+        validators: committees.witness.members.len() as f64,
         prover: ProverModel {
-            proof_base,
+            stage_floor_s,
             ..ProverModel::default()
         },
         ..StreamPolicy::default()
@@ -1015,32 +1025,33 @@ async fn test_ssz_file_streaming_schedule() {
         schedule.plan.groups.iter().map(|g| g.len()).collect()
     };
 
-    // The floor Zisk displays, and the floor a source-level audit of the shipped
-    // proving key says it really is.
-    const FLOORS: [(&str, f64); 2] = [("293.6M", 293_601_280.0), ("789M", 789_000_000.0)];
+    // The measured stage floor, and what the two superseded cost-unit floors
+    // were worth in seconds at the rate they were quoted against.
+    const FLOORS: [(&str, f64); 3] = [
+        ("measured 7.18s", 7.176),
+        ("293.6M units = 4.85s", 293_601_280.0 / 67_452_592.0 + 0.5),
+        ("789M units = 12.20s", 789_000_000.0 / 67_452_592.0 + 0.5),
+    ];
 
-    for (label, proof_base) in FLOORS {
-        eprintln!(
-            "\n=== per-proof floor {label} ({:.1}s warm) ===",
-            proof_base / 67_452_592.0 + 0.5,
-        );
+    for (label, stage_floor_s) in FLOORS {
+        eprintln!("\n=== stage floor {label} ===");
         eprintln!(
             "{:>5} {:>12} {:>8} {:>6} {:>9} {:>7} {:>10}  groups + inline",
-            "budget", "pool", "T2-T", "cards", "cost", "proofs", "committee",
+            "budget", "pool", "T2-T", "cards", "prover", "proofs", "committee",
         );
         for lanes in 1..=6 {
             for lane_pool in [LanePool::Fungible, LanePool::Specialised] {
                 let schedule = streaming::schedule(
                     &units,
                     total_active_balance,
-                    &policy(proof_base, lanes, lane_pool),
+                    &policy(stage_floor_s, lanes, lane_pool),
                 );
                 eprintln!(
-                    "{lanes:>6} {:>12} {:>7.1}s {:>6} {:>8.1}B {:>7} {:>9.0}s  {:?} + {}",
+                    "{lanes:>6} {:>12} {:>7.1}s {:>6} {:>8.0}s {:>7} {:>9.0}s  {:?} + {}",
                     format!("{lane_pool:?}"),
                     schedule.latency_s(),
                     schedule.lanes,
-                    schedule.total_cost / 1e9,
+                    schedule.total_prover_s,
                     schedule.proofs.len(),
                     schedule.committee_done_s,
                     sizes(&schedule),
@@ -1054,10 +1065,10 @@ async fn test_ssz_file_streaming_schedule() {
     let chosen = streaming::schedule(
         &units,
         total_active_balance,
-        &policy(789_000_000.0, 4, LanePool::Fungible),
+        &policy(7.176, 4, LanePool::Fungible),
     );
     eprintln!(
-        "\n=== 789M floor, 4-card budget: T = {:.0}s, T2 = {:.0}s, T2-T = {:.1}s on {} card(s) ===",
+        "\n=== measured floor, 4-card budget: T = {:.0}s, T2 = {:.0}s, T2-T = {:.1}s on {} card(s) ===",
         chosen.threshold_s,
         chosen.postable_s,
         chosen.latency_s(),
@@ -1086,12 +1097,8 @@ async fn test_ssz_file_streaming_schedule() {
             _ => String::new(),
         };
         eprintln!(
-            "  card {}  {:>6.1}s -> {:>6.1}s  {:>7.3}B  {:?} {covers}",
-            proof.lane,
-            proof.start_s,
-            proof.end_s,
-            proof.cost / 1e9,
-            proof.stage,
+            "  card {}  {:>6.1}s -> {:>6.1}s  {:>7.2}s  {:?} {covers}",
+            proof.lane, proof.start_s, proof.end_s, proof.duration_s, proof.stage,
         );
     }
 
@@ -1099,31 +1106,90 @@ async fn test_ssz_file_streaming_schedule() {
     eprintln!("\n=== sensitivity to the floor, 4-card budget ===");
     eprintln!(
         "{:>8} {:>8} {:>7} {:>6} {:>9} {:>7}  groups",
-        "floor", "T2-T", "inline", "cards", "cost", "proofs",
+        "floor", "T2-T", "inline", "cards", "prover", "proofs",
     );
-    for proof_base in [
-        100e6, 200e6, 293.6e6, 400e6, 500e6, 620e6, 789e6, 1000e6, 1500e6,
-    ] {
+    for stage_floor_s in [2.0, 4.843, 7.176, 10.0, 12.2, 15.0, 20.0, 30.0] {
         let schedule = streaming::schedule(
             &units,
             total_active_balance,
-            &policy(proof_base, 4, LanePool::Fungible),
+            &policy(stage_floor_s, 4, LanePool::Fungible),
         );
         eprintln!(
-            "{:>7.0}M {:>7.1}s {:>7} {:>6} {:>8.1}B {:>7}  {:?}",
-            proof_base / 1e6,
+            "{:>7.2}s {:>7.1}s {:>7} {:>6} {:>8.0}s {:>7}  {:?}",
+            stage_floor_s,
             schedule.latency_s(),
             schedule.plan.tail.len(),
             schedule.lanes,
-            schedule.total_cost / 1e9,
+            schedule.total_prover_s,
             schedule.proofs.len(),
+            sizes(&schedule),
+        );
+    }
+
+    // The Fp2-tower rate is the model's largest uncertainty: no measurement in
+    // the campaign runs BLS at mainnet scale, and a mainnet group carries a
+    // message per head vote.
+    eprintln!("\n=== sensitivity to the Fp2-tower rate, 4-card budget ===");
+    eprintln!(
+        "{:>12} {:>8} {:>7} {:>6} {:>9}  groups",
+        "units/s", "T2-T", "inline", "cards", "prover",
+    );
+    for rate in [121_351_898.0, 207_400_000.0, 400e6, 663_293_070.0] {
+        let schedule = streaming::schedule(
+            &units,
+            total_active_balance,
+            &StreamPolicy {
+                prover: ProverModel {
+                    bls_units_per_second: rate,
+                    ..ProverModel::default()
+                },
+                ..policy(7.176, 4, LanePool::Fungible)
+            },
+        );
+        eprintln!(
+            "{:>12.0} {:>7.1}s {:>7} {:>6} {:>8.0}s  {:?}",
+            rate,
+            schedule.latency_s(),
+            schedule.plan.tail.len(),
+            schedule.lanes,
+            schedule.total_prover_s,
+            sizes(&schedule),
+        );
+    }
+
+    // Recursion is the one term nothing measured: the fixtures carry stub child
+    // proofs, so the stages that would exercise it only ran with it removed.
+    eprintln!("\n=== sensitivity to recursive verification, 4-card budget ===");
+    eprintln!(
+        "{:>10} {:>8} {:>7} {:>6} {:>9}  groups",
+        "per child", "T2-T", "inline", "cards", "prover",
+    );
+    for recursion_verify_s in [0.0, 0.5, 1.0, 2.0, 5.0] {
+        let schedule = streaming::schedule(
+            &units,
+            total_active_balance,
+            &StreamPolicy {
+                prover: ProverModel {
+                    recursion_verify_s,
+                    ..ProverModel::default()
+                },
+                ..policy(7.176, 4, LanePool::Fungible)
+            },
+        );
+        eprintln!(
+            "{:>9.1}s {:>7.1}s {:>7} {:>6} {:>8.0}s  {:?}",
+            recursion_verify_s,
+            schedule.latency_s(),
+            schedule.plan.tail.len(),
+            schedule.lanes,
+            schedule.total_prover_s,
             sizes(&schedule),
         );
     }
 
     // The trigger margin. `T` is 2/3 either way, so a margin that pushes the
     // crossing into the next slot shows up here as a whole slot of latency.
-    eprintln!("\n=== sensitivity to the trigger margin, 789M floor, 4-card budget ===");
+    eprintln!("\n=== sensitivity to the trigger margin, measured floor, 4-card budget ===");
     eprintln!(
         "{:>7} {:>8} {:>7} {:>10} {:>9}",
         "margin", "T2-T", "slots", "balance", "over 2/3",
@@ -1134,7 +1200,7 @@ async fn test_ssz_file_streaming_schedule() {
             total_active_balance,
             &StreamPolicy {
                 threshold_numerator: numerator,
-                ..policy(789_000_000.0, 4, LanePool::Fungible)
+                ..policy(7.176, 4, LanePool::Fungible)
             },
         );
         let share = schedule.plan.attesting_balance as f64 / total_active_balance as f64;
@@ -1149,35 +1215,35 @@ async fn test_ssz_file_streaming_schedule() {
 
     // The committee proof: half the epoch's cost, a whole epoch of lead time,
     // and trivially chunkable. What it decides is the card count, not `T2 − T`.
-    eprintln!("\n=== committee proof chunking, 789M floor ===");
+    eprintln!("\n=== committee proof chunking, measured floor ===");
     eprintln!(
         "{:>7} {:>7} {:>8} {:>7} {:>9} {:>9}",
         "chunks", "cards", "T2-T", "done", "committee", "total",
     );
-    for chunks in [1usize, 2, 4, 8, 16] {
-        for lanes in 1..=6 {
+    for chunks in [1usize, 2, 3, 4, 6, 8] {
+        for lanes in 1..=8 {
             let schedule = streaming::schedule(
                 &units,
                 total_active_balance,
                 &StreamPolicy {
                     committee_chunks: chunks,
-                    ..policy(789_000_000.0, lanes, LanePool::Fungible)
+                    ..policy(7.176, lanes, LanePool::Fungible)
                 },
             );
-            if schedule.committee_overrun_s() == 0.0 || lanes == 6 {
+            if schedule.committee_overrun_s() == 0.0 || lanes == 8 {
                 let committee: f64 = schedule
                     .proofs
                     .iter()
                     .filter(|p| matches!(p.stage, Stage::Committee(_) | Stage::CommitteeFold))
-                    .map(|p| p.cost)
+                    .map(|p| p.duration_s)
                     .sum();
                 eprintln!(
-                    "{chunks:>7} {:>7} {:>7.1}s {:>6.0}s {:>8.1}B {:>8.1}B",
+                    "{chunks:>7} {:>7} {:>7.1}s {:>6.0}s {:>8.0}s {:>8.0}s",
                     schedule.lanes,
                     schedule.latency_s(),
                     schedule.committee_done_s,
-                    committee / 1e9,
-                    schedule.total_cost / 1e9,
+                    committee,
+                    schedule.total_prover_s,
                 );
                 break;
             }

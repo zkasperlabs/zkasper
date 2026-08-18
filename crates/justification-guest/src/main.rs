@@ -8,7 +8,7 @@ ziskos::entrypoint!(main);
 
 fn main() {
     let witness: JustificationWitness =
-        bincode::deserialize(&zkasper_guest_io::read_witness()).expect("deserialize witness");
+        bincode::deserialize(zkasper_guest_io::read_witness()).expect("deserialize witness");
 
     zkasper_guest_io::commit(verify_justification(&witness).public_bytes());
 }

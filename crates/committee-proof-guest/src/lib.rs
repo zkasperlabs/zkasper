@@ -9,10 +9,10 @@
 //!
 //! The committee for epoch `N` is fixed by a RANDAO mix that stops changing two
 //! epochs earlier, so this proof can run a whole epoch ahead of the attestations
-//! it serves — 384 seconds of slack against roughly 19.5B cost units at mainnet
-//! scale. It is also the only proof in the pipeline whose cost is a function of
-//! the *whole* validator set, which is exactly what buys every proof after it a
-//! cost that is a function of the absentees.
+//! it serves — 384 seconds of slack against a modelled 169 s at mainnet scale.
+//! It is also the only proof in the pipeline whose cost is a function of the
+//! *whole active* validator set, which is exactly what buys every proof after it
+//! a cost that is a function of the absentees.
 //!
 //! It is additive over validator index ranges — bucket sums add, and a validator
 //! lands in one range — so splitting it across parallel proofs needs only a fold

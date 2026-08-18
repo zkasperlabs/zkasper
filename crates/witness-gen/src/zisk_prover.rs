@@ -175,9 +175,17 @@ impl ZiskProver {
 
     /// Prove one witness, and check the proof says what the circuit said.
     fn prove(&self, stage: Stage, witness: &impl Serialize, publics: &[u8]) -> Result<Proof> {
+        self.prove_input(
+            stage,
+            bincode::serialize(witness).context("serialize witness")?,
+            publics,
+        )
+    }
+
+    /// The same, for a guest whose witness is not bincode.
+    fn prove_input(&self, stage: Stage, input: Vec<u8>, publics: &[u8]) -> Result<Proof> {
         let program = self.program(stage);
-        let stdin =
-            ZiskStdin::from_bytes(bincode::serialize(witness).context("serialize witness")?);
+        let stdin = ZiskStdin::from_bytes(input);
 
         let started = Instant::now();
         let proven = self
@@ -335,10 +343,15 @@ impl Prover for ZiskProver {
     }
 
     fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
+        let words = zkasper_common::committee::encode(witness);
         let output = run_circuit(Stage::Committee, || {
-            zkasper_common::committee::verify(witness, self.chain.acc_tree_depth)
+            zkasper_common::committee::verify(&words, self.chain.acc_tree_depth)
         })?;
-        let proof = self.prove(Stage::Committee, witness, &output.public_bytes())?;
+        let proof = self.prove_input(
+            Stage::Committee,
+            zkasper_common::committee::to_bytes(&words),
+            &output.public_bytes(),
+        )?;
         Ok((output, proof))
     }
 

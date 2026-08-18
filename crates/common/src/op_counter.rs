@@ -8,6 +8,26 @@
 //! The previous version of this file guessed 29,000 "constraints" for SHA-256
 //! and 250 for Poseidon, from before either had a precompile. The real ratio is
 //! 16x, not 116x, and both are now rounding errors next to BLS.
+//!
+//! # These are trace area, not time
+//!
+//! An RTX 5090 campaign against Zisk v1.0.0-alpha (`data/gpu_bench/`) measured
+//! effective throughput on real guests spanning 18M to 249M cost units/s — a
+//! 13.8x range — so [`OpCounts::cost`] must never be divided by a
+//! units-per-second constant to get seconds. It is a comparison of *shapes*:
+//! whether an accumulator node beats an SSZ node, whether batching a pairing
+//! pays. For wall-clock, use `scripts/time_model.py` or
+//! `zkasper_witness_gen::streaming::ProverModel`, which are denominated in
+//! seconds and calibrated per work class.
+//!
+//! There used to be a `PROOF_BASE` here, 293,601,280, described as the cost
+//! floor every proof pays. It is a compile-time constant in zisk's
+//! `emulator/src/emu_costs.rs` that no part of the prover reads and that does
+//! not describe the shipped proving key: an empty guest instantiates eleven
+//! full AIRs totalling 1,447,034,880 trace cells, 4.93x that. Measured, an
+//! empty guest proves in 4.843 s and a zkasper stage floor is 7.176 s. Those
+//! are the numbers; the constant is gone rather than corrected, because a floor
+//! in cost units cannot be converted to one in seconds.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,10 +69,6 @@ pub mod cost {
     pub const COMMIT_FP12: u64 = 78_002;
     /// G2 subgroup check on a batch's summed signature.
     pub const G2_SUBGROUP: u64 = 8_219_617;
-
-    /// Cost floor every proof pays regardless of what it computes. Roughly one
-    /// pairing check, which is why small proofs are almost all overhead.
-    pub const PROOF_BASE: u64 = 293_601_280;
 }
 
 macro_rules! counters {
@@ -116,7 +132,11 @@ pub fn inc_recursive_verify() {
 }
 
 impl OpCounts {
-    /// Estimated Zisk cost of these operations, excluding the per-proof floor.
+    /// Trace area these operations occupy, in Zisk cost units.
+    ///
+    /// Not seconds, and not convertible to seconds: see the module docs. It
+    /// also counts nothing a guest spends in plain interpreted RISC-V, which on
+    /// a witness-walking guest is two thirds of the real cost.
     pub fn cost(&self) -> u64 {
         self.poseidon2 * cost::POSEIDON2
             + self.acc_leaf * cost::ACC_LEAF

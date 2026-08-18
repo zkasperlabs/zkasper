@@ -131,13 +131,21 @@ the schedule:
   slot inline, settles every signature, checks 2/3, and emits the finalization —
   instead of four proofs in series.
 
-Modelled at mainnet scale, `T2 - T` is **0.57B cost units**: 9.6s on an RTX 5090
-that keeps its allocation open, against 1.418B — 22.2s — for the same pipeline
-enumerating the marginal aggregate's attesters, and 129.6s for fixed groups of
-eight with a four-stage tail. Three quarters of what is left is the per-proof
-floor and the one final exponentiation. The warm path is the product — a cold
-`cargo-zisk` invocation is 19.52s of startup before it proves anything, which is
-why `crates/witness-gen/src/prover.rs` requires a long-running prover. See
+Scheduled against a real mainnet epoch — 430529, 2,212,730 validators — on
+measured RTX 5090 times, `T2 - T` is **25.6s on one card**. Five proofs run in
+the epoch and only one of them is after the last attestation: 13.5s of final
+proof and 0.2s of wrap, with the other 12s spent waiting for the crossing slot's
+block to arrive. The same tail modelled in isolation is 9.1s, three quarters of
+which is the measured 7.18s floor every proof pays whatever it computes. Against
+that, fixed groups of eight enumerating every attester is 311s.
+
+Those are seconds, not cost units, and that is deliberate: measured throughput
+on the campaign's own guests spans 18M to 246M Zisk cost units per second, so no
+single units-per-second constant describes this prover. `scripts/time_model.py`
+and `ProverModel` in `crates/witness-gen/src/streaming.rs` predict wall-clock
+directly, with a rate per work class. The warm path is the product — a cold
+`cargo-zisk` invocation adds **13.5s** of startup per proof, which is why
+`crates/witness-gen/src/prover.rs` requires a long-running prover. See
 [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Building
@@ -296,7 +304,8 @@ exactly one epoch forward.
       `state_roots` list.
 - [ ] Splitting the committee proof across validator index ranges. Bucket sums
       add and a validator lands in one range, so a fold that adds aggregates is
-      all it needs — and it is half the epoch's cost.
+      all it needs. No longer urgent: at 169 s against a 384 s epoch the proof
+      fits whole, and every extra chunk is an extra stage floor.
 - [ ] Projective or batched-inversion G1 aggregation
 - [ ] Solidity verifier integration with the Zisk proof format
 - [ ] Bootstrap chunking across recursive proofs

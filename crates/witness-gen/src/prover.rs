@@ -6,20 +6,26 @@
 //! # One prover, many proofs
 //!
 //! Every method takes `&self`, and that is load-bearing rather than incidental.
-//! Measured on an RTX 5090 against Zisk 1.0.0-alpha, a proof costs 19.52 s
-//! before it computes anything — process startup and 30 GB of GPU allocation —
-//! against 67,452,592 cost units per second once it is running. The SNARK wrap
-//! makes the same point more sharply: `cargo-zisk wrap --minimal -g` takes
-//! 18.4 s of which **0.192 s** is the compression.
+//! Measured on an RTX 5090 against Zisk 1.0.0-alpha over 87 warm proves, wall
+//! clock exceeds the prover's own `Proof generated` by **13.49 s** —
+//! `INITIALIZING_PROOFMAN` is 7.74 s +/- 0.71 of that and process start and
+//! teardown are the rest. That is what a long-lived prover saves, per proof.
+//! The SNARK wrap makes the same point more sharply: `cargo-zisk wrap
+//! --minimal -g` takes 12.5 s of which **0.157 s** is the compression.
 //!
-//! The streaming pipeline exists to make `T2 - T` one proof and a wrap. At
-//! 0.75B cost units that is 11 s of real work, so two cold starts would be
-//! four times the thing they are wrapped around, and the difference between
-//! advertising 12 s and 50 s. An implementation must therefore hold the GPU
-//! allocation open across proofs — one long-running process, or a pool of them,
-//! serving many calls. Shelling out to `cargo-zisk` per proof is not an
-//! acceptable implementation of this trait, and the trait is shaped so that it
-//! does not have to be: `&self`, `Send + Sync`, no per-call setup hook.
+//! The streaming pipeline exists to make `T2 - T` one proof and a wrap. The
+//! measured floor of a zkasper stage is 7.18 s and the final proof of a mainnet
+//! epoch is about 9 s, so two cold starts would be three times the thing they
+//! are wrapped around. An implementation must therefore hold the GPU allocation
+//! open across proofs — one long-running process, or a pool of them, serving
+//! many calls. Shelling out to `cargo-zisk` per proof is not an acceptable
+//! implementation of this trait, and the trait is shaped so that it does not
+//! have to be: `&self`, `Send + Sync`, no per-call setup hook.
+//!
+//! Do not reintroduce the 19.52 s that used to be quoted here. It was a
+//! regression intercept over wall clock that absorbed the per-proof floor as
+//! well as the startup, so adding it to a floor term counts the floor twice.
+//! See `scripts/time_model.py`.
 //!
 //! [`crate::zisk_prover::ZiskProver`] is that implementation — one embedded
 //! `zisk-sdk` client, initialised once, proving for the life of the process. It
@@ -220,7 +226,10 @@ impl Prover for NativeProver {
 
     fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
         let output = run_circuit(Stage::Committee, || {
-            zkasper_common::committee::verify(witness, self.config.acc_tree_depth)
+            zkasper_common::committee::verify(
+                &zkasper_common::committee::encode(witness),
+                self.config.acc_tree_depth,
+            )
         })?;
         Ok((output, Proof::new()))
     }

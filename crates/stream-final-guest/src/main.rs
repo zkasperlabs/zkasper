@@ -8,7 +8,7 @@ ziskos::entrypoint!(main);
 
 fn main() {
     let witness: StreamFinalWitness =
-        bincode::deserialize(&zkasper_guest_io::read_witness()).expect("deserialize witness");
+        bincode::deserialize(zkasper_guest_io::read_witness()).expect("deserialize witness");
 
     zkasper_guest_io::commit(verify_stream_final(&witness).public_bytes());
 }

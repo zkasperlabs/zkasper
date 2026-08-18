@@ -53,8 +53,6 @@ pub fn batch_root<T: Copy>(
     aux: &[T],
     depth: u32,
 ) -> T {
-    assert!(!leaves.is_empty(), "batch_root: empty leaf set");
-
     let mut idx: Vec<u64> = Vec::with_capacity(leaves.len());
     let mut val: Vec<T> = Vec::with_capacity(leaves.len());
     for (i, (v, k)) in leaves.iter().enumerate() {
@@ -65,6 +63,26 @@ pub fn batch_root<T: Copy>(
         idx.push(*k);
         val.push(*v);
     }
+
+    batch_root_columns(compress, idx, val, aux, depth)
+}
+
+/// The same, over columns the caller already holds and has already checked are
+/// strictly increasing.
+///
+/// The committee proof walks a million members in one pass — asserting that
+/// order as it goes, because the order is what makes its slot buckets disjoint
+/// — and fills these two vectors while it does. Taking them directly spares it
+/// a third vector of pairs for this function to take apart again, which at
+/// mainnet scale is 38 MB of proven memory traffic for nothing.
+pub fn batch_root_columns<T: Copy>(
+    compress: impl Fn(&T, &T) -> T,
+    mut idx: Vec<u64>,
+    mut val: Vec<T>,
+    aux: &[T],
+    depth: u32,
+) -> T {
+    assert!(!idx.is_empty(), "batch_root: empty leaf set");
 
     let mut next_idx: Vec<u64> = Vec::with_capacity(idx.len());
     let mut next_val: Vec<T> = Vec::with_capacity(val.len());
