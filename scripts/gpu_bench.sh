@@ -13,9 +13,26 @@ set -euo pipefail
 #   bench n=220k 866,953,297 units -> 1030.0 s
 #   fit: time = 333.4 s + units / 1,244,523
 #
+# GPU result (RTX 5090, Zisk 1.0.0-alpha, 2026-08-18), warm proves:
+#   slot-proof   575,395,812 units ->  27.70 s   (5 samples, 27.09-28.70)
+#   bench n=220k 866,953,297 units ->  32.30 s   (2 samples, 32.03-32.56)
+#   fit: time = 19.5 s + units / 67,452,592
+#   -> 54x the CPU marginal throughput; 29x end-to-end on the slot proof.
+#   wrap --minimal: 18.5 s wall, of which only 0.2 s is the compression itself.
+#
+# That fit is a least-squares line over five bench sizes (n = 55k, 110k, 220k,
+# 440k, 660k), not the two points below; residuals are under 0.12 s. The
+# slot-proof measurement was not used to build it and lands 1.3% off it, which
+# is the evidence that Zisk cost units really are hardware-portable across two
+# very different workloads (BLS precompiles vs poseidon2).
+#
 # Usage: ./scripts/gpu_bench.sh
 #
-# Requires: NVIDIA driver >= 525.60.13, ~90 GB free disk, ~32 GB RAM.
+# Requires: NVIDIA driver >= 525.60.13, ~120 GB free disk, ~32 GB RAM.
+#
+# Disk is the easy thing to underestimate. The downloaded proving key is 26 GB,
+# but the first `setup`/`prove` regenerates constant trees into it and it grows
+# to ~85 GB. Each program's setup adds a further ~3 GB to ~/.zisk/cache.
 #
 # Run it under `setsid nohup ./scripts/gpu_bench.sh > gpu_bench.log 2>&1 &` and
 # tail the log. Setup plus two proofs takes tens of minutes, and an ssh session
@@ -60,8 +77,9 @@ command -v cargo >/dev/null || {
 }
 curl -sSf https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
 # --gpu selects the CUDA build; --provingkey pulls the 3.2 GB key (26 GB
-# unpacked); --with-snark adds the final SNARK key that `cargo-zisk wrap` needs.
-"$HOME/.zisk/bin/ziskup" --version "$ZISK_VERSION" --gpu --provingkey --with-snark -y
+# unpacked). That key is enough for `wrap --minimal`; only `wrap --plonk` needs
+# the extra SNARK key, which is `ziskup ... --provingkey --with-snark`.
+"$HOME/.zisk/bin/ziskup" --version "$ZISK_VERSION" --gpu --provingkey -y
 export PATH="$HOME/.zisk/bin:$PATH"
 cargo-zisk --version
 
@@ -110,20 +128,47 @@ for e in slot-proof bench; do
   esac
   echo "--- setup $e ---"
   time cargo-zisk setup -e "$ELF"
-  echo "--- prove $e ---"
+  echo "--- prove $e (cold: includes one-time const-tree regeneration) ---"
+  time cargo-zisk prove -e "$ELF" -i "$IN" -o "target/gpu/${e}_proof.bin" -g -y
+  # The very first prove on a fresh box spends ~70 s inside INITIALIZING_PROOFMAN
+  # regenerating Vadcop constant polynomials and trees. That is a one-time global
+  # cost, not part of per-proof latency, and it would poison the fit. Prove a
+  # second time and use the warm number.
+  echo "--- prove $e (warm: this is the number to use) ---"
   time cargo-zisk prove -e "$ELF" -i "$IN" -o "target/gpu/${e}_proof.bin" -g -y
 done
 
 echo "=== 6b. Wrap the slot proof, timed ==="
-# Wrapping is its own subcommand, not a flag on `prove`. It compresses the
-# VADCOP STARK into the final proof that goes on the latency critical path, so
-# it belongs in the measurement.
+# Wrapping is its own subcommand, not a flag on `prove` (there is no `prove -f`).
+# It compresses the VADCOP STARK into the final proof that goes on the latency
+# critical path, so it belongs in the measurement.
+#
+# `wrap` refuses to run without one of --minimal or --plonk. --minimal is the
+# recursive STARK compression and works with the standard proving key (verified:
+# no --with-snark needed). --plonk targets the on-chain EVM verifier and does
+# additionally need the SNARK key (`ziskup ... --provingkey --with-snark`).
+#
+# Almost all of wrap's wall-clock is process startup and GPU allocation; the
+# compression itself is ~0.2 s. Read the GENERATE_VADCOP_FINAL_COMPRESSED_PROOF
+# line in the log, not just the `time` output.
 time cargo-zisk wrap --proof target/gpu/slot-proof_proof.bin \
-  --output target/gpu/slot-proof_wrapped.bin -g
+  --output target/gpu/slot-proof_wrapped.bin -g --minimal
 
 echo
 echo "=== 7. Fit ==="
-echo "Take the two (TOTAL cost, prove wall-clock) pairs and solve:"
+echo "Take the two (TOTAL cost, warm prove wall-clock) pairs and solve:"
 echo "    marginal = (c2 - c1) / (t2 - t1)      fixed = t1 - c1 / marginal"
 echo "Speedup vs the CPU baseline = marginal / 1,244,523"
+echo
+echo "Two points is a fragile fit: the costs differ by ~1.5x but the times by"
+echo "only ~4.6 s, against ~0.5 s of run-to-run noise. For a number worth"
+echo "quoting, sweep the bench guest instead - it takes n on stdin, so several"
+echo "sizes cost minutes and turn the extrapolation into a regression:"
+echo "    for n in 55000 110000 220000 440000 660000; do"
+echo "      python3 -c \"import struct,sys;n=int(sys.argv[1]);open('target/gpu/bench_%d.bin'%n,'wb').write(struct.pack('<QII',8,1,n))\" \$n"
+echo "      ziskemu -X -e $BENCH_ELF -i target/gpu/bench_\$n.bin | grep '^TOTAL'"
+echo "      time cargo-zisk prove -e $BENCH_ELF -i target/gpu/bench_\$n.bin -o target/gpu/sweep.bin -g"
+echo "    done"
+echo "Then keep the slot proof out of the fit and use it to check the line."
+echo
 echo "Then: scripts/proving_cost.py --cells-per-second <marginal> --dollars-per-hour <gpu rate>"
