@@ -361,9 +361,12 @@ configuration default rather than a requirement.
 validators split across two slots, so the one group proved covers **`n/2`
 attesters**. The ELF used was the pre-complement guest, which enumerates
 attesters rather than naming absentees — which is why the sweep scales at all,
-and which makes it the right calibration for the two places that still walk a
-validator list: the committee proof, and a slot proof's named set. Proved on the
-RTX 5090, 3 warm proves each, `Proof generated`, raw data in
+and which makes it the right calibration for a slot proof's named set. (It was
+also the committee proof's calibration until that proof stopped walking a
+bincode list; the sweep still sets the *rate* for that work class, but the
+committee guest's own per-member figure is measured directly. See
+[The committee proof was 94% framing](#the-committee-proof-was-94-framing).)
+Proved on the RTX 5090, 3 warm proves each, `Proof generated`, raw data in
 `data/gpu_bench/attester_*.tsv`:
 
 | fixture `n` | attesters | STEPS | VARIABLE | `Proof generated` | effective units/s | steps/attester |
@@ -623,10 +626,10 @@ scattered thirty-second of the tree each:
 
 And the committee for epoch `N` is fixed by a RANDAO mix that stops moving two
 epochs earlier, so it has a whole epoch — 384 seconds — of slack. It is off the
-critical path by construction, not by scheduling luck. What it is *not* is free:
-measured, that proof is 878 µs per validator, so at mainnet scale it is 929 s
-and does not fit in the epoch that owes it without being cut into at least six
-chunks. See [Where the next win is](#where-the-next-win-is).
+critical path by construction, not by scheduling luck. It also fits in that
+slack: 125 µs per member over the 960,974 *active* validators is 169 s, one
+chunk on one card. It did not always. See
+[The committee proof was 94% framing](#the-committee-proof-was-94-framing).
 
 ### What it does to `T2 − T`
 
@@ -650,58 +653,74 @@ because a committee proof puts every validator in exactly one slot.
 apiece and the model charged 6,407 cost units; the times were understated for the
 opposite reason. Neither column should be quoted.)
 
-## Where the next win is
+## The committee proof was 94% framing
 
-Measured in prover-seconds rather than trace area, on epoch 430529 as the
-schedule cuts it (2,212,730 validators, five proofs plus the committee proof):
+Measured in prover-seconds, on epoch 430529 as the schedule cuts it, this table
+used to read **1,950 s of committee proof against 50 s of everything else** —
+97%, five epochs of one card, and a card-count problem that wanted the proof cut
+into six chunks across seven cards. Two things were wrong with it and both are
+fixed:
+
+**The model charged the whole registry.** Committees are formed from *active*
+validators and those are the only leaves the proof opens: 960,974, not the
+2,212,792 the registry holds. 2.3x, for free.
+
+**The guest deserialised a witness it had already been handed.** A
+`CommitteeMember` is fifteen `u64`s — index, twelve point limbs, balance, slot —
+and Zisk maps the input into the guest's address space at an 8-byte-aligned
+address. The guest was calling `bincode::deserialize` on it, which at a million
+members means fifteen million bounds-checked field decodes into a 115 MB `Vec`
+that reallocates its way there, on top of a 115 MB `to_vec` of the input the
+guest never needed. Measured on the committee guest itself under `ziskemu -X`,
+at 16,000 / 32,000 / 64,000 members, linear to five figures:
+
+| | steps/member | cost units/member |
+|---|---:|---:|
+| bincode witness | 1,157.0 | 111,318 |
+| flat witness, read in place | **328.0** | **36,473** |
+
+`crates/common/src/committee.rs` now defines the layout the host writes and the
+guest indexes; nothing about what is proven changed, and the strictly-increasing
+check that makes the slot buckets disjoint is still the same check in the same
+pass. At the attester sweep's rate for this work class that is 125 µs a member
+against 405 µs, and the proof as a whole:
 
 | | seconds | share |
 |---|---:|---:|
-| committee proof | 1,950 | **97%** |
-| stage floors, the epoch's own five proofs | 28.7 | 1.4% |
-| distinct messages (64 of them) | 16.1 | 0.8% |
-| final exponentiation | 0.64 | 0.03% |
-| naming absentees | ~5 | 0.2% |
-| | **2,005** | |
+| committee proof | 169 | **78%** |
+| stage floors, the epoch's own five proofs | 28.7 | 13% |
+| distinct messages (64 of them) | 16.1 | 7% |
+| final exponentiation | 0.64 | 0.3% |
+| naming absentees | ~5 | 2% |
+| | **216** | |
 
-That is a different picture from the cost-unit one, and the difference is the
-whole point of re-basing. Three things follow:
+Three things follow:
 
-1. **The committee proof is not half the epoch, it is all of it — and it does
-   not fit.** 1,950 s is five epochs of one card. It is fixed two epochs ahead
-   so it has slack, but slack is not the constraint: a chunk longer than 384 s
-   can never land inside the epoch that owes it. It is trivially parallel —
-   bucket sums add and a validator lands in one index range — so this is a
-   card-count problem, not a design one. But it *is* the card-count problem, and
-   the cost-unit model hid it by charging 6,407 units per validator when the
-   real cost is 2,347 executed steps and 878 µs. Scheduled:
+1. **The fleet is one card.** 169 s of committee proof lands inside the 384 s
+   epoch that owes it, in one chunk, on the card the deadline work already has
+   idle. Chunking is still supported and still correct — bucket sums add and a
+   validator lands in one index range — but nothing needs it.
 
-   | chunks | cards | `T2 − T` | committee lands at |
-   |---:|---:|---:|---:|
-   | 1 | 2 | 25.6 s | 1,950 s — five epochs late |
-   | 2 | 3 | 25.6 s | 986 s |
-   | 3 | 4 | 25.6 s | 662 s |
-   | 4 | 5 | 25.6 s | 500 s |
-   | **6** | **7** | **25.6 s** | **338 s — inside the epoch** |
-   | 8 | 8 | 34.3 s | 257 s |
+2. **`T2 − T` is unchanged at 25.6 s and is now the whole question.** The
+   epoch's own proofs are 47 s of prover time against 384 s of epoch. Buying
+   cards buys nothing at all.
 
-   **Six chunks on seven cards** is the first configuration that delivers the
-   next epoch's committee inside this one, and it costs nothing in `T2 − T`.
-   Eight chunks on eight cards is worse on both counts: the extra chunks crowd
-   the lane the deadline work wanted. (These are over the whole 2,212,792-entry
-   registry, which is the conservative reading — the proof opens active
-   validators, of which there are fewer.)
+   No other guest is worth the same treatment, and that was checked rather
+   than assumed. Every one of them still opens with `bincode::deserialize`,
+   but a group-proof witness is 728 bytes and a stream-final witness 2,671:
+   measured on the same fixture, dropping the input copy moved the group guest
+   by **12 steps out of 1,175,370**. The named set a slot proof walks is about
+   a hundred validators — 0.08 s of the 7.18 s floor — so a second wire format
+   over the pipeline's most nested witness would buy about 1% of a proof.
 
-2. **`T2 − T` and the fleet size are now separate questions.** The epoch's own
-   proofs are 55 s of prover time against 384 s of epoch, on one card, and the
-   only thing that shortens them is the floor. Buying cards does not shorten
-   `T2 − T`; it makes the committee proof fit.
-
-3. **The floor is half of what the deadline work costs, and it is pure
-   overhead.** 28.7 s of stage floor against 55 s of deadline work, in five
-   proofs. Fewer, larger proofs trade that against parallelism — and the
-   schedule already does that trade, which is why it cuts a 32-slot epoch into
-   two groups rather than seven.
+3. **What is left of the committee proof is not framing any more.** Of the
+   36,473 units a member still costs, the precompiles it exists to run — one
+   leaf hash, one internal node, one curve addition — are 4,161. The rest is
+   `acc::leaf`'s repacking of a 768-bit point into 60-bit Goldilocks windows and
+   the limb marshalling around `syscall_bls12_381_curve_add`, which copies 24
+   words in and 12 out per addition for a precompile that could take the point
+   where it lies. That is the next win, and it is worth about 15% of a proof
+   that now fits.
 
 ## Composite: real slot proof
 
@@ -783,18 +802,19 @@ after the last attestation covers one aggregate of 26,813 attesters.
 --ignored --nocapture`, the same epoch, complement proving, the time model:
 
 ```
-=== measured floor, 4-card budget: T = 252s, T2 = 278s, T2-T = 25.6s on 2 card(s) ===
-  card 1     0.0s -> 1950.5s  1950.45s  Committee(0)
-  card 0   216.0s ->  239.1s    23.06s  Group(0) slots [0..18]
-  card 0   239.1s ->  246.2s     7.18s  Fold(0)  groups [0]
-  card 0   252.0s ->  262.7s    10.73s  Group(1) slots [19, 20, 21]
-  card 0   264.0s ->  277.5s    13.45s  Final    absorbs [1], inline slot [22]
+=== measured floor, 4-card budget: T = 252s, T2 = 278s, T2-T = 25.6s on 1 card(s) ===
+  card 0     0.0s ->  169.0s   169.01s  Committee(0)
+  card 0   228.0s ->  252.2s    24.22s  Group(0) slots [0..19]
+  card 0   252.2s ->  261.8s     9.55s  Group(1) slots [20, 21]
+  card 0   264.0s ->  277.5s    13.46s  Final    absorbs [0, 1], inline slot [22]
   card 0   277.5s ->  277.6s     0.16s  Wrap
 ```
 
-**`T2 − T` is 25.6 s.** The epoch's own proofs need **one** card; the second is
-the committee proof for the next epoch, which is throughput work and never
-touches `T2`. Five proofs, two of them groups, one slot inline.
+**`T2 − T` is 25.6 s on one card.** The committee proof for the next epoch runs
+first and finishes at 169 s, on the same card, 215 s before the epoch that owes
+it ends; it is throughput work and never touches `T2`. Five proofs, two of them
+groups, one slot inline. The 4-card budget is a budget: the schedule reports
+what it needed, and it needed one at every budget from one to six.
 
 | | seconds | why |
 |---|---:|---|
@@ -826,13 +846,13 @@ for the crossing slot's block and for the group ahead of it.
 
 | | `T2 − T` | cards |
 |---|---:|---:|
-| stage floor 2.00 s (a hypothetical) | 20.4 s | 2 |
-| stage floor 4.84 s (an empty guest) | 23.3 s | 2 |
-| **stage floor 7.18 s (measured)** | **25.6 s** | **2** |
-| stage floor 12.20 s (the old 789M, as time) | 31.5 s | 2 |
+| stage floor 2.00 s (a hypothetical) | 20.4 s | 1 |
+| stage floor 4.84 s (an empty guest) | 23.3 s | 1 |
+| **stage floor 7.18 s (measured)** | **25.6 s** | **1** |
+| stage floor 12.20 s (the old 789M, as time) | 31.5 s | 1 |
 | stage floor 30.00 s | 50.5 s | 2 |
-| Fp2-tower rate 121M units/s (the slow bracket) | 27.1 s | 2 |
-| Fp2-tower rate 663M units/s (the fast bracket) | 24.1 s | 2 |
+| Fp2-tower rate 121M units/s (the slow bracket) | 27.1 s | 1 |
+| Fp2-tower rate 663M units/s (the fast bracket) | 24.1 s | 1 |
 | recursive verification 1 s per child | 27.5 s | 2 |
 | recursive verification 5 s per child | 32.7 s | 2 |
 

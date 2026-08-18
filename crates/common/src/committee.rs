@@ -66,9 +66,9 @@
 
 use alloc::vec::Vec;
 
-use crate::acc::{self, Digest};
+use crate::acc::{self, Digest, G1Point};
 use crate::bls::PointSum;
-use crate::merkle::batch_root;
+use crate::merkle::{batch_root, batch_root_columns};
 use crate::types::{CommitteeAggregate, CommitteeOutput, CommitteeWitness};
 
 /// Depth of the per-epoch committee tree: one leaf per slot in the epoch.
@@ -120,64 +120,163 @@ pub fn root(slots: &[Option<CommitteeAggregate>]) -> Digest {
     level[0]
 }
 
+// ---------------------------------------------------------------------------
+// Wire format
+// ---------------------------------------------------------------------------
+
+/// Words the header spends before the first member.
+const HEADER_WORDS: usize = 12;
+
+/// Words one member spends: index, twelve public-key limbs, balance, slot.
+const MEMBER_WORDS: usize = 15;
+
+/// Words one digest spends.
+const DIGEST_WORDS: usize = 4;
+
+/// Lay a committee witness out as the flat word array [`verify`] reads.
+///
+/// ```text
+/// [0..4)   accumulator_commitment
+/// [4..8)   acc_root
+/// [8]      target_epoch
+/// [9]      total_active_balance
+/// [10]     member count
+/// [11]     auxiliary count
+/// [12..]   members, MEMBER_WORDS each
+/// [..]     auxiliaries, DIGEST_WORDS each
+/// ```
+///
+/// This exists because framing is what the committee proof was actually made
+/// of. A `CommitteeMember` is fifteen `u64`s and nothing else, and Zisk hands a
+/// guest its input as an 8-byte-aligned slice, so at a million validators the
+/// bincode witness was 115 MB of self-describing records decoded field by field
+/// into a second 115 MB `Vec`. Measured under `ziskemu -X`, that cost 1,157
+/// proven RISC-V steps a member, of which 829 were the decode. A fixed stride
+/// with the counts up front lets the guest read every member where the prover
+/// put it, and the same measurement comes out at 328.
+pub fn encode(witness: &CommitteeWitness) -> Vec<u64> {
+    let mut words = Vec::with_capacity(
+        HEADER_WORDS
+            + witness.members.len() * MEMBER_WORDS
+            + witness.acc_multi_proof.auxiliaries.len() * DIGEST_WORDS,
+    );
+    words.extend_from_slice(&witness.accumulator_commitment);
+    words.extend_from_slice(&witness.acc_root);
+    words.push(witness.target_epoch);
+    words.push(witness.total_active_balance);
+    words.push(witness.members.len() as u64);
+    words.push(witness.acc_multi_proof.auxiliaries.len() as u64);
+
+    for member in &witness.members {
+        words.push(member.validator_index);
+        words.extend_from_slice(&member.pubkey);
+        words.push(member.active_effective_balance);
+        words.push(member.slot_in_epoch);
+    }
+    for auxiliary in &witness.acc_multi_proof.auxiliaries {
+        words.extend_from_slice(auxiliary);
+    }
+    words
+}
+
+/// The same array as the bytes a witness file or a prover's stdin carries.
+pub fn to_bytes(words: &[u64]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// Reinterpret a run of words as the fixed-stride records it holds.
+///
+/// Sound for any `[u64; N]`: it is `N` words with no padding, its alignment is
+/// a `u64`'s, and every bit pattern is a valid one. This is what makes reading
+/// a member free — the guest borrows it out of the input buffer rather than
+/// copying it into one of its own.
+fn records<const N: usize>(words: &[u64]) -> &[[u64; N]] {
+    let (prefix, records, suffix) = unsafe { words.align_to::<[u64; N]>() };
+    assert!(
+        prefix.is_empty() && suffix.is_empty(),
+        "committee witness is not a whole number of records",
+    );
+    records
+}
+
 /// Verify a committee proof: sum each slot's committee out of the accumulator.
 ///
 /// The witness names every committee member once, in strictly increasing
-/// validator-index order, with the leaf preimage that opens it. One batched
-/// multi-proof establishes that every one of those leaves is in the accumulator;
-/// the same pass sums each slot's public keys and balances. See the module docs
-/// for why the slot each member is assigned to needs no proof of its own.
-pub fn verify(witness: &CommitteeWitness, acc_depth: u32) -> CommitteeOutput {
+/// validator-index order, with the leaf preimage that opens it, in the flat
+/// layout [`encode`] writes. One batched multi-proof establishes that every one
+/// of those leaves is in the accumulator; the same pass sums each slot's public
+/// keys and balances. See the module docs for why the slot each member is
+/// assigned to needs no proof of its own.
+pub fn verify(witness: &[u64], acc_depth: u32) -> CommitteeOutput {
+    assert!(
+        witness.len() >= HEADER_WORDS,
+        "committee witness is shorter than its header",
+    );
+    let accumulator_commitment: Digest = witness[0..4].try_into().expect("a digest is four words");
+    let acc_root: Digest = witness[4..8].try_into().expect("a digest is four words");
+    let target_epoch = witness[8];
+    let member_count = witness[10] as usize;
+
     assert_eq!(
-        acc::commitment(&witness.acc_root, witness.total_active_balance),
-        witness.accumulator_commitment,
+        acc::commitment(&acc_root, witness[9]),
+        accumulator_commitment,
         "accumulator commitment mismatch",
     );
 
-    let mut leaves: Vec<(Digest, u64)> = Vec::with_capacity(witness.members.len());
+    let auxiliaries = HEADER_WORDS + member_count * MEMBER_WORDS;
+    assert_eq!(
+        witness.len(),
+        auxiliaries + witness[11] as usize * DIGEST_WORDS,
+        "committee witness does not hold the counts its header names",
+    );
+
+    let mut indices: Vec<u64> = Vec::with_capacity(member_count);
+    let mut leaves: Vec<Digest> = Vec::with_capacity(member_count);
     let mut sums: Vec<PointSum> = alloc::vec![PointSum::default(); MAX_SLOTS as usize];
     let mut balances: Vec<u64> = alloc::vec![0u64; MAX_SLOTS as usize];
 
     let mut previous: Option<u64> = None;
-    for member in &witness.members {
+    for member in records::<MEMBER_WORDS>(&witness[HEADER_WORDS..auxiliaries]) {
+        let validator_index = member[0];
+        let pubkey: &G1Point = member[1..13].try_into().expect("a point is twelve limbs");
+        let active_effective_balance = member[13];
+        let slot_in_epoch = member[14];
+
         // Strictly increasing is what makes the slot buckets disjoint: a
         // validator read once cannot land in two of them.
         if let Some(previous) = previous {
             assert!(
-                member.validator_index > previous,
-                "committee members must be strictly increasing: {} followed {previous}",
-                member.validator_index,
+                validator_index > previous,
+                "committee members must be strictly increasing: {validator_index} followed {previous}",
             );
         }
-        previous = Some(member.validator_index);
+        previous = Some(validator_index);
 
         assert!(
-            member.slot_in_epoch < MAX_SLOTS,
-            "slot {} is past the {MAX_SLOTS} a committee tree holds",
-            member.slot_in_epoch,
+            slot_in_epoch < MAX_SLOTS,
+            "slot {slot_in_epoch} is past the {MAX_SLOTS} a committee tree holds",
         );
 
         // Key and balance come out of the one preimage the accumulator commits
         // to, so nothing can inflate the balance side on its own.
-        leaves.push((
-            acc::leaf(&member.pubkey, member.active_effective_balance),
-            member.validator_index,
-        ));
-        let slot = member.slot_in_epoch as usize;
+        indices.push(validator_index);
+        leaves.push(acc::leaf(pubkey, active_effective_balance));
+        let slot = slot_in_epoch as usize;
         sums[slot]
-            .add(&member.pubkey)
+            .add(pubkey)
             .expect("committee aggregation hit a shared x-coordinate");
-        balances[slot] += member.active_effective_balance;
+        balances[slot] += active_effective_balance;
     }
 
     assert_eq!(
-        batch_root(
+        batch_root_columns(
             acc::compress,
-            &leaves,
-            &witness.acc_multi_proof.auxiliaries,
+            indices,
+            leaves,
+            records::<DIGEST_WORDS>(&witness[auxiliaries..]),
             acc_depth,
         ),
-        witness.acc_root,
+        acc_root,
         "accumulator root mismatch",
     );
 
@@ -191,8 +290,8 @@ pub fn verify(witness: &CommitteeWitness, acc_depth: u32) -> CommitteeOutput {
         .collect();
 
     CommitteeOutput {
-        accumulator_commitment: witness.accumulator_commitment,
-        target_epoch: witness.target_epoch,
+        accumulator_commitment,
+        target_epoch,
         committee_root: root(&slots),
     }
 }
@@ -243,6 +342,43 @@ mod tests {
         assert_ne!(
             root(&[Some(aggregate(1, 64))]),
             root(&[Some(aggregate(1, 65))]),
+        );
+    }
+
+    /// The bytes a witness file carries and the words the guest reads have to
+    /// be the same thing: Zisk hands the input in as an aligned byte slice and
+    /// the guest views it as `u64`s without touching it.
+    #[test]
+    fn the_wire_format_is_the_word_array_little_endian() {
+        let witness = CommitteeWitness {
+            accumulator_commitment: [1, 2, 3, 4],
+            target_epoch: 430529,
+            acc_root: [5, 6, 7, 8],
+            total_active_balance: 32_000_000_000,
+            members: alloc::vec![crate::types::CommitteeMember {
+                validator_index: 9,
+                pubkey: [11; 12],
+                active_effective_balance: 32_000_000_000,
+                slot_in_epoch: 3,
+            }],
+            acc_multi_proof: crate::types::AccMultiProof {
+                auxiliaries: alloc::vec![[12, 13, 14, 15]],
+            },
+        };
+        let words = encode(&witness);
+
+        assert_eq!(words.len(), HEADER_WORDS + MEMBER_WORDS + DIGEST_WORDS);
+        assert_eq!(
+            &words[10..12],
+            &[1, 1],
+            "the counts locate everything after"
+        );
+        assert_eq!(
+            to_bytes(&words),
+            words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<u8>>(),
         );
     }
 

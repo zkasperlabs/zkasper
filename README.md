@@ -304,7 +304,8 @@ exactly one epoch forward.
       `state_roots` list.
 - [ ] Splitting the committee proof across validator index ranges. Bucket sums
       add and a validator lands in one range, so a fold that adds aggregates is
-      all it needs — and it is half the epoch's cost.
+      all it needs. No longer urgent: at 169 s against a 384 s epoch the proof
+      fits whole, and every extra chunk is an extra stage floor.
 - [ ] Projective or batched-inversion G1 aggregation
 - [ ] Solidity verifier integration with the Zisk proof format
 - [ ] Bootstrap chunking across recursive proofs

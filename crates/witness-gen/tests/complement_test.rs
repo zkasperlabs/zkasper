@@ -285,7 +285,7 @@ fn the_committee_proof_cannot_inflate_a_member_balance() {
     witness.members[0].active_effective_balance += 1_000_000_000;
 
     let message = rejection("an inflated member balance was accepted", move || {
-        committee::verify(&witness, ACC_DEPTH);
+        committee::verify(&committee::encode(&witness), ACC_DEPTH);
     });
     assert!(
         message.contains("accumulator root mismatch"),
@@ -346,7 +346,7 @@ fn the_committee_proof_reads_each_validator_once() {
     witness.members.insert(1, duplicate);
 
     let message = rejection("a validator was assigned to two slots", move || {
-        committee::verify(&witness, ACC_DEPTH);
+        committee::verify(&committee::encode(&witness), ACC_DEPTH);
     });
     assert!(
         message.contains("strictly increasing"),

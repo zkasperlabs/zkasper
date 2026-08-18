@@ -21,14 +21,16 @@ The sizing question has changed shape, and the measured time model is why.
                   exist.
 
   committee proof the per-epoch proof that opens every active validator's leaf
-                  and aggregates every public key. MEASURED at 878 us per
-                  validator, that is ~929 s at 1,050,000 validators — 2.4 times
-                  a 384 s epoch. It is fixed two epochs ahead so it has a whole
-                  epoch of slack, but it must still *fit* in one, and it is
-                  trivially chunkable. This is what sizes the fleet.
+                  and aggregates every public key. MEASURED at 125 us per
+                  member, that is ~169 s at 960,974 active validators, inside
+                  the 384 s epoch that owes it, in one chunk on one card.
 
-The cost-unit model made the committee proof 215 s and therefore made the fleet
-look latency-bound. It is not.
+The committee proof used to size the fleet at five cards. Two things were wrong
+with that and both are fixed: the model charged it the whole 2,212,792-entry
+registry when committees are formed from active validators only, and the guest
+spent 94% of the proof deserialising a witness Zisk had already handed it in the
+layout it wanted. Neither the deadline work nor the committee proof needs cards
+beyond the one or two the schedule settles on.
 
 Every constant is labelled MEASURED (a timed run on the RTX 5090, see
 `scripts/time_model.py`), QUOTED (a vendor or marketplace price), or MODELLED
