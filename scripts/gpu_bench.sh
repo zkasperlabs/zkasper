@@ -156,6 +156,12 @@ echo "=== 1. System dependencies ==="
 # Identical results for the v1.0.0-alpha and v1.1.0-alpha sources: the rewrite
 # between the tags did not touch the failing call, which is byte-identical.
 #
+# CONFIRMED END TO END 2026-08-18 on nvidia/cuda:12.9.1-devel-ubuntu24.04, an
+# RTX 5090 with driver 590.48.01: with the five packages above,
+# `cargo build --release --features zisk-prover` compiles the whole stack in
+# 2m11s on 64 cores, and the resulting binary proves on the card. The 12.9 line
+# of the matrix is no longer just a translation unit.
+#
 # So: **build --features zisk-prover on CUDA 12.9 or newer.** The old advice to
 # "use an older CUDA image" was wrong in both directions — 12.6 fails the same
 # way, and it additionally cannot emit sm_120 at all, so it can never build the

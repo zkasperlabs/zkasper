@@ -85,6 +85,20 @@ cargo build --release --features zisk-prover
 zkasperd --beacon-url ... --mode streaming --prover zisk --gpu
 ```
 
+That puts the prover in the daemon, which only suits a single box. The
+deployment runs the beacon node and `zkasperd` on a stable machine and a prover
+server on the rented GPU box:
+
+```sh
+# GPU box
+zkasper-prover-server --gpu --listen 0.0.0.0:9099 --mode streaming
+# stable machine, no CUDA needed
+zkasperd --beacon-url ... --mode streaming --prover remote --prover-addr <gpu>:9099
+```
+
+If the server goes away the daemon keeps generating witnesses, spools the ones
+it could not prove, and backfills them when the server returns.
+
 Given `--api-url`, the daemon also mirrors every stage to
 [the v1 API](docs/api-v1.md) as it happens, and uploads the proof bytes of each
 epoch. That is what drives the live view on zkasper.com. Publishing never holds

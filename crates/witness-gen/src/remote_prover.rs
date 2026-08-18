@@ -45,12 +45,21 @@
 //! - A request that fails is retried once on a fresh connection, because a
 //!   connection idle since the last epoch is usually discovered dead by the
 //!   write that follows.
-//! - A request that still fails spools the witness to disk and returns an error.
-//!   Nothing is lost and nothing blocks.
+//! - A request that still fails spools the witness to disk and returns **the
+//!   empty proof a witness-only run returns**. The daemon carries on: it holds
+//!   the outputs its own circuits computed, so the accumulator still advances
+//!   and the epoch is still published — without a proof. `write_proof` and
+//!   `Publisher::proof_bytes` both skip an empty proof, so nothing claims an
+//!   epoch was proven when it was not, and the manifest records `proof_bytes:
+//!   0` for the stage.
 //! - After a failed *connect* the client backs off, so an outage costs one
 //!   connect attempt every `reconnect_backoff` rather than one per stage.
 //! - A background thread drains the spool onto the same connection once it is
 //!   back, oldest first, and writes the recovered proofs under `recovered/`.
+//!
+//! A witness the server *reached and refused* is a different thing and is an
+//! error. The circuit rejected those bytes and will reject them again, so it is
+//! reported where it happened rather than queued.
 //!
 //! This mirrors `crate::publish`, with one deliberate difference. The publisher
 //! keeps strict order by spooling everything once anything is spooled, because a
@@ -60,6 +69,12 @@
 //! the connection only when it can take it without waiting, and only after
 //! `backfill_quiet` with no foreground proof — and the spool drains in the slack
 //! between epochs rather than ahead of them.
+//!
+//! What an outage does cost is the epochs it spans. A parent stage binds its
+//! children's proofs, so a stream-final witness built over an unproven group
+//! cannot be proven — the server refuses it, and that is the error above. The
+//! epoch is lost and the next one starts clean, which is what a daemon restart
+//! costs anyway.
 //!
 //! # The wire
 //!
@@ -423,6 +438,8 @@ impl RemoteProverConfig {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteCounters {
     pub proved: u64,
+    /// Stages that got no proof because the server was unreachable.
+    pub unproven: u64,
     pub spooled: u64,
     pub dropped: u64,
     pub recovered: u64,
@@ -432,6 +449,7 @@ pub struct RemoteCounters {
 #[derive(Default)]
 struct Counters {
     proved: AtomicU64,
+    unproven: AtomicU64,
     spooled: AtomicU64,
     dropped: AtomicU64,
     recovered: AtomicU64,
@@ -639,6 +657,7 @@ impl RemoteProver {
         let c = &self.inner.counters;
         RemoteCounters {
             proved: c.proved.load(Ordering::Relaxed),
+            unproven: c.unproven.load(Ordering::Relaxed),
             spooled: c.spooled.load(Ordering::Relaxed),
             dropped: c.dropped.load(Ordering::Relaxed),
             recovered: c.recovered.load(Ordering::Relaxed),
@@ -799,10 +818,14 @@ impl Inner {
                 self.config.addr,
                 stage.as_str(),
             ),
+            // The server is not there. Keep the witness, and hand back the empty
+            // proof a witness-only run would: the daemon has its own outputs, so
+            // it keeps following the chain and the epoch is published without a
+            // proof rather than not published at all.
             Err(e) => {
                 let Request::Prove { witness, .. } = request;
-                self.spool(stage, witness, publics);
-                Err(e.context(format!("prove {} at {}", stage.as_str(), self.config.addr)))
+                self.spool(stage, witness, publics, &e);
+                Ok(Proof::new())
             }
         }
     }
@@ -820,10 +843,12 @@ impl Inner {
         Ok(())
     }
 
-    fn spool(&self, stage: Stage, witness: Vec<u8>, publics: &[u8]) {
+    fn spool(&self, stage: Stage, witness: Vec<u8>, publics: &[u8], error: &anyhow::Error) {
+        self.counters.unproven.fetch_add(1, Ordering::Relaxed);
         let Some(spool) = &self.spool else {
             warn!(
                 stage = stage.as_str(),
+                error = %format!("{error:#}"),
                 "the prover is unreachable and no spool is configured; this witness is lost",
             );
             return;
@@ -840,7 +865,8 @@ impl Inner {
         warn!(
             stage = stage.as_str(),
             pending = self.counters.pending.load(Ordering::Relaxed),
-            "the prover is unreachable; the witness was spooled and this epoch loses its proof",
+            error = %format!("{error:#}"),
+            "the prover is unreachable; the witness was spooled and this stage has no proof",
         );
     }
 

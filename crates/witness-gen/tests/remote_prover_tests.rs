@@ -219,15 +219,24 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
     let mut server = Server::bind();
     let prover = RemoteProver::connect(client(&server.addr, Some(spool.path()))).expect("connect");
     let witness = witness();
-    prover.prove_group(&witness).expect("the first proof");
+    let (proven, _, _) = prover.prove_group(&witness).expect("the first proof");
 
     let vk = prover.program_vk(Stage::Group);
     server.stop();
 
-    // Two epochs' worth of stages, against a prover that is not there.
+    // Two epochs' worth of stages, against a prover that is not there. Each call
+    // returns the outputs the local circuit computed and the empty proof of a
+    // witness-only run, so the daemon keeps following the chain.
     let started = Instant::now();
     for _ in 0..4 {
-        assert!(prover.prove_group(&witness).is_err());
+        let (output, _, proof) = prover
+            .prove_group(&witness)
+            .expect("no proof, but no error");
+        assert!(
+            proof.is_empty(),
+            "an unreachable server cannot return a proof"
+        );
+        assert_eq!(output.public_bytes(), proven.public_bytes());
     }
     // Fast, because the backoff means an outage costs one connect attempt per
     // interval rather than one per stage. The bound is loose enough for a loaded
@@ -244,6 +253,7 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
 
     let counters = prover.counters();
     assert_eq!(counters.spooled, 4, "every lost witness must be kept");
+    assert_eq!(counters.unproven, 4);
     assert_eq!(counters.pending, 4);
     assert_eq!(counters.dropped, 0);
     assert_eq!(spooled_files(spool.path()), 4);
@@ -260,15 +270,18 @@ fn reconnects_and_backfills_what_the_outage_cost() {
 
     server.stop();
     for _ in 0..3 {
-        assert!(prover.prove_group(&witness).is_err());
+        prover
+            .prove_group(&witness)
+            .expect("no proof, but no error");
     }
     assert_eq!(prover.counters().pending, 3);
 
     server.restart();
     // The backoff from the last failed connect has to expire first.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while prover.prove_group(&witness).is_err() {
+    while prover.counters().proved < 2 {
         assert!(Instant::now() < deadline, "never reconnected");
+        prover.prove_group(&witness).expect("prove");
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -303,7 +316,9 @@ fn the_spool_is_bounded() {
 
     server.stop();
     for _ in 0..5 {
-        assert!(prover.prove_group(&witness).is_err());
+        prover
+            .prove_group(&witness)
+            .expect("no proof, but no error");
     }
     let counters = prover.counters();
     assert_eq!(counters.spooled, 5);
@@ -324,7 +339,9 @@ fn a_restart_picks_the_spool_back_up() {
             RemoteProver::connect(client(&server.addr, Some(spool.path()))).expect("connect");
         server.stop();
         for _ in 0..2 {
-            assert!(prover.prove_group(&witness).is_err());
+            prover
+                .prove_group(&witness)
+                .expect("no proof, but no error");
         }
     }
 
@@ -448,12 +465,14 @@ fn proves_against_a_real_server() {
         prover.last_cost(),
     );
 
-    // The server disappears mid-run.
+    // The server disappears mid-run. The daemon keeps its outputs and loses only
+    // the proof.
     server.kill();
-    assert!(
-        prover.prove_group(&witness).is_err(),
-        "a proof against a dead server must fail rather than hang",
-    );
+    let (still, _, none) = prover
+        .prove_group(&witness)
+        .expect("no proof, but no error");
+    assert!(none.is_empty());
+    assert_eq!(still.public_bytes(), group.public_bytes());
     assert_eq!(prover.program_vk(Stage::Group), group_vk);
     assert_eq!(prover.counters().pending, 1);
 
@@ -461,9 +480,11 @@ fn proves_against_a_real_server() {
     // outage cost — the recovered proof faces the same `verify_child` the live
     // path applies, so a backfill that produced rubbish would fail here.
     server.respawn();
+    let proved = prover.counters().proved;
     let deadline = Instant::now() + Duration::from_secs(600);
-    while prover.prove_group(&witness).is_err() {
+    while prover.counters().proved == proved {
         assert!(Instant::now() < deadline, "the server never came back");
+        prover.prove_group(&witness).expect("prove");
         std::thread::sleep(Duration::from_secs(1));
     }
     while prover.counters().pending > 0 {

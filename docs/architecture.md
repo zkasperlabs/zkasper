@@ -188,9 +188,25 @@ A cold start costs 5.80 s, against a 3.640 s stage floor. A prover that restarts
 per proof spends more time on startup than on proving.
 
 The daemon reaches the prover through the `Prover` trait: witness in,
-`(public output, proof)` out, every method on `&self`. The trait is the seam a
-network prover plugs into. A network implementation is not written yet, so
-today both parts run in one process.
+`(public output, proof)` out, every method on `&self`. `RemoteProver` is that
+trait over a socket, and `zkasper-prover-server` is the process on the far side
+holding the one client. The daemon needs no CUDA to drive it — measured
+2026-08-18, a client built without `--features zisk-prover` proved a group and a
+slot proof on an RTX 5090 through the server and accepted both with
+`verify_child`.
+
+The client runs the guest logic natively and asks the server only for the
+cryptography, so the outputs the accumulator advances on never come off the
+wire, and a proof that comes back is checked against the key the handshake
+reported. One connection, length-prefixed bincode frames, a shared token.
+
+**When the server disappears the daemon keeps going.** The witness is spooled to
+disk and the call returns the empty proof a witness-only run returns, so the
+epoch is published without a proof rather than not published at all. The
+verification keys were cached at the handshake, so the witness builders keep
+binding them. The next call reconnects, and a background thread proves the
+backlog in the slack between epochs. `crates/witness-gen/src/remote_prover.rs`
+has the detail.
 
 **The split is affordable because the critical-path witness is small.**
 Complement proving shrank the witness of the proof after `T` to **2,671 bytes**.

@@ -184,6 +184,68 @@ of the 29 sizes. Only 1.26x of it is throughput. What is unambiguous is the
 wall clock on identical work: `n = 10,000` proves in 2.92 s against 5.29 s, and
 `n = 1,000,000` in 32.29 s against 107.38 s.
 
+## The warm prover, on a card
+
+Everything above is `cargo-zisk`, one process per proof. This is the same
+stages through `ZiskProver` — one `zisk-sdk` `EmbeddedClient`, initialised once
+and proving for the life of the process, which is what `zkasper-prover-server`
+runs and what the whole streaming design assumes. Until 2026-08-18 it had only
+ever been run on a CPU.
+
+RTX 5090, driver 590.48.01, CUDA 12.9.1, Zisk v1.1.0-alpha, vast.ai, 64 vCPU.
+Six warm repeats per stage over two independent processes.
+
+```sh
+ZKASPER_GPU=1 ZKASPER_REPEATS=3 cargo test --release --features zisk-prover \
+  --test zisk_proof_tests -- --ignored --nocapture warm_stage_times
+```
+
+| stage | published | warm, in process | |
+|---|---:|---:|---:|
+| stage floor — committee proof, 64 members | 3.640 s ± 0.053 | **3.262 s ± 0.155** | −10.4% |
+| group proof | 4.188 s ± 0.061 | **3.770 s ± 0.093** | −10.0% |
+| slot proof | 4.506 s ± 0.393 | **3.822 s ± 0.062** | −15.2% |
+| wrap compression | 0.048 s | **0.050 s ± 0.004** (n=18) | +4.6% |
+
+Every stage is faster than the figure the schedule is built on and the wrap is
+the same, so `docs/architecture.md` is conservative rather than optimistic.
+Only the wrap is like for like: the other three drop the process start and the
+device allocation a per-proof `cargo-zisk` pays, which is the point of holding
+one client open.
+
+**Three repeats understate the spread.** A third process, set up for two ELFs
+rather than three, measured the group proof at 4.140 s — outside the six-sample
+range of 3.669 to 3.931 s. Within one process the stages repeat to about 2.5%;
+across processes they move about 10%. Quote a ± from repeats in one process and
+it will be too tight.
+
+**What initialisation costs, and what the second proof does not pay.**
+
+| | value |
+|---|---:|
+| `EmbeddedClient::build()`, GPU, constant trees already generated | **14.8 s** |
+| ROM setup per guest, cache warm | 37–48 ms |
+| ROM setup per guest, cache cold | 1.9–2.2 s |
+| one-time `REGENERATING_VADCOP_CONST_POLS` | 7.899 s |
+| one-time `REGENERATING_VADCOP_CONST_TREE` | 25.756 s |
+| first run on a fresh box, two ELFs, end to end | **57.1 s** |
+| a later run on the same box, three ELFs | **16.9 s** |
+
+Nothing is re-initialised between proofs and swapping ELFs is free at this
+resolution. Measured as `call − (prove + wrap)` — the client's own native
+circuit run, the serialization, and the switch — where every proof follows a
+proof of a *different* guest:
+
+| stage | gap |
+|---|---:|
+| committee | 9–11 ms |
+| slot proof | 127–129 ms |
+| group | 226–231 ms |
+
+The committee row bounds the ELF switch itself at **under 11 ms**; the other two
+are their own native circuits, which open accumulator paths and run BLS. The
+same quantity on CPU was 0.36 s.
+
 ## `T2 - T`
 
 `T` is the moment the chain has published enough attestations to justify a

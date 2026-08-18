@@ -32,6 +32,11 @@
 //! is behind the `zisk-prover` feature because it drags in the whole Zisk
 //! proving stack, which needs a C++ toolchain and 47 GB of proving key.
 //!
+//! [`crate::remote_prover::RemoteProver`] is the same prover on another machine,
+//! reached over a socket. It is the shape the deployment has, because the box
+//! that holds the GPU must not also hold a beacon node, and it needs none of the
+//! proving stack on the daemon's side.
+//!
 //! [`NativeProver`] implements the same trait by running the guest's
 //! verification logic natively and returning an empty proof. An empty proof is
 //! what `recursion::verify_child` accepts on a native target, so justification

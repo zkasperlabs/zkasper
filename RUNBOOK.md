@@ -295,8 +295,35 @@ cd /root/.openclaw/workspace/zkasper
 cargo build --release --bin zkasperd
 ```
 
-For real proofs add `--features zisk-prover`, and read the CUDA matrix in
-`scripts/gpu_bench.sh` first — **that build needs CUDA 12.9 or newer.**
+For real proofs the proving stack goes on the GPU box, not here. Build
+`--features zisk-prover` **there**, and read the CUDA matrix in
+`scripts/gpu_bench.sh` first — that build needs CUDA 12.9 or newer, and it was
+confirmed against `nvidia/cuda:12.9.1-devel-ubuntu24.04` on 2026-08-18.
+
+```sh
+# on the GPU box, after ziskup --gpu --provingkey
+./scripts/build_guests.sh
+cargo build --release --features zisk-prover --bin zkasper-prover-server
+ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasper-prover-server \
+  --gpu --listen 0.0.0.0:9099 --mode streaming
+```
+
+The token is sent in the clear, so bind the server to a private interface or an
+SSH tunnel — `ssh -N -L 9099:127.0.0.1:9099 <gpu-box>` is enough. Then point the
+daemon at it:
+
+```sh
+cargo build --release --bin zkasperd     # no CUDA needed here
+ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasperd \
+  --prover remote --prover-addr 127.0.0.1:9099 ...
+```
+
+`--stages group,slot_proof` starts a server for part of a pipeline; each guest
+costs a ROM setup and gigabytes of `~/.zisk/cache`, so do not set up nine when
+the run needs two.
+
+Only for a single-box run does the prover go in the daemon: add
+`--features zisk-prover` here and use `--prover zisk`.
 
 ### Step 7 — Check the node still holds the state you will bootstrap from
 
@@ -674,8 +701,12 @@ $4.60. Decide on how many epochs you need proven, not on the hourly rate.
 
 The daemon survives an interruption without doing anything: it holds the store,
 it keeps generating witnesses, and it is the prover connection that fails. That
-is only true once the prover is remote — see §1. Today, with the prover
-in-process, losing the box loses the daemon too.
+is what `--prover remote` buys, and it was measured on 2026-08-18: the server
+was killed mid-run, the client kept its outputs and spooled the witness, the
+server came back and the backfill proved it. **Replacing the box costs ~15 s to
+a warm prover** once its proving key and ROM setups exist — `EmbeddedClient`
+build 14.8 s, ROM setup 37–48 ms per guest — so the 25 minutes above is the cost
+of provisioning a *new* box, not of restarting a server on the same one.
 
 ---
 
