@@ -451,6 +451,14 @@ pub struct RemoteCounters {
     pub proved: u64,
     /// Stages that got no proof because the server was unreachable.
     pub unproven: u64,
+    /// Stages whose witness the server took and never answered for.
+    ///
+    /// Counted apart from the rest because it is a different fault. A server
+    /// that is down refuses the connection; a server that accepts the witness
+    /// and goes silent is a box under memory pressure, a proof slower than
+    /// `request_timeout`, or a prover wedged on one — and only the last of
+    /// those is fixed by waiting longer.
+    pub timed_out: u64,
     pub spooled: u64,
     pub dropped: u64,
     pub recovered: u64,
@@ -461,6 +469,7 @@ pub struct RemoteCounters {
 struct Counters {
     proved: AtomicU64,
     unproven: AtomicU64,
+    timed_out: AtomicU64,
     spooled: AtomicU64,
     dropped: AtomicU64,
     recovered: AtomicU64,
@@ -673,6 +682,7 @@ impl RemoteProver {
         RemoteCounters {
             proved: c.proved.load(Ordering::Relaxed),
             unproven: c.unproven.load(Ordering::Relaxed),
+            timed_out: c.timed_out.load(Ordering::Relaxed),
             spooled: c.spooled.load(Ordering::Relaxed),
             dropped: c.dropped.load(Ordering::Relaxed),
             recovered: c.recovered.load(Ordering::Relaxed),
@@ -685,6 +695,22 @@ impl Drop for RemoteProver {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whether `error` is the connection going quiet rather than going away.
+///
+/// A read or write deadline on a socket surfaces as `WouldBlock` or
+/// `TimedOut` depending on the platform, and both mean the same thing here: the
+/// server has the witness and has said nothing since.
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
+    })
 }
 
 /// Open a connection and learn what the server can prove.
@@ -782,6 +808,9 @@ impl Inner {
         match self.roundtrip(link, request) {
             Ok(reply) => Ok(reply),
             Err(first) => {
+                if is_timeout(&first) {
+                    self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
+                }
                 link.stream = None;
                 match self.roundtrip(link, request) {
                     Ok(reply) => Ok(reply),
@@ -997,6 +1026,19 @@ impl Prover for RemoteProver {
 
     fn program_digest(&self, stage: Stage) -> Option<String> {
         self.inner.program(stage).elf_sha256.clone()
+    }
+
+    fn health(&self) -> Option<crate::prover::ProverHealth> {
+        let c = self.counters();
+        Some(crate::prover::ProverHealth {
+            proved: c.proved,
+            unproven: c.unproven,
+            timed_out: c.timed_out,
+            spooled: c.spooled,
+            recovered: c.recovered,
+            dropped: c.dropped,
+            pending: c.pending,
+        })
     }
 
     fn last_cost(&self) -> Option<ProveCost> {

@@ -152,6 +152,28 @@ impl std::str::FromStr for Stage {
     }
 }
 
+/// How a prover that lives somewhere else is doing.
+///
+/// Every field is a count since the process started.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct ProverHealth {
+    pub proved: u64,
+    /// Stages published without a proof, because the prover could not be
+    /// reached or did not answer.
+    pub unproven: u64,
+    /// Stages whose witness the prover took and never answered for, as opposed
+    /// to refusing the connection. A different fault, and a different fix.
+    pub timed_out: u64,
+    /// Witnesses held on disk for a prover that was not there.
+    pub spooled: u64,
+    /// Witnesses proved later, out of the spool.
+    pub recovered: u64,
+    /// Witnesses dropped because the spool filled before the prover returned.
+    pub dropped: u64,
+    /// Witnesses waiting in the spool now.
+    pub pending: u64,
+}
+
 /// What a proof cost inside the prover.
 ///
 /// The orchestrator times the whole stage, witness generation included; this is
@@ -192,6 +214,16 @@ pub trait Prover: Send + Sync {
 
     /// What the last proof cost, for a prover that produces proofs.
     fn last_cost(&self) -> Option<ProveCost> {
+        None
+    }
+
+    /// How proving has gone, for a prover that can fail apart from the daemon.
+    ///
+    /// `None` for one that cannot: a prover in this process fails by returning
+    /// an error, and there is nothing to report between calls. A prover over a
+    /// network can be down, or silent, or catching up on a backlog, and an
+    /// operator has to be able to see which without reading the log.
+    fn health(&self) -> Option<ProverHealth> {
         None
     }
 
