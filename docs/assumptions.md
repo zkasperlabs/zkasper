@@ -330,6 +330,10 @@ adversarial stake into a one-slot window. The default byzantine threshold is
 - the stage floor, the empty-guest floor, and the per-proof floor and slope
 - the accumulator node cost, the wrap, and the cold penalty
 - every precompile cost, and the VRAM behaviour
+- **recursive verification: 53.087 s per child**, linear from 2 children to 23,
+  with an intercept that lands on the stage floor. It was carried as zero for as
+  long as nothing could measure it, and it is larger than every other constant
+  in the model put together.
 
 **Carried forward from Zisk v1.0.0-alpha**: the cost per opened validator and
 the cost per committee member. The attester sweep cannot be reproduced, because
@@ -339,12 +343,11 @@ look worse than it is.
 
 **Modelled, not measured**:
 
-- **`T2 - T` is 5.5 s in a model**, over measured per-stage times. **No
-  streaming epoch has a real end-to-end proof yet.**
-- **Recursive verification is a parameter with a default of zero.** Both stages
-  that exercise it can only be proved with it removed. Their fixtures carry stub
-  child proofs. It is not a zero, and at 1 s per child the schedule
-  needs a second GPU.
+- **`T2 - T` is 117.7 s in a model** over measured per-stage times, on two GPUs.
+  A production stream-final proof took 148.2 s four times within ±1.1 s, so the
+  model and the one real measurement agree to within the difference between a
+  synthetic epoch and a live one. **The 5.5 s this document used to quote was
+  computed with recursion priced at zero and is withdrawn.**
 - **The Fp2-tower rate is fitted**, with a bracket from 162M to 268M units per
   second. Nothing in the campaign runs BLS at mainnet scale.
 - **The committee proof cost at mainnet scale is an extrapolation** from

@@ -246,6 +246,64 @@ The committee row bounds the ELF switch itself at **under 11 ms**; the other two
 are their own native circuits, which open accumulator paths and run BLS. The
 same quantity on CPU was 0.36 s.
 
+## Recursive verification
+
+**The single largest cost in the pipeline, and it was carried as zero.**
+
+```sh
+./scripts/build_guests.sh committee-proof-guest slot-proof-guest justification-guest
+ZKASPER_GPU=1 cargo test --release --features zisk-prover \
+  --test zisk_proof_tests -- --ignored --nocapture recursion_cost_curve
+```
+
+One justification link per point, over real child proofs, varying how many it
+verifies. RTX 5090, driver 580.159.03, CUDA 12.9.1, Zisk v1.1.0-alpha, warm
+in-process prover, 2026-08-18.
+
+| children | prove | marginal | fit |
+|---:|---:|---:|---:|
+| 2 | **105.787 s** | | 109.6 s |
+| 3 | **161.345 s** | 55.56 s | 162.7 s |
+| 4 | **221.546 s** | 60.20 s | 215.8 s |
+| 23 | 1,224 s (mainnet epoch 469424, production) | 52.76 s | 1,224.5 s |
+
+**It is linear, and the intercept is the stage floor.** Least squares over the
+four is **3.47 s + 53.087 s a child**, and no point sits more than 5.7 s off it
+across a span of 2 to 23 children. The intercept lands on the measured 3.640 s
+stage floor, which is the cost model decomposing exactly as it claims to: a
+proof is a floor plus its work, and a child is 53 s of work.
+
+Nothing in the shape suggests a fixed cost that many children could amortise,
+and nothing suggests it gets worse than linear either. That was the open
+question — 1,224/22 divides to 55.6 whether the cost is per child or per proof —
+and three points between 2 and 4 settle it: the second child costs the same as
+the twenty-third.
+
+**A recursion costs fifteen proofs.** Against the 3.640 s stage floor, one
+recursive verification is worth more than fifteen whole proofs of anything else
+here: a slot proof is 4.2 s, a committee proof over 64 members is 3.3 s, a
+mainnet slot inside a proof already running is about 1 s. Every other constant
+in `ProverModel` put together is noise beside it.
+
+**What it inverts.** The model carried it as zero, and a zero implies that
+splitting work into more proofs is free. It is the opposite:
+
+- **Children, not proofs, are the cost.** Twenty-two slots proven one at a time
+  are twenty-two children — 1,222 s of recursion — where the same slots in two
+  groups are two children, 111 s. Grouping is the whole of the saving.
+- **A fold buys latency, never throughput.** Absorbing `k` children into a fold
+  pays `k + 1` recursions to take `k` off whoever would otherwise have verified
+  them. It is worth doing for the children that would otherwise land between `T`
+  and `T2`, and never for any other reason.
+- **Bounding a proof's child count costs work.** It is still right — a proof
+  whose size is the epoch's is a proof that grows with the chain — but it is a
+  safety property that is paid for, not a saving.
+
+The measurement is possible at all only because a real prover is behind it. The
+fixtures carry stub child proofs, and a guest rejects an empty proof, so every
+earlier attempt to measure this had to remove the recursion first and measured
+the remainder.
+
 ## `T2 - T`
 
 `T` is the moment the chain has published enough attestations to justify a
@@ -255,35 +313,54 @@ checkpoint. `T2` is the moment a wrapped proof exists.
 cargo test --release --test ssz_file_tests test_ssz_file_streaming_schedule -- --ignored --nocapture
 ```
 
-On mainnet epoch 430529, 2,212,730 validators, the schedule needs **one GPU**
-and puts `T2 - T` at **5.5 s**. It reports one GPU at every lane budget from one
-to six, because the pipeline is deadline-bound and not throughput-bound: a group
-proof cannot start before its blocks exist.
+On mainnet epoch 430529, 2,212,730 validators, the schedule needs **two GPUs**
+and puts `T2 - T` at **117.7 s**.
 
-**This is a model over measured per-stage times. No streaming epoch has been
-proven end to end.**
+**It was 5.5 s on one GPU until recursion was measured, and that number is
+withdrawn.** The model carried `recursion_verify_s` as zero; it is 53.087 s, and
+the final proof of an epoch verifies two children it cannot avoid — the running
+aggregate and the previous epoch's justification. Those two are 106 s of the
+117.7, and everything the schedule can actually choose is the remaining 12.
+
+The production run agrees, independently and from the other direction: a real
+stream-final proof took **148.2 s over four epochs, within ±1.1 s**, and did not
+move when its nominal work did — `tail_named` ranged from 54 to 1,319 attesters
+for the same 148 s. A cost that ignores the work in front of it is a cost per
+child.
+
+**This is a model over measured per-stage times, and it is now anchored at both
+ends: per-stage times measured warm, and a whole epoch measured in production.**
 
 What it is sensitive to:
 
 | | `T2 - T` | GPUs |
 |---|---:|---:|
-| stage floor 2.43 s (an empty guest) | 4.3 s | 1 |
-| **stage floor 3.64 s (measured)** | **5.5 s** | **1** |
-| stage floor 7.18 s (the v1.0.0-alpha floor) | 9.1 s | 1 |
-| stage floor 20.00 s | 23.1 s | 1 |
-| Fp2-tower rate 162M units/s (the slow bracket) | 5.9 s | 1 |
-| Fp2-tower rate 400M units/s (the fast end) | 4.7 s | 1 |
-| recursive verification 1 s per child | 6.5 s | 2 |
-| recursive verification 5 s per child | 11.8 s | 2 |
+| **recursion 53.087 s per child (measured)** | **117.7 s** | **2** |
+| recursion 5 s per child | 11.8 s | 2 |
+| recursion 1 s per child | 6.5 s | 2 |
+| recursion 0 s per child (what the model used to assume) | 5.5 s | 1 |
+| stage floor 2.43 s (an empty guest) | 115.0 s | 2 |
+| **stage floor 3.64 s (measured)** | **117.7 s** | **2** |
+| stage floor 20.00 s | 135.4 s | 2 |
+| Fp2-tower rate 162M units/s (the slow bracket) | 118.5 s | 2 |
+| Fp2-tower rate 400M units/s (the fast end) | 115.8 s | 2 |
 
-`T2 - T` tracks the stage floor almost one for one. The Fp2-tower rate, which is
-the largest uncertainty in the model, moves it by 1.2 s across its whole
-bracket. Recursive verification, which nothing has measured, is worth more than
-that.
+**Recursion is the whole answer and everything else is rounding.** The stage
+floor moves `T2 - T` by 20 s across a ten-fold range; the Fp2-tower rate, which
+is the largest *uncertainty* in the model, moves it by 2.7 s across its whole
+bracket. One child of recursion is worth more than both together.
+
+**The critical path is two recursions, and one of them need not be there.** The
+final proof has to verify the running aggregate — that is what an aggregate is
+for. It also verifies the previous epoch's justification, and that proof exists
+an epoch early, exactly like the epoch diff and the committee proof, both of
+which were already moved into the fold that opens the epoch for this reason.
+Moving the third one there would take 53 s off `T2 - T` and is the largest
+single latency win available.
 
 **The trigger threshold dominates every prover term.** At 66 to 68% of the stake
-the epoch closes on 22 slots and `T2 - T` is 5.5 s. At 69 to 70% it waits for a
-23rd slot and pays 21.6 s. The default is 2/3 exactly, which is the rule the
+the epoch closes on 22 slots and `T2 - T` is 117.7 s. At 69 to 70% it waits for
+a 23rd slot and pays 133.7 s. The default is 2/3 exactly, which is the rule the
 circuit enforces.
 
 **Warm and cold are different products.** The cold penalty is 5.80 s of process
@@ -384,10 +461,6 @@ steps, and pointing the curve precompile at the running sum cut it to 254.
 
 ## What is still unmeasured
 
-- **Recursive verification.** Both stages that exercise it can only be proved
-  with it removed. Their fixtures carry stub child proofs, and a panicking guest
-  never returns from `ziskemu`. It is a parameter with a default
-  of zero, and it is not a zero.
 - **BLS at mainnet scale.** One sweep over distinct message count closes the
   Fp2-tower bracket.
 - **A streaming epoch, proven end to end.** `scripts/gpu_bench.sh` is what that

@@ -12,20 +12,29 @@ use super::Pipeline;
 
 /// Attestation slots one slot proof covers, by default.
 ///
-/// Four, which puts a mainnet epoch's ~22 slots into six proofs instead of
-/// twenty-two. It is bounded rather than unbounded for the same reason the fold
-/// is: a proof whose size is the epoch's is a proof that grows with the chain.
-pub const DEFAULT_SLOT_GROUP_WIDTH: usize = 4;
+/// **Eleven, and it is this large because a child is the expensive thing.**
+/// A recursive verification is
+/// [`crate::streaming::ProverModel::recursion_verify_s`] — 55.56 s, MEASURED —
+/// against 1.01 s for a mainnet slot inside a proof that is already running and
+/// 3.64 s for the proof itself. So a slot that shares a proof with ten others
+/// costs a hundredth of a slot that brings its own recursion, and grouping is
+/// the whole of the saving: a mainnet epoch's ~22 slots become two children
+/// rather than twenty-two.
+///
+/// It is a bound and not a target. A group covers at most this many slots
+/// whatever the epoch does, so no proof here grows with the chain — which is
+/// the property that was lost when one justification verified the whole epoch.
+pub const DEFAULT_SLOT_GROUP_WIDTH: usize = 11;
 
 /// Slot proofs one link of the justification chain absorbs, by default.
 ///
-/// Two, because a link's cost is a floor plus a recursion per child and the
-/// recursion is the expensive half: a link of two verifies three children —
-/// its predecessor and two slot proofs — which is the same shape the streaming
-/// fold has. Widening it trades fewer proofs for a bigger trace in each, and
-/// past a handful of children the trace stops being the linear thing the trade
-/// assumes. `BENCHMARKS.md` has the curve that set this.
-const DEFAULT_JUSTIFICATION_FOLD_WIDTH: usize = 2;
+/// Four, on the same reasoning and pointing the same way. A link costs a floor
+/// plus a recursion for each slot proof it takes *and* one for the link before
+/// it, so a narrow link is a chain of many links each paying that extra
+/// recursion. On mainnet the two groups above fit in one link of three children
+/// — the committee proof and both slot proofs — and the chain never forms at
+/// all; it is here for the epochs where it has to.
+const DEFAULT_JUSTIFICATION_FOLD_WIDTH: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct OrchestratorConfig {
@@ -59,10 +68,12 @@ pub struct OrchestratorConfig {
     /// How many slot proofs one link of the justification chain absorbs.
     ///
     /// The batch path used to fold the whole epoch at once, which is where its
-    /// 1,221 s justification came from. Recursion costs
-    /// [`crate::streaming::ProverModel::recursion_verify_s`] a child and grows
-    /// faster than linearly past a handful of them, so a link stays small and
-    /// the chain stays long. See [`crate::streaming`] for the trade.
+    /// 1,221 s justification came from — 23 children at
+    /// [`crate::streaming::ProverModel::recursion_verify_s`] each. Bounding the
+    /// link is what stops that number being the epoch's size; it is not what
+    /// makes it small, because recursion is linear in children and a chain pays
+    /// one more of them per link. Both widths are therefore bounds set as wide
+    /// as the bound allows.
     pub justification_fold_width: usize,
     pub pipeline: Pipeline,
     /// When the streaming pipeline stops collecting, and how long the trigger
