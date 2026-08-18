@@ -588,9 +588,24 @@ the same one epoch a daemon restart costs — plus the prover's setup on the
 replacement box, which is the expensive part: **~16 min** for apt, rustup and the
 3.2 GB proving key, plus **~4.6 min** for the first ELF's one-time constant-tree
 regeneration and ~14 s for each ELF after. Call it **25 minutes to a warm prover**,
-about 4 epochs. At 55–60% of on-demand you break even on one interruption per
-~11 hours, so interruptible is the better buy for a day and a close call for a
-month.
+about 4 epochs.
+
+**On money, interruptible wins easily.** Take the midpoints: $0.43/hr on-demand
+against $0.24/hr interruptible, and 0.42 hr of paid-but-unproductive setup per
+interruption. Running H hours with N interruptions costs `0.24(H + 0.42N)`
+against `0.43H`, so interruptible is cheaper while `N < 1.9H` — about two
+interruptions an hour. No real interruption rate comes close, so **buy
+interruptible.**
+
+**The cost that matters is coverage, not dollars.** Each interruption is ~25
+minutes with no prover, which is **4 epochs of a day's 225, or 1.8%**. Ten
+interruptions in a day would still be under 20% of epochs missed and would save
+$4.60. Decide on how many epochs you need proven, not on the hourly rate.
+
+The daemon survives an interruption without doing anything: it holds the store,
+it keeps generating witnesses, and it is the prover connection that fails. That
+is only true once the prover is remote — see §1. Today, with the prover
+in-process, losing the box loses the daemon too.
 
 ---
 
