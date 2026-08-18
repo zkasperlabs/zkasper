@@ -529,7 +529,8 @@ the epoch redone with no `recent_latencies` entry for it.
 | lighthouse RSS | **5.8 GB** | With `--subscribe-all-subnets` and multiplier 2000. |
 | Node datadir | **947 MB** after 15 minutes | Checkpoint-synced, backfill running. Budget 450+ GB for a month with default `--hierarchy-exponents`. |
 | `zkasperd.db` | **343 MB** | Rewritten whole twice an epoch. |
-| `out/` | **110 MB per epoch** | Witness files. **7.7 GB/day, 232 GB/month.** Prune or ship them. |
+| `out/` | **110–120 MB per epoch** | Witness files, of which `committee.bin` is 113 MB. At 225 epochs a day that is **~26 GB/day, ~780 GB/month** — larger than the beacon database. Prune or ship them; nothing re-reads a closed epoch's directory. |
+| bootstrap epoch dir | **986 MB** | One-off, holds the bootstrap witness. |
 | SSE ingest | 28,033 events/slot | ~1.47 MB/s sustained, 3.8 TB/month if it crosses a network. |
 
 Machine: 8 cores, 32 GB RAM and 1 TB is the floor for daemon + node with a mock
