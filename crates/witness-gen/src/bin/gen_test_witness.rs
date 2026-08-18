@@ -195,12 +195,14 @@ fn gen_epoch_diff(output_path: &str) {
 // Slot proof
 // ---------------------------------------------------------------------------
 
-/// Two slots of two validators each.
+/// Two committees, `per_slot` validators each.
 ///
-/// Small, but the shape is the real one: a committee summed out of the
-/// accumulator, a derived aggregate key, and an absentee opened against a leaf.
-fn fixture() -> Epoch {
-    Epoch::new(CONFIG, 100, 2, 2)
+/// Small by default, but the shape is the real one: a committee summed out of
+/// the accumulator, a derived aggregate key, and an absentee opened against a
+/// leaf. The size is a parameter so a bench can generate a witness at whatever
+/// scale it wants to measure.
+fn fixture(per_slot: usize) -> Epoch {
+    Epoch::new(CONFIG, 100, 2, per_slot)
 }
 
 /// Build the witness for one slot's complement.
@@ -221,7 +223,7 @@ fn slot_witness(fixture: &Epoch, slot_in_epoch: u64, absent: &[u64]) -> SlotProo
 }
 
 fn gen_slot_proof(output_path: &str) {
-    let fixture = fixture();
+    let fixture = fixture(2);
     let witness = slot_witness(&fixture, 0, &[1]);
 
     let bytes = bincode::serialize(&witness).unwrap();
@@ -237,7 +239,7 @@ fn gen_slot_proof(output_path: &str) {
 // ---------------------------------------------------------------------------
 
 fn gen_justification(output_path: &str) {
-    let fixture = fixture();
+    let fixture = fixture(2);
 
     let outputs: Vec<SlotProofOutput> = (0..2)
         .map(|slot| {
@@ -274,7 +276,7 @@ fn gen_justification(output_path: &str) {
 // ---------------------------------------------------------------------------
 
 fn gen_finalization(output_path: &str) {
-    let data = fixture();
+    let data = fixture(2);
     let epoch_e = 100u64;
     let epoch_e1 = 101u64;
     // The finalized root must be the header's own root, since the circuit now
@@ -351,11 +353,11 @@ fn gen_finalization(output_path: &str) {
 /// Miller accumulator is bound by the aggregate that folds it, and the
 /// aggregate's counted-set root by the proof that closes the epoch — so they are
 /// generated from one run rather than assembled separately.
-fn gen_stream(output_path: &str, stage: &str) {
+fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
     use zkasper_common::types::{EpochDiffOutput, PreviousJustification};
     use zkasper_witness_gen::streaming::{self, StreamPolicy};
 
-    let data = fixture();
+    let data = fixture(n_validators / 2);
     let epoch = data.epoch;
     let target_root = data.target_root;
 
@@ -445,10 +447,10 @@ fn gen_stream(output_path: &str, stage: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
+    if args.len() != 3 && args.len() != 4 {
         eprintln!(
             "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|justification|finalization|\
-             group-proof|aggregation|stream-final> <output-path>"
+             group-proof|aggregation|stream-final> <output-path> [n-validators]"
         );
         std::process::exit(1);
     }
@@ -459,7 +461,13 @@ fn main() {
         "slot-proof" => gen_slot_proof(&args[2]),
         "justification" => gen_justification(&args[2]),
         "finalization" => gen_finalization(&args[2]),
-        stage @ ("group-proof" | "aggregation" | "stream-final") => gen_stream(&args[2], stage),
+        stage @ ("group-proof" | "aggregation" | "stream-final") => gen_stream(
+            &args[2],
+            stage,
+            args.get(3)
+                .map(|a| a.parse().expect("n-validators must be an integer"))
+                .unwrap_or(4),
+        ),
         other => {
             eprintln!("unknown proof type: {other}");
             std::process::exit(1);
