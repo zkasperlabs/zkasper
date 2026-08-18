@@ -57,6 +57,8 @@ set -euo pipefail
 # Usage: ./scripts/gpu_bench.sh
 #
 # Requires: NVIDIA driver >= 525.60.13, ~150 GB free disk, ~32 GB RAM.
+# For the in-process prover (--features zisk-prover) also CUDA >= 12.9;
+# see the CUDA matrix under step 1.
 #
 # Disk is the easy thing to underestimate. On v1.1.0-alpha the downloaded
 # proving key is 31 GB, and the first `setup`/`prove` regenerates constant trees
@@ -127,19 +129,47 @@ echo "=== 1. System dependencies ==="
 # (libsodium23 is the runtime; the build wants sodium.h. protobuf-compiler alone
 # is not enough - prost needs the well-known .proto files from libprotobuf-dev.)
 #
-# With all five installed the build still FAILS on CUDA 12.8.1, in
-# mem-planner-cpp:
+# With all five installed the build FAILS on CUDA 12.8.1, in mem-planner-cpp:
 #     cub/agent/agent_reduce_by_key.cuh(210): error: no instance of function
 #     template "cuda::std::__4::equal_to<void>::operator()" matches the argument list
-# That was zisk v1.0.0-alpha against CUDA 12.8 CCCL, not anything about this
-# repo. Use an older CUDA image if you need the in-process prover; the prebuilt
-# cargo-zisk from ziskup is unaffected and is what this script uses.
 #
-# UNRETESTED on v1.1.0-alpha. The v1.1.0-alpha campaign ran on
-# nvidia/cuda:12.6.3-devel-ubuntu24.04 and never exercised the 12.8 path.
-# `state-machines/mem-cpp/cu/count_and_plan.cu` was rewritten between the tags
-# (224 lines, part of "porting mops to GPU"), so the failure may well be gone —
-# but nobody has checked. Assume 12.4/12.6 until someone does.
+# SETTLED 2026-08-18, and the earlier advice here was wrong twice over.
+#
+# The cause is one CUB call, `state-machines/mem-cpp/cu/count_and_plan.cu`:
+#     cub::DeviceRunLengthEncode::Encode(.., thrust::discard_iterator<>{}, ..)
+# CUB instantiates `Equality` on the discard iterator's value type,
+# `thrust::detail::any_assign`, which has no `operator==`. Nothing about zisk or
+# this repo; a CCCL regression, present in CCCL 2.5 and 2.7 and fixed in 2.8.
+#
+# Measured by compiling that translation unit under four toolkits. nvcc needs no
+# GPU for this — the failure is a header template error — so the whole matrix
+# runs in docker on any box, in minutes, for nothing:
+#     docker run --rm -v $PWD:/w nvidia/cuda:<tag>-devel-ubuntu24.04 \
+#       nvcc -O3 -std=c++20 -gencode arch=compute_120,code=sm_120 \
+#       -Xcompiler -fPIC -c /w/count_and_plan.cu -o /tmp/o.o
+#
+#   CUDA     CCCL/CUB   sm_89 (4090)   sm_120 (5090)
+#   12.6.3   2.5.0      FAIL           nvcc: "Unsupported gpu architecture"
+#   12.8.1   2.7.0      FAIL           FAIL
+#   12.9.1   2.8.2      OK             OK
+#   13.0.1   3.x        OK             OK
+# Identical results for the v1.0.0-alpha and v1.1.0-alpha sources: the rewrite
+# between the tags did not touch the failing call, which is byte-identical.
+#
+# So: **build --features zisk-prover on CUDA 12.9 or newer.** The old advice to
+# "use an older CUDA image" was wrong in both directions — 12.6 fails the same
+# way, and it additionally cannot emit sm_120 at all, so it can never build the
+# in-process prover for a 5090 whatever CCCL does.
+#
+# 12.6 was never contradicted by the v1.1.0-alpha campaign because that campaign
+# used the prebuilt cargo-zisk from ziskup, which is a binary and does not
+# compile CUDA. Only the from-source `--features zisk-prover` build hits this.
+#
+# If you are pinned to <= 12.8 for another reason, two lines fix it (verified on
+# 12.8.1/sm_120): include <cub/iterator/discard_output_iterator.cuh> instead of
+# <thrust/iterator/discard_iterator.h>, and pass cub::DiscardOutputIterator<>{}
+# in place of thrust::discard_iterator<>{} at both call sites. Do not carry that
+# patch onto 13.x — the CUB header moved, and 13.x needs no patch.
 sudo apt-get update -qq
 for pkg in \
   build-essential curl git jq xz-utils nasm python3 ca-certificates \

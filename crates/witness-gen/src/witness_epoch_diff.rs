@@ -1,7 +1,7 @@
 //! Assemble an EpochDiffWitness between two beacon states.
 
 use anyhow::{Context, Result};
-use tracing::{info, info_span};
+use tracing::{info, info_span, warn};
 
 use zkasper_common::acc;
 use zkasper_common::ssz::validator_hash_tree_root;
@@ -149,6 +149,15 @@ pub async fn build(
             );
             (proof.state_root, proof.siblings)
         } else {
+            // Nothing downstream can tell this apart from a real state root, and
+            // it is what anchors the accumulator chain to the beacon chain. A
+            // node that stops serving the debug endpoint mid-run would otherwise
+            // degrade silently, so say so on every epoch it happens.
+            warn!(
+                slot = slot_2,
+                "the node does not serve the debug state endpoint; \
+                 anchoring this epoch on a synthetic state root",
+            );
             make_state_proof(&new_data_root, num_validators_2)
         };
 

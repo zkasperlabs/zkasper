@@ -1650,11 +1650,28 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 root
             }
         };
-        let fork_version = self
-            .api
-            .get_fork_version(&state_id)
-            .await
-            .context("fetch fork version")?;
+        // A checkpoint-synced node keeps only the states after its anchor, so the
+        // first slot of an epoch it is still working through can be a 404 - which
+        // would wedge the daemon on that epoch for as long as it ran. The fork
+        // version is a property of the fork schedule rather than of the state, so
+        // head answers for any epoch in the same fork period, which every epoch a
+        // following daemon works on is. Pass --signing-domain to pin it across a
+        // fork boundary.
+        let fork_version = match self.api.get_fork_version(&state_id).await {
+            Ok(version) => version,
+            Err(e) => {
+                warn!(
+                    epoch,
+                    state_id,
+                    error = %e,
+                    "no state to read the fork version from; taking head's",
+                );
+                self.api
+                    .get_fork_version("head")
+                    .await
+                    .context("fetch fork version at head")?
+            }
+        };
         Ok(compute_domain(
             &DOMAIN_BEACON_ATTESTER,
             &fork_version,
