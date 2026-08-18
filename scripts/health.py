@@ -11,7 +11,7 @@ Run it from cron or a monitoring agent. Nothing here writes anything.
 
 WHAT THE THRESHOLDS MEAN. Each is a claim about the deployment, not a taste:
 
-  stale > 120 s      The manifest is rewritten after every stage, about five
+  stale > 300 s      The manifest is rewritten after every stage, about five
                      times a second during a streaming epoch and every poll
                      interval otherwise. Two minutes of silence is a dead or
                      wedged daemon, and every other field is then untrustworthy.

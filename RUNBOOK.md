@@ -98,7 +98,7 @@ zkasperd needs more from a node than a validator does. All three must hold.
 | # | Requirement | Why |
 |---|---|---|
 | 1 | `--subscribe-all-subnets` | The `single_attestation` topic only carries subnets the node joined. A default node joins **2 of 64** (`SUBNETS_PER_NODE: 2`), so its feed is 3.1% of gossip. |
-| 2 | `--http-sse-capacity-multiplier` ≥ 2000 | Lighthouse buffers each SSE topic in a broadcast ring of `multiplier × 16`. The default multiplier is 1, so **16 messages** against a slot's 28,130. |
+| 2 | `--http-sse-capacity-multiplier` **20000** | Lighthouse buffers each SSE topic in a broadcast ring of `multiplier × 16`. The default multiplier is 1, so **16 messages** against a slot's 28,130. 2000 gives 32,000 — only **1.1 slots** of headroom, so one stalled slot drops attestations. **20000 gives 320,000, about 11 slots, for roughly 128 MB of ring.** Overshoot deliberately: the ring is cheap and a drop is silent and unrecoverable. |
 | 3 | `/eth/v2/debug/beacon/states/{id}` enabled | Bootstrap reads the whole `BeaconState` from it, and **so does every epoch diff** — it is a continuous dependency, not a one-off. |
 
 **Subscribe to `single_attestation`, not `attestation`.** Since Electra,

@@ -19,11 +19,35 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-STATUS = "/mnt/ssd/zkasper-run/out/status.json"
+DEFAULT_STATUS = "/mnt/ssd/zkasper-run/out/status.json"
+
+
+def status_path():
+    """Where the *running* daemon writes, not where one used to.
+
+    A hardcoded path made this check fail loudly the moment the daemon was
+    restarted with a different --output-dir, which is the fastest way to teach
+    an operator to ignore an alert. Ask the process instead, and fall back only
+    when nothing is running.
+    """
+    try:
+        pids = subprocess.run(["pgrep", "-f", "release/zkasperd"],
+                              capture_output=True, text=True, timeout=15).stdout.split()
+        for pid in pids:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            for i, a in enumerate(argv):
+                if a == b"--output-dir" and i + 1 < len(argv):
+                    return str(Path(argv[i + 1].decode()) / "status.json")
+    except Exception:
+        pass
+    return DEFAULT_STATUS
 VAST_KEY_FILE = "/root/.openclaw/workspace/.vast-api"
 API = "https://api.zkasper.com/v1/status"
 SITE = "https://zkasper.com"
-STALE_S = 120
+# A single committee proof runs ~132 s and the manifest is not rewritten inside
+# a stage, so a 120 s threshold fires on healthy proving. Above the longest
+# stage, below an epoch.
+STALE_S = 300
 
 
 def check(name, ok, detail):
@@ -33,9 +57,9 @@ def check(name, ok, detail):
 def daemon():
     """The daemon, from the manifest it rewrites after every stage."""
     try:
-        s = json.loads(Path(STATUS).read_text())
+        s = json.loads(Path(status_path()).read_text())
     except Exception as e:
-        return [check("daemon", False, f"no manifest: {e}")]
+        return [check("daemon", False, f"no manifest at {status_path()}: {e}")]
 
     out, age = [], time.time() - s.get("updated_unix", 0)
     out.append(check("daemon", age <= STALE_S,
