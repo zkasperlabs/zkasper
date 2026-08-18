@@ -226,7 +226,10 @@ impl Prover for NativeProver {
 
     fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
         let output = run_circuit(Stage::Committee, || {
-            zkasper_common::committee::verify(witness, self.config.acc_tree_depth)
+            zkasper_common::committee::verify(
+                &zkasper_common::committee::encode(witness),
+                self.config.acc_tree_depth,
+            )
         })?;
         Ok((output, Proof::new()))
     }

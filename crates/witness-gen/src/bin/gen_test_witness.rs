@@ -235,6 +235,32 @@ fn gen_slot_proof(output_path: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Committee
+// ---------------------------------------------------------------------------
+
+/// A whole epoch of committees, which is the one witness whose size is the
+/// validator set rather than the absentees — and therefore the only one whose
+/// framing was ever worth measuring.
+///
+/// `n_validators` is spread over all the epoch's slots, so the shape is
+/// mainnet's: one bucket per slot, every index opened exactly once, and the
+/// opened set one contiguous range.
+fn gen_committee(output_path: &str, n_validators: usize) {
+    let slots = CONFIG.slots_per_epoch;
+    let fixture = Epoch::new(CONFIG, 100, slots, n_validators.div_ceil(slots as usize));
+
+    let bytes = zkasper_common::committee::to_bytes(&zkasper_common::committee::encode(
+        &fixture.committees.witness,
+    ));
+    std::fs::write(output_path, &bytes).unwrap();
+    eprintln!(
+        "wrote committee witness: {} members, {} bytes -> {output_path}",
+        fixture.committees.witness.members.len(),
+        bytes.len(),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Justification
 // ---------------------------------------------------------------------------
 
@@ -449,8 +475,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 && args.len() != 4 {
         eprintln!(
-            "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|justification|finalization|\
-             group-proof|aggregation|stream-final> <output-path> [n-validators]"
+            "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|committee|justification|\
+             finalization|group-proof|aggregation|stream-final> <output-path> [n-validators]"
         );
         std::process::exit(1);
     }
@@ -459,6 +485,12 @@ fn main() {
         "bootstrap" => gen_bootstrap(&args[2]),
         "epoch-diff" => gen_epoch_diff(&args[2]),
         "slot-proof" => gen_slot_proof(&args[2]),
+        "committee" => gen_committee(
+            &args[2],
+            args.get(3)
+                .map(|a| a.parse().expect("n-validators must be an integer"))
+                .unwrap_or(64),
+        ),
         "justification" => gen_justification(&args[2]),
         "finalization" => gen_finalization(&args[2]),
         stage @ ("group-proof" | "aggregation" | "stream-final") => gen_stream(

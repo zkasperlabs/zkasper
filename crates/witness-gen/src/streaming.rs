@@ -48,7 +48,13 @@
 //! comfortably. What it cannot do is start before the attestations exist. Extra
 //! GPUs buy the *bulk* of the epoch — and the committee proof the next epoch
 //! needs — but never the end of it, which is why [`Schedule::lanes`] settles low
-//! for the deadline and is then driven by the committee proof alone.
+//! and stays there.
+//!
+//! The committee proof used to be the exception that sized the fleet: 1,950 s
+//! against a 384 s epoch, five cards' worth, cut into chunks to fit. It is
+//! 169 s now — the model was charging it the whole registry rather than the
+//! active set, and the guest was spending 94% of it deserialising a witness it
+//! was handed in its own memory layout. One card, one chunk, inside the epoch.
 //!
 //! # Margin
 //!
@@ -149,6 +155,21 @@ pub struct ProverModel {
     /// attesters is 878.2 us +/- 6.5, less one internal node for the contiguous
     /// range it opened.
     pub per_validator_s: f64,
+    /// Seconds per committee member: the same leaf and the same curve addition,
+    /// out of a witness the guest does not parse.
+    ///
+    /// MEASURED under `ziskemu -X` on the committee guest itself, at 16,000,
+    /// 32,000 and 64,000 members: 328.0 executed steps and 36,473 cost units a
+    /// member, linear to five figures. Converted at the rate the attester sweep
+    /// sets for this work class — 223,450 units bought 834.7 us — which is a
+    /// within-class ratio and not a proving time of its own; the step ratio
+    /// 328 / 2,311 puts it at 124.6 us, so the two yardsticks agree to 0.2%.
+    ///
+    /// It was 404.5 us while the witness travelled as bincode, which is what
+    /// made this proof 94% of the fleet. A `CommitteeMember` is fifteen `u64`s
+    /// in the layout the guest already wants, and decoding it as fifteen
+    /// self-describing records cost 829 of the 1,157 steps a member took.
+    pub per_member_s: f64,
     /// Seconds per internal accumulator node above the opened leaves.
     ///
     /// MEASURED: the 29-point poseidon2 sweep gives 69,714,770 cost units/s on
@@ -182,6 +203,7 @@ impl Default for ProverModel {
         Self {
             stage_floor_s: 7.176,
             per_validator_s: 834.7e-6,
+            per_member_s: 124.9e-6,
             acc_node_s: 43.5e-6,
             bls_units_per_second: 207_400_000.0,
             wrap_s: 0.157,
@@ -202,9 +224,11 @@ impl ProverModel {
         leaves * self.per_validator_s + scattered_nodes(leaves, depth) * self.acc_node_s
     }
 
-    /// The same, when the leaves are one index range.
+    /// The same, when the leaves are one index range and the guest reads them
+    /// in place rather than deserialising them — which is the committee proof
+    /// and only the committee proof.
     fn open_contiguous_s(&self, leaves: f64, depth: u32) -> f64 {
-        leaves * self.per_validator_s + contiguous_nodes(leaves, depth) * self.acc_node_s
+        leaves * self.per_member_s + contiguous_nodes(leaves, depth) * self.acc_node_s
     }
 
     /// Rebuilding the 32-leaf committee tree from its summed buckets.
@@ -277,11 +301,12 @@ impl ProverModel {
     /// the 32 partial buckets rather than a root, so only the last proof in the
     /// chain builds the tree.
     ///
-    /// This is the stage the time model moved most. At 1,050,000 validators one
-    /// chunk is about 929 s — 2.4 epochs of a single card — against the 215 s
-    /// the cost-unit model claimed, because the model counted a leaf hash and a
-    /// curve addition per validator and none of the 2,311 executed steps that go
-    /// with them.
+    /// `validators` is the *active* set, not the registry: committees are
+    /// formed from active validators, and those are the only leaves this proof
+    /// opens. At mainnet's 960,974 one chunk is about 169 s, which is inside
+    /// the 384 s epoch that owes it, so the pipeline no longer needs the proof
+    /// cut up at all. It was 1,950 s when the model charged the whole
+    /// 2,212,792-entry registry at the bincode witness's 448 us a validator.
     pub fn committee_chunk_s(&self, validators: f64, chunks: f64) -> f64 {
         let share = validators / chunks;
         self.stage_floor_s
@@ -1379,15 +1404,17 @@ mod tests {
     }
 
     /// The committee proof the next epoch needs is fixed two epochs ahead, so it
-    /// is the one thing extra cards buy: it fills whatever the deadline work
-    /// leaves and never moves `T2`.
+    /// fills whatever the deadline work leaves and never moves `T2`.
+    ///
+    /// It used to need cards of its own on top of that, and does not any more:
+    /// at a million members one chunk is 176 s against a 384 s epoch, so it
+    /// lands inside the epoch that owes it, in one piece, on the card the
+    /// deadline work had already idle.
     #[test]
     fn the_committee_proof_costs_throughput_and_not_latency() {
         let units = even_epoch();
         let policy = StreamPolicy {
             validators: 1_000_000.0,
-            committee_chunks: 4,
-            lanes: 4,
             ..with_floor(MEASURED_FLOOR_S)
         };
         let with = schedule(&units, 100, &policy);
@@ -1397,10 +1424,15 @@ mod tests {
             (with.latency_s() * 10.0).round(),
             (without.latency_s() * 10.0).round(),
         );
-        assert!(with.committee_done_s > 0.0);
-        assert!(
-            with.lanes > without.lanes,
-            "the chunks found no card to run on",
+        assert!(with.total_prover_s > without.total_prover_s);
+        assert_eq!(
+            with.committee_overrun_s(),
+            0.0,
+            "the committee proof is late"
+        );
+        assert_eq!(
+            with.lanes, without.lanes,
+            "the committee proof took a card of its own",
         );
     }
 

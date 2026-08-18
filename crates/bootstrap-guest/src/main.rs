@@ -8,7 +8,7 @@ ziskos::entrypoint!(main);
 
 fn main() {
     let witness: BootstrapWitness =
-        bincode::deserialize(&zkasper_guest_io::read_witness()).expect("deserialize witness");
+        bincode::deserialize(zkasper_guest_io::read_witness()).expect("deserialize witness");
 
     let (commitment, acc_root, total_active_balance) = verify_bootstrap(&witness);
 

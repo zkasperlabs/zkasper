@@ -953,7 +953,7 @@ async fn test_ssz_file_streaming_schedule() {
     let (target_epoch, target_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
 
-    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, num_validators) =
+    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
         zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
             .await
             .unwrap();
@@ -983,7 +983,12 @@ async fn test_ssz_file_streaming_schedule() {
     .await
     .unwrap();
 
-    eprintln!("\nepoch {epoch}: {} slot complements", units.len());
+    eprintln!(
+        "\nepoch {epoch}: {} slot complements, {} committee members of {} registered",
+        units.len(),
+        committees.witness.members.len(),
+        api.get_validators(&slot.to_string()).await.unwrap().len(),
+    );
     eprintln!(
         "{:>4} {:>6} {:>8} {:>7} {:>6}",
         "slot", "named", "absent", "messages", "cum%",
@@ -1004,7 +1009,10 @@ async fn test_ssz_file_streaming_schedule() {
     let policy = |stage_floor_s: f64, lanes: usize, lane_pool: LanePool| StreamPolicy {
         lanes,
         lane_pool,
-        validators: num_validators as f64,
+        // The committee proof opens the validators the committees are formed
+        // from, which is the active set. Charging it the whole registry
+        // overstated it by 2.3x.
+        validators: committees.witness.members.len() as f64,
         prover: ProverModel {
             stage_floor_s,
             ..ProverModel::default()

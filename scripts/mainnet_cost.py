@@ -130,13 +130,14 @@ def main():
           f"   ({enumerating / complemented:.0f}x)")
     print(f"  {'32 of the latter, serial':<44}{32 * complemented:>9.2f}s"
           f"   against a {SLOTS_PER_EPOCH * 12}s epoch")
-    print(f"  {'committee proof, whole registry':<44}"
+    print(f"  {'committee proof, active validators':<44}"
           f"{tm.committee_chunk_s(args.validators, 1):>9.2f}s"
           f"   {tm.committee_chunk_s(args.validators, 1) / (SLOTS_PER_EPOCH * 12):.1f} cards held")
-    print("\n  The committee proof is now the fleet-sizing constraint. The cost")
-    print("  model made it 215 s because it charged a leaf hash and a curve")
-    print("  addition per validator and none of the 2,311 executed steps that")
-    print("  walk one; measured, a validator costs 878 us.\n")
+    print("\n  The committee proof used to size the fleet at five cards: the")
+    print("  model charged it the whole registry rather than the active set,")
+    print("  and the guest spent 94% of the proof deserialising a witness Zisk")
+    print("  had already handed it as aligned words. It reads them in place")
+    print("  now — 328 executed steps a member, not 1,157.\n")
 
 
 if __name__ == "__main__":

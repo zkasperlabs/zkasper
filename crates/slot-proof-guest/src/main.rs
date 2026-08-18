@@ -8,7 +8,7 @@ ziskos::entrypoint!(main);
 
 fn main() {
     let witness: SlotProofWitness =
-        bincode::deserialize(&zkasper_guest_io::read_witness()).expect("deserialize witness");
+        bincode::deserialize(zkasper_guest_io::read_witness()).expect("deserialize witness");
 
     zkasper_guest_io::commit(verify_slot_proof(&witness).public_bytes());
 }
