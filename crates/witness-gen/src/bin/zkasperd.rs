@@ -15,6 +15,7 @@
 //! else. It needs no CUDA here, so a witness-only build can drive a real GPU.
 //! See `crate::remote_prover`.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use zkasper_common::ChainConfig;
@@ -232,6 +235,26 @@ struct Cli {
     /// against their own hardware needs the two numbers apart.
     #[arg(long)]
     prover_usd_per_hour: Option<f64>,
+
+    /// File a submitter appends postings to, one JSON object per line, as
+    /// `zkasper-cli` in the zkasper-solana repository writes it. The daemon
+    /// reads it, publishes each new line as a `posting.landed` event and
+    /// carries the recent ones in `status.json`. Without it the daemon says
+    /// nothing about any chain a proof was posted to.
+    #[arg(long, env = "ZKASPER_POSTINGS")]
+    postings: Option<PathBuf>,
+
+    /// Address to serve Prometheus metrics on, at `/metrics`.
+    ///
+    /// Localhost by default: this is a scrape target for an agent on the same
+    /// box, not a public surface, and it says where the accumulator is before
+    /// the daemon has published anything.
+    #[arg(long, default_value = "127.0.0.1:9464")]
+    metrics_addr: SocketAddr,
+
+    /// Serve no metrics at all.
+    #[arg(long)]
+    no_metrics: bool,
 }
 
 impl Cli {
@@ -331,24 +354,45 @@ impl Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    // The stage spans are the benchmark instrument: `fmt` logs each one's
+    // busy/idle when it closes, and the metrics layer records the same
+    // measurement as a histogram. One instrumentation, two consumers.
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(FmtSpan::CLOSE)
+                .with_target(false),
         )
-        .with_span_events(FmtSpan::CLOSE)
-        .with_target(false)
+        .with(zkasper_witness_gen::metrics::StageMetrics)
         .init();
 
     let pipeline = match cli.mode {
         Mode::Batch => Pipeline::Batch,
         Mode::Streaming => Pipeline::Streaming,
     };
+    // Before the first beacon call, so that a daemon which cannot reach its node
+    // is still a scrape target saying so rather than a silent absence.
+    if !cli.no_metrics {
+        zkasper_witness_gen::metrics::install(cli.metrics_addr)?;
+        info!(addr = %cli.metrics_addr, "serving Prometheus metrics");
+    }
 
     // The label this run publishes comes from the node, never from `--chain`.
     // See `crate::network`: the flag picks parameters, and a node running
     // mainnet parameters is not therefore mainnet.
     let api = BeaconApiClient::new(&cli.beacon_url);
     let (chain_name, genesis_validators_root) = network::resolve(&api, cli.chain.name()).await?;
+    if !cli.no_metrics {
+        zkasper_witness_gen::metrics::build_info(
+            &chain_name,
+            cli.prover_name(),
+            match pipeline {
+                Pipeline::Batch => "batch",
+                Pipeline::Streaming => "streaming",
+            },
+        );
+    }
 
     let config = OrchestratorConfig {
         db_path: cli.db_path.clone(),
@@ -373,6 +417,7 @@ async fn main() -> Result<()> {
         // path walks blocks either way.
         gossip_url: (pipeline == Pipeline::Streaming && !cli.no_gossip)
             .then(|| cli.beacon_url.clone()),
+        postings_path: cli.postings.clone(),
         genesis_validators_root: Some(genesis_validators_root),
         prover_usd_per_hour: cli.prover_usd_per_hour,
         ..OrchestratorConfig::new(cli.chain.config(), chain_name)
