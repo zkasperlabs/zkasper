@@ -757,20 +757,35 @@ Per-slot counts are steady: min 27,841, median 28,053, max 28,071.
 ### The trigger cap is binding, and it binds against the design's own rule
 
 The daemon does not fire the instant 2/3 is crossed. Every attestation still in
-flight is one fewer named absentee in the final proof, and the README puts a
-named absentee at **1.79 ms**, so one more second of waiting pays for itself
-while arrivals exceed **558 validators a second**. That rule is capped by
+flight is one fewer named absentee in the final proof, so one more second of
+waiting pays for itself while arrivals exceed break-even. That rule is capped by
 `--max-trigger-wait-millis`, default 6,000.
 
-The measured arrival rate crosses 558/s between **8,000 and 9,000 ms** into the
-slot:
+**The break-even is 651 validators a second, not 558.** It is not a constant of
+its own — `ProverModel::per_named_s()` derives it from two measured ones, and the
+derivation is the authority:
 
-| ms into slot | 5–6 k | 6–7 k | 7–8 k | **8–9 k** | 9–10 k | 10–11 k |
-|---|---|---|---|---|---|---|
-| arrivals/s | 4,849 | 2,554 | 1,384 | **555** | 259 | 128 |
+| | per_validator_s | acc_node_s x 22 | per named leaf | break-even |
+|---|---|---|---|---|
+| Zisk v1.0.0-alpha | 834.7 us | 43.5 us | 1.79 ms | 558/s |
+| **Zisk v1.1.0-alpha** | 834.7 us | **31.9 us** | **1.5365 ms** | **651/s** |
 
-So the 558/s constant is well chosen — it lands exactly where the curve flattens.
-The cap was not, and **it is now 10,000 ms**. The arithmetic:
+`acc_node_s` was re-measured at 31.9 us on v1.1.0-alpha and the model carries
+that value; 1.79 ms and 558/s are the v1.0.0-alpha pair, left behind in prose
+that the re-measurement did not reach. Every "at 1.79 ms" in an older revision of
+this document is 14% too high. `waiting_pays_exactly_while_arrivals_outrun_the_per_leaf_price`
+asserts the derived figure, so the code has been right throughout.
+
+The measured arrival rate — 168 slots where the capture was complete, singles and
+aggregates together — crosses 651/s between **8,000 and 9,000 ms** into the slot:
+
+| ms into slot | 4–5 k | 5–6 k | 6–7 k | 7–8 k | **8–9 k** | 9–10 k | 10–11 k |
+|---|---|---|---|---|---|---|---|
+| arrivals/s | 5,984 | 4,858 | 2,538 | 1,423 | **652** | 313 | 215 |
+
+Both constants land in that same bucket, so the correction does not move the cap.
+The cap was wrong for its own reasons, and **it is now 10,000 ms**. The
+arithmetic:
 
 - Waiting pays while arrivals exceed break-even, which the table above puts
   between **8,000 and 9,000 ms** into the slot.
@@ -788,8 +803,12 @@ The cap was not, and **it is now 10,000 ms**. The arithmetic:
 At it the cap should never bind: the rate rule fires first, 8–9 s into the slot,
 where 96.2% of the slot's singles are in hand. Expect **`tail_named` of order
 1,000** — 3.8% of a 28,044-validator slot — against the 4,999 to 8,159 measured
-at 6,000 ms. That is ~1.9 s of absentee opening in place of 8.9 to 14.6 s, for at
+at 6,000 ms. That is ~1.5 s of absentee opening in place of 7.7 to 12.5 s, for at
 most ~3.6 s more waiting, and usually none.
+
+Replaying the rule that replaced it against 23 measured epochs bears the cap out:
+caps of 6, 10 and 20 s all give the identical firing instant, and only a cap of
+4 s changes it. The cap does not decide anything any more.
 
 A cap that never binds in normal operation is the right shape for it. It is a
 backstop against a source that trickles for ever, and it should not be what
@@ -799,17 +818,102 @@ Under `--prover native` none of this shows up in `T2 - T`. **On a GPU it would
 dominate the critical path**, which is why it is worth the change before a GPU
 run rather than after one.
 
-**The cap is not the whole story, and the other half is open.** Only epoch 469375
-was cut off by it. The other two steady-state epochs fired at **924 ms and
-1,355 ms** of wait, on the rate rule, with 8,159 and 6,822 attesters still in
-flight — a single 200 ms evaluation window with fewer than ~112 removals ends the
-wait, and the burst is noisy enough at that resolution to produce one. Raising
-the cap does not reach those two. Whether the rule should read a longer window,
-or hysteresis, is not something three epochs can answer; it needs a run that
-stays up for hours.
+**The cap is not the whole story, and the other half is the rate rule itself.**
+The section below is the answer, from a run that did stay up for hours.
 
 This was only visible because the arrival curve and `tail_named` were measured
 together.
+
+### A slot's gossip is two arrivals, and the rate rule stopped between them
+
+The rule was: keep waiting while the last 200 ms removed more than 130 leaves.
+Over **23 steady-state epochs** it fired at a median of **6,248 ms into the
+filling slot** and left a median **`tail_named` of 6,563** — 10.1 s of absentee
+opening. Not one epoch reached the cap.
+
+It stops early for two reasons, and 200 ms of resolution is only the smaller one.
+
+**A slot's unaggregated attestations arrive in a burst with holes in it.** Twelve
+of the 23 epochs fired while later windows in the same slot were still above
+break-even; the worst, 469391, fired **3,908 ms** into the slot with **14,538**
+attesters still to come, on a dip between the block-triggered arrivals and the
+4-second attestation deadline.
+
+**And the aggregates are a second arrival entirely.** Averaged over the 168
+complete-capture slots, per 200 ms window:
+
+| ms into slot | 6,000 | 6,600 | 7,200 | 7,800 | **8,000** | 8,400 | 9,000 |
+|---|---|---|---|---|---|---|---|
+| singles | 675 | 419 | 327 | 229 | 151 | 111 | 70 |
+| aggregate events | 0 | 0 | 0 | 2.1 | **72** | 1.4 | 0.5 |
+
+Aggregates land in one 200 ms piece at 8,000 ms and are worth far more than their
+count: on the five epochs the daemon happened to fire after them, they removed
+**3,635 to 4,494 validators** the singles never delivered — 5.6 to 6.9 s of
+proving. Seventeen of the 23 epochs fired **before the first aggregate for their
+slot arrived**, and paid for it.
+
+So the failure is structural, not statistical. The rule reads a rate off the last
+interval and treats a quiet interval as the slot being finished, and between the
+two arrivals there is a silence that means nothing of the kind. **A longer window
+or more hysteresis moves which silence it stops in; it does not stop it stopping
+in one.** Replayed against the same 23 epochs' arrivals, 20 tick phases apiece:
+
+| rule | median fire, ms into slot | mean `tail_named` | mean `wait + tail x 1.5365 ms` |
+|---|---|---|---|
+| **measured, as it ran** | 6,248 | 5,347 | **9.93 s** |
+| 200 ms window (the rule, replayed) | 6,132 | 5,427 | 9.80 s |
+| 1,000 ms evaluation window | 7,231 | 4,744 | 9.56 s |
+| 2,000 ms evaluation window | 7,621 | 4,365 | 9.51 s |
+| hysteresis, 5 windows | 7,845 | 4,119 | 9.29 s |
+| hysteresis, 10 windows | 10,228 | 2,780 | 8.64 s |
+| hysteresis, 15 windows | 11,266 | 2,156 | 8.88 s |
+| in-flight floor, 1,000 | 13,426 | 2,218 | 10.33 s |
+| in-flight floor, 2,500 | 9,403 | 2,375 | 9.17 s |
+| in-flight floor, 5,000 | 8,466 | 2,556 | 7.04 s |
+| **hold until the aggregates have been and gone** | **8,672** | **2,160** | **6.86 s** |
+| fire at a fixed 8,400 ms (reference) | 8,400 | 2,149 | 6.66 s |
+| per-epoch hindsight optimum (reference) | — | — | 6.56 s |
+
+The replay reproduces the measured baseline to 1.5% on the mean tail and 1.3% on
+the objective, which is what makes the other rows worth reading.
+
+**Every rate-only rule is beaten by the same 2 s of silence.** It has to observe
+that silence to know the singles are done, and if it waits long enough to survive
+it, it also pays it again after the aggregates land. Hysteresis at 10 windows is
+the best of them and is still 1.8 s short. **An in-flight floor** is not a rate
+rule and gets much closer, but only at 5,000 — a value that happens to sit
+between the 6,300 still in flight before the aggregate burst and the 2,150 after
+it, on this node, on this run. At 2,500 it is 2.1 s worse and at 1,000 it is
+3.5 s worse. It is a fitted constant with no meaning on another chain, another
+committee size, or a node with different subnet coverage, so it is rejected
+despite the number.
+
+**The rule the daemon now runs** keeps waiting while either the last interval
+paid for itself, **or** the aggregate half of the slot's gossip has not yet been
+and gone — which it reads off the gossip, as "no aggregate for this slot yet, or
+one arrived in the last interval", and not off a clock. The hold is not free, so
+it is taken only while what is still in flight could pay for the silence so far
+at the same 1.5365 ms a leaf. A slot that has already converged fires instead of
+waiting for aggregates that cannot be worth much, and a slot with nothing in
+flight fires on the instant.
+
+It costs **2.1 s more waiting** (mean 1,465 → 3,545 ms) and buys back **3,267
+leaves, 5.0 s of proving**, for **2.9 s** net off `T2 - T`.
+`--max-trigger-wait-millis` and `--trigger-interval-millis` both stop mattering:
+6, 10 and 20 s of cap give the same answer, and 100, 200 and 400 ms of interval
+are within 0.3 s of each other.
+
+**What this is not.** Twenty-three epochs from one afternoon, on one node, tuned
+and replayed against themselves. The replay's aggregate yield is calibrated from
+five epochs. The prediction is `tail_named` **~2,200 mean, ~2,500 median, ~3,800
+p90**, and what would falsify it is a run of a hundred-odd epochs *not* used to
+choose the rule, reporting `tail_named` and `wait_millis` per epoch: the tail
+distribution should sit where the table says, the cap should still never bind,
+and `late_groups` should stay 0 — a wait 1.9 s longer leaves that much less of
+the slot before the frontier moves. A second node, with different subnet
+coverage, is the other half of it: the rule's premise is that aggregates are the
+second arrival, and a node that sees every single would have less to gain.
 
 ### Volume cross-check
 
@@ -867,26 +971,26 @@ is what three epochs can support.
   these are a baseline for the *trigger*, not for proving.
 - **`tail_named` is the number that will hurt on a GPU, and it is two orders of
   magnitude larger in steady state**: 4,999 / 6,822 / 8,159, against 75–111 on
-  every catch-up. At the README's 1.79 ms per named leaf that is **8.9 s, 12.2 s
-  and 14.6 s of proving** on the critical path, against a `T2 - T` of 1.2–7.0 s
-  today. On a GPU it does not add to the critical path — it becomes it, dwarfing
-  the 3.640 s stage floor and the ~0.87 s of BLS, and the modelled `T2 - T` of
-  5.5 s does not survive it. The correction is configuration rather than circuit
-  work: see the trigger-cap section above. The fixture epoch's tail of ~113 is
-  small by construction — a replay has the whole epoch available at once — and is
-  not a steady-state number.
+  every catch-up. At 1.5365 ms per named leaf that is **7.7 s, 10.5 s and 12.5 s
+  of proving** on the critical path, against a `T2 - T` of 1.2–7.0 s today. On a
+  GPU it does not add to the critical path — it becomes it, dwarfing the 3.640 s
+  stage floor and the ~0.87 s of BLS, and the modelled `T2 - T` of 5.5 s does not
+  survive it. The correction is configuration rather than circuit work: see the
+  trigger section above. The fixture epoch's tail of ~113 is small by
+  construction — a replay has the whole epoch available at once — and is not a
+  steady-state number.
 - **Waiting longer does buy fewer absentees, and the three epochs show it in the
   predicted direction:**
 
   | `wait_millis` | 924 | 1,355 | 6,378 |
   |---|---|---|---|
   | `tail_named` | 8,159 | 6,822 | 4,999 |
-  | that costs, at 1.79 ms | 14.6 s | 12.2 s | 8.9 s |
+  | that costs, at 1.5365 ms | 12.5 s | 10.5 s | 7.7 s |
 
   Monotonic, and it is the mechanism the trigger exists to exploit. It is three
   points from three different epochs with different arrival patterns, so treat it
   as a direction rather than a slope. Note that even the longest wait observed —
-  6,378 ms, which hit the old 6,000 ms cap — still left 8.9 s of proving, and
+  6,378 ms, which hit the old 6,000 ms cap — still left 7.7 s of proving, and
   that the burst does not drain until a median of 7,326 ms. **The old cap sat
   below the useful range at every point measured**, which is why it is now
   10,000 ms.
@@ -894,8 +998,27 @@ is what three epochs can support.
 The catch-up rows are not noise, incidentally — they are what every epoch after
 a restart looks like, and §6 explains why restarts happen.
 
-Getting a real distribution needs a run that stays up for hours. The section
-below explains why this one could not.
+#### The longer run: 23 steady-state epochs
+
+A later run stayed up for 23 consecutive steady-state epochs, 469381–469403, all
+with `late_groups = 0` and 18–22 folded groups. It is what the trigger section
+above is argued from. Waiting still buys absentees, and with 23 points the
+relationship is a distribution rather than a direction:
+
+| fired, ms into the filling slot | < 6,000 | 6,000–7,000 | 7,000–8,000 | > 8,000 |
+|---|---|---|---|---|
+| epochs | 9 | 4 | 5 | 5 |
+| median `tail_named` | 7,334 | 7,814 | 1,197 | 1,310 |
+
+| | median | mean | min | max |
+|---|---|---|---|---|
+| `wait_millis` | 1,192 | 1,715 | 239 | 4,761 |
+| fired, ms into slot | 6,248 | — | 3,908 | 8,684 |
+| `tail_named` | 6,563 | 5,347 | 603 | 14,538 |
+| that costs, at 1.5365 ms | 10.1 s | 8.2 s | 0.9 s | 22.3 s |
+
+The cap did not bind on any of the 23. What ended every one of them was the rate
+rule, and the trigger section above is what was wrong with it.
 
 ### Two bugs the run found
 

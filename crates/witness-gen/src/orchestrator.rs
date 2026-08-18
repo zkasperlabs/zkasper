@@ -90,7 +90,7 @@ use crate::publish::{self, ClosedEpoch, EpochProgress, Publisher};
 use crate::store::{
     EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState, StreamFinalRecord,
 };
-use crate::streaming::{self, StreamContext, StreamPolicy};
+use crate::streaming::{self, Filling, StreamContext, StreamPolicy};
 use crate::{witness_bootstrap, witness_epoch_diff, witness_justification};
 
 /// How many stage timings the manifest keeps.
@@ -269,9 +269,13 @@ struct StreamAggregator {
     /// Whether the node has reported a reorg that this epoch has not checked.
     reorged: bool,
     /// The last reading of the slot gossip was filling: when it was taken, which
-    /// slot, and how many accumulator leaves it would have opened. The trigger
-    /// is the difference between two of these.
-    last_filling: Option<(Instant, u64, usize)>,
+    /// slot, how many accumulator leaves it would have opened, and how many
+    /// network aggregates it had. The trigger is the difference between two of
+    /// these.
+    last_filling: Option<(Instant, u64, usize, usize)>,
+    /// Seconds the wait has run without an interval paying for itself. Reset by
+    /// any interval that does, and by anything that ends the wait.
+    stalled_s: f64,
     /// Attestation slots closed so far, in order.
     units: Vec<SlotComplement>,
     /// How many of them a group proof already covers.
@@ -304,10 +308,11 @@ struct GroupProof {
 struct Held {
     /// Attested balance: closed units and still-filling slots together.
     balance: u64,
-    /// The slot gossip is still filling that the proof would have to carry, and
-    /// the accumulator leaves it would open if the trigger fired now. Waiting
-    /// buys the difference between two readings of it; nothing else moves.
-    filling: Option<(u64, usize)>,
+    /// The slot gossip is still filling that the proof would have to carry: the
+    /// accumulator leaves it would open if the trigger fired now, and the
+    /// network aggregates it has. Waiting buys the difference between two
+    /// readings of it; nothing else moves.
+    filling: Option<(u64, usize, usize)>,
     /// Every slot gossip has reached, priced as if it closed now.
     open: Vec<SlotComplement>,
 }
@@ -365,7 +370,13 @@ impl StreamAggregator {
             .last()
             .filter(|unit| unit.slot >= frontier)
             .filter(|_| crossing.is_none_or(|c| c + 1 == self.units.len() + open.len()))
-            .map(|unit| (unit.slot, unit.named_indices.len()));
+            .map(|unit| {
+                (
+                    unit.slot,
+                    unit.named_indices.len(),
+                    self.stream.aggregates(unit.slot),
+                )
+            });
 
         Held {
             balance,
@@ -374,23 +385,41 @@ impl StreamAggregator {
         }
     }
 
-    /// Whether the last interval of waiting shortened the proof by more than it
-    /// cost, which is the whole of the firing decision once the weight is there.
+    /// Whether waiting another interval is still worth it, which is the whole of
+    /// the firing decision once the weight is there.
     ///
     /// No reading to compare against — nothing still filling, or a different
     /// slot than last time — means fire. There is nothing in flight to wait for,
     /// and a daemon that opened an epoch already past the threshold must not
     /// invent a wait it never observed.
-    fn worth_waiting(&self, policy: &StreamPolicy, filling: Option<(u64, usize)>) -> bool {
-        let (Some((at, was, before)), Some((slot, named))) = (self.last_filling, filling) else {
+    fn worth_waiting(
+        &mut self,
+        policy: &StreamPolicy,
+        filling: Option<(u64, usize, usize)>,
+    ) -> bool {
+        let (Some((at, was, named, aggregates)), Some((slot, now_named, now_aggregates))) =
+            (self.last_filling, filling)
+        else {
+            self.stalled_s = 0.0;
             return false;
         };
-        was == slot
-            && policy.worth_waiting(
-                before.saturating_sub(named),
-                at.elapsed().as_secs_f64(),
-                self.waited_s(),
-            )
+        if was != slot {
+            self.stalled_s = 0.0;
+            return false;
+        }
+        let interval_s = at.elapsed().as_secs_f64();
+        let filling = Filling {
+            in_flight: now_named,
+            removed: named.saturating_sub(now_named),
+            aggregates: now_aggregates,
+            new_aggregates: now_aggregates.saturating_sub(aggregates),
+        };
+        self.stalled_s = if policy.interval_paid(filling.removed, interval_s) {
+            0.0
+        } else {
+            self.stalled_s + interval_s
+        };
+        policy.worth_waiting(filling, interval_s, self.stalled_s, self.waited_s())
     }
 
     /// Seconds since `T`, which is what the cap on waiting is measured against.
@@ -1366,7 +1395,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             && !aggregator.worth_waiting(&policy, held.filling);
         aggregator.last_filling = held
             .filling
-            .map(|(slot, named)| (Instant::now(), slot, named));
+            .map(|(slot, named, aggregates)| (Instant::now(), slot, named, aggregates));
 
         if !fire {
             if let Some(publish) = &self.publish {
@@ -1552,6 +1581,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             gap: true,
             reorged: false,
             last_filling: None,
+            stalled_s: 0.0,
             units: Vec::new(),
             proved: 0,
             attesting_balance: 0,
