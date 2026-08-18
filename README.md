@@ -155,6 +155,7 @@ Open:
 | [BENCHMARKS.md](BENCHMARKS.md) | every cost constant, and what measured it |
 | [docs/gossip.md](docs/gossip.md) | where attestations come from, and what they cost |
 | [docs/api-v1.md](docs/api-v1.md) | the public HTTP API |
+| [monitoring/README.md](monitoring/README.md) | the metrics the daemon serves, and what pages on them |
 | [FCR_CIRCUIT_DESIGN.md](FCR_CIRCUIT_DESIGN.md) | fast confirmation, designed and not built |
 
 ## Requirements

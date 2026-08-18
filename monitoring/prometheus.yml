@@ -24,9 +24,14 @@ rule_files:
 scrape_configs:
   # The daemon's own exporter. Not a sidecar and not a file being parsed —
   # zkasperd serves this itself, and the histograms come from its tracing spans.
+  #
+  # 9464 is the default, so a second daemon on this box has to be given
+  # `--metrics-addr 127.0.0.1:9465` or it will fail to bind and crash-loop.
+  # Uncomment its target when there is one.
   - job_name: zkasperd
     static_configs:
       - targets: ['localhost:9464']
+      # - targets: ['localhost:9465']
 
   # The host, and with it the GPU cost exporter, which writes into
   # node_exporter's textfile collector rather than running a server of its own.

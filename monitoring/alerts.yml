@@ -42,8 +42,15 @@ groups:
       # An epoch is 6.4 minutes on mainnet. Half an hour without the accumulator
       # moving is the daemon alive and not making progress, which the heartbeat
       # alone cannot see.
+      #
+      # The uptime clause is not a nicety. Without it a freshly started daemon
+      # trips this immediately, because a series with two minutes of history has
+      # trivially not changed in thirty — and an alert that fires on every
+      # restart is one nobody reads.
       - alert: ZkasperEpochNotAdvancing
-        expr: changes(zkasper_accumulator_epoch[30m]) == 0
+        expr: >-
+          changes(zkasper_accumulator_epoch[30m]) == 0
+          and (time() - process_start_time_seconds{job="zkasperd"}) > 1800
         for: 5m
         labels:
           severity: page
@@ -119,10 +126,16 @@ groups:
       # The expensive failure: a card is rented and nothing is proving on it.
       # Deliberately not conditioned on the daemon being up, because a daemon
       # that died overnight while a card kept billing is exactly this alert.
+      #
+      # `on()` is load-bearing. The right-hand side falls back to `vector(0)`,
+      # which carries no labels, and the default matching would then find no
+      # counterpart for the instance and job on the left — so the alert would
+      # never fire, on the one condition it exists for. Checked against a live
+      # Prometheus, not reasoned about.
       - alert: ZkasperGpuIdle
         expr: >-
           zkasper_vast_instances_running > 0
-          and (sum(rate(zkasper_prove_duration_seconds_count[30m])) or vector(0)) == 0
+          and on() (sum(rate(zkasper_prove_duration_seconds_count[30m])) or vector(0)) == 0
         for: 30m
         labels:
           severity: page
