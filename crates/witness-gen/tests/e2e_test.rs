@@ -13,6 +13,8 @@ use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::types::*;
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::acc_tree::AccTree;
+use zkasper_witness_gen::beacon_api::{CommitteeResponse, ValidatorResponse};
+use zkasper_witness_gen::committee::EpochCommittees;
 
 const TEST_CONFIG: ChainConfig = ChainConfig {
     slots_per_epoch: 4,
@@ -42,81 +44,125 @@ fn generate_test_keys(n: usize) -> Vec<(blst::min_pk::SecretKey, [u8; 48])> {
         .collect()
 }
 
-fn sign_message(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
-    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    let sigs: Vec<blst::min_pk::Signature> = sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
-    let sig_refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
-    let agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true).unwrap();
-    agg.to_signature().to_bytes()
+// ---------------------------------------------------------------------------
+// Committees and complements
+// ---------------------------------------------------------------------------
+
+/// Sum the epoch's committees out of the accumulator.
+///
+/// Two committees of two, which is the smallest shape that still partitions the
+/// validator set — and a partition is all the committee proof needs it to be.
+fn committees(
+    validators: &[ValidatorData],
+    responses: &[ValidatorResponse],
+    tree: &AccTree,
+    epoch: u64,
+    total_active_balance: u64,
+) -> EpochCommittees {
+    let table: Vec<CommitteeResponse> = (0..validators.len() as u64 / 2)
+        .map(|slot| CommitteeResponse {
+            slot: epoch * TEST_CONFIG.slots_per_epoch + slot,
+            index: 0,
+            validators: vec![slot * 2, slot * 2 + 1],
+        })
+        .collect();
+
+    zkasper_witness_gen::committee::build(
+        &table,
+        responses,
+        tree,
+        &TEST_CONFIG,
+        epoch,
+        epoch,
+        total_active_balance,
+    )
+    .unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// Test attestation builder
-// ---------------------------------------------------------------------------
-
-/// Build an AttestationWitness with real BLS aggregate signatures.
+/// One slot's complement, with the whole committee attesting.
 ///
-/// `validator_indices` indexes into the `keys` array.
-/// `seen` tracks which validators have already been counted across attestations.
+/// Nothing is named, so nothing is opened against the accumulator: the aggregate
+/// public key the signature is checked against is the committee's own, and the
+/// support is the committee's own balance.
 #[allow(clippy::too_many_arguments)]
-fn make_test_attestation(
+fn complement(
     keys: &[(blst::min_pk::SecretKey, [u8; 48])],
-    validator_data: &[ValidatorData],
-    validator_indices: &[usize],
-    data_slot: u64,
-    data_index: u64,
-    target_epoch: u64,
+    committees: &EpochCommittees,
+    slot_in_epoch: u64,
+    epoch: u64,
     target_root: [u8; 32],
     source_epoch: u64,
     source_root: [u8; 32],
     signing_domain: [u8; 32],
-    epoch: u64,
-    seen: &mut std::collections::BTreeSet<u64>,
-) -> AttestationWitness {
-    let beacon_block_root = [0u8; 32]; // synthetic
-
-    // Compute attestation_data_root
-    let data_root = attestation_data_root(
-        data_slot,
-        data_index,
-        &beacon_block_root,
-        source_epoch,
-        &source_root,
-        target_epoch,
-        &target_root,
+) -> SlotComplementWitness {
+    let data_slot = epoch * TEST_CONFIG.slots_per_epoch + slot_in_epoch;
+    let signing_root = compute_signing_root(
+        &attestation_data_root(
+            data_slot,
+            0,
+            &[0u8; 32],
+            source_epoch,
+            &source_root,
+            epoch,
+            &target_root,
+        ),
+        &signing_domain,
     );
 
-    // Compute signing_root
-    let sig_root = compute_signing_root(&data_root, &signing_domain);
+    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+    let signatures: Vec<blst::min_pk::Signature> = committees.members[slot_in_epoch as usize]
+        .iter()
+        .map(|&i| keys[i as usize].0.sign(&signing_root, dst, &[]))
+        .collect();
+    let refs: Vec<&blst::min_pk::Signature> = signatures.iter().collect();
 
-    // Sign with selected keys
-    let sks: Vec<&blst::min_pk::SecretKey> =
-        validator_indices.iter().map(|&i| &keys[i].0).collect();
-    let signature = sign_message(&sks, &sig_root);
-
-    // Build attesting validators
-    let mut attesting_validators = Vec::with_capacity(validator_indices.len());
-    for &idx in validator_indices {
-        let v = &validator_data[idx];
-        let count_balance = seen.insert(idx as u64);
-        attesting_validators.push(AttestingValidator {
-            validator_index: idx as u64,
-            pubkey: zkasper_witness_gen::pubkey::decompress(&keys[idx].1).unwrap(),
-            active_effective_balance: v.active_effective_balance(epoch),
-            count_balance,
-        });
+    SlotComplementWitness {
+        slot_in_epoch,
+        committee: committees.aggregate(slot_in_epoch).unwrap().clone(),
+        primary: vec![AttestationWitness {
+            data_slot,
+            data_index: 0,
+            data_beacon_block_root: [0u8; 32],
+            data_source_epoch: source_epoch,
+            data_source_root: source_root,
+            data_target_epoch: epoch,
+            data_target_root: target_root,
+            signature: BlsSignature(
+                blst::min_pk::AggregateSignature::aggregate(&refs, true)
+                    .unwrap()
+                    .to_signature()
+                    .to_bytes(),
+            ),
+            attesting_validators: Vec::new(),
+        }],
+        secondary: Vec::new(),
+        absentees: Vec::new(),
     }
+}
 
-    AttestationWitness {
-        data_slot,
-        data_index,
-        data_beacon_block_root: beacon_block_root,
-        data_source_epoch: source_epoch,
-        data_source_root: source_root,
-        data_target_epoch: target_epoch,
-        data_target_root: target_root,
-        signature: BlsSignature(signature),
-        attesting_validators,
+/// The witness for one slot proof over one committee's complement.
+#[allow(clippy::too_many_arguments)]
+fn slot_witness(
+    committees: &EpochCommittees,
+    slot: SlotComplementWitness,
+    accumulator_commitment: acc::Digest,
+    acc_root: acc::Digest,
+    total_active_balance: u64,
+    target_epoch: u64,
+    target_root: [u8; 32],
+    signing_domain: [u8; 32],
+) -> SlotProofWitness {
+    SlotProofWitness {
+        accumulator_commitment,
+        committee_root: committees.root(),
+        target_epoch,
+        target_root,
+        signing_domain,
+        acc_root,
+        total_active_balance,
+        acc_multi_proof: AccMultiProof::default(),
+        committee_multi_proof: committees.multi_proof(&[slot.slot_in_epoch]),
+        slots: vec![slot],
     }
 }
 
@@ -220,87 +266,50 @@ fn test_e2e_full_pipeline() {
     eprintln!("✓ Bootstrap verified");
 
     // =========================================================
-    // Step B: Slot proofs for epoch E (2 slots with attestations)
+    // Step B: Slot proofs for epoch E (2 committees, both fully attesting)
     // =========================================================
-    // Slot E*4: validators [0,1] attest
-    // Slot E*4+1: validators [2,3] attest
-
-    let slot_e0 = epoch_e * TEST_CONFIG.slots_per_epoch;
-    let slot_e1 = slot_e0 + 1;
-
-    let mut seen_e = std::collections::BTreeSet::new();
-    let att_e_slot0 = make_test_attestation(
-        &keys,
+    let committees_e = committees(
         &validators,
-        &[0, 1],
-        slot_e0,
-        0,
+        &responses,
+        &tree,
         epoch_e,
-        target_root_e,
-        epoch_e.saturating_sub(1),
-        source_root,
-        signing_domain,
-        epoch_e,
-        &mut seen_e,
+        total_active_balance,
     );
 
-    let att_e_slot1 = make_test_attestation(
-        &keys,
-        &validators,
-        &[2, 3],
-        slot_e1,
-        0,
-        epoch_e,
-        target_root_e,
-        epoch_e.saturating_sub(1),
-        source_root,
-        signing_domain,
-        epoch_e,
-        &mut seen_e,
-    );
+    let outputs_e: Vec<SlotProofOutput> = (0..2)
+        .map(|slot_in_epoch| {
+            zkasper_slot_proof_guest::verify_slot_proof_with_depth(
+                &slot_witness(
+                    &committees_e,
+                    complement(
+                        &keys,
+                        &committees_e,
+                        slot_in_epoch,
+                        epoch_e,
+                        target_root_e,
+                        epoch_e.saturating_sub(1),
+                        source_root,
+                        signing_domain,
+                    ),
+                    commitment,
+                    acc_root,
+                    total_active_balance,
+                    epoch_e,
+                    target_root_e,
+                    signing_domain,
+                ),
+                TEST_DEPTH,
+            )
+        })
+        .collect();
 
-    let (_, slot0_poseidon_proof) =
-        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[0, 1]);
-
-    let slot0_witness = SlotProofWitness {
-        accumulator_commitment: commitment,
-        target_epoch: epoch_e,
-        target_root: target_root_e,
-        signing_domain,
-        acc_root,
-        total_active_balance,
-        attestations: vec![att_e_slot0],
-        acc_multi_proof: slot0_poseidon_proof,
-    };
-
-    let slot0_output =
-        zkasper_slot_proof_guest::verify_slot_proof_with_depth(&slot0_witness, TEST_DEPTH);
-
-    assert_eq!(slot0_output.accumulator_commitment, commitment);
-    assert_eq!(slot0_output.target_epoch, epoch_e);
-    assert_eq!(slot0_output.target_root, target_root_e);
-    assert_eq!(slot0_output.attesting_balance, 2 * balance_gwei);
-    assert_eq!(slot0_output.num_counted_validators, 2);
-
-    let (_, slot1_poseidon_proof) =
-        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[2, 3]);
-
-    let slot1_witness = SlotProofWitness {
-        accumulator_commitment: commitment,
-        target_epoch: epoch_e,
-        target_root: target_root_e,
-        signing_domain,
-        acc_root,
-        total_active_balance,
-        attestations: vec![att_e_slot1],
-        acc_multi_proof: slot1_poseidon_proof,
-    };
-
-    let slot1_output =
-        zkasper_slot_proof_guest::verify_slot_proof_with_depth(&slot1_witness, TEST_DEPTH);
-
-    assert_eq!(slot1_output.attesting_balance, 2 * balance_gwei);
-    assert_eq!(slot1_output.num_counted_validators, 2);
+    assert_eq!(outputs_e[0].accumulator_commitment, commitment);
+    assert_eq!(outputs_e[0].target_epoch, epoch_e);
+    assert_eq!(outputs_e[0].target_root, target_root_e);
+    assert_eq!(outputs_e[0].attesting_balance, 2 * balance_gwei);
+    assert_eq!(outputs_e[0].slots_mask, 0b01);
+    assert_eq!(outputs_e[1].attesting_balance, 2 * balance_gwei);
+    assert_eq!(outputs_e[1].slots_mask, 0b10);
 
     eprintln!("✓ Slot proofs (epoch E) verified");
 
@@ -309,13 +318,15 @@ fn test_e2e_full_pipeline() {
     // =========================================================
     let just_e_witness = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
+        committee: committees_e.output.clone(),
+        committee_proof: vec![], // stub proof
         accumulator_commitment: commitment,
         target_epoch: epoch_e,
         target_root: target_root_e,
         total_active_balance,
-        slot_proof_outputs: vec![slot0_output, slot1_output],
+        slot_proof_outputs: outputs_e,
         slot_proofs: vec![vec![], vec![]], // stub proofs
-        counted_indices_per_slot: vec![vec![0, 1], vec![2, 3]],
     };
 
     let just_e_output = zkasper_justification_guest::verify_justification(&just_e_witness);
@@ -348,7 +359,7 @@ fn test_e2e_full_pipeline() {
     mock.headers.insert(slot_e1_0.to_string(), header_e1);
 
     let old_state = zkasper_witness_gen::EpochState::empty(bootstrap_slot, 4);
-    let mut tree_e1 = tree;
+    let mut tree_e1 = tree.clone();
 
     let (epoch_diff_witness, _new_epoch_state, new_balance, new_count) = rt
         .block_on(zkasper_witness_gen::witness_epoch_diff::build(
@@ -397,81 +408,52 @@ fn test_e2e_full_pipeline() {
     // =========================================================
     // Step E: Slot proofs for epoch E+1, against the new accumulator
     // =========================================================
-    let slot_e1_1 = slot_e1_0 + 1;
-
-    let mut seen_e1 = std::collections::BTreeSet::new();
-    let att_e1_slot0 = make_test_attestation(
-        &keys,
-        &validators_e1,
-        &[0, 1],
-        slot_e1_0,
-        0,
-        epoch_e1,
-        target_root_e1,
-        epoch_e,
-        target_root_e,
-        signing_domain,
-        epoch_e1,
-        &mut seen_e1,
-    );
-
-    let att_e1_slot1 = make_test_attestation(
-        &keys,
-        &validators_e1,
-        &[2, 3],
-        slot_e1_1,
-        0,
-        epoch_e1,
-        target_root_e1,
-        epoch_e,
-        target_root_e,
-        signing_domain,
-        epoch_e1,
-        &mut seen_e1,
-    );
-
-    let (rebuilt_root, slot_e1_0_proof) =
-        build_acc_tree_multi_proof(&validators_e1, epoch_e1, TEST_DEPTH, &[0, 1]);
     assert_eq!(
-        rebuilt_root, acc_root_e1,
+        AccTree::build(&validators_e1, epoch_e1, TEST_DEPTH).root(),
+        acc_root_e1,
         "the diff's incremental update must match a tree rebuilt from scratch",
     );
-    let (_, slot_e1_1_proof) =
-        build_acc_tree_multi_proof(&validators_e1, epoch_e1, TEST_DEPTH, &[2, 3]);
 
-    let slot_e1_0_witness = SlotProofWitness {
-        accumulator_commitment: commitment_e1,
-        target_epoch: epoch_e1,
-        target_root: target_root_e1,
-        signing_domain,
-        acc_root: acc_root_e1,
-        total_active_balance: new_balance,
-        attestations: vec![att_e1_slot0],
-        acc_multi_proof: slot_e1_0_proof,
-    };
-
-    let slot_e1_0_output =
-        zkasper_slot_proof_guest::verify_slot_proof_with_depth(&slot_e1_0_witness, TEST_DEPTH);
-
-    // Validator 0 now carries 16 ETH, so the slot's attesting balance moved too.
-    assert_eq!(
-        slot_e1_0_output.attesting_balance,
-        16_000_000_000 + balance_gwei
+    let committees_e1 = committees(
+        &validators_e1,
+        &responses_e1,
+        &tree_e1,
+        epoch_e1,
+        new_balance,
     );
 
-    let slot_e1_1_witness = SlotProofWitness {
-        accumulator_commitment: commitment_e1,
-        target_epoch: epoch_e1,
-        target_root: target_root_e1,
-        signing_domain,
-        acc_root: acc_root_e1,
-        total_active_balance: new_balance,
-        attestations: vec![att_e1_slot1],
-        acc_multi_proof: slot_e1_1_proof,
-    };
+    let outputs_e1: Vec<SlotProofOutput> = (0..2)
+        .map(|slot_in_epoch| {
+            zkasper_slot_proof_guest::verify_slot_proof_with_depth(
+                &slot_witness(
+                    &committees_e1,
+                    complement(
+                        &keys,
+                        &committees_e1,
+                        slot_in_epoch,
+                        epoch_e1,
+                        target_root_e1,
+                        epoch_e,
+                        target_root_e,
+                        signing_domain,
+                    ),
+                    commitment_e1,
+                    acc_root_e1,
+                    new_balance,
+                    epoch_e1,
+                    target_root_e1,
+                    signing_domain,
+                ),
+                TEST_DEPTH,
+            )
+        })
+        .collect();
 
-    let slot_e1_1_output =
-        zkasper_slot_proof_guest::verify_slot_proof_with_depth(&slot_e1_1_witness, TEST_DEPTH);
+    // Validator 0 now carries 16 ETH, so its committee's balance moved with it.
+    assert_eq!(
+        outputs_e1[0].attesting_balance,
+        16_000_000_000 + balance_gwei
+    );
 
     eprintln!("✓ Slot proofs (epoch E+1) verified");
 
@@ -480,13 +462,15 @@ fn test_e2e_full_pipeline() {
     // =========================================================
     let just_e1_witness = JustificationWitness {
         slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
+        committee: committees_e1.output.clone(),
+        committee_proof: vec![],
         accumulator_commitment: commitment_e1,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         total_active_balance: new_balance,
-        slot_proof_outputs: vec![slot_e1_0_output, slot_e1_1_output],
+        slot_proof_outputs: outputs_e1,
         slot_proofs: vec![vec![], vec![]],
-        counted_indices_per_slot: vec![vec![0, 1], vec![2, 3]],
     };
 
     let just_e1_output = zkasper_justification_guest::verify_justification(&just_e1_witness);
@@ -545,19 +529,4 @@ fn test_e2e_full_pipeline() {
 
     eprintln!("✓ Full E2E pipeline passed!");
     eprintln!("  Bootstrap → Slot proofs (epoch E) → Justification E → Epoch diff → Slot proofs (epoch E+1) → Justification E+1 → Finalization");
-}
-
-// ---------------------------------------------------------------------------
-// Accumulator helpers — thin wrappers over the production tree, so the test
-// exercises the same multi-proof ordering the circuit consumes.
-// ---------------------------------------------------------------------------
-
-fn build_acc_tree_multi_proof(
-    validators: &[ValidatorData],
-    epoch: u64,
-    depth: u32,
-    leaf_indices: &[u64],
-) -> (acc::Digest, AccMultiProof) {
-    let tree = AccTree::build(validators, epoch, depth);
-    (tree.root(), tree.build_multi_proof(leaf_indices))
 }

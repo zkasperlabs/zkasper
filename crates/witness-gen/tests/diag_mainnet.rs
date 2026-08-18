@@ -1,10 +1,17 @@
 //! TEMPORARY diagnostic harness (not part of the suite). Reports real-mainnet
-//! facts and isolates the BLS batch failure seen in `test_ssz_file_finality`.
+//! facts and checks, against real aggregates, that the key a slot proof never
+//! enumerates is the key that signed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use zkasper_common::acc::G1Point;
+use zkasper_common::bls::{
+    compute_signing_root, fast_aggregate_verify, verify_attestation_batch, PointSum, SignedMessage,
+};
+use zkasper_common::types::{AttestationWitness, SlotComplementWitness};
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::{
     self, AttestationResponse, BeaconApi, CommitteeResponse, HeaderResponse, ValidatorResponse,
@@ -172,15 +179,54 @@ async fn diag_active_validator_count() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. BLS failure isolation + slot-proof op counts
+// 2. Complement verification + slot-proof op counts
 // ---------------------------------------------------------------------------
+
+/// `hash_tree_root(AttestationData)` for one aggregate.
+fn data_root(a: &AttestationWitness) -> [u8; 32] {
+    zkasper_common::ssz::attestation_data_root(
+        a.data_slot,
+        a.data_index,
+        &a.data_beacon_block_root,
+        a.data_source_epoch,
+        &a.data_source_root,
+        a.data_target_epoch,
+        &a.data_target_root,
+    )
+}
+
+/// Validator indices a complement names — absentees plus the signers of any
+/// minority head vote. Exactly what its accumulator opening covers.
+fn named(complement: &SlotComplementWitness) -> BTreeSet<u64> {
+    let mut named: BTreeSet<u64> = complement
+        .absentees
+        .iter()
+        .map(|v| v.validator_index)
+        .collect();
+    for a in &complement.secondary {
+        named.extend(a.attesting_validators.iter().map(|v| v.validator_index));
+    }
+    named
+}
+
+/// The primary aggregate's public key, derived the way the circuit derives it:
+/// the committee minus everyone the complement names.
+fn derived_key(complement: &SlotComplementWitness) -> G1Point {
+    let mut key = PointSum::from_point(complement.committee.pubkey);
+    for a in &complement.secondary {
+        for v in &a.attesting_validators {
+            key.sub(&v.pubkey).expect("shared x-coordinate");
+        }
+    }
+    for v in &complement.absentees {
+        key.sub(&v.pubkey).expect("shared x-coordinate");
+    }
+    key.get().expect("committee aggregate is the identity")
+}
 
 #[tokio::test]
 #[ignore]
 async fn diag_finality_bls() {
-    use zkasper_common::bls::{
-        compute_signing_root, fast_aggregate_verify, verify_attestation_batch, SignedMessage,
-    };
     use zkasper_common::op_counter;
 
     const CONFIG: ChainConfig = ChainConfig::MAINNET;
@@ -204,10 +250,24 @@ async fn diag_finality_bls() {
         &ssz_state::extract_genesis_validators_root(raw),
     );
 
+    let committees = Arc::new(
+        zkasper_witness_gen::committee::build(
+            &api.committees[&target_epoch],
+            &api.states[&slot.to_string()].validators,
+            &tree,
+            &CONFIG,
+            target_epoch,
+            target_epoch,
+            total_active_balance,
+        )
+        .unwrap(),
+    );
+
     let slots = zkasper_witness_gen::witness_slot_proof::build_per_slot(
         &api,
         &CONFIG,
         &tree,
+        committees,
         target_epoch,
         target_root,
         total_active_balance,
@@ -216,264 +276,173 @@ async fn diag_finality_bls() {
     .await
     .unwrap();
 
-    eprintln!("\n=== per-slot BLS diagnosis ===");
-    let mut total_dupe_slots = 0;
-    let mut total_att = 0;
-    let mut indiv_fail = 0;
-    let mut batch_fail_dupe = 0;
-    let mut batch_ok = 0;
-    let mut attesting_balance_total: u64 = 0;
+    eprintln!("\n=== per-slot complement diagnosis ===");
+    let mut total_primary = 0;
+    let mut total_secondary = 0;
+    let mut minority_slots = 0;
+    let mut derived_fail = 0;
+    let mut secondary_fail = 0;
 
     for s in &slots {
-        let mut roots = Vec::new();
-        let mut msgs_pk = Vec::new();
-        for a in &s.witness.attestations {
-            let dr = zkasper_common::ssz::attestation_data_root(
-                a.data_slot,
-                a.data_index,
-                &a.data_beacon_block_root,
-                a.data_source_epoch,
-                &a.data_source_root,
-                a.data_target_epoch,
-                &a.data_target_root,
-            );
-            roots.push(compute_signing_root(&dr, &signing_domain));
-            msgs_pk.push(
-                a.attesting_validators
-                    .iter()
-                    .map(|v| v.pubkey)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        total_att += s.witness.attestations.len();
+        let complement = &s.witness.slots[0];
 
-        // Individual FastAggregateVerify per attestation
-        let mut per_att_ok = Vec::new();
-        for (i, a) in s.witness.attestations.iter().enumerate() {
-            let ok = fast_aggregate_verify(&msgs_pk[i], &roots[i], &a.signature.0);
-            if !ok {
-                indiv_fail += 1;
-            }
-            per_att_ok.push(ok);
+        // The claim the whole scheme rests on: the key nobody enumerated is the
+        // key that signed. Everything else in this loop is context for it.
+        let signatures: Vec<[u8; 96]> = complement.primary.iter().map(|a| a.signature.0).collect();
+        let derived_ok = verify_attestation_batch(&[SignedMessage {
+            pubkeys: &[derived_key(complement)],
+            signing_root: &compute_signing_root(
+                &data_root(&complement.primary[0]),
+                &signing_domain,
+            ),
+            signatures: &signatures,
+        }]);
+        if !derived_ok {
+            derived_fail += 1;
         }
 
-        // Duplicate signing roots?
-        let mut dupe = false;
-        for i in 0..roots.len() {
-            for j in i + 1..roots.len() {
-                if roots[i] == roots[j] {
-                    dupe = true;
-                }
+        // Minority head votes, whose signers are named rather than derived.
+        let mut secondary_ok = true;
+        for a in &complement.secondary {
+            let pubkeys: Vec<G1Point> = a.attesting_validators.iter().map(|v| v.pubkey).collect();
+            if !fast_aggregate_verify(
+                &pubkeys,
+                &compute_signing_root(&data_root(a), &signing_domain),
+                &a.signature.0,
+            ) {
+                secondary_ok = false;
+                secondary_fail += 1;
             }
         }
-        if dupe {
-            total_dupe_slots += 1;
+
+        total_primary += complement.primary.len();
+        total_secondary += complement.secondary.len();
+        if !complement.secondary.is_empty() {
+            minority_slots += 1;
         }
 
-        let msgs: Vec<SignedMessage> = s
-            .witness
-            .attestations
-            .iter()
-            .enumerate()
-            .map(|(i, a)| SignedMessage {
-                pubkeys: &msgs_pk[i],
-                signing_root: &roots[i],
-                signature: &a.signature.0,
-            })
-            .collect();
-        let batch = verify_attestation_batch(&msgs);
-        if batch {
-            batch_ok += 1;
-        } else if dupe {
-            batch_fail_dupe += 1;
-        }
-
-        let all_indiv_ok = per_att_ok.iter().all(|&b| b);
         eprintln!(
-            "slot {} atts={} indiv_all_ok={} dup_signing_root={} batch_ok={}",
+            "slot {} primary={} secondary={} absentees={} named={} derived_ok={derived_ok} secondary_ok={secondary_ok}",
             s.slot,
-            s.witness.attestations.len(),
-            all_indiv_ok,
-            dupe,
-            batch,
+            complement.primary.len(),
+            complement.secondary.len(),
+            complement.absentees.len(),
+            named(complement).len(),
         );
     }
 
     eprintln!(
-        "\nslots={} atts={} indiv_failures={} slots_with_dup_signing_roots={} batch_ok={} batch_fail_due_to_dup={}",
-        slots.len(), total_att, indiv_fail, total_dupe_slots, batch_ok, batch_fail_dupe,
+        "\nslots={} primary_aggregates={total_primary} secondary_aggregates={total_secondary} \
+         slots_with_minority_head_vote={minority_slots} derived_key_failures={derived_fail} \
+         secondary_failures={secondary_fail}",
+        slots.len(),
     );
 
-    // How many slots have acc_multi_proof built over a wider index set than the
-    // circuit reconstructs (all attesters vs count_balance=true only)?
-    let mut mismatch_slots = 0;
-    for s in &slots {
-        let mut all: Vec<u64> = Vec::new();
-        for a in &s.witness.attestations {
-            for v in &a.attesting_validators {
-                all.push(v.validator_index);
-            }
-        }
-        all.sort_unstable();
-        all.dedup();
-        if all.len() != s.counted_indices.len() {
-            mismatch_slots += 1;
-        }
-    }
+    // Op counts on the slot that names the most validators: everything a slot
+    // proof does beyond one multi-pairing scales with that number, so the worst
+    // case is the one the cost model is about.
+    let worst = slots
+        .iter()
+        .max_by_key(|s| named(&s.witness.slots[0]).len())
+        .expect("no slots collected");
+    let complement = &worst.witness.slots[0];
     eprintln!(
-        "\nslots where acc multi-proof index set != circuit leaf set: {mismatch_slots}/{}",
-        slots.len()
+        "\n=== slot-proof op count: slot {} ({} primary, {} secondary, {} absentees, {} named, {} auxiliaries) ===",
+        worst.slot,
+        complement.primary.len(),
+        complement.secondary.len(),
+        complement.absentees.len(),
+        named(complement).len(),
+        worst.witness.acc_multi_proof.auxiliaries.len(),
     );
 
-    // Op counts on a slot with distinct signing roots AND all==counted.
-    let clean = slots.iter().find(|s| {
-        let mut roots = Vec::new();
-        let mut all: Vec<u64> = Vec::new();
-        for a in &s.witness.attestations {
-            let dr = zkasper_common::ssz::attestation_data_root(
-                a.data_slot,
-                a.data_index,
-                &a.data_beacon_block_root,
-                a.data_source_epoch,
-                &a.data_source_root,
-                a.data_target_epoch,
-                &a.data_target_root,
-            );
-            roots.push(compute_signing_root(&dr, &signing_domain));
-            for v in &a.attesting_validators {
-                all.push(v.validator_index);
-            }
+    op_counter::reset();
+    let before = op_counter::snapshot();
+    let out = zkasper_slot_proof_guest::verify_slot_proof(&worst.witness);
+    let total = op_counter::snapshot().delta(&before);
+    eprintln!("TOTAL {total}");
+    eprintln!("  bls_fraction {:.4}", total.bls_fraction());
+    eprintln!("  attesting_balance {}", out.attesting_balance);
+
+    op_counter::reset();
+    let s0 = op_counter::snapshot();
+    let mut leaves = Vec::new();
+    for a in &complement.secondary {
+        for v in &a.attesting_validators {
+            leaves.push((
+                zkasper_common::acc::leaf(&v.pubkey, v.active_effective_balance),
+                v.validator_index,
+            ));
         }
-        all.sort_unstable();
-        all.dedup();
-        let n = roots.len();
-        roots.sort();
-        roots.dedup();
-        roots.len() == n && n > 1 && all.len() == s.counted_indices.len()
-    });
-
-    if let Some(s) = clean {
-        let n_att = s.witness.attestations.len();
-        let n_val: usize = s
-            .witness
-            .attestations
-            .iter()
-            .map(|a| a.attesting_validators.len())
-            .sum();
-        let n_counted = s.counted_indices.len();
-        eprintln!(
-            "\n=== slot-proof op count: slot {} ({n_att} attestations, {n_val} attester slots, {n_counted} counted, {} auxiliaries) ===",
-            s.slot,
-            s.witness.acc_multi_proof.auxiliaries.len(),
-        );
-
-        op_counter::reset();
-        let before = op_counter::snapshot();
-        let out = zkasper_slot_proof_guest::verify_slot_proof(&s.witness);
-        let total = op_counter::snapshot().delta(&before);
-        eprintln!("TOTAL {total}");
-        eprintln!("  bls_fraction {:.4}", total.bls_fraction());
-        eprintln!("  attesting_balance {}", out.attesting_balance);
-
-        op_counter::reset();
-        let s0 = op_counter::snapshot();
-        let mut leaves = Vec::new();
-        for a in &s.witness.attestations {
-            for v in &a.attesting_validators {
-                if v.count_balance {
-                    leaves.push((
-                        zkasper_common::acc::leaf(&v.pubkey, v.active_effective_balance),
-                        v.validator_index,
-                    ));
-                }
-            }
-        }
-        let ph_leaf = op_counter::snapshot().delta(&s0);
-        eprintln!("  acc_leaf   {ph_leaf}");
-
-        leaves.sort_unstable_by_key(|&(_, i)| i);
-        op_counter::reset();
-        let s0 = op_counter::snapshot();
-        let _ = zkasper_common::merkle::batch_root(
-            zkasper_common::acc::compress,
-            &leaves,
-            &s.witness.acc_multi_proof.auxiliaries,
-            CONFIG.acc_tree_depth,
-        );
-        let ph_merkle = op_counter::snapshot().delta(&s0);
-        eprintln!("  acc_merkle {ph_merkle}");
-
-        let mut roots = Vec::new();
-        let mut pks = Vec::new();
-        for a in &s.witness.attestations {
-            let dr = zkasper_common::ssz::attestation_data_root(
-                a.data_slot,
-                a.data_index,
-                &a.data_beacon_block_root,
-                a.data_source_epoch,
-                &a.data_source_root,
-                a.data_target_epoch,
-                &a.data_target_root,
-            );
-            roots.push(compute_signing_root(&dr, &signing_domain));
-            pks.push(
-                a.attesting_validators
-                    .iter()
-                    .map(|v| v.pubkey)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        let msgs: Vec<SignedMessage> = s
-            .witness
-            .attestations
-            .iter()
-            .enumerate()
-            .map(|(i, a)| SignedMessage {
-                pubkeys: &pks[i],
-                signing_root: &roots[i],
-                signature: &a.signature.0,
-            })
-            .collect();
-        op_counter::reset();
-        let s0 = op_counter::snapshot();
-        let ok = verify_attestation_batch(&msgs);
-        let ph_bls = op_counter::snapshot().delta(&s0);
-        eprintln!("  bls_batch  {ph_bls} (ok={ok})");
-
-        op_counter::reset();
-        let s0 = op_counter::snapshot();
-        let mut hashes = 0u64;
-        for a in &s.witness.attestations {
-            let _ = zkasper_common::ssz::attestation_data_root(
-                a.data_slot,
-                a.data_index,
-                &a.data_beacon_block_root,
-                a.data_source_epoch,
-                &a.data_source_root,
-                a.data_target_epoch,
-                &a.data_target_root,
-            );
-            hashes += 1;
-        }
-        let ph_data = op_counter::snapshot().delta(&s0);
-        eprintln!("  att_data_root ({hashes} atts) {ph_data}");
-    } else {
-        eprintln!("\nno clean slot found");
     }
+    for v in &complement.absentees {
+        leaves.push((
+            zkasper_common::acc::leaf(&v.pubkey, v.active_effective_balance),
+            v.validator_index,
+        ));
+    }
+    let ph_leaf = op_counter::snapshot().delta(&s0);
+    eprintln!("  acc_leaf   {ph_leaf}");
+
+    leaves.sort_unstable_by_key(|&(_, i)| i);
+    op_counter::reset();
+    let s0 = op_counter::snapshot();
+    let _ = zkasper_common::merkle::batch_root(
+        zkasper_common::acc::compress,
+        &leaves,
+        &worst.witness.acc_multi_proof.auxiliaries,
+        CONFIG.acc_tree_depth,
+    );
+    let ph_merkle = op_counter::snapshot().delta(&s0);
+    eprintln!("  acc_merkle {ph_merkle}");
+
+    // The curve subtractions that replaced one Merkle opening per attester.
+    op_counter::reset();
+    let s0 = op_counter::snapshot();
+    let primary_key = derived_key(complement);
+    let ph_complement = op_counter::snapshot().delta(&s0);
+    eprintln!("  complement {ph_complement}");
+
+    let mut pubkeys: Vec<Vec<G1Point>> = vec![vec![primary_key]];
+    let mut roots = vec![compute_signing_root(
+        &data_root(&complement.primary[0]),
+        &signing_domain,
+    )];
+    let mut signatures: Vec<Vec<[u8; 96]>> =
+        vec![complement.primary.iter().map(|a| a.signature.0).collect()];
+    for a in &complement.secondary {
+        pubkeys.push(a.attesting_validators.iter().map(|v| v.pubkey).collect());
+        roots.push(compute_signing_root(&data_root(a), &signing_domain));
+        signatures.push(vec![a.signature.0]);
+    }
+    let msgs: Vec<SignedMessage> = (0..roots.len())
+        .map(|i| SignedMessage {
+            pubkeys: &pubkeys[i],
+            signing_root: &roots[i],
+            signatures: &signatures[i],
+        })
+        .collect();
+    op_counter::reset();
+    let s0 = op_counter::snapshot();
+    let ok = verify_attestation_batch(&msgs);
+    let ph_bls = op_counter::snapshot().delta(&s0);
+    eprintln!("  bls_batch  {ph_bls} (ok={ok})");
+
+    op_counter::reset();
+    let s0 = op_counter::snapshot();
+    let mut hashes = 0u64;
+    for a in complement.primary.iter().chain(&complement.secondary) {
+        let _ = data_root(a);
+        hashes += 1;
+    }
+    let ph_data = op_counter::snapshot().delta(&s0);
+    eprintln!("  att_data_root ({hashes} atts) {ph_data}");
 
     // Aggregate participation across all slots, ignoring the BLS check.
-    for s in &slots {
-        for a in &s.witness.attestations {
-            for v in &a.attesting_validators {
-                if v.count_balance {
-                    attesting_balance_total += v.active_effective_balance;
-                }
-            }
-        }
-    }
+    let attesting_balance: u64 = slots.iter().map(|s| s.marginal_balance).sum();
     eprintln!(
-        "\ntotal_active_balance {total_active_balance}  attesting_balance {attesting_balance_total}  participation {:.2}%",
-        attesting_balance_total as f64 / total_active_balance as f64 * 100.0,
+        "\ntotal_active_balance {total_active_balance}  attesting_balance {attesting_balance}  participation {:.2}%",
+        attesting_balance as f64 / total_active_balance as f64 * 100.0,
     );
 }
 

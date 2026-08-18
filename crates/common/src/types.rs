@@ -136,17 +136,17 @@ pub struct EpochDiffWitness {
     pub ssz_multi_proof_2: SszMultiProof,
 }
 
-/// Per-validator data carried inside an attestation witness.
+/// A validator named in a witness, with the leaf preimage that opens it against
+/// the accumulator.
+///
+/// Used for both halves of a complement: the absentees a slot subtracts, and the
+/// signers of any attestation whose keys are enumerated rather than derived.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AttestingValidator {
+pub struct OpenedValidator {
     pub validator_index: u64,
     /// Decompressed public key, matching what the accumulator leaf commits to.
     pub pubkey: G1Point,
     pub active_effective_balance: u64,
-    /// Whether this validator's balance should be counted towards the
-    /// attesting total. False when the same validator appears in an
-    /// earlier attestation (prevents double-counting).
-    pub count_balance: bool,
 }
 
 /// One aggregated attestation.
@@ -162,8 +162,91 @@ pub struct AttestationWitness {
     pub data_target_root: [u8; 32],
     /// Aggregate BLS signature over the signing root.
     pub signature: BlsSignature,
-    /// All validators that participated (bit set in aggregation_bits).
-    pub attesting_validators: Vec<AttestingValidator>,
+    /// Signers whose keys are enumerated and opened.
+    ///
+    /// Empty for the one aggregate per slot whose key is derived by complement —
+    /// not enumerating it is the whole point of the scheme.
+    pub attesting_validators: Vec<OpenedValidator>,
+}
+
+// ---------------------------------------------------------------------------
+// Committee proof
+// ---------------------------------------------------------------------------
+
+/// One slot's committee, summed: the universe its attesters are the complement
+/// of.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitteeAggregate {
+    /// Sum of the committee's public keys.
+    pub pubkey: G1Point,
+    /// Sum of the committee's `active_effective_balance`.
+    pub balance: u64,
+}
+
+/// One validator's committee assignment, with the leaf preimage that opens it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommitteeMember {
+    pub validator_index: u64,
+    pub pubkey: G1Point,
+    pub active_effective_balance: u64,
+    /// Slot within the epoch this validator is assigned to attest at.
+    ///
+    /// Plain witness, deliberately: see the `committee` module docs for why a
+    /// wrong assignment costs liveness and never soundness.
+    pub slot_in_epoch: u64,
+}
+
+/// Witness for the committee proof: one per epoch, entirely off the critical
+/// path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommitteeWitness {
+    // -- public inputs --
+    pub accumulator_commitment: Digest,
+    pub target_epoch: u64,
+
+    // -- private witness --
+    pub acc_root: Digest,
+    pub total_active_balance: u64,
+    /// Every committee member, strictly increasing by validator index.
+    pub members: Vec<CommitteeMember>,
+    pub acc_multi_proof: AccMultiProof,
+}
+
+/// Public outputs of a committee proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitteeOutput {
+    pub accumulator_commitment: Digest,
+    pub target_epoch: u64,
+    /// Root of the tree of per-slot [`CommitteeAggregate`]s.
+    ///
+    /// Every proof that counts a slot carries this, so a pipeline can never mix
+    /// buckets from two different partitions of the same validator set.
+    pub committee_root: Digest,
+}
+
+/// One attestation slot, proven by complement.
+///
+/// The committee aggregate is the universe; `secondary` and `absentees` name
+/// everyone who is not a signer of `primary`; `primary`'s aggregate public key
+/// is what is left over, and is never enumerated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SlotComplementWitness {
+    /// Slot within the epoch, and the index of this committee's leaf.
+    pub slot_in_epoch: u64,
+    pub committee: CommitteeAggregate,
+    /// The aggregates whose signer set is derived: the committee minus
+    /// everything named below.
+    ///
+    /// All of them carry the same `AttestationData` — a slot's attesters usually
+    /// arrive as several aggregates over one message — so they pair once, as one
+    /// derived key against one hashed message, with their signatures summed.
+    /// Their `attesting_validators` must be empty.
+    pub primary: Vec<AttestationWitness>,
+    /// Aggregates over a different message than `primary` — a minority head vote
+    /// — whose signers are named and opened.
+    pub secondary: Vec<AttestationWitness>,
+    /// Committee members this proof counts no attestation for.
+    pub absentees: Vec<OpenedValidator>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,21 +259,27 @@ pub struct AttestationWitness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotProofOutput {
     pub accumulator_commitment: Digest,
+    /// Committee tree the slots below were counted against.
+    pub committee_root: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
-    /// Sum of `active_effective_balance` for validators with `count_balance=true`.
+    /// Sum over the slots proven here of `committee_balance − absentee balances`.
     pub attesting_balance: u64,
-    /// Sponge commitment over sorted counted validator indices.
-    pub counted_validators_commitment: Digest,
-    /// Number of counted validators (for commitment verification).
-    pub num_counted_validators: u64,
+    /// Which slots of the epoch this proof counted, one bit each.
+    ///
+    /// This is the whole of cross-slot deduplication. A committee proof assigns
+    /// every validator to exactly one slot, so counting a slot at most once
+    /// counts a validator at most once — a 32-bit mask where the old design
+    /// needed a committed set over a million indices.
+    pub slots_mask: u64,
 }
 
-/// Witness for a slot proof (one block's attestations).
+/// Witness for a slot proof: the complement of one or more attestation slots.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlotProofWitness {
     // -- public inputs --
     pub accumulator_commitment: Digest,
+    pub committee_root: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub signing_domain: [u8; 32],
@@ -198,8 +287,13 @@ pub struct SlotProofWitness {
     // -- private witness --
     pub acc_root: Digest,
     pub total_active_balance: u64,
-    pub attestations: Vec<AttestationWitness>,
+    /// Attestation slots, strictly increasing by `slot_in_epoch`.
+    pub slots: Vec<SlotComplementWitness>,
+    /// Opening of every validator named across `slots`, absentees and enumerated
+    /// signers together.
     pub acc_multi_proof: AccMultiProof,
+    /// Opening of each slot's committee aggregate against `committee_root`.
+    pub committee_multi_proof: AccMultiProof,
 }
 
 /// Public outputs of a justification proof.
@@ -223,14 +317,17 @@ pub struct JustificationWitness {
     /// output so the on-chain verifier can pin which program the slot proofs
     /// came from.
     pub slot_program_vk: crate::recursion::ProgramVk,
+    /// Verification key of the committee program.
+    pub committee_program_vk: crate::recursion::ProgramVk,
+
+    /// The committee proof every slot proof counted against.
+    pub committee: CommitteeOutput,
+    pub committee_proof: Vec<u64>,
 
     // -- slot proof outputs, verified recursively --
     pub slot_proof_outputs: Vec<SlotProofOutput>,
     /// Zisk proof words per slot (empty in native testing mode).
     pub slot_proofs: Vec<Vec<u64>>,
-
-    // -- dedup witness: per-slot sorted counted validator indices --
-    pub counted_indices_per_slot: Vec<Vec<u64>>,
 }
 
 /// The five fields of a `BeaconBlockHeader`, enough to recompute its root.
@@ -316,11 +413,21 @@ impl SlotProofOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
+            .digest(&self.committee_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
             .u64(self.attesting_balance)
-            .digest(&self.counted_validators_commitment)
-            .u64(self.num_counted_validators)
+            .u64(self.slots_mask)
+            .finish()
+    }
+}
+
+impl CommitteeOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .u64(self.target_epoch)
+            .digest(&self.committee_root)
             .finish()
     }
 }
@@ -387,11 +494,11 @@ impl Default for MillerAccumulator {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupProofOutput {
     pub accumulator_commitment: Digest,
+    pub committee_root: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub attesting_balance: u64,
-    pub counted_validators_commitment: Digest,
-    pub num_counted_validators: u64,
+    pub slots_mask: u64,
     /// [`crate::acc::commit_fp12`] of this group's Miller-loop accumulator. The
     /// signatures are *not* verified here — they are verified by whichever proof
     /// finally runs the exponentiation over the product of every group's
@@ -403,6 +510,8 @@ pub struct GroupProofOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateOutput {
     pub accumulator_commitment: Digest,
+    /// Committee tree every folded group counted against.
+    pub committee_root: Digest,
     /// Accumulator the *previous* epoch was justified against, taken from the
     /// epoch diff that links the two.
     ///
@@ -421,9 +530,8 @@ pub struct AggregateOutput {
     pub target_root: [u8; 32],
     /// Attesting balance accumulated so far, already deduplicated.
     pub attesting_balance: u64,
-    /// Root of the counted-set tree — which validators have been counted.
-    pub dedup_root: Digest,
-    pub num_counted_validators: u64,
+    /// Which slots of the epoch have been counted, one bit each.
+    pub slots_mask: u64,
     /// Commitment to the product of every folded group's Miller accumulator.
     pub miller_commitment: Digest,
 }
@@ -443,6 +551,8 @@ pub struct AggregateWitness {
     pub aggregate_program_vk: crate::recursion::ProgramVk,
     /// Verification key of the epoch-diff program.
     pub epoch_diff_program_vk: crate::recursion::ProgramVk,
+    /// Verification key of the committee program.
+    pub committee_program_vk: crate::recursion::ProgramVk,
 
     /// The diff that carried the accumulator from the previous epoch to this
     /// one. Required when `previous` is absent — the fold that opens an epoch is
@@ -450,6 +560,12 @@ pub struct AggregateWitness {
     /// folds inherit it.
     pub epoch_diff: Option<EpochDiffOutput>,
     pub epoch_diff_proof: Vec<u64>,
+
+    /// The committee proof for this epoch, on the same terms as the diff: the
+    /// fold that opens the epoch verifies it, everything after inherits the root
+    /// it published.
+    pub committee: Option<CommitteeOutput>,
+    pub committee_proof: Vec<u64>,
 
     /// The aggregate being extended. `None` opens the epoch: the counted set is
     /// empty and the Miller accumulator is 1.
@@ -462,11 +578,6 @@ pub struct AggregateWitness {
     pub groups: Vec<GroupProofOutput>,
     pub group_proofs: Vec<Vec<u64>>,
     pub group_millers: Vec<MillerAccumulator>,
-    /// Sorted counted indices behind each group's `counted_validators_commitment`.
-    pub counted_indices_per_group: Vec<Vec<u64>>,
-
-    /// Opening of the counted-set tree over every index being added.
-    pub dedup_proof: crate::dedup::DedupProof,
 }
 
 /// A justification of the previous epoch, whichever program proved it.
@@ -552,11 +663,16 @@ pub struct StreamFinalWitness {
     pub aggregate_program_vk: crate::recursion::ProgramVk,
     pub previous_program_vk: crate::recursion::ProgramVk,
     pub epoch_diff_program_vk: crate::recursion::ProgramVk,
+    pub committee_program_vk: crate::recursion::ProgramVk,
 
     /// The epoch diff linking the previous epoch's accumulator to this one's.
     /// Only needed when there is no aggregate to inherit it from.
     pub epoch_diff: Option<EpochDiffOutput>,
     pub epoch_diff_proof: Vec<u64>,
+
+    /// The committee proof for this epoch, on the same terms as the diff.
+    pub committee: Option<CommitteeOutput>,
+    pub committee_proof: Vec<u64>,
 
     /// Running aggregate for this epoch. `None` means the whole epoch is being
     /// proven inline, which only makes sense for tiny chains and tests.
@@ -568,17 +684,14 @@ pub struct StreamFinalWitness {
     pub groups: Vec<GroupProofOutput>,
     pub group_proofs: Vec<Vec<u64>>,
     pub group_millers: Vec<MillerAccumulator>,
-    pub counted_indices_per_group: Vec<Vec<u64>>,
 
-    /// The marginal attestations that carry the epoch over the threshold,
-    /// proven here rather than in a group proof of their own. One proof stage
-    /// saved is one per-proof floor and one recursion saved from the only
-    /// latency that matters.
-    pub tail: Vec<AttestationWitness>,
+    /// The marginal slot that carries the epoch over the threshold, proven here
+    /// rather than in a group proof of its own. One proof stage saved is one
+    /// per-proof floor and one recursion saved from the only latency that
+    /// matters.
+    pub tail: Vec<SlotComplementWitness>,
     pub tail_acc_multi_proof: AccMultiProof,
-
-    /// Opening of the counted-set tree over every index counted here.
-    pub dedup_proof: crate::dedup::DedupProof,
+    pub tail_committee_multi_proof: AccMultiProof,
 
     /// The previous epoch's justification, which this proof turns into a
     /// finalization.
@@ -592,11 +705,11 @@ impl GroupProofOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
+            .digest(&self.committee_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
             .u64(self.attesting_balance)
-            .digest(&self.counted_validators_commitment)
-            .u64(self.num_counted_validators)
+            .u64(self.slots_mask)
             .digest(&self.miller_commitment)
             .finish()
     }
@@ -606,13 +719,13 @@ impl AggregateOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
+            .digest(&self.committee_root)
             .digest(&self.previous_accumulator_commitment)
             .bytes32(&self.anchor_state_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
             .u64(self.attesting_balance)
-            .digest(&self.dedup_root)
-            .u64(self.num_counted_validators)
+            .u64(self.slots_mask)
             .digest(&self.miller_commitment)
             .finish()
     }

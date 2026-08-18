@@ -1,26 +1,29 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
 use zkasper_common::types::{JustificationOutput, JustificationWitness};
 
-/// Verify a justification: aggregate slot proofs, dedup validators, check 2/3.
+/// Verify a justification: aggregate slot proofs, dedup slots, check 2/3.
 pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutput {
-    use zkasper_common::acc;
     use zkasper_common::recursion::verify_child;
 
     assert!(
         !witness.slot_proof_outputs.is_empty(),
         "no slot proofs provided",
     );
-    assert_eq!(
-        witness.slot_proof_outputs.len(),
-        witness.counted_indices_per_slot.len(),
-        "slot_proof_outputs and counted_indices_per_slot length mismatch",
+
+    // Every slot proof counted against this committee proof, which is what makes
+    // the slot mask below a deduplication of validators rather than of slots.
+    let committee_root = zkasper_aggregation_guest::committee_link(
+        Some(&witness.committee),
+        &witness.committee_proof,
+        &witness.committee_program_vk,
+        &witness.accumulator_commitment,
+        witness.target_epoch,
     );
 
     let mut total_attesting_balance: u64 = 0;
+    let mut slots_mask: u64 = 0;
 
-    // Phase 1: Verify each slot proof and its counted-validators commitment
     for (i, slot_output) in witness.slot_proof_outputs.iter().enumerate() {
         // Verify the slot proof, and bind it to this exact program and these
         // exact outputs — a proof of a different slot must not be accepted.
@@ -34,10 +37,16 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
             i,
         );
 
-        // Verify all slot proofs target the same checkpoint and accumulator
+        // Verify all slot proofs target the same checkpoint, accumulator and
+        // committee partition
         assert_eq!(
             slot_output.accumulator_commitment, witness.accumulator_commitment,
             "slot proof {} accumulator mismatch",
+            i,
+        );
+        assert_eq!(
+            slot_output.committee_root, committee_root,
+            "slot proof {} committee mismatch",
             i,
         );
         assert_eq!(
@@ -51,51 +60,18 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
             i,
         );
 
-        // Re-hash the counted indices to verify they match the slot's commitment
-        let indices = &witness.counted_indices_per_slot[i];
+        // Cross-slot deduplication. A committee proof assigns every validator to
+        // exactly one slot, so a slot counted once is a validator counted once.
         assert_eq!(
-            indices.len() as u64,
-            slot_output.num_counted_validators,
-            "slot proof {} counted validator count mismatch",
-            i,
+            slots_mask & slot_output.slots_mask,
+            0,
+            "slot proof {i} counts a slot that was already counted",
         );
-        let recomputed = acc::commit_indices(indices);
-        assert_eq!(
-            recomputed, slot_output.counted_validators_commitment,
-            "slot proof {} counted validators commitment mismatch",
-            i,
-        );
-
-        // Verify indices are sorted within this slot
-        for j in 1..indices.len() {
-            assert!(
-                indices[j] > indices[j - 1],
-                "slot proof {} indices not strictly increasing: {} followed {}",
-                i,
-                indices[j - 1],
-                indices[j],
-            );
-        }
+        slots_mask |= slot_output.slots_mask;
 
         total_attesting_balance += slot_output.attesting_balance;
     }
 
-    // Phase 2: Cross-slot dedup — merge sorted per-slot indices, verify globally unique
-    let mut all_indices: Vec<u64> = Vec::new();
-    for indices in &witness.counted_indices_per_slot {
-        all_indices.extend_from_slice(indices);
-    }
-    all_indices.sort_unstable();
-
-    for i in 1..all_indices.len() {
-        assert!(
-            all_indices[i] > all_indices[i - 1],
-            "cross-slot duplicate validator: {}",
-            all_indices[i],
-        );
-    }
-
-    // Phase 3: Supermajority check
     assert!(
         total_attesting_balance as u128 * 3 >= witness.total_active_balance as u128 * 2,
         "insufficient attesting balance: {} / {} ({:.1}%)",

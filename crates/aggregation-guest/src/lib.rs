@@ -8,7 +8,7 @@
 //! produces the next aggregate. Its output is three running values —
 //!
 //! - `attesting_balance`, the deduplicated weight behind the target,
-//! - `dedup_root`, which validators that weight came from,
+//! - `slots_mask`, which attestation slots that weight came from,
 //! - `miller_commitment`, the product of every folded group's Miller-loop
 //!   accumulator,
 //!
@@ -18,36 +18,33 @@
 //!
 //! Everything in the fold scales with the groups being folded, not with what
 //! has already accumulated. Balances add. Miller accumulators multiply, at
-//! 141,090 each. The counted set is a bitmap tree, so marking a group's
-//! attesters opens only the leaves they fall in.
+//! 737,503 each. Deduplication is a 32-bit mask, because the committee proof
+//! assigns every validator to exactly one slot: counting a slot at most once is
+//! counting a validator at most once, and the check is an `AND` against zero.
 //!
 //! That is the property the pipeline needs: the join that runs after the last
 //! attestation of the epoch must not be a function of the whole epoch, or the
 //! epoch's size would be back on the critical path.
+//!
+//! # Why the committee root is carried
+//!
+//! The disjointness that makes the mask sufficient is a property of *one*
+//! committee proof. Two committee proofs of the same epoch partition the same
+//! validators differently, and a fold that took slot 3 from one and slot 7 from
+//! the other could count a validator twice. Every group therefore publishes the
+//! committee root it counted against, and the fold requires them all equal.
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use zkasper_common::acc;
 use zkasper_common::bls::{fp12_mul, Fp12, FP12_ONE};
-use zkasper_common::dedup;
 use zkasper_common::recursion::verify_child;
-use zkasper_common::types::{AggregateOutput, AggregateWitness, EpochDiffOutput, GroupProofOutput};
+use zkasper_common::types::{
+    AggregateOutput, AggregateWitness, CommitteeOutput, EpochDiffOutput, GroupProofOutput,
+};
 
 /// Fold group proofs into a running aggregate.
 pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
-    verify_aggregate_with_depth(
-        witness,
-        dedup::tree_depth(zkasper_common::constants::ACC_TREE_DEPTH),
-    )
-}
-
-/// Aggregation with a configurable counted-set tree depth.
-pub fn verify_aggregate_with_depth(
-    witness: &AggregateWitness,
-    dedup_depth: u32,
-) -> AggregateOutput {
     assert!(
         !witness.groups.is_empty(),
         "aggregation proof folds no groups",
@@ -62,71 +59,76 @@ pub fn verify_aggregate_with_depth(
         witness.group_millers.len(),
         "groups and Miller accumulators length mismatch",
     );
-    assert_eq!(
-        witness.groups.len(),
-        witness.counted_indices_per_group.len(),
-        "groups and counted index lists length mismatch",
-    );
 
     // The aggregate being extended. Absent means the epoch opens here: nothing
-    // counted, an empty counted-set tree, an empty product of pairings, and the
-    // epoch diff still to be verified.
-    let (previous_accumulator_commitment, anchor_state_root) = match &witness.previous {
-        Some(previous) => (
-            previous.previous_accumulator_commitment,
-            previous.anchor_state_root,
-        ),
-        None => epoch_link(
-            witness.epoch_diff.as_ref(),
-            &witness.epoch_diff_proof,
-            &witness.epoch_diff_program_vk,
-            &witness.accumulator_commitment,
-            witness.target_epoch,
-        ),
-    };
-
-    let (mut attesting_balance, mut dedup_root, mut num_counted, mut miller) =
+    // counted, an empty slot mask, an empty product of pairings, and the epoch
+    // diff still to be verified.
+    let (previous_accumulator_commitment, anchor_state_root, committee_root) =
         match &witness.previous {
-            Some(previous) => {
-                assert!(
-                    verify_child(
-                        &witness.previous_proof,
-                        &witness.aggregate_program_vk,
-                        &previous.public_bytes(),
-                    ),
-                    "previous aggregate failed recursive verification",
-                );
-                assert_eq!(
-                    previous.accumulator_commitment, witness.accumulator_commitment,
-                    "previous aggregate accumulator mismatch",
-                );
-                assert_eq!(
-                    previous.target_epoch, witness.target_epoch,
-                    "previous aggregate target_epoch mismatch",
-                );
-                assert_eq!(
-                    previous.target_root, witness.target_root,
-                    "previous aggregate target_root mismatch",
-                );
-                assert_eq!(
-                    acc::commit_fp12(&witness.previous_miller.0),
-                    previous.miller_commitment,
-                    "previous aggregate Miller accumulator does not match its commitment",
+            Some(previous) => (
+                previous.previous_accumulator_commitment,
+                previous.anchor_state_root,
+                previous.committee_root,
+            ),
+            None => {
+                let (previous_accumulator_commitment, anchor_state_root) = epoch_link(
+                    witness.epoch_diff.as_ref(),
+                    &witness.epoch_diff_proof,
+                    &witness.epoch_diff_program_vk,
+                    &witness.accumulator_commitment,
+                    witness.target_epoch,
                 );
                 (
-                    previous.attesting_balance,
-                    previous.dedup_root,
-                    previous.num_counted_validators,
-                    witness.previous_miller.0,
+                    previous_accumulator_commitment,
+                    anchor_state_root,
+                    committee_link(
+                        witness.committee.as_ref(),
+                        &witness.committee_proof,
+                        &witness.committee_program_vk,
+                        &witness.accumulator_commitment,
+                        witness.target_epoch,
+                    ),
                 )
             }
-            None => (0u64, dedup::empty_root(dedup_depth), 0u64, FP12_ONE),
         };
 
-    let mut added: Vec<u64> = Vec::new();
+    let (mut attesting_balance, mut slots_mask, mut miller) = match &witness.previous {
+        Some(previous) => {
+            assert!(
+                verify_child(
+                    &witness.previous_proof,
+                    &witness.aggregate_program_vk,
+                    &previous.public_bytes(),
+                ),
+                "previous aggregate failed recursive verification",
+            );
+            assert_eq!(
+                previous.accumulator_commitment, witness.accumulator_commitment,
+                "previous aggregate accumulator mismatch",
+            );
+            assert_eq!(
+                previous.target_epoch, witness.target_epoch,
+                "previous aggregate target_epoch mismatch",
+            );
+            assert_eq!(
+                previous.target_root, witness.target_root,
+                "previous aggregate target_root mismatch",
+            );
+            assert_eq!(
+                acc::commit_fp12(&witness.previous_miller.0),
+                previous.miller_commitment,
+                "previous aggregate Miller accumulator does not match its commitment",
+            );
+            (
+                previous.attesting_balance,
+                previous.slots_mask,
+                witness.previous_miller.0,
+            )
+        }
+        None => (0u64, 0u64, FP12_ONE),
+    };
 
     for (i, group) in witness.groups.iter().enumerate() {
-        let indices = &witness.counted_indices_per_group[i];
         let miller_i = &witness.group_millers[i].0;
 
         verify_group(
@@ -134,41 +136,37 @@ pub fn verify_aggregate_with_depth(
             &witness.group_proofs[i],
             &witness.group_program_vk,
             witness.accumulator_commitment,
+            committee_root,
             witness.target_epoch,
             &witness.target_root,
-            indices,
             miller_i,
             i,
         );
 
-        attesting_balance += group.attesting_balance;
-        num_counted += group.num_counted_validators;
-        miller = fp12_mul(&miller, miller_i);
-        added.extend_from_slice(indices);
-    }
+        // A slot already counted, by an earlier fold or by another group in this
+        // one, is what makes balances additive across the whole chain — and it
+        // is a validator counted twice, because the committee proof gave that
+        // validator exactly one slot.
+        assert_eq!(
+            slots_mask & group.slots_mask,
+            0,
+            "group proof {i} counts a slot that was already counted",
+        );
+        slots_mask |= group.slots_mask;
 
-    // Mark every validator counted here. `apply` proves each one was clear
-    // beforehand, which is what makes the balances additive across the whole
-    // chain of aggregates: a validator already counted by an earlier fold, or by
-    // another group in this one, fails here.
-    added.sort_unstable();
-    let update = dedup::apply(&added, &witness.dedup_proof, dedup_depth)
-        .expect("validator counted twice, or malformed counted-set proof");
-    assert_eq!(
-        update.old_root, dedup_root,
-        "counted-set proof does not open the running root",
-    );
-    dedup_root = update.new_root;
+        attesting_balance += group.attesting_balance;
+        miller = fp12_mul(&miller, miller_i);
+    }
 
     AggregateOutput {
         accumulator_commitment: witness.accumulator_commitment,
+        committee_root,
         previous_accumulator_commitment,
         anchor_state_root,
         target_epoch: witness.target_epoch,
         target_root: witness.target_root,
         attesting_balance,
-        dedup_root,
-        num_counted_validators: num_counted,
+        slots_mask,
         miller_commitment: acc::commit_fp12(&miller),
     }
 }
@@ -183,9 +181,9 @@ pub fn verify_group(
     proof: &[u64],
     program_vk: &zkasper_common::recursion::ProgramVk,
     accumulator_commitment: acc::Digest,
+    committee_root: acc::Digest,
     target_epoch: u64,
     target_root: &[u8; 32],
-    counted_indices: &[u64],
     miller: &Fp12,
     position: usize,
 ) {
@@ -196,6 +194,10 @@ pub fn verify_group(
     assert_eq!(
         group.accumulator_commitment, accumulator_commitment,
         "group proof {position} accumulator mismatch",
+    );
+    assert_eq!(
+        group.committee_root, committee_root,
+        "group proof {position} committee mismatch",
     );
     assert_eq!(
         group.target_epoch, target_epoch,
@@ -215,24 +217,6 @@ pub fn verify_group(
         group.miller_commitment,
         "group proof {position} Miller accumulator does not match its commitment",
     );
-
-    // Same for the counted indices: the group published a sponge over them.
-    assert_eq!(
-        counted_indices.len() as u64,
-        group.num_counted_validators,
-        "group proof {position} counted validator count mismatch",
-    );
-    assert_eq!(
-        acc::commit_indices(counted_indices),
-        group.counted_validators_commitment,
-        "group proof {position} counted validators commitment mismatch",
-    );
-    for j in 1..counted_indices.len() {
-        assert!(
-            counted_indices[j] > counted_indices[j - 1],
-            "group proof {position} indices not strictly increasing",
-        );
-    }
 }
 
 /// Verify the epoch diff that carries the previous epoch's accumulator to this
@@ -284,4 +268,41 @@ pub fn epoch_link(
     );
 
     (diff.prev_accumulator_commitment, diff.state_root_1)
+}
+
+/// Verify the committee proof this epoch's slot buckets came from, and return
+/// the root every group has to have counted against.
+///
+/// Verified once, in the fold that opens the epoch, for the same reason the diff
+/// is: the committee for an epoch is fixed two epochs earlier, so waiting until
+/// the last attestation would put a recursive verification on the critical path
+/// for nothing.
+///
+/// One proof is not a detail. The slot mask deduplicates validators only because
+/// a single committee proof puts each validator in exactly one slot; two
+/// partitions of the same epoch overlap, so exactly one of them may be in play.
+pub fn committee_link(
+    committee: Option<&CommitteeOutput>,
+    proof: &[u64],
+    program_vk: &zkasper_common::recursion::ProgramVk,
+    accumulator_commitment: &acc::Digest,
+    target_epoch: u64,
+) -> acc::Digest {
+    let committee = committee.expect("an epoch's first aggregation must carry the committee proof");
+
+    assert!(
+        verify_child(proof, program_vk, &committee.public_bytes()),
+        "committee proof failed recursive verification",
+    );
+    assert_eq!(
+        committee.accumulator_commitment, *accumulator_commitment,
+        "committee proof was built against a different accumulator",
+    );
+    assert_eq!(
+        committee.target_epoch, target_epoch,
+        "committee proof covers epoch {} but epoch {target_epoch} is being proven",
+        committee.target_epoch,
+    );
+
+    committee.committee_root
 }

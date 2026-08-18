@@ -20,7 +20,6 @@ pub const ZERO: Digest = [0; 4];
 const DOMAIN_NODE: u64 = 0;
 const DOMAIN_LEAF: u64 = 1;
 const DOMAIN_COMMITMENT: u64 = 2;
-const DOMAIN_INDEX_LIST: u64 = 3;
 const DOMAIN_FP12: u64 = 4;
 
 #[inline(always)]
@@ -119,31 +118,6 @@ pub fn commitment(root: &Digest, total_active_balance: u64) -> Digest {
     st[5] = total_active_balance >> 32;
     st[15] = DOMAIN_COMMITMENT;
     permute(&mut st);
-    [st[0], st[1], st[2], st[3]]
-}
-
-/// Sponge commitment over a sorted list of validator indices, used to detect
-/// double-counting across slot proofs.
-///
-/// Absorbs 8 indices per permutation. The length is bound in the capacity, so
-/// lists of different lengths cannot collide through padding.
-pub fn commit_indices(sorted_indices: &[u64]) -> Digest {
-    let mut st = [0u64; 16];
-    st[8] = DOMAIN_INDEX_LIST;
-    st[9] = sorted_indices.len() as u64;
-
-    let mut i = 0usize;
-    loop {
-        let n = core::cmp::min(8, sorted_indices.len().saturating_sub(i));
-        let mut rate = [0u64; 8];
-        rate[..n].copy_from_slice(&sorted_indices[i..i + n]);
-        st[0..8].copy_from_slice(&rate);
-        permute(&mut st);
-        i += 8;
-        if i >= sorted_indices.len() {
-            break;
-        }
-    }
     [st[0], st[1], st[2], st[3]]
 }
 
@@ -272,11 +246,6 @@ mod tests {
             leaf(&p, 0),
             compress(&[packed[0], packed[1], packed[2], packed[3]], &ZERO),
         );
-    }
-
-    #[test]
-    fn index_commitment_binds_length() {
-        assert_ne!(commit_indices(&[1, 2, 3]), commit_indices(&[1, 2, 3, 0]));
     }
 
     #[test]

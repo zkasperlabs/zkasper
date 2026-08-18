@@ -57,9 +57,10 @@ use zisk_sdk::{EmbeddedClient, GuestProgram, ProofKind, ProverClient, ZiskStdin}
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::{verify_child, ProgramVk};
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, EpochDiffOutput, EpochDiffWitness,
-    FinalizationOutput, FinalizationWitness, GroupProofOutput, JustificationOutput,
-    JustificationWitness, SlotProofOutput, SlotProofWitness, StreamFinalOutput, StreamFinalWitness,
+    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
+    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
+    StreamFinalOutput, StreamFinalWitness,
 };
 use zkasper_common::ChainConfig;
 
@@ -272,6 +273,7 @@ impl StageProgram {
 fn elf_name(stage: Stage) -> &'static str {
     match stage {
         Stage::Bootstrap => "zkasper-bootstrap-guest",
+        Stage::Committee => "zkasper-committee-proof-guest",
         Stage::EpochDiff => "zkasper-epoch-diff-guest",
         Stage::SlotProof => "zkasper-slot-proof-guest",
         Stage::Justification => "zkasper-justification-guest",
@@ -332,6 +334,14 @@ impl Prover for ZiskProver {
         Ok((output, proof))
     }
 
+    fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
+        let output = run_circuit(Stage::Committee, || {
+            zkasper_common::committee::verify(witness, self.chain.acc_tree_depth)
+        })?;
+        let proof = self.prove(Stage::Committee, witness, &output.public_bytes())?;
+        Ok((output, proof))
+    }
+
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)> {
         let output = run_circuit(Stage::SlotProof, || {
             zkasper_slot_proof_guest::verify_slot_proof_with_depth(
@@ -381,10 +391,7 @@ impl Prover for ZiskProver {
 
     fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)> {
         let output = run_circuit(Stage::Aggregate, || {
-            zkasper_aggregation_guest::verify_aggregate_with_depth(
-                witness,
-                zkasper_common::dedup::tree_depth(self.chain.acc_tree_depth),
-            )
+            zkasper_aggregation_guest::verify_aggregate(witness)
         })?;
         let proof = self.prove(Stage::Aggregate, witness, &output.public_bytes())?;
         Ok((output, proof))

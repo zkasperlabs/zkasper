@@ -164,33 +164,87 @@ on the next point or its negation — a discrete-log problem, not something a
 prover can arrange. `aggregate_points` checks for it and rejects rather than
 assuming it away.
 
-## Where the next win is
+## Complement proving: name the absentees
 
-With public keys handled, an epoch is:
+`scripts/complement_cost.py`, at 1,050,000 active validators and 99.7%
+participation — so 32,812 to a committee and **98** of them absent.
+
+A slot proof used to open an accumulator path for every attester. That is
+proving the overwhelmingly common case tens of thousands of times, and at
+mainnet participation it is 99.7% of the work:
+
+| per slot | leaves | internal nodes | cost |
+|---|---:|---:|---:|
+| open every attester | 32,714 | 232,927 | 836.6M |
+| open every absentee | 98 | 1,524 | **5.0M** |
+
+**167x.** What replaces the openings is a per-slot `(summed public key, summed
+effective balance)` pair, published by a committee proof and subtracted from:
+
+```text
+agg_pk  = committee.pubkey  − Σ(absentee pubkeys)
+support = committee.balance − Σ(absentee balances)
+```
+
+The committee proof pays for the whole epoch at once — it opens every active
+validator's leaf and aggregates every public key — and that is the only place
+the old per-slot work goes:
+
+| | | |
+|---|---:|---:|
+| open 1,050,000 leaves (2,462,373 internal nodes) | 11.65B | |
+| aggregate 1,050,000 public keys | 2.55B | |
+| per-proof floor | 0.29B | |
+| **committee proof, once per epoch** | | **14.49B** |
+
+Even paying that, the epoch gets cheaper, because 32 slot proofs stop opening a
+scattered thirty-second of the tree each:
+
+| | |
+|---|---:|
+| 32 slot proofs, enumerating attesters | 54.86B |
+| 32 slot proofs, naming absentees | 14.11B |
+| committee proof | 14.49B |
+| **total** | **28.60B** (−47.9%) |
+
+And the committee for epoch `N` is fixed by a RANDAO mix that stops moving two
+epochs earlier, so the 14.49B has a whole epoch — 384 seconds — of slack. It is
+off the critical path by construction, not by scheduling luck.
+
+### What it does to `T2 − T`
+
+The marginal unit used to be one aggregate; it is now one slot, because a slot is
+the smallest thing a committee aggregate can be the complement of. Measured
+against the 26,813-attester aggregate that crossed the threshold on epoch
+430529:
+
+| | cost | GPU warm |
+|---|---:|---:|
+| marginal aggregate, enumerated | 1.42B | 22.2s |
+| marginal slot, complemented | **0.57B** | **9.6s** |
+
+**2.5x**, and what is left is almost entirely irreducible: 0.294B of per-proof
+floor and 0.133B of final exponentiation are 75% of it, the accumulator work is
+0.005B, and the counted-set opening is gone — deduplication is now a 32-bit slot
+mask, because a committee proof puts every validator in exactly one slot.
+
+## Where the next win is
 
 | | | share |
 |---|---:|---:|
-| accumulator hashing | 26.8B | 44% |
-| pairings | 21.5B | 35% |
-| per-proof floor | 9.7B | 16% |
-| public keys | 2.5B | 4% |
+| committee proof | 14.5B | 51% |
+| per-proof floor | 9.7B | 34% |
+| pairings | 3.9B | 14% |
+| slot accumulator work | 0.2B | 1% |
 
-Three things worth measuring next, in rough order of size:
+Two things worth measuring next:
 
-1. **Accumulator membership is proven 32 times over.** Each slot proof opens a
-   different scattered 1/32 of the tree, which is the worst case for a
-   multi-proof: the upper levels get rebuilt in every one of the 32 proofs.
-   Proving membership once per epoch over the union of attesters — effectively
-   rebuilding the whole tree once — is ~16.9B against 26.8B. It moves work from
-   the slot proofs into the justification proof, which also makes the slot
-   proofs cheaper to parallelise.
+1. **The committee proof is half the epoch and is trivially parallel.** Bucket
+   sums add and a validator lands in one index range, so splitting it across
+   *n* proofs needs only a fold that adds aggregates. Nothing else in the
+   pipeline has that shape.
 
-2. **Aggregate count drives the pairings.** The 21.5B assumes 8 aggregates per
-   slot. Post-Electra a single aggregate can cover every committee in a slot, so
-   this scales directly with how many a block actually carries — at one per slot
-   it is 8.5B.
-
-3. **The floor is 16% and it is pure overhead.** 33 proofs at 293,601,280 each.
+2. **The floor is 34% and it is pure overhead.** 34 proofs at 293,601,280 each.
    Fewer, larger proofs trade that against parallelism.
 
 ## Composite: real slot proof
@@ -292,7 +346,10 @@ invocations are 39s of nothing, which is why the pipeline is only under 30
 seconds on a prover that stays up. `crates/witness-gen/src/prover.rs` documents
 this as a requirement of the trait rather than a deployment note.
 
-### Where the remaining 1.418B is
+### Where the remaining 1.418B went
+
+That measurement predates complement proving, and the thing it identified as the
+next win is what complement proving is:
 
 | | | share |
 |---|---:|---:|
@@ -304,14 +361,10 @@ this as a requirement of the trait rather than a deployment note.
 | public key aggregation | 0.065B | 4.6% |
 | Fp12 multiply and commitment | 0.001B | 0.1% |
 
-The critical path is now dominated by opening 26,813 accumulator leaves for the
-one aggregate that crosses the threshold — 0.602B of it internal nodes, 0.107B
-leaves — and not by the pairing, which is what dominated before. Two things follow. A chain with smaller aggregates has a shorter
-critical path for free, since the marginal unit is one aggregate and its size is
-whatever the block builder chose. And the next real win is proving membership
-for a *superset* of the likely marginal attesters before `T`, leaving the final
-proof to select from it: that is the only remaining term that is large and not
-irreducible.
+Half the critical path was opening 26,813 accumulator leaves for one aggregate.
+Naming that slot's ~98 absentees instead drops it to 0.005B, and the counted-set
+opening disappears with the counted set. 1.418B becomes 0.57B; see
+**Complement proving** above.
 
 ## Composite: the streaming guests
 
@@ -333,3 +386,40 @@ inside a guest, so they panic — and a panicking guest does not return from
 `ziskemu`. The justification and finalization guests have always had this
 property; it is a property of the fixture, not of the circuits, and it goes away
 with real child proofs.
+
+## The warm prover, measured
+
+Everything above is trace area, which is hardware-independent. This is the other
+half: what a proof costs when the prover is a long-lived process rather than a
+`cargo-zisk` invocation. Measured through `crates/witness-gen/src/zisk_prover.rs`
+on a 20-core CPU box with no GPU, against the standard proving key, by
+`tests/zisk_proof_tests.rs`:
+
+```
+initialise + ROM setup for two guests            31.25 s   (once, per process)
+group proof   428,784,600 units    811.97 s  =  805.91 prove +  5.89 wrap
+slot proof    575,610,460 units    850.08 s  =  841.78 prove +  8.22 wrap
+switch from the group ELF to the slot ELF         0.36 s   (263 ms of it the guest)
+```
+
+Two things in that table are the point.
+
+**The second proof used a different guest and paid nothing for it.** The client
+keeps a map of set-up programs, so changing guest is an `Arc` swap of a cached
+ROM plus a 32-byte read of that ROM's Merkle root. Subtract the guest's own
+263 ms execution and the switch is under a tenth of a second. A pipeline of eight
+stages therefore needs one prover, not eight — a fleet is sized by how many
+proofs must be in flight at once, never by how many programs there are.
+
+**The wrap never pays for a process.** `cargo-zisk wrap --minimal` measures 18.4 s
+on a GPU of which 0.192 s is the compression; the rest is startup and device
+allocation. In-process there is no startup, and what is left is the compression
+itself — 5.89 s here, because compressing on a CPU really does cost seconds.
+
+Do not fit a line to these two points. The box was shared with other work while
+they were taken, and `scripts/gpu_bench.sh` explains why two points a few seconds
+apart is not a measurement. They are here to show the shape, not the slope.
+
+What they do not show is a streaming epoch proven end to end. That needs a GPU
+and is what `scripts/gpu_bench.sh` is for; until it is run, the 22.2 s in
+"Streaming: what `T2 - T` costs" is a model.

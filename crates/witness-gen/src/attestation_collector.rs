@@ -1,202 +1,299 @@
-//! Collect attestations for a target checkpoint and build AttestationWitness values.
+//! Collect attestations for a target checkpoint and build slot complements.
+//!
+//! # Why slots are keyed by attestation, not by inclusion
+//!
+//! Complement proving works against a committee, and a committee belongs to the
+//! slot the attestation is *for*, not the slot whose block carried it. An
+//! attestation for slot `s` can be included anywhere in `s+1 ..= s+32`, so the
+//! collector buckets by `AttestationData.slot` and a bucket closes when the
+//! caller stops feeding it blocks.
+//!
+//! Closing a bucket early is safe and is the normal case: a committee member
+//! whose attestation has not been seen is simply an absentee, which lowers that
+//! slot's support and nothing else. The schedule wants that trade — waiting for
+//! stragglers costs latency and buys a few basis points of weight.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::info;
 
-use zkasper_common::types::{AttestationWitness, AttestingValidator, BlsSignature};
+use zkasper_common::types::{
+    AttestationWitness, BlsSignature, OpenedValidator, SlotComplementWitness,
+};
 use zkasper_common::ChainConfig;
 
-use crate::beacon_api::{AttestationResponse, BeaconApi, CommitteeResponse, ValidatorResponse};
-use crate::state_diff::validator_response_to_data;
+use crate::beacon_api::{AttestationResponse, BeaconApi};
+use crate::committee::EpochCommittees;
 
-/// Per-slot attestation data.
-pub struct SlotAttestations {
+/// One attestation slot, ready to be proven as a complement.
+pub struct SlotComplement {
+    /// The attestation slot, globally numbered.
     pub slot: u64,
-    pub attestations: Vec<AttestationWitness>,
-    /// Sorted indices of validators with count_balance=true in this slot.
-    pub counted_indices: Vec<u64>,
-    /// All unique validator indices in this slot's attestations.
-    pub all_validator_indices: Vec<u64>,
+    pub witness: SlotComplementWitness,
+    /// What this slot adds to the epoch: committee balance minus absentees.
+    pub marginal_balance: u64,
+    /// Validator indices the witness names, sorted — absentees and enumerated
+    /// signers together. These are the accumulator leaves it opens.
+    pub named_indices: Vec<u64>,
+}
+
+/// One aggregate as the node published it, with its signers resolved.
+struct Aggregate {
+    attestation: AttestationWitness,
+    signers: BTreeSet<u64>,
+}
+
+/// `AttestationData`, as the key that decides which aggregates share a message.
+type DataKey = (u64, u64, [u8; 32], u64, [u8; 32], u64, [u8; 32]);
+
+fn data_key(a: &AttestationWitness) -> DataKey {
+    (
+        a.data_slot,
+        a.data_index,
+        a.data_beacon_block_root,
+        a.data_source_epoch,
+        a.data_source_root,
+        a.data_target_epoch,
+        a.data_target_root,
+    )
 }
 
 /// Incremental collector for one target checkpoint.
 ///
 /// Attestations for a checkpoint arrive over the whole epoch, so the collector
-/// is fed one block at a time rather than handed the finished epoch. It carries
-/// the committee table and the running cross-slot `seen` set, which is what
-/// makes the `count_balance` flag correct without a second pass, and what lets a
-/// caller stop the moment the 2/3 threshold is crossed instead of scanning to
-/// the end of the epoch.
+/// is fed one block at a time rather than handed the finished epoch. It holds
+/// the epoch's committees, which is what lets a slot be closed into a complement
+/// the moment the caller stops expecting more of its attestations.
 ///
-/// Slots must be fed in ascending order: which slot gets to count a validator is
-/// first-come, and the justification proof checks that the merged per-slot index
-/// lists are strictly increasing.
+/// Blocks must be fed in ascending slot order.
 pub struct SlotStream {
     target_epoch: u64,
     target_root: [u8; 32],
-    /// Epoch each attester's `active_effective_balance` is evaluated at.
-    balance_epoch: u64,
-    committee_map: HashMap<(u64, u64), Vec<u64>>,
-    seen_validators: BTreeSet<u64>,
+    slots_per_epoch: u64,
+    committees: Arc<EpochCommittees>,
+    /// Aggregates seen so far, keyed by the slot they attest to.
+    pending: BTreeMap<u64, Vec<Aggregate>>,
 }
 
 impl SlotStream {
-    /// Fetch the target epoch's committees and open a stream over them.
-    pub async fn open(
-        api: &impl BeaconApi,
+    pub fn new(
         config: &ChainConfig,
+        committees: Arc<EpochCommittees>,
         target_epoch: u64,
         target_root: [u8; 32],
-        balance_epoch: u64,
-    ) -> Result<Self> {
-        let slot_str = (target_epoch * config.slots_per_epoch).to_string();
-        let committees = api
-            .get_committees(&slot_str, target_epoch)
-            .await
-            .context("fetch committees")?;
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             target_epoch,
             target_root,
-            balance_epoch,
-            committee_map: build_committee_map(&committees),
-            seen_validators: BTreeSet::new(),
-        })
+            slots_per_epoch: config.slots_per_epoch,
+            committees,
+            pending: BTreeMap::new(),
+        }
     }
 
-    /// Number of distinct validators counted so far, across every slot fed in.
-    pub fn counted_so_far(&self) -> usize {
-        self.seen_validators.len()
+    pub fn committees(&self) -> &EpochCommittees {
+        &self.committees
     }
 
     /// Feed one block's attestations.
     ///
-    /// Returns `None` when the block carries nothing for this checkpoint, which
-    /// covers both a skipped slot and a block whose attestations all target
-    /// something else.
-    pub fn ingest(
-        &mut self,
-        slot: u64,
-        attestations: &[AttestationResponse],
-        validators: &[ValidatorResponse],
-    ) -> Result<Option<SlotAttestations>> {
-        let matching = attestations.iter().filter(|att| {
-            att.data_target_epoch == self.target_epoch && att.data_target_root == self.target_root
-        });
-
-        let mut attestation_witnesses = Vec::new();
-        let mut slot_counted_indices: BTreeSet<u64> = BTreeSet::new();
-        let mut slot_all_indices: BTreeSet<u64> = BTreeSet::new();
-
-        for att in matching {
-            let attesting_indices = resolve_attesting_validators(att, &self.committee_map)
-                .context("resolve attestors")?;
-
-            let sorted_indices: BTreeSet<u64> = attesting_indices.into_iter().collect();
-            if sorted_indices.is_empty() {
+    /// Only those targeting this checkpoint are kept, and they are filed under
+    /// the slot they attest to rather than the block that carried them.
+    ///
+    /// Nothing here materialises a public key. Signers are held as indices, and
+    /// the leaf preimages are read off the committee proof's members at
+    /// [`Self::close`] — for the handful of validators a complement names, not
+    /// for the tens of thousands it does not.
+    pub fn ingest(&mut self, attestations: &[AttestationResponse]) -> Result<()> {
+        for att in attestations {
+            if att.data_target_epoch != self.target_epoch
+                || att.data_target_root != self.target_root
+            {
                 continue;
             }
 
-            let mut attesting_validators = Vec::with_capacity(sorted_indices.len());
-
-            for &idx in &sorted_indices {
-                let v_resp = validators
-                    .get(idx as usize)
-                    .context("validator index out of range")?;
-                let v_data = validator_response_to_data(v_resp);
-                let active_balance = v_data.active_effective_balance(self.balance_epoch);
-                let count_balance = self.seen_validators.insert(idx);
-
-                if count_balance {
-                    slot_counted_indices.insert(idx);
-                }
-                slot_all_indices.insert(idx);
-
-                attesting_validators.push(AttestingValidator {
-                    validator_index: idx,
-                    pubkey: crate::pubkey::decompress(&v_resp.pubkey)
-                        .context("decompress attester public key")?,
-                    active_effective_balance: active_balance,
-                    count_balance,
-                });
+            let signers: BTreeSet<u64> = resolve_attesting_validators(att, &self.committees)
+                .context("resolve attestors")?
+                .into_iter()
+                .collect();
+            if signers.is_empty() {
+                continue;
             }
 
-            attestation_witnesses.push(AttestationWitness {
-                data_slot: att.data_slot,
-                data_index: att.data_index,
-                data_beacon_block_root: att.data_beacon_block_root,
-                data_source_epoch: att.data_source_epoch,
-                data_source_root: att.data_source_root,
-                data_target_epoch: att.data_target_epoch,
-                data_target_root: att.data_target_root,
-                signature: BlsSignature(att.signature),
-                attesting_validators,
-            });
+            self.pending
+                .entry(att.data_slot)
+                .or_default()
+                .push(Aggregate {
+                    attestation: AttestationWitness {
+                        data_slot: att.data_slot,
+                        data_index: att.data_index,
+                        data_beacon_block_root: att.data_beacon_block_root,
+                        data_source_epoch: att.data_source_epoch,
+                        data_source_root: att.data_source_root,
+                        data_target_epoch: att.data_target_epoch,
+                        data_target_root: att.data_target_root,
+                        signature: BlsSignature(att.signature),
+                        attesting_validators: Vec::new(),
+                    },
+                    signers,
+                });
+        }
+        Ok(())
+    }
+
+    /// Close an attestation slot into the complement that proves it.
+    ///
+    /// Returns `None` for a slot with no attestations at all: there is no
+    /// primary message for the derived key to pair against, and a slot that
+    /// contributes nothing is better left uncounted than counted at zero.
+    pub fn close(&mut self, slot: u64) -> Option<SlotComplement> {
+        let aggregates = self.pending.remove(&slot)?;
+        let slot_in_epoch = slot % self.slots_per_epoch;
+        let committee = self.committees.aggregate(slot_in_epoch)?.clone();
+        let members = &self.committees.members[slot_in_epoch as usize];
+
+        // Aggregates over one message have to be pairwise disjoint before their
+        // signatures can be summed against one aggregate key, so overlapping
+        // ones are dropped in favour of the larger. On a live chain the later
+        // block's aggregate is a superset of the earlier one's, so this drops
+        // duplicates rather than attesters.
+        let mut by_message: BTreeMap<DataKey, (Vec<&Aggregate>, BTreeSet<u64>)> = BTreeMap::new();
+        let mut order: Vec<&Aggregate> = aggregates.iter().collect();
+        order.sort_by_key(|a| std::cmp::Reverse(a.signers.len()));
+        for aggregate in order {
+            let entry = by_message
+                .entry(data_key(&aggregate.attestation))
+                .or_default();
+            if entry.1.intersection(&aggregate.signers).next().is_some() {
+                continue;
+            }
+            entry.1.extend(&aggregate.signers);
+            entry.0.push(aggregate);
         }
 
-        if attestation_witnesses.is_empty() {
-            return Ok(None);
+        // The message with the most signers is the one worth deriving; every
+        // other message's signers are named, which is what makes them a minority
+        // head vote rather than a cost.
+        let primary_key = *by_message
+            .iter()
+            .max_by_key(|(_, (_, signers))| signers.len())?
+            .0;
+        let (primary_aggregates, primary_signers) = by_message.remove(&primary_key)?;
+
+        // Each named aggregate carries its *own* signers, not its message's:
+        // the guest folds aggregates over one message by adding their keys, so a
+        // shared list would subtract the same validator once per aggregate.
+        let mut named: BTreeSet<u64> = BTreeSet::new();
+        let mut secondary: Vec<AttestationWitness> = Vec::new();
+        for (aggregates, signers) in by_message.into_values() {
+            named.extend(&signers);
+            for aggregate in aggregates {
+                secondary.push(AttestationWitness {
+                    attesting_validators: aggregate
+                        .signers
+                        .iter()
+                        .map(|&index| self.opened(index))
+                        .collect::<Option<Vec<_>>>()?,
+                    ..aggregate.attestation.clone()
+                });
+            }
         }
 
-        Ok(Some(SlotAttestations {
+        // Everyone in the committee that no counted aggregate covers. A signer
+        // outside the committee cannot happen on a well-formed chain, and if it
+        // did the derived key would not match, so it is not special-cased.
+        let absentees: Vec<OpenedValidator> = members
+            .iter()
+            .filter(|index| !primary_signers.contains(index) && !named.contains(index))
+            .map(|&index| self.opened(index))
+            .collect::<Option<Vec<_>>>()?;
+
+        let marginal_balance = committee.balance
+            - absentees
+                .iter()
+                .map(|v| v.active_effective_balance)
+                .sum::<u64>();
+
+        named.extend(absentees.iter().map(|v| v.validator_index));
+
+        Some(SlotComplement {
             slot,
-            attestations: attestation_witnesses,
-            counted_indices: slot_counted_indices.into_iter().collect(),
-            all_validator_indices: slot_all_indices.into_iter().collect(),
-        }))
+            marginal_balance,
+            named_indices: named.iter().copied().collect(),
+            witness: SlotComplementWitness {
+                slot_in_epoch,
+                committee,
+                primary: primary_aggregates
+                    .into_iter()
+                    .map(|a| a.attestation.clone())
+                    .collect(),
+                secondary,
+                absentees,
+            },
+        })
+    }
+
+    /// Attestation slots that have been fed and not yet closed.
+    pub fn open_slots(&self) -> Vec<u64> {
+        self.pending.keys().copied().collect()
+    }
+
+    /// The accumulator leaf preimage for one validator, read off the committee
+    /// proof's members rather than decompressed again.
+    fn opened(&self, index: u64) -> Option<OpenedValidator> {
+        let member = self
+            .committees
+            .witness
+            .members
+            .binary_search_by_key(&index, |m| m.validator_index)
+            .ok()?;
+        let member = &self.committees.witness.members[member];
+        Some(OpenedValidator {
+            validator_index: member.validator_index,
+            pubkey: member.pubkey,
+            active_effective_balance: member.active_effective_balance,
+        })
     }
 }
 
-/// Collect attestations grouped by the block slot they were included in.
+/// Collect and close every attestation slot of a target epoch.
 ///
 /// Scans every block in `[target_epoch, target_epoch + 2)` with no early stop.
 /// Continuous mode drives [`SlotStream`] directly so that it can stop at the
 /// threshold; this stays for one-shot generation of a whole epoch's witnesses.
-///
-/// Returns one `SlotAttestations` per block slot that contained matching
-/// attestations.
 pub async fn collect_per_slot_for_checkpoint(
     api: &impl BeaconApi,
     config: &ChainConfig,
+    committees: Arc<EpochCommittees>,
     target_epoch: u64,
     target_root: &[u8; 32],
-    validators: &[ValidatorResponse],
-    epoch: u64,
-) -> Result<Vec<SlotAttestations>> {
+) -> Result<Vec<SlotComplement>> {
     let spe = config.slots_per_epoch;
-    let mut stream = SlotStream::open(api, config, target_epoch, *target_root, epoch).await?;
-
-    let mut result = Vec::new();
+    let mut stream = SlotStream::new(config, committees, target_epoch, *target_root);
 
     for slot in target_epoch * spe..(target_epoch + 2) * spe {
         let Ok(attestations) = api.get_block_attestations(&slot.to_string()).await else {
             continue;
         };
-        if let Some(slot_data) = stream.ingest(slot, &attestations, validators)? {
-            result.push(slot_data);
+        stream.ingest(&attestations)?;
+    }
+
+    let mut result = Vec::new();
+    for slot in target_epoch * spe..(target_epoch + 1) * spe {
+        if let Some(complement) = stream.close(slot) {
+            result.push(complement);
         }
     }
 
     info!(
         slots = result.len(),
-        total_unique_validators = stream.counted_so_far(),
-        "collected per-slot attestations",
+        attesting_balance = result.iter().map(|s| s.marginal_balance).sum::<u64>(),
+        "collected per-slot complements",
     );
 
     Ok(result)
-}
-
-/// Build a committee lookup map from committee responses.
-///
-/// Key: (slot, committee_index) → Value: list of validator indices
-fn build_committee_map(committees: &[CommitteeResponse]) -> HashMap<(u64, u64), Vec<u64>> {
-    let mut map = HashMap::new();
-    for c in committees {
-        map.insert((c.slot, c.index), c.validators.clone());
-    }
-    map
 }
 
 /// Resolve which global validator indices are attesting in an attestation.
@@ -206,45 +303,43 @@ fn build_committee_map(committees: &[CommitteeResponse]) -> HashMap<(u64, u64), 
 /// aggregation_bits to pick validators within each committee.
 ///
 /// For pre-Electra attestations, uses data_index as the committee index directly.
+///
+/// Both forms index into the epoch's committee table, which is also what the
+/// committee proof partitioned — so an attester resolved here is a validator the
+/// complement can subtract.
 fn resolve_attesting_validators(
     att: &AttestationResponse,
-    committee_map: &HashMap<(u64, u64), Vec<u64>>,
+    committees: &EpochCommittees,
 ) -> Result<Vec<u64>> {
     let mut result = Vec::new();
 
     if att.committee_bits.is_empty() {
-        // Pre-Electra: single committee identified by data_index
-        let committee = committee_map
-            .get(&(att.data_slot, att.data_index))
+        // Pre-Electra: a single committee identified by data_index.
+        let committee = committees
+            .committee(att.data_slot, att.data_index)
             .context("committee not found")?;
-
-        for (bit_idx, &validator_idx) in committee.iter().enumerate() {
-            if get_bit(&att.aggregation_bits, bit_idx) {
-                result.push(validator_idx);
+        for (bit, &validator_index) in committee.iter().enumerate() {
+            if get_bit(&att.aggregation_bits, bit) {
+                result.push(validator_index);
             }
         }
-    } else {
-        // Electra: committee_bits indicates which committees are included
-        let mut aggregation_offset = 0;
+        return Ok(result);
+    }
 
-        for committee_idx in 0..att.committee_bits.len() * 8 {
-            if !get_bit(&att.committee_bits, committee_idx) {
-                continue;
-            }
-
-            let committee = match committee_map.get(&(att.data_slot, committee_idx as u64)) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            for (j, &validator_idx) in committee.iter().enumerate() {
-                if get_bit(&att.aggregation_bits, aggregation_offset + j) {
-                    result.push(validator_idx);
-                }
-            }
-
-            aggregation_offset += committee.len();
+    let mut offset = 0;
+    for committee_index in 0..att.committee_bits.len() * 8 {
+        if !get_bit(&att.committee_bits, committee_index) {
+            continue;
         }
+        let Some(committee) = committees.committee(att.data_slot, committee_index as u64) else {
+            continue;
+        };
+        for (j, &validator_index) in committee.iter().enumerate() {
+            if get_bit(&att.aggregation_bits, offset + j) {
+                result.push(validator_index);
+            }
+        }
+        offset += committee.len();
     }
 
     Ok(result)

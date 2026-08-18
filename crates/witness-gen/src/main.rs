@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use zkasper_common::ChainConfig;
 
-use beacon_api::BeaconApiClient;
+use beacon_api::{BeaconApi, BeaconApiClient};
 use db::Db;
 use epoch_state::EpochState;
 
@@ -162,10 +162,22 @@ async fn main() -> Result<()> {
             let target_root = parse_hex_bytes32(&target_root)?;
             let signing_domain = parse_hex_bytes32(&signing_domain)?;
 
+            let boundary = (epoch * config.slots_per_epoch).to_string();
+            let committees = std::sync::Arc::new(zkasper_witness_gen::committee::build(
+                &api.get_committees(&boundary, epoch).await?,
+                &api.get_validators(&boundary).await?,
+                &tree,
+                &config,
+                epoch,
+                epoch,
+                total_active_balance,
+            )?);
+
             let slot_witnesses = witness_slot_proof::build_per_slot(
                 &api,
                 &config,
                 &tree,
+                committees,
                 epoch,
                 target_root,
                 total_active_balance,
@@ -182,10 +194,10 @@ async fn main() -> Result<()> {
                     bincode::serialize(&sw.witness).context("serialize slot proof witness")?;
                 std::fs::write(&output_path, &bytes).context("write slot proof witness")?;
                 eprintln!(
-                    "  slot {}: {} bytes, {} counted validators",
+                    "  slot {}: {} bytes, {} absentees",
                     sw.slot,
                     bytes.len(),
-                    sw.counted_indices.len(),
+                    sw.witness.slots[0].absentees.len(),
                 );
             }
 
@@ -193,9 +205,9 @@ async fn main() -> Result<()> {
             // The slot proof outputs would come from running the provers,
             // but for now we can pre-build the justification metadata.
             let output_path = format!("{}/slot_proofs_metadata.bin", cli.output_dir);
-            let metadata: Vec<(u64, Vec<u64>)> = slot_witnesses
+            let metadata: Vec<(u64, u64)> = slot_witnesses
                 .iter()
-                .map(|sw| (sw.slot, sw.counted_indices.clone()))
+                .map(|sw| (sw.slot, sw.marginal_balance))
                 .collect();
             let bytes = bincode::serialize(&metadata).context("serialize metadata")?;
             std::fs::write(&output_path, &bytes).context("write metadata")?;

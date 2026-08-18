@@ -26,17 +26,14 @@
 //!
 //! # What it does not do
 //!
-//! It does not update the counted-set tree. Nothing is added after it, so the
-//! new root would be thrown away; it only proves the attesters it counts were
-//! not counted already, which is half the hashing.
+//! It does not enumerate a single attester. The marginal slot arrives as a
+//! committee aggregate minus its ~90 absentees, which is 790 accumulator nodes
+//! where opening every attester was 190,706.
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use zkasper_common::acc;
 use zkasper_common::bls::{fp12_mul, FP12_ONE};
-use zkasper_common::dedup;
 use zkasper_common::recursion::verify_child;
 use zkasper_common::types::{StreamFinalOutput, StreamFinalWitness};
 
@@ -50,8 +47,6 @@ pub fn verify_stream_final_with_depth(
     witness: &StreamFinalWitness,
     acc_depth: u32,
 ) -> StreamFinalOutput {
-    let dedup_depth = dedup::tree_depth(acc_depth);
-
     assert_eq!(
         acc::commitment(&witness.acc_root, witness.total_active_balance),
         witness.accumulator_commitment,
@@ -66,21 +61,37 @@ pub fn verify_stream_final_with_depth(
     // one unit crossed the threshold on its own — has to verify the diff here
     // instead, which is the only path where that recursion is on the critical
     // path.
-    let (previous_accumulator_commitment, anchor_state_root) = match &witness.aggregate {
-        Some(aggregate) => (
-            aggregate.previous_accumulator_commitment,
-            aggregate.anchor_state_root,
-        ),
-        None => zkasper_aggregation_guest::epoch_link(
-            witness.epoch_diff.as_ref(),
-            &witness.epoch_diff_proof,
-            &witness.epoch_diff_program_vk,
-            &witness.accumulator_commitment,
-            witness.target_epoch,
-        ),
-    };
+    let (previous_accumulator_commitment, anchor_state_root, committee_root) =
+        match &witness.aggregate {
+            Some(aggregate) => (
+                aggregate.previous_accumulator_commitment,
+                aggregate.anchor_state_root,
+                aggregate.committee_root,
+            ),
+            None => {
+                let (previous_accumulator_commitment, anchor_state_root) =
+                    zkasper_aggregation_guest::epoch_link(
+                        witness.epoch_diff.as_ref(),
+                        &witness.epoch_diff_proof,
+                        &witness.epoch_diff_program_vk,
+                        &witness.accumulator_commitment,
+                        witness.target_epoch,
+                    );
+                (
+                    previous_accumulator_commitment,
+                    anchor_state_root,
+                    zkasper_aggregation_guest::committee_link(
+                        witness.committee.as_ref(),
+                        &witness.committee_proof,
+                        &witness.committee_program_vk,
+                        &witness.accumulator_commitment,
+                        witness.target_epoch,
+                    ),
+                )
+            }
+        };
 
-    let (mut attesting_balance, dedup_root, mut miller) = match &witness.aggregate {
+    let (mut attesting_balance, mut slots_mask, mut miller) = match &witness.aggregate {
         Some(aggregate) => {
             assert!(
                 verify_child(
@@ -109,14 +120,12 @@ pub fn verify_stream_final_with_depth(
             );
             (
                 aggregate.attesting_balance,
-                aggregate.dedup_root,
+                aggregate.slots_mask,
                 witness.aggregate_miller.0,
             )
         }
-        None => (0u64, dedup::empty_root(dedup_depth), FP12_ONE),
+        None => (0u64, 0u64, FP12_ONE),
     };
-
-    let mut counted: Vec<u64> = Vec::new();
 
     // -- group proofs that finished too late to be folded ---------------------
     assert_eq!(
@@ -129,14 +138,8 @@ pub fn verify_stream_final_with_depth(
         witness.group_millers.len(),
         "groups and Miller accumulators length mismatch",
     );
-    assert_eq!(
-        witness.groups.len(),
-        witness.counted_indices_per_group.len(),
-        "groups and counted index lists length mismatch",
-    );
 
     for (i, group) in witness.groups.iter().enumerate() {
-        let indices = &witness.counted_indices_per_group[i];
         let miller_i = &witness.group_millers[i].0;
 
         zkasper_aggregation_guest::verify_group(
@@ -144,46 +147,53 @@ pub fn verify_stream_final_with_depth(
             &witness.group_proofs[i],
             &witness.group_program_vk,
             witness.accumulator_commitment,
+            committee_root,
             witness.target_epoch,
             &witness.target_root,
-            indices,
             miller_i,
             i,
         );
 
+        assert_eq!(
+            slots_mask & group.slots_mask,
+            0,
+            "group proof {i} counts a slot that was already counted",
+        );
+        slots_mask |= group.slots_mask;
+
         attesting_balance += group.attesting_balance;
         miller = fp12_mul(&miller, miller_i);
-        counted.extend_from_slice(indices);
     }
 
-    // -- the marginal attestations, inline ------------------------------------
+    // -- the marginal slot, inline --------------------------------------------
     //
     // This is the work that genuinely depends on the last attestation: opening
-    // its attesters against the accumulator, aggregating their keys, hashing
-    // their message to G2 and running two Miller loops. Everything else in this
-    // proof is either recursion or arithmetic on values that were already fixed.
+    // the slot's committee aggregate and its absentees against the accumulator,
+    // subtracting them, hashing the message to G2 and running two Miller loops.
+    // Everything else in this proof is either recursion or arithmetic on values
+    // that were already fixed.
     if !witness.tail.is_empty() {
         let tail = zkasper_slot_proof_guest::verify_attestations(
             &witness.tail,
             &witness.acc_root,
             &witness.tail_acc_multi_proof,
+            &committee_root,
+            &witness.tail_committee_multi_proof,
             witness.target_epoch,
             &witness.target_root,
             &witness.signing_domain,
             acc_depth,
         );
 
+        assert_eq!(
+            slots_mask & tail.slots_mask,
+            0,
+            "the marginal slot was already counted",
+        );
+
         attesting_balance += tail.attesting_balance;
         miller = fp12_mul(&miller, &tail.miller);
-        counted.extend_from_slice(&tail.counted_indices);
     }
-
-    // -- nothing counted here was counted before ------------------------------
-    counted.sort_unstable();
-    assert!(
-        dedup::verify_absent(&dedup_root, &counted, &witness.dedup_proof, dedup_depth),
-        "validator counted twice, or malformed counted-set proof",
-    );
 
     // -- the one final exponentiation -----------------------------------------
     //

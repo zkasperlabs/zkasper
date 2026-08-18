@@ -1,18 +1,19 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use zkasper_common::acc::Digest;
+use zkasper_common::acc::{Digest, G1Point};
 use zkasper_common::bls::Fp12;
 use zkasper_common::types::{
-    AccMultiProof, AttestationWitness, GroupProofOutput, SlotProofOutput, SlotProofWitness,
+    AccMultiProof, AttestationWitness, GroupProofOutput, SlotComplementWitness, SlotProofOutput,
+    SlotProofWitness,
 };
 
-/// What verifying a set of attestations establishes.
+/// What verifying a set of attestation slots establishes.
 pub struct Attested {
-    /// Sum of `active_effective_balance` over validators marked `count_balance`.
+    /// Sum over those slots of `committee balance − absentee balances`.
     pub attesting_balance: u64,
-    /// Those validators' indices, sorted and strictly increasing.
-    pub counted_indices: Vec<u64>,
+    /// Which slots of the epoch were counted, one bit each.
+    pub slots_mask: u64,
     /// The Miller-loop half of the signature check over every attestation.
     ///
     /// The final exponentiation is *not* done here. Nothing is proven about
@@ -40,13 +41,11 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
 
     SlotProofOutput {
         accumulator_commitment: witness.accumulator_commitment,
+        committee_root: witness.committee_root,
         target_epoch: witness.target_epoch,
         target_root: witness.target_root,
         attesting_balance: attested.attesting_balance,
-        counted_validators_commitment: zkasper_common::acc::commit_indices(
-            &attested.counted_indices,
-        ),
-        num_counted_validators: attested.counted_indices.len() as u64,
+        slots_mask: attested.slots_mask,
     }
 }
 
@@ -59,17 +58,17 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
 ///
 /// # Why the signatures are not checked here
 ///
-/// The final exponentiation costs 169,455,773 against 39,299,490 for a Miller
-/// loop — 81% of a two-pair pairing check — and one of them settles a product of
-/// any number of Miller loops. Charging every group for its own would spend that
-/// once per group for no gain, since the epoch's proof chain has to run one
-/// anyway over whatever the last attestation contributes.
+/// The final exponentiation costs 132,665,557 against 33,222,822 for a Miller
+/// loop, and one of them settles a product of any number of Miller loops.
+/// Charging every group for its own would spend that once per group for no gain,
+/// since the epoch's proof chain has to run one anyway over whatever the last
+/// attestation contributes.
 ///
 /// The consequence is that a group proof alone proves nothing about signatures.
-/// It is a claim of the form "these attesters are in the accumulator, and *if*
-/// the product of everyone's accumulators exponentiates to 1, these are their
-/// balances". The proof that closes the epoch is what discharges the *if*, and
-/// it must cover every group whose balance it counts.
+/// It is a claim of the form "these are the committees of these slots, and *if*
+/// the product of everyone's accumulators exponentiates to 1, this is their
+/// attesting balance". The proof that closes the epoch is what discharges the
+/// *if*, and it must cover every group whose balance it counts.
 pub fn verify_group_proof(witness: &SlotProofWitness) -> GroupProofOutput {
     verify_group_proof_with_depth(witness, zkasper_common::constants::ACC_TREE_DEPTH)
 }
@@ -83,13 +82,11 @@ pub fn verify_group_proof_with_depth(
 
     GroupProofOutput {
         accumulator_commitment: witness.accumulator_commitment,
+        committee_root: witness.committee_root,
         target_epoch: witness.target_epoch,
         target_root: witness.target_root,
         attesting_balance: attested.attesting_balance,
-        counted_validators_commitment: zkasper_common::acc::commit_indices(
-            &attested.counted_indices,
-        ),
-        num_counted_validators: attested.counted_indices.len() as u64,
+        slots_mask: attested.slots_mask,
         miller_commitment: zkasper_common::acc::commit_fp12(&attested.miller),
     }
 }
@@ -111,9 +108,11 @@ pub fn attest(witness: &SlotProofWitness, acc_depth: u32) -> Attested {
     );
 
     verify_attestations(
-        &witness.attestations,
+        &witness.slots,
         &witness.acc_root,
         &witness.acc_multi_proof,
+        &witness.committee_root,
+        &witness.committee_multi_proof,
         witness.target_epoch,
         &witness.target_root,
         &witness.signing_domain,
@@ -121,154 +120,300 @@ pub fn attest(witness: &SlotProofWitness, acc_depth: u32) -> Attested {
     )
 }
 
-/// Verify attestations against the accumulator and accumulate their pairings.
+/// Verify attestation slots by complement and accumulate their pairings.
 ///
-/// Shared by the slot proof, the group proof, and the marginal attestations the
-/// final proof of an epoch does inline — the last of which is the only place
-/// this work sits on the critical path, so there is exactly one implementation
-/// of it.
+/// Shared by the slot proof, the group proof, and the marginal slot the final
+/// proof of an epoch does inline — the last of which is the only place this work
+/// sits on the critical path, so there is exactly one implementation of it.
 ///
-/// 1. Opens every attester's accumulator leaf in one batched multi-proof.
-/// 2. Sums the balances of validators marked `count_balance`, rejecting
-///    duplicates.
-/// 3. Recomputes each `AttestationData` root and folds every signature into one
-///    Miller-loop accumulator.
+/// # What is proven, and what proves it
+///
+/// A slot's committee arrives already summed, as a `(pubkey, balance)` pair
+/// opened from the committee tree. What this function does with it is:
+///
+/// ```text
+/// agg_pk  = committee.pubkey  − Σ(secondary signers) − Σ(absentees)
+/// support = committee.balance − Σ(absentee balances)
+/// ```
+///
+/// and then pairs `agg_pk` against the primary message. Nothing enumerates the
+/// ~99.7% of the committee that attested, which is the entire saving: 90
+/// openings for a mainnet slot instead of 29,940.
+///
+/// **The public keys are pinned by the pairing.** The multi-pairing forces
+/// `agg_pk` to be the sum of the keys that actually signed the primary message.
+/// A prover who omits a genuine absentee leaves `agg_pk` too large by that
+/// validator's key; one who names an attester leaves it too small; one who names
+/// a validator outside the committee leaves it something that is not a subset
+/// sum of the committee at all. Each is an aggregate-signature forgery, so the
+/// aggregation bitfield never has to enter the circuit and no per-attester
+/// committee-membership check is needed. This is the same argument that used to
+/// justify opening *every* attester rather than only the counted ones — a key
+/// that is never opened is a key the prover chose freely — and it still holds,
+/// because every key that goes into `agg_pk` is either opened here or summed
+/// into `committee.pubkey` by the committee proof.
+///
+/// **The balances are not pinned by the pairing**, and are bound instead by the
+/// accumulator leaf, which is one Poseidon2 hash over `(pubkey, balance)`
+/// together. A validator cannot be subtracted from `agg_pk` at one balance and
+/// from `support` at another, and the committee proof summed its two totals out
+/// of the same leaves in the same pass. `checked_sub` below is the last line of
+/// that defence: a balance sum that goes negative is rejected rather than
+/// wrapping into an enormous one.
+///
+/// **Nothing is counted twice.** Within a group, every named validator index is
+/// strictly increasing, so no validator is subtracted twice and no slot appears
+/// twice. Across groups, the slot mask does the same job for slots — which is
+/// enough, because a committee proof puts each validator in exactly one slot.
+///
+/// That check is not decoration. Summed signatures do *not* imply disjoint
+/// signers: `e(2·pkᵥ + rest, H(m)) · e(−G, sigᵥ + sigᵥ + rest)` verifies
+/// perfectly well, so any scheme that adds signatures has to prove the sets
+/// behind them are disjoint rather than assume it. The enumerated side does
+/// prove it, by the strictly-increasing index check. The derived side does not
+/// have to: `agg_pk` is `committee.pubkey` *minus* a nonnegative sum of opened
+/// keys, and no such subtraction can produce a key with a coefficient of two —
+/// arriving at `2·pkᵥ + rest` would take a relation among distinct validator
+/// public keys, which is the assumption this whole file already rests on. A
+/// host that hands over two overlapping aggregates of one message therefore
+/// gets a proof that does not verify, not one that over-counts.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_attestations(
-    attestations: &[AttestationWitness],
+    slots: &[SlotComplementWitness],
     acc_root: &Digest,
     acc_multi_proof: &AccMultiProof,
+    committee_root: &Digest,
+    committee_multi_proof: &AccMultiProof,
     target_epoch: u64,
     target_root: &[u8; 32],
     signing_domain: &[u8; 32],
     acc_depth: u32,
 ) -> Attested {
     use zkasper_common::acc;
-    use zkasper_common::bls::{compute_signing_root, miller_accumulator, SignedMessage};
+    use zkasper_common::bls::{miller_accumulator, PointSum, SignedMessage};
+    use zkasper_common::committee;
 
-    // Phase 1: Collect the accumulator leaves the attestations claim.
-    //
-    // Membership is proven for *every* attester, not just the ones whose
-    // balance is counted. Two reasons. The witness generator builds the
-    // multi-proof over every attester, so proving a subset leaves auxiliaries
-    // unconsumed and the batch aborts. More importantly, Phase 3 aggregates the
-    // public keys of every attester: a key that is never opened against the
-    // accumulator is a key the prover chose freely, which is a rogue-key
-    // opening. `count_balance` governs the balance sum only.
     let mut attesting_balance: u64 = 0;
-    let mut multi_proof_leaves: Vec<(acc::Digest, u64)> = Vec::new();
-    let mut counted_indices: Vec<u64> = Vec::new();
+    let mut slots_mask: u64 = 0;
+    let mut opened: Vec<(acc::Digest, u64)> = Vec::new();
+    let mut committee_leaves: Vec<(acc::Digest, u64)> = Vec::new();
 
-    for attestation in attestations {
-        let mut last_index: Option<u64> = None;
+    // One entry per attestation: its derived-or-enumerated aggregate key, the
+    // root it signed, and the signature. `miller_accumulator` folds aggregates
+    // over the same message together, so a slot whose primary and secondary
+    // carry identical `AttestationData` costs one Miller loop, not two.
+    let mut aggregate_keys: Vec<Vec<G1Point>> = Vec::new();
+    let mut signing_roots: Vec<[u8; 32]> = Vec::new();
+    let mut signatures: Vec<Vec<[u8; 96]>> = Vec::new();
 
-        for v in &attestation.attesting_validators {
-            // Enforce strictly increasing validator indices within each attestation
-            if let Some(prev) = last_index {
-                assert!(
-                    v.validator_index > prev,
-                    "validator indices must be strictly increasing: {} followed {}",
+    let mut previous_slot: Option<u64> = None;
+    for slot in slots {
+        if let Some(previous) = previous_slot {
+            assert!(
+                slot.slot_in_epoch > previous,
+                "attestation slots must be strictly increasing: {} followed {previous}",
+                slot.slot_in_epoch,
+            );
+        }
+        previous_slot = Some(slot.slot_in_epoch);
+        assert!(
+            slot.slot_in_epoch < committee::MAX_SLOTS,
+            "slot {} is past the {} a committee tree holds",
+            slot.slot_in_epoch,
+            committee::MAX_SLOTS,
+        );
+        slots_mask |= 1u64 << slot.slot_in_epoch;
+
+        committee_leaves.push((committee::leaf(&slot.committee), slot.slot_in_epoch));
+
+        let mut support = slot.committee.balance;
+        let mut primary_key = PointSum::from_point(slot.committee.pubkey);
+
+        let (first, rest) = slot
+            .primary
+            .split_first()
+            .expect("slot has no primary aggregate");
+        for attestation in &slot.primary {
+            assert!(
+                attestation.attesting_validators.is_empty(),
+                "the primary aggregate of slot {} names its signers, which is the \
+                 work complement proving exists to avoid",
+                slot.slot_in_epoch,
+            );
+        }
+        // One derived key can only pair against one message, so every aggregate
+        // it covers has to be over that message.
+        for attestation in rest {
+            assert!(
+                same_data(first, attestation),
+                "slot {} pairs one derived key against two messages",
+                slot.slot_in_epoch,
+            );
+        }
+
+        // Aggregates over a message other than the primary one: their signers
+        // are named, so their keys leave the primary sum and form their own.
+        // Their balances stay counted — they did attest to the target.
+        for attestation in &slot.secondary {
+            let mut keys = PointSum::default();
+            for v in &attestation.attesting_validators {
+                opened.push((
+                    acc::leaf(&v.pubkey, v.active_effective_balance),
                     v.validator_index,
-                    prev,
-                );
+                ));
+                primary_key
+                    .sub(&v.pubkey)
+                    .expect("public key aggregation hit a shared x-coordinate");
+                keys.add(&v.pubkey)
+                    .expect("public key aggregation hit a shared x-coordinate");
             }
-            last_index = Some(v.validator_index);
+            push_message(
+                core::slice::from_ref(attestation),
+                keys.get().expect("secondary aggregate names no signers"),
+                target_epoch,
+                target_root,
+                signing_domain,
+                &mut aggregate_keys,
+                &mut signing_roots,
+                &mut signatures,
+            );
+        }
 
-            multi_proof_leaves.push((
+        for v in &slot.absentees {
+            opened.push((
                 acc::leaf(&v.pubkey, v.active_effective_balance),
                 v.validator_index,
             ));
-
-            if v.count_balance {
-                attesting_balance += v.active_effective_balance;
-                counted_indices.push(v.validator_index);
-            }
+            primary_key
+                .sub(&v.pubkey)
+                .expect("public key aggregation hit a shared x-coordinate");
+            support = support
+                .checked_sub(v.active_effective_balance)
+                .expect("absentee balances exceed the committee's");
         }
+
+        push_message(
+            &slot.primary,
+            primary_key
+                .get()
+                .expect("committee aggregate is the identity"),
+            target_epoch,
+            target_root,
+            signing_domain,
+            &mut aggregate_keys,
+            &mut signing_roots,
+            &mut signatures,
+        );
+
+        attesting_balance += support;
     }
 
-    // A validator may appear in more than one aggregate in the same group. The
-    // accumulator leaf is a function of the validator alone, so duplicates are
-    // identical and collapse; the batch scan requires strictly increasing
-    // indices.
-    multi_proof_leaves.sort_unstable_by_key(|&(_, idx)| idx);
-    multi_proof_leaves.dedup_by_key(|&mut (_, idx)| idx);
-
-    // Every counted validator must be distinct — this is what stops a balance
-    // from being counted twice inside the group. Across groups, the counted-set
-    // tree does the same job.
-    counted_indices.sort_unstable();
-    for i in 1..counted_indices.len() {
+    // Every named validator, across every slot in the group, opened at once.
+    // Strictly increasing after the sort is what stops a key being subtracted
+    // twice — from one slot's absentees and another's, or from two aggregates.
+    opened.sort_unstable_by_key(|&(_, index)| index);
+    for i in 1..opened.len() {
         assert!(
-            counted_indices[i] > counted_indices[i - 1],
-            "duplicate validator counted: {}",
-            counted_indices[i],
+            opened[i].1 > opened[i - 1].1,
+            "validator {} named twice",
+            opened[i].1,
         );
     }
 
-    // Phase 2: Check every claimed leaf against the accumulator root at once
+    if !opened.is_empty() {
+        assert_eq!(
+            zkasper_common::merkle::batch_root(
+                acc::compress,
+                &opened,
+                &acc_multi_proof.auxiliaries,
+                acc_depth,
+            ),
+            *acc_root,
+            "accumulator root mismatch",
+        );
+    } else {
+        assert!(
+            acc_multi_proof.auxiliaries.is_empty(),
+            "accumulator opening with nothing to open",
+        );
+    }
+
     assert_eq!(
         zkasper_common::merkle::batch_root(
             acc::compress,
-            &multi_proof_leaves,
-            &acc_multi_proof.auxiliaries,
-            acc_depth,
+            &committee_leaves,
+            &committee_multi_proof.auxiliaries,
+            committee::TREE_DEPTH,
         ),
-        *acc_root,
-        "accumulator root mismatch",
+        *committee_root,
+        "committee root mismatch",
     );
 
-    // Phase 3: Fold every attestation's signature into one Miller accumulator.
-    //
-    // Each distinct message contributes one Miller loop, plus one for the
-    // group's summed signature.
-    let mut pubkeys_per_attestation: Vec<Vec<acc::G1Point>> =
-        Vec::with_capacity(attestations.len());
-    let mut signing_roots: Vec<[u8; 32]> = Vec::with_capacity(attestations.len());
-
-    for attestation in attestations {
-        assert_eq!(
-            attestation.data_target_epoch, target_epoch,
-            "attestation target_epoch mismatch",
-        );
-        assert_eq!(
-            attestation.data_target_root, *target_root,
-            "attestation target_root mismatch",
-        );
-
-        let data_root = zkasper_common::ssz::attestation_data_root(
-            attestation.data_slot,
-            attestation.data_index,
-            &attestation.data_beacon_block_root,
-            attestation.data_source_epoch,
-            &attestation.data_source_root,
-            attestation.data_target_epoch,
-            &attestation.data_target_root,
-        );
-
-        signing_roots.push(compute_signing_root(&data_root, signing_domain));
-        pubkeys_per_attestation.push(
-            attestation
-                .attesting_validators
-                .iter()
-                .map(|v| v.pubkey)
-                .collect(),
-        );
-    }
-
-    let messages: Vec<SignedMessage> = attestations
-        .iter()
-        .enumerate()
-        .map(|(i, a)| SignedMessage {
-            pubkeys: &pubkeys_per_attestation[i],
+    let messages: Vec<SignedMessage> = (0..aggregate_keys.len())
+        .map(|i| SignedMessage {
+            pubkeys: &aggregate_keys[i],
             signing_root: &signing_roots[i],
-            signature: &a.signature.0,
+            signatures: &signatures[i],
         })
         .collect();
 
-    let miller = miller_accumulator(&messages).expect("BLS pairing inputs rejected");
-
     Attested {
         attesting_balance,
-        counted_indices,
-        miller,
+        slots_mask,
+        miller: miller_accumulator(&messages).expect("BLS pairing inputs rejected"),
     }
+}
+
+/// Whether two aggregates carry byte-identical `AttestationData`.
+fn same_data(a: &AttestationWitness, b: &AttestationWitness) -> bool {
+    a.data_slot == b.data_slot
+        && a.data_index == b.data_index
+        && a.data_beacon_block_root == b.data_beacon_block_root
+        && a.data_source_epoch == b.data_source_epoch
+        && a.data_source_root == b.data_source_root
+        && a.data_target_epoch == b.data_target_epoch
+        && a.data_target_root == b.data_target_root
+}
+
+/// Check a message's checkpoint and queue it for the multi-pairing.
+///
+/// `aggregates` all carry the same `AttestationData`; their signatures sum into
+/// one pairing term against `aggregate_key`.
+#[allow(clippy::too_many_arguments)]
+fn push_message(
+    aggregates: &[AttestationWitness],
+    aggregate_key: G1Point,
+    target_epoch: u64,
+    target_root: &[u8; 32],
+    signing_domain: &[u8; 32],
+    aggregate_keys: &mut Vec<Vec<G1Point>>,
+    signing_roots: &mut Vec<[u8; 32]>,
+    signatures: &mut Vec<Vec<[u8; 96]>>,
+) {
+    let attestation = &aggregates[0];
+    assert_eq!(
+        attestation.data_target_epoch, target_epoch,
+        "attestation target_epoch mismatch",
+    );
+    assert_eq!(
+        attestation.data_target_root, *target_root,
+        "attestation target_root mismatch",
+    );
+
+    let data_root = zkasper_common::ssz::attestation_data_root(
+        attestation.data_slot,
+        attestation.data_index,
+        &attestation.data_beacon_block_root,
+        attestation.data_source_epoch,
+        &attestation.data_source_root,
+        attestation.data_target_epoch,
+        &attestation.data_target_root,
+    );
+
+    aggregate_keys.push(alloc::vec![aggregate_key]);
+    signing_roots.push(zkasper_common::bls::compute_signing_root(
+        &data_root,
+        signing_domain,
+    ));
+    signatures.push(aggregates.iter().map(|a| a.signature.0).collect());
 }
