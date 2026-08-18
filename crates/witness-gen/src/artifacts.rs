@@ -299,14 +299,65 @@ pub struct GossipStatus {
 /// Writes artifacts under an output directory.
 pub struct ArtifactSink {
     root: PathBuf,
+    keep_epochs: usize,
 }
+
+/// Epoch directories to keep before the oldest are deleted.
+///
+/// A mainnet epoch's witnesses are about 200 MB, so an unbounded output
+/// directory fills a disk in a couple of days and ends a long run at whatever
+/// hour it happens to run out. The witnesses exist to debug the epoch that
+/// produced them; once a proof is published, the proof is the artifact.
+pub const DEFAULT_KEEP_EPOCHS: usize = 8;
 
 impl ArtifactSink {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create output directory {}", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            keep_epochs: DEFAULT_KEEP_EPOCHS,
+        })
+    }
+
+    /// Keep a different number of epoch directories. Zero keeps everything.
+    pub fn keeping(mut self, epochs: usize) -> Self {
+        self.keep_epochs = epochs;
+        self
+    }
+
+    /// Delete the oldest epoch directories beyond `keep_epochs`.
+    ///
+    /// Called after an epoch closes rather than on a timer, so the bound holds
+    /// without a background task and a crash cannot leave it disabled. Failing
+    /// to prune is logged and never fatal: a full disk is a worse outcome than
+    /// a stale directory, but neither is worth ending a run over.
+    fn prune(&self) {
+        if self.keep_epochs == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("epoch-"))
+            })
+            .collect();
+        if dirs.len() <= self.keep_epochs {
+            return;
+        }
+        dirs.sort();
+        for dir in &dirs[..dirs.len() - self.keep_epochs] {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                tracing::warn!(path = %dir.display(), error = %e, "prune epoch directory");
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -338,6 +389,11 @@ impl ArtifactSink {
             path: path.display().to_string(),
             bytes: bytes.len() as u64,
         })
+    }
+
+    /// Drop the oldest epoch directories beyond the retention bound.
+    pub fn prune_old_epochs(&self) {
+        self.prune();
     }
 
     /// Rewrite `status.json`.
@@ -393,4 +449,36 @@ pub fn now_unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_the_newest_epoch_directories() {
+        let tmp = std::env::temp_dir().join(format!("zkasper-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let sink = ArtifactSink::new(&tmp).unwrap().keeping(3);
+        for epoch in 100u64..110 {
+            sink.write_witness(epoch, "committee", &epoch).unwrap();
+            sink.prune_old_epochs();
+        }
+        let mut left: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("epoch-"))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "epoch-000000107".to_string(),
+                "epoch-000000108".to_string(),
+                "epoch-000000109".to_string()
+            ],
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }

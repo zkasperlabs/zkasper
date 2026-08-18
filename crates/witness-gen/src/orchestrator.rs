@@ -1849,6 +1849,10 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             millis = started.elapsed().as_millis() as u64,
             "epoch closed",
         );
+        // The witnesses exist to debug the epoch that produced them. Once its
+        // proof is out, the proof is the artifact, and an unbounded output
+        // directory ends a long run whenever the disk happens to fill.
+        self.sink.prune_old_epochs();
         self.record(
             StageTiming::new(
                 Stage::StreamFinal,
