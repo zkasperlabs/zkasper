@@ -654,6 +654,36 @@ between samples while the aggregate median moves by ~10 ms.
 
 Per-slot counts are steady: min 27,841, median 28,053, max 28,071.
 
+### The trigger cap is binding, and it binds against the design's own rule
+
+The daemon does not fire the instant 2/3 is crossed. Every attestation still in
+flight is one fewer named absentee in the final proof, and the README puts a
+named absentee at **1.79 ms**, so one more second of waiting pays for itself
+while arrivals exceed **558 validators a second**. That rule is capped by
+`--max-trigger-wait-millis`, default 6,000.
+
+The measured arrival rate crosses 558/s between **8,000 and 9,000 ms** into the
+slot:
+
+| ms into slot | 5–6 k | 6–7 k | 7–8 k | **8–9 k** | 9–10 k | 10–11 k |
+|---|---|---|---|---|---|---|
+| arrivals/s | 4,849 | 2,554 | 1,384 | **555** | 259 | 128 |
+
+So the 558/s constant is well chosen — it lands exactly where the curve flattens.
+The cap is not. On epoch 469375 the daemon waited **6,378 ms**, i.e. it ran past
+the 6,000 ms cap at the 200 ms evaluation interval and was cut off while the
+adaptive rule still wanted to wait, and the final proof carried **4,999 named
+absentees — 8.95 s of proving** at 1.79 ms each.
+
+Under `--prover native` that costs nothing and does not show up in `T2 - T`.
+**On a GPU it would dominate the critical path.** Before any GPU run, raise
+`--max-trigger-wait-millis` toward 9,000–10,000 so the adaptive rule fires on its
+own criterion instead of being truncated, and confirm `tail_named` falls. The
+trade is up to ~3 s more wait against up to ~9 s less proving.
+
+This is the single most actionable thing the local run found, and it was only
+visible because the arrival curve and `tail_named` were measured together.
+
 ### Volume cross-check
 
 `/eth/v1/beacon/states/head/committees` reports 64 committees and 28,130

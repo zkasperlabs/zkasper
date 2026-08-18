@@ -275,6 +275,11 @@ number, for paging), `status` (`proven`, `proving`, `abandoned`).
 - `abandoned` — the chain never justified the checkpoint, or it reorged out from
   under the daemon. `abandoned_reason` says which.
 
+The first epoch of a run is `proven` with `finalized: null` and a `proof` whose
+stage is `justification`. It has nothing before it to finalize — a bootstrap has
+no previous justification to pair with — so a justification is the only proof it
+will ever have. Every epoch after it is closed by `stream_final`.
+
 `next_before` is null when there is no older page. Cache: `public, max-age=5`.
 
 ## `GET /v1/epochs/{epoch}`
