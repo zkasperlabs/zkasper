@@ -59,15 +59,35 @@ def daemon_running():
     return status_path() is not None
 VAST_KEY_FILE = "/root/.openclaw/workspace/.vast-api"
 API = "https://api.zkasper.com/v1/status"
+METRICS = "http://127.0.0.1:9464/metrics"
 SITE = "https://zkasper.com"
-# A single committee proof runs ~132 s and the manifest is not rewritten inside
-# a stage, so a 120 s threshold fires on healthy proving. Above the longest
-# stage, below an epoch.
-STALE_S = 300
+# Liveness comes from the daemon's heartbeat, not from its manifest. The
+# manifest is only rewritten when a stage *finishes*, and stages legitimately
+# run for minutes — a committee proof is ~127 s and a batch justification 1,224 s
+# — so every manifest-based threshold has fired on a healthy daemon. The
+# heartbeat is written once a second by its own task and means only "the process
+# is alive", which is the question being asked.
+HEARTBEAT_STALE_S = 90
+# The manifest is still worth a much looser bound: no stage finishing for half an
+# hour means the pipeline is stuck even if the process breathes.
+STALE_S = 1800
 
 
 def check(name, ok, detail):
     return {"name": name, "ok": bool(ok), "detail": detail}
+
+
+def heartbeat_age():
+    """Seconds since the daemon last breathed, or None if it serves no metrics."""
+    try:
+        req = Request(METRICS, headers={"User-Agent": "zkasper-monitor"})
+        with urlopen(req, timeout=10) as r:
+            for line in r.read().decode().splitlines():
+                if line.startswith("zkasper_heartbeat_timestamp_seconds "):
+                    return time.time() - float(line.split()[1])
+    except Exception:
+        pass
+    return None
 
 
 def daemon():
@@ -84,9 +104,15 @@ def daemon():
         return [check("daemon", False, f"no manifest at {path}: {e}")]
 
     out, age = [], time.time() - s.get("updated_unix", 0)
-    out.append(check("daemon", age <= STALE_S,
+    beat = heartbeat_age()
+    alive = beat is not None and beat <= HEARTBEAT_STALE_S
+    out.append(check("daemon", alive if beat is not None else age <= STALE_S,
                      f"epoch {(s.get('accumulator') or {}).get('epoch')}, "
-                     f"head {s.get('head_slot')}, manifest {age:.0f}s old"))
+                     f"head {s.get('head_slot')}, "
+                     + (f"heartbeat {beat:.0f}s ago" if beat is not None
+                        else "no heartbeat endpoint")))
+    out.append(check("pipeline", age <= STALE_S,
+                     f"last stage finished {age:.0f}s ago"))
 
     g = s.get("gossip") or {}
     if g:
