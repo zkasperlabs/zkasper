@@ -1,17 +1,45 @@
 # Measured Zisk costs
 
-All numbers from `scripts/bench.py` against **zisk v1.0.0-alpha** (CPU build),
-via `ziskemu -X`. Each primitive runs at two iteration counts inside a guest and
-the results are subtracted, so program setup, input parsing and output
-commitment cancel out and what remains is the marginal cost of one operation.
+All numbers from `scripts/bench.py`, via `ziskemu -X`. Each primitive runs at
+two iteration counts inside a guest and the results are subtracted, so program
+setup, input parsing and output commitment cancel out and what remains is the
+marginal cost of one operation.
 
 Re-run after any Zisk version bump — these are properties of the prover, not of
-zkasper:
+zkasper. `ZISK_BIN` selects which install to measure with, so two versions can
+be compared on one machine:
 
 ```sh
 python3 scripts/bench.py --build
+ZISK_BIN=/path/to/other/zisk/bin python3 scripts/bench.py
 ```
 
+The toolchain and `ziskos` must match: v1.1.0-alpha changed the guest linker
+script (`_global_pointer`, `_init_stack_top`, `_kernel_heap_*`), so a guest
+built against one and linked by the other fails with undefined symbols.
+
+> **Zisk v1.1.0-alpha, 2026-08-18.** The project moved from v1.0.0-alpha to
+> v1.1.0-alpha and the whole campaign was re-run on an RTX 5090, same sweep,
+> same fixtures. Raw data in `data/gpu_bench_v1.1.0/`; the v1.0.0-alpha campaign
+> is kept beside it in `data/gpu_bench/` so the two can be diffed.
+>
+> | | v1.0.0-alpha | v1.1.0-alpha |
+> |---|---:|---:|
+> | per-proof floor (`Proof generated`) | 4.940 s | **2.367 s** |
+> | empty guest, measured direct | 4.843 s | **2.429 s** |
+> | stage floor | 7.176 s | **3.640 s** |
+> | slot proof | 8.216 s | **4.506 s** |
+> | group proof | 7.998 s | **4.188 s** |
+> | wrap compression | 157 ms | **48 ms** |
+> | cold penalty | 13.49 s | **5.80 s** |
+> | `T2 − T` | 9.1 s on 2 cards | **5.5 s on 1 card** |
+>
+> **Cost units are not comparable across the two versions.** v1.1.0-alpha
+> re-based `POSEIDON_COST` from `14 * 75` to `14 * 392` so that it matches the
+> Poseidon AIR's actual column count, which is a 5.23x change in the *price* of
+> an operation whose *work* is identical. Anything quoted in cost units below
+> says which version produced it.
+>
 > **Recalibration, 2026-08-18.** The per-proof floor and the GPU throughput model
 > in this file were re-measured on an RTX 5090 against Zisk v1.0.0-alpha over a
 > 29-point sweep. `BASE = 293,601,280` is a compile-time constant in zisk that
@@ -28,24 +56,52 @@ python3 scripts/bench.py --build
 
 ## Primitives
 
-| primitive | cost | precompiles used |
-|---|---:|---|
-| `syscall_poseidon2` (raw) | 1,772 | `poseidon2` |
-| `acc::compress` — accumulator node | 3,033 | `poseidon2` |
-| `acc::leaf` — one validator | 3,979 | `poseidon2` |
-| `sha256_pair` — one SSZ node | 50,662 | `sha256` ×2 |
-| G1 decompress — one public key | 49,311 | `arith384_mod` |
-| G1 add — `add_complete_safe_bls12_381` | 67,854 | `bls12_381_curve_add` |
-| G1 add — raw `syscall_bls12_381_curve_add` | 2,428 | `bls12_381_curve_add` |
-| hash-to-curve G2 | 18,594,521 | Fp2 tower |
-| Miller loop, marginal pair | 33,222,822 | Fp2 tower |
-| Miller loop, fixed per batch | 39,633,399 | Fp2 tower |
-| final exponentiation | 132,665,557 | Fp2 tower |
-| Fp12 multiply | 737,503 | Fp2 tower |
-| `acc::commit_fp12` | 78,002 | `poseidon2` |
-| G2 subgroup check | 8,219,617 | Fp2 tower |
-| pairing check, 2 pairs (`pairing_check_safe`) | 248,054,847 | Fp2 tower |
-| **per-proof floor (BASE)** | **293,601,280** *(superseded: it is not a cost, it is 7.18 s — see below)* | — |
+Both columns were measured in one session on the same fixtures: each guest built
+against its own `ziskos` and read by its own `ziskemu`, because v1.1.0-alpha
+changed the guest linker script and the two cannot be mixed.
+
+| primitive | v1.0.0-alpha | v1.1.0-alpha | cost | steps | precompiles used |
+|---|---:|---:|---:|---:|---|
+| `syscall_poseidon2` (raw) | 1,772 | 6,463 | +265% | 3 → 5 | `poseidon2` |
+| `acc::compress` — accumulator node | 3,033 | 7,462 | +146% | 19 → 12 | `poseidon2` |
+| `acc::leaf` — one validator | 3,979 | 8,617 | +117% | 28 → 30 | `poseidon2` |
+| `sha256_pair` — one SSZ node | 50,662 | 36,207 | −29% | 316 → 131 | `sha256` ×2 |
+| G1 decompress — one public key | 49,311 | 45,349 | −8% | 414 → 326 | `arith384_mod` |
+| G1 add — `add_complete_safe_bls12_381` | 67,947 | 54,241 | −20% | 525 → 276 | `bls12_381_curve_add` |
+| G1 add — raw `syscall_bls12_381_curve_add` | 2,428 | 2,730 | +12% | 1 → 3 | `bls12_381_curve_add` |
+| hash-to-curve G2 | 18,594,521 | 12,748,974 | −31% | 160,957 → 47,416 | Fp2 tower |
+| Miller loop, marginal pair | 33,222,822 | 22,701,833 | −32% | | Fp2 tower |
+| final exponentiation | 132,665,557 | 85,147,848 | −36% | 1,129,993 → 224,710 | Fp2 tower |
+| Fp12 multiply | 737,503 | 492,687 | −33% | 6,369 → 1,486 | Fp2 tower |
+| `acc::commit_fp12` | 78,002 | 156,329 | +100% | 524 → 503 | `poseidon2` |
+| G2 subgroup check | 8,218,954 | 5,565,696 | −32% | 71,290 → 19,458 | Fp2 tower |
+| pairing check, 2 pairs (`pairing_check_safe`) | 248,054,847 | 163,974,164 | −34% | 2,110,257 → 465,339 | Fp2 tower |
+| **per-proof floor (BASE)** | 293,601,280 | 287,309,824 | −2% | | — |
+
+### Poseidon2 did not get five times more expensive; it got priced
+
+Read the `+265%` on `syscall_poseidon2` as a unit change, not a regression.
+`POSEIDON_COST` went from `14 * 75` to `14 * 392`, and **392 is the Poseidon
+AIR's column count**. Every v1.1.0-alpha precompile constant now equals its
+AIR's width — Sha256f 122, Keccakf 3023, ArithEq 90, ArithEq384 80 — and none of
+the v1.0.0-alpha constants did. Three independent checks say the work is
+unchanged and only the price moved:
+
+- On the same committee fixture both versions execute **exactly** 4,159
+  `poseidon2` and 2,016 `bls12_381_curve_add` calls.
+- `precompiles/poseidon/` changed by 13 lines between the tags and no `.pil`
+  file was touched, so the arithmetization is the same.
+- Measured on a GPU, a guest that is almost all poseidon2 proves **faster**, not
+  slower — see [the campaign](#the-measured-gpu-model).
+
+This is the same 4.3x that the v1.0.0-alpha campaign had already found from the
+other end, when it reported poseidon2 work proving at 70M units/s against 299M
+for padded rows. That gap was the constant being wrong, and it is now closed.
+
+The correction does change one architectural number. An accumulator node against
+an SSZ node was **16.70x in favour of poseidon2** and is now **4.85x**. The
+accumulator is still the right structure, but the margin is a third of what the
+design was argued on.
 
 ### The pairing numbers were three things in a trench coat
 
@@ -189,6 +245,25 @@ constant under test.
 | prover's own `Proof generated` | **4.940 s ± 0.096** | **69,714,770 ± 420,107 units/s** | 0.328 s |
 | ...restricted to one `Main` instance | 5.170 s ± 0.094 | 73,315,993 ± 1,107,828 units/s | 0.220 s |
 
+The same sweep on **v1.1.0-alpha**, 29 sizes, 3 warm proves each, same card:
+
+| | floor | slope | residual rms |
+|---|---:|---:|---:|
+| wall clock per `cargo-zisk prove` | 8.168 s ± 0.128 | 238,478,901 ± 2,442,850 units/s | 0.436 s |
+| prover's own `Proof generated` | **2.367 s ± 0.049** | **233,988,033 ± 895,838 units/s** | 0.166 s |
+| ...restricted to one `Main` instance | 2.561 s ± 0.034 | 245,451,826 ± 1,531,944 units/s | 0.084 s |
+
+The slope looks 3.36x better and is not. This guest's cost units are multiplied
+by **exactly 2.669 at every one of the 29 sizes** by the `POSEIDON_COST`
+re-basing, so only **1.26x** of it is throughput. What is unambiguous is the
+wall clock on identical work: n = 10,000 proves in 2.92 s against the
+v1.0.0-alpha model's 5.29 s, and n = 1,000,000 in 32.29 s against 107.38 s.
+
+The floor is the result that matters, because it is what `T2 − T` is made of:
+**4.940 s → 2.367 s**, and the empty guest measured directly gives 4.843 s →
+2.429 s. The cold penalty — process start plus GPU allocation, which a warm
+prover never pays — fell with it, 13.49 s → 5.80 s.
+
 Against the superseded `time = 19.5 s + units / 67,452,592`: the slope was 3.4%
 low, and the 19.5 s was never a proving floor. It is **13.49 s of process start
 and GPU allocation** plus about 5 s of actual floor, which is why it cannot be
@@ -203,40 +278,66 @@ is below.
 `crates/witness-gen/src/streaming.rs`. It predicts seconds from the quantities
 that drive them, with a rate per work class rather than one rate for everything.
 
-| term | value | what set it |
-|---|---:|---|
-| stage floor | **7.176 s ± 0.084** | MEASURED — the aggregation guest with recursion removed: 34,002 executed steps, 3 warm proves |
-| empty-guest floor | 4.843 s ± 0.027 | MEASURED — 496 steps, eleven AIRs, 3 warm proves |
-| per opened validator | **834.7 µs** | DERIVED — the attester sweep's 878.2 µs slope, less one internal node |
-| per accumulator node | 43.5 µs | MEASURED — 3,033 cost units at the poseidon2 sweep's 69,714,770 units/s |
-| Fp2-tower rate | 207,400,000 units/s | FITTED — least squares on the group and slot fixtures |
-| ...one distinct message | 0.250 s | hash-to-curve plus a marginal Miller loop, at that rate |
-| ...per-proof Miller batch | 0.231 s | the 63 shared squarings plus the G2 subgroup check |
-| ...final exponentiation | 0.640 s | once per epoch |
-| wrap compression | 0.157 s | MEASURED — five warm wraps, 151–170 ms |
-| cold penalty | 13.49 s | MEASURED — 87 proves, wall minus `Proof generated` |
-| recursive verification | **unmeasured** | the fixtures carry stub children; it is a parameter, not a zero |
+All values are Zisk v1.1.0-alpha unless the row says otherwise.
+
+| term | value | v1.0.0-alpha | what set it |
+|---|---:|---:|---|
+| stage floor | **3.640 s ± 0.053** | 7.176 s | MEASURED — the committee proof over 64 members: 21,680 executed steps, 3 warm proves |
+| empty-guest floor | 2.429 s ± 0.040 | 4.843 s | MEASURED — 496 steps, thirteen AIRs, 3 warm proves |
+| per opened validator | **834.7 µs** | 834.7 µs | **NOT re-measured** — the attester sweep cannot be reproduced, see below |
+| per committee member | 101.2 µs | 101.2 µs | **NOT re-measured** — derived from the same sweep |
+| per accumulator node | 31.9 µs | 43.5 µs | MEASURED — 7,462 cost units at the poseidon2 sweep's 233,988,033 units/s |
+| Fp2-tower rate | 200,000,000 units/s | 207,400,000 | FITTED — bracket 162M to 268M, against 160M to 609M before |
+| ...one distinct message | 0.177 s | 0.250 s | hash-to-curve plus a marginal Miller loop, at that rate |
+| ...per-proof Miller batch | 0.160 s | 0.231 s | the 63 shared squarings plus the G2 subgroup check |
+| ...final exponentiation | 0.426 s | 0.640 s | once per epoch |
+| wrap compression | 0.048 s | 0.157 s | MEASURED — six warm wraps, 46–52 ms |
+| cold penalty | 5.80 s | 13.49 s | MEASURED — the sweep's two intercepts, wall minus `Proof generated` |
+| recursive verification | **unmeasured** | unmeasured | the fixtures carry stub children; it is a parameter, not a zero |
 
 The stage floor is the load-bearing one, and it is worth being clear about what
-it is. An empty guest instantiates eleven AIRs for 4.843 s. The aggregation
-guest executes 34,002 steps — 82x an empty guest's cost units, still nothing —
-and takes 7.176 s. The 2.33 s between them is the AIRs a poseidon2-and-Fp12
-guest instantiates and an empty one does not, and every zkasper stage pays it.
+it is. An empty guest instantiates thirteen AIRs for 2.429 s. The committee
+proof over a 64-member witness executes 21,680 steps — nothing — and takes
+3.640 s. The 1.21 s between them is the AIRs a poseidon2 guest instantiates and
+an empty one does not, and every zkasper stage pays it.
+
+v1.0.0-alpha measured this on the aggregation guest with recursion removed, at
+7.176 s. That guest cannot stand in any more: with `verify_child` stubbed it
+still fails a later assert on the fixture's stub children, and a panicking guest
+never returns from `ziskemu` — it spins to the step limit. The tiny committee
+proof is the same workload class at the same order of magnitude (21,680 steps
+and 3.53M units against 34,002 and 3.31M) and needs no stub at all.
+
+**Two constants were not re-measured, and both are carried forward from
+v1.0.0-alpha unchanged.** `per_validator_s` came from the attester sweep, and
+that sweep no longer exists as a measurement: a group-proof witness is a slot
+*complement*, so `gen-test-witness group-proof n` returns the same 728 bytes at
+every `n` and there is nothing to regress against. `per_member_s` is derived
+from the same sweep's rate. Under `ziskemu -X` a committee member fell from
+254.0 steps to 208.0 while its price rose from 30,127 units to 36,406, so the
+work is down 18% — but converting that to seconds needs a committee sweep on
+hardware that this campaign did not run. Every constant that *was* re-measured
+improved, so carrying these two forward can only make the schedule look worse
+than it is.
 
 There is deliberately no per-invocation constant. These are the prover's own
-`Proof generated` times and a warm prover pays exactly them; the 19.52 s that
-used to be added on top already contained the floor.
+`Proof generated` times and a warm prover pays exactly them.
 
 ### How well it does
 
-Against the four fixture stages it was fitted on, worst error **4.3%**:
+Against the three fixture stages it is fitted on, worst error **5.0%**
+(v1.1.0-alpha):
 
 | stage | model | measured | error |
 |---|---:|---:|---:|
-| aggregation, recursion removed | 7.18 s | 7.18 s ± 0.08 | −0.0% |
-| group proof | 7.66 s | 8.00 s ± 0.03 | −4.3% |
-| slot proof, own final exponentiation | 8.36 s | 8.22 s ± 0.13 | +1.7% |
-| stream-final, recursion removed | 8.30 s | 8.21 s ± 0.21 | +1.1% |
+| committee proof, 64 members | 3.64 s | 3.64 s ± 0.053 | −0.0% |
+| group proof | 3.98 s | 4.19 s ± 0.061 | −5.0% |
+| slot proof, own final exponentiation | 4.45 s | 4.51 s ± 0.393 | −1.2% |
+
+It was four stages and worst error 4.3% on v1.0.0-alpha. Two of them are gone
+rather than worse: the aggregation and stream-final stubs cannot be proved at
+all now, because stubbing `verify_child` leaves a later assert failing on the
+fixture's stub children and a panicking guest never returns from `ziskemu`.
 
 Against the group-size sweep, which it was *not* shaped for — the sweep is the
 enumerating guest, whose floor is about 1 s below a complement group proof's —
@@ -292,6 +393,28 @@ Minimum free memory available for GPU usage: 30.609253 GB
 GPU 0: Allocated 30.135334 GB (28.413327 GB unified + 1.722007 GB const pols)
 Pinned host memory per GPU: 2.000000 GB
 ```
+
+**v1.1.0-alpha does not change this.** On the same 32.61 GB card it still reads
+free VRAM and fills it, over the same 100x span of workload:
+
+```
+Minimum free memory available for GPU usage: 30.781128 GB
+GPU 0: Allocated 29.347325 GB (28.296217 GB unified + 1.051108 GB const pols)
+Pinned host memory per GPU: 2.000000 GB
+```
+
+The one thing that moved is the constant polynomials, 1.722 GB → **1.051 GB**,
+a 39% cut. The unified arena is unchanged at 28.3 GB because it is sized by what
+the card has free, not by what the witness needs. The "GPU memory usage
+reporting" and "improved GPU memory planning" in the release notes did not make
+a warm prover take less of the card.
+
+Two operational numbers did get worse, and they are provisioning ones. The
+proving key grows to **105 GB** after the first setup, against ~85 GB on
+v1.0.0-alpha, and `~/.zisk/cache` reaches 13 GB for four ELFs. Budget 150 GB of
+disk, not the 120 GB `scripts/gpu_bench.sh` still suggests. Setup itself got
+much faster: 275 s for the first ELF including the one-time global constant-tree
+regeneration, then **13–15 s per additional ELF** against ~6.4 min before.
 
 `cargo-zisk prove -m/--minimal-memory` does **not** change this: same 30.135334
 GB allocated, same 31,684 MiB peak, same proving time (12.455 s against
@@ -459,6 +582,14 @@ floor, and 7.18 s of it. That is the single most useful number in this file: a
 guest doing 34,002 steps of nothing takes 2.33 s longer than an empty guest
 doing 496, and the only thing between them is the AIRs a poseidon2-and-Fp12
 guest instantiates. It is the `stage_floor_s` of the time model.
+
+**On v1.1.0-alpha neither stub runs at all.** With `verify_child` returning true
+the guests get further and then fail a later assert on the same stub children,
+and a panicking guest never returns from `ziskemu` — it spins to the step limit.
+The floor is now measured on the committee proof over a 64-member witness
+instead: 21,680 steps and 3.53M cost units, **3.640 s ± 0.053**, which is the
+same workload class at the same size and needs no stub. Both figures sit 1.2 s
+above their own version's empty guest.
 
 What these do *not* give is the cost of recursion. Whatever an aggregation proof
 really costs is almost entirely the recursive verification of its children,
@@ -680,6 +811,11 @@ at 16,000 / 32,000 / 64,000 members, linear to five figures:
 | flat witness, read in place | 328.0 | 36,473 |
 | curve add takes the sum in place | **254.0** | **30,127** |
 
+All three rows are v1.0.0-alpha. Re-measured on v1.1.0-alpha at the same three
+sizes, the last row is **208.0 steps and 36,406 cost units** — 18.1% fewer steps
+for 20.8% more units, which is the poseidon2 re-pricing and not a regression.
+Priced at v1.0.0-alpha's constants a member now costs 26,958, or 10.5% less.
+
 `crates/common/src/committee.rs` now defines the layout the host writes and the
 guest indexes; nothing about what is proven changed, and the strictly-increasing
 check that makes the slot buckets disjoint is still the same check in the same
@@ -721,30 +857,39 @@ Three things follow:
    but a group-proof witness is 728 bytes and a stream-final witness 2,671:
    measured on the same fixture, dropping the input copy moved the group guest
    by **12 steps out of 1,175,370**. The named set a slot proof walks is about
-   a hundred validators — 0.08 s of the 7.18 s floor — so a second wire format
+   a hundred validators — 0.08 s of the 3.64 s floor — so a second wire format
    over the pipeline's most nested witness would buy about 1% of a proof.
 
 3. **What is left of the committee proof is not framing any more.** Of the
-   30,127 units a member still costs, the precompiles it exists to run — one
-   leaf hash, one internal node, one curve addition — are 4,161, or 14%. The
-   rest is `acc::leaf`'s repacking of a 768-bit point into 60-bit Goldilocks
-   windows and the multi-proof's scan bookkeeping. `scripts/committee_bench.py`
-   attributes it, at 1,024 -> 2,048 members and depth 12:
+   30,127 units a member cost on v1.0.0-alpha, the precompiles it exists to run
+   — one leaf hash, one internal node, one curve addition — were 4,161, or 14%.
+   On v1.1.0-alpha the same three are 13,609 of 36,406, or **37%**, because
+   poseidon2 is now charged what it occupies. The rest is `acc::leaf`'s
+   repacking of a 768-bit point into 60-bit Goldilocks windows and the
+   multi-proof's scan bookkeeping. `scripts/committee_bench.py` attributes it,
+   at 1,024 -> 2,048 members and depth 12:
 
-   | | cost units/member | share |
-   |---|---:|---:|
-   | accumulator multi-proof | 10,801 | 36% |
-   | leaf hash | 11,210 | 37% |
-   | curve addition | 5,405 | 18% |
-   | witness I/O, what is left of it | 1,281 | 4% |
-   | balances, asserts, the 32-leaf tree | 1,219 | 4% |
+   | | v1.0.0-alpha | share | v1.1.0-alpha | share |
+   |---|---:|---:|---:|---:|
+   | accumulator multi-proof | 10,801 | 36% | 13,016 | 36% |
+   | leaf hash | 11,210 | 37% | 15,344 | 43% |
+   | curve addition | 5,405 | 18% | 4,573 | 13% |
+   | witness I/O, what is left of it | 1,281 | 4% | 1,336 | 4% |
+   | balances, asserts, the 32-leaf tree | 1,219 | 4% | 1,826 | 5% |
+
+   The curve addition is the only one of the five whose *price* barely moved
+   (`ARITH_EQ_384_COST` rose 1.3%), so its **−15.4%** is real work removed by the
+   new Main and Binary arithmetization. The marshalling this list exists to
+   track — `MAIN` per member — fell from 17,272 to 14,144, exactly tracking the
+   18.1% step reduction.
 
    Writing the packed point straight into the permutation state was measured and
    is **worth nothing** — 30,568 against 30,127, LLVM already elides the
    intermediate array. What does pay is arity: a 4-ary accumulator absorbs four
    digests in the permutation a 2-ary node spends on two, which takes the
    internal nodes from one a leaf to a third of one and measures **25,965 units
-   a member, 13% off**. It also halves the levels a scattered absentee opening
+   a member, 13% off** (v1.1.0-alpha: 30,039 against 36,095, 17% off). It also
+   halves the levels a scattered absentee opening
    hashes, against three auxiliaries a level instead of one. It is not landed:
    it changes the accumulator every other proof binds.
 
@@ -763,7 +908,8 @@ figure to 0.7%, which is what licenses the extrapolation to 961k.
 Three questions it closed:
 
 **Accumulator depth does not matter.** Per-member cost at depths 12, 16, 20 and
-22 is 254 steps and 29,916 units, identical to the last unit. The committee
+22 is 254 steps and 29,916 units, identical to the last unit — 208 steps and
+36,095 on v1.1.0-alpha, equally flat. The committee
 proof opens an index range, so the levels above it are a constant, not a term.
 An `ACC_TREE_DEPTH` cheaper than 22 buys the committee proof nothing.
 
@@ -771,7 +917,8 @@ An `ACC_TREE_DEPTH` cheaper than 22 buys the committee proof nothing.
 across a level of a binary reduction is the classic win when an inversion costs
 what a hundred multiplications cost. In Zisk it costs what *one* does:
 `arith384_mod` and `bls12_381_curve_add` are the same `ARITH_EQ_384` operation
-at 1,896 cost units, and `inv_fp_bls12_381` is a hinted inverse plus one
+at 1,896 cost units (1,920 on v1.1.0-alpha, and the AIR behind it was rebuilt
+from 2^18 x 135 to 2^20 x 80), and `inv_fp_bls12_381` is a hinted inverse plus one
 multiplication to check it. A whole affine addition is one precompile; doing it
 in software is ten, and batching the inversion makes it twelve. Measured:
 **112,272 units a member against 29,916**, with 11.94 `arith384_mod` calls a
@@ -917,17 +1064,33 @@ for the crossing slot's block and for the group ahead of it.
 
 #### What it is sensitive to
 
+All rows are Zisk v1.1.0-alpha, from
+`test_ssz_file_streaming_schedule`. `T2 − T` is **5.5 s on one card**, against
+9.1 s on two cards under v1.0.0-alpha's constants.
+
 | | `T2 − T` | cards |
 |---|---:|---:|
-| stage floor 2.00 s (a hypothetical) | 20.4 s | 1 |
-| stage floor 4.84 s (an empty guest) | 23.3 s | 1 |
-| **stage floor 7.18 s (measured)** | **25.6 s** | **1** |
-| stage floor 12.20 s (the old 789M, as time) | 31.5 s | 1 |
-| stage floor 30.00 s | 50.5 s | 2 |
-| Fp2-tower rate 121M units/s (the slow bracket) | 27.1 s | 1 |
-| Fp2-tower rate 663M units/s (the fast bracket) | 24.1 s | 1 |
-| recursive verification 1 s per child | 27.5 s | 2 |
-| recursive verification 5 s per child | 32.7 s | 2 |
+| stage floor 2.00 s (a hypothetical) | 3.9 s | 1 |
+| stage floor 2.43 s (an empty guest) | 4.3 s | 1 |
+| **stage floor 3.64 s (measured, v1.1.0-alpha)** | **5.5 s** | **1** |
+| stage floor 4.84 s (v1.0.0-alpha's empty guest) | 6.7 s | 1 |
+| stage floor 7.18 s (v1.0.0-alpha's measured floor) | 9.1 s | 1 |
+| stage floor 12.20 s (the old 789M, as time) | 15.3 s | 1 |
+| stage floor 20.00 s | 23.1 s | 1 |
+| Fp2-tower rate 162M units/s (the slow bracket) | 5.9 s | 1 |
+| Fp2-tower rate 400M units/s (the fast end) | 4.7 s | 1 |
+| recursive verification 1 s per child | 6.5 s | 2 |
+| recursive verification 5 s per child | 11.8 s | 2 |
+
+`T2 − T` tracks the stage floor almost one for one, which is why halving the
+floor is the whole of this release for zkasper's latency. The Fp2-tower rate,
+the model's largest uncertainty, now moves it by 1.2 s across its entire
+bracket, against 2.3 s before.
+
+The trigger margin still dominates everything else. At 66–68% the epoch closes
+on 22 slots and `T2 − T` is 5.5 s; at 69–70% it waits for a 23rd and pays
+21.6 s. That cliff is a consensus decision, not a prover one, and v1.1.0-alpha
+moves the far side of it from 25.6 s to 21.6 s without moving the cliff.
 
 The whole Fp2-tower bracket moves `T2 − T` by 3 s, so the model's largest
 uncertainty is not the answer's largest uncertainty. Recursion, which nothing
@@ -973,6 +1136,17 @@ Built for `riscv64ima-zisk-zkvm-elf` and run on the 4-validator test witness:
 group proof   STEPS 1,180,802   VARIABLE 135,183,320   BASE 293,601,280   TOTAL 428,784,600
 slot proof    STEPS 2,405,933   VARIABLE 282,009,180   BASE 293,601,280   TOTAL 575,610,460
 ```
+
+On v1.1.0-alpha, same fixtures:
+
+```
+group proof   STEPS   329,675   VARIABLE  92,078,690   BASE 287,309,824   TOTAL 379,388,514
+slot proof    STEPS   569,601   VARIABLE 180,840,309   BASE 287,309,824   TOTAL 468,150,133
+```
+
+Cost units fall 32% and 34%, but **executed steps fall 72% and 76%** — these are
+the two most Fp2-tower-heavy stages in the pipeline and the new arithmetization
+lands hardest on them.
 
 Same attestations, same membership proof; the group proof is 146,825,860
 cheaper because it does not finish the pairing. That is the final exponentiation

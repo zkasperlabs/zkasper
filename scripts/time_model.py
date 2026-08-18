@@ -40,16 +40,24 @@ import math
 # Constants. Every one names the measurement that set it.
 # ---------------------------------------------------------------------------
 
-# MEASURED. Empty guest, 496 executed steps, 3 warm proves, sd 0.027 s
-# (`data/gpu_bench/trivial_times.tsv`, m0n0). Eleven AIRs and nothing else.
-EMPTY_FLOOR_S = 4.843
+# MEASURED. Empty guest, 496 executed steps, 3 warm proves, sd 0.040 s
+# (`data/gpu_bench_v1.1.0/trivial_times.tsv`, m0n0). Thirteen AIRs and nothing
+# else. It was 4.843 s on v1.0.0-alpha, over eleven AIRs.
+EMPTY_FLOOR_S = 2.429
 
-# MEASURED. `data/gpu_bench/stubbed_times.tsv`, aggregation with recursion
-# removed: 34,002 executed steps and 3.31M cost units, 3 warm proves, sd 0.084 s.
-# That is 82x the empty guest's cost units for 2.33 s more time, which can only
-# be the AIRs a poseidon2-and-Fp12 guest instantiates that an empty one does
-# not. It is the floor of any zkasper stage.
-STAGE_FLOOR_S = 7.176
+# MEASURED. `data/gpu_bench_v1.1.0/stage_times.tsv`, the committee proof over a
+# 64-member witness: 21,680 executed steps and 3.53M cost units, 3 warm proves,
+# sd 0.053 s. It is 1.21 s above the empty guest, which can only be the AIRs a
+# poseidon2 guest instantiates that an empty one does not. It is the floor of
+# any zkasper stage.
+#
+# v1.0.0-alpha measured this as the aggregation guest with recursion removed
+# (34,002 steps, 3.31M units) at 7.176 s. That guest is not usable as a floor
+# any more: with `verify_child` stubbed it still fails a later assert on the
+# fixture's stub children, and a panicking guest never returns from ziskemu. The
+# tiny committee proof is the same workload class at the same order of
+# magnitude and needs no stub.
+STAGE_FLOOR_S = 3.640
 
 # MEASURED. `data/gpu_bench/attester_*.tsv`, the enumerating group proof over
 # 2,048 .. 154,000 attesters, OLS slope, se 6.5 us. The fixture argument is
@@ -73,43 +81,49 @@ PER_ATTESTER_S = 878.2e-6
 # a change like that in a minute rather than an hour.
 PER_MEMBER_S = 101.2e-6
 
-# MEASURED. `data/gpu_bench/bench_*.tsv`, 29 sizes, 3 warm proves each, OLS on
-# the poseidon2 guest: 37.381 us per permutation, se 0.225 us, at 2,606 cost
-# units per permutation.
-POSEIDON_UNITS_PER_S = 69_714_770
+# MEASURED. `data/gpu_bench_v1.1.0/bench_*.tsv`, 29 sizes, 3 warm proves each,
+# OLS on the poseidon2 guest, se 895,838 units/s.
+#
+# It was 69,714,770 on v1.0.0-alpha, so this looks like 3.36x. Only 1.26x of
+# that is throughput: v1.1.0-alpha re-based POSEIDON_COST from 14*75 to 14*392
+# to match the Poseidon AIR's actual 392-column width, which multiplies this
+# guest's cost units by exactly 2.669 at every size. The wall-clock improvement
+# on the same work is 37% to 45%.
+POSEIDON_UNITS_PER_S = 233_988_033
 
 # FITTED on the fixture stages, against their Fp2-tower cost-unit content: least
 # squares through the origin on what the group and slot proofs cost above
 # STAGE_FLOOR_S. This is the weakest constant in the file — no measurement in
 # the campaign exercises BLS at mainnet scale, so it is a within-family rate
 # read off floor-dominated proofs. `--report` prints the bracket it sits in.
-BLS_UNITS_PER_S = 207_400_000
+BLS_UNITS_PER_S = 200_000_000
 
-# MEASURED. `data/gpu_bench/wrap_times.tsv`, the prover's own
-# GENERATE_VADCOP_FINAL_COMPRESSED_PROOF over the five warm wraps: 157, 151,
-# 152, 170, 153 ms. The 12.5 s of wall around it is process startup.
-WRAP_S = 0.157
+# MEASURED. `data/gpu_bench_v1.1.0/wrap_times.tsv`, the prover's own
+# GENERATE_VADCOP_FINAL_COMPRESSED_PROOF over six warm wraps: 52, 46, 46, 48,
+# 47, 47 ms. The 5.4 s of wall around it is process startup. It was 151-170 ms
+# on v1.0.0-alpha.
+WRAP_S = 0.048
 
-# MEASURED. 87 warm proves: mean wall 30.46 s against mean `Proof generated`
-# 16.97 s, of which INITIALIZING_PROOFMAN is 7.74 s +/- 0.71. This is what a
-# long-lived prover saves per proof. It is NOT a proving floor and must never be
-# added to one; the 19.52 s that used to be quoted was this plus the floor.
-COLD_PENALTY_S = 13.49
+# MEASURED. The 29-size sweep's two intercepts differ by wall 8.168 s against
+# `Proof generated` 2.367 s. This is what a long-lived prover saves per proof.
+# It is NOT a proving floor and must never be added to one. It was 13.49 s on
+# v1.0.0-alpha.
+COLD_PENALTY_S = 5.80
 
 # MEASURED cost units, `scripts/bench.py`. Used only as *ratios* inside one work
 # class, never as a currency across classes.
 UNITS = {
-    "acc_node": 3_033,
-    "acc_leaf": 3_979,
-    "g1_add": 2_428,
-    "hash_to_curve": 18_594_521,
-    "miller_pair": 33_222_822,
-    "miller_batch": 39_633_399,
-    "final_exp": 132_665_557,
-    "pair_validation": 6_076_715,
-    "fp12_mul": 737_503,
-    "commit_fp12": 78_002,
-    "g2_subgroup": 8_219_617,
+    "acc_node": 7_462,
+    "acc_leaf": 8_617,
+    "g1_add": 2_730,
+    "hash_to_curve": 12_748_974,
+    "miller_pair": 22_701_833,
+    "miller_batch": 26_527_397,
+    "final_exp": 85_147_848,
+    "pair_validation": 4_751_360,
+    "fp12_mul": 492_687,
+    "commit_fp12": 156_329,
+    "g2_subgroup": 5_565_696,
 }
 
 ACC_DEPTH = 22
@@ -236,7 +250,7 @@ def _measurements():
     import statistics as st
 
     d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                     "data", "gpu_bench")
+                     "data", "gpu_bench_v1.1.0")
     times = {}
     with open(os.path.join(d, "bench_phases.tsv")) as f:
         for r in csv.DictReader(f, delimiter="\t"):
@@ -274,59 +288,50 @@ def _report():
     print(__doc__.split("Usage:")[0].rstrip())
 
     print("\n=== constants ===")
-    print(f"  stage floor                  {STAGE_FLOOR_S:>14.3f} s    MEASURED, aggregation stub")
-    print(f"  empty-guest floor            {EMPTY_FLOOR_S:>14.3f} s    MEASURED, eleven AIRs")
-    print(f"  per opened validator         {PER_VALIDATOR_S * 1e6:>14.1f} us   DERIVED, attester sweep")
+    print(f"  stage floor                  {STAGE_FLOOR_S:>14.3f} s    MEASURED, tiny committee proof")
+    print(f"  empty-guest floor            {EMPTY_FLOOR_S:>14.3f} s    MEASURED, thirteen AIRs")
+    print(f"  per opened validator         {PER_VALIDATOR_S * 1e6:>14.1f} us   v1.0.0-alpha, not re-measured")
     print(f"  per accumulator node         {ACC_NODE_S * 1e6:>14.1f} us   MEASURED, poseidon2 sweep")
     print(f"  Fp2-tower rate               {BLS_UNITS_PER_S:>14,.0f} u/s  FITTED, fixtures")
     print(f"    one message                {bls_s(UNITS['hash_to_curve'] + UNITS['miller_pair']):>14.3f} s")
     print(f"    per-proof Miller batch     {bls_s(UNITS['miller_batch'] + UNITS['g2_subgroup']):>14.3f} s")
     print(f"    final exponentiation       {bls_s(UNITS['final_exp']):>14.3f} s")
     print(f"  wrap compression             {WRAP_S:>14.3f} s    MEASURED")
-    print(f"  cold penalty per invocation  {COLD_PENALTY_S:>14.3f} s    MEASURED, 87 proves")
+    print(f"  cold penalty per invocation  {COLD_PENALTY_S:>14.3f} s    MEASURED, sweep intercepts")
 
     print("\n=== residuals: the fixture stages (4 validators, 1 slot, 1 message) ===")
     print(f"  {'stage':<38}{'model':>9}{'measured':>10}{'':<12}{'error':>8}")
     errs = []
-    errs.append(line("aggregation, recursion removed", fold_s(0.0), *warm("prove_stub_aggregation", True)))
-    errs.append(line("group proof", group_s(0.0, 1.0, 1.0), *warm("prove_group-proof", True)))
+    errs.append(line("committee proof, 64 members", STAGE_FLOOR_S,
+                     *warm("prove_committee-proof", False)))
+    errs.append(line("group proof", group_s(0.0, 1.0, 1.0), *warm("prove_group-proof", False)))
     errs.append(line(
         "slot proof, own final exponentiation",
         group_s(0.0, 1.0, 1.0) + bls_s(UNITS["final_exp"] + 2 * UNITS["pair_validation"]),
-        *warm("prove_slot-proof", True)))
-    errs.append(line("stream-final, recursion removed",
-                     final_s(0.0, 1.0, 1.0, 0.0, True), *warm("prove_stub_stream-final", True)))
+        *warm("prove_slot-proof", False)))
     print(f"  worst {max(abs(e) for e in errs):.1f}%")
+    print("  The stream-final and aggregation stubs are gone: with recursion")
+    print("  removed they still fail a later assert on the fixture's stub")
+    print("  children, and a panicking guest never returns from ziskemu.")
 
     print("\n=== residuals: the group stage against attester count ===")
-    print("  The sweep is the *enumerating* group proof, which is where the")
-    print("  per-validator term comes from; it opens a contiguous range and has")
-    print("  no committee aggregate to subtract, so the complement guest's floor")
-    print("  is about 1 s higher and the model runs high at the small end.")
-    att = costs("attester_costs.tsv", 6)
-    print(f"  {'attesters':>10}{'steps':>14}{'units/s':>14}{'model':>9}{'measured':>10}{'sd':>7}{'error':>8}")
-    for key in sorted(att, key=int):
-        steps, variable = att[key]
-        a = int(key) / 2
-        m, sd = warm(f"prove_a{key}", False)
-        pred = STAGE_FLOOR_S + open_leaves_s(a, contiguous=True) + attestation_s(0, 1, 1)
-        print(f"  {a:>10,.0f}{steps:>14,}{variable / m:>14,.0f}{pred:>8.1f}s{m:>9.1f}s"
-              f"{sd:>7.2f}{100 * (pred - m) / m:>+8.1f}%")
-    print("  The units/s column is the whole point: one prover, one guest, one")
-    print(f"  workload family, and the rate still moves {2_511_870 / 167_773:.0f}x across it.")
+    print("  Not re-measured on v1.1.0-alpha. A group-proof witness is a slot")
+    print("  *complement*, so gen-test-witness returns the same 728 bytes at")
+    print("  every attester count and there is nothing to regress against.")
+    print("  PER_ATTESTER_S and PER_MEMBER_S are therefore still v1.0.0-alpha.")
 
     print("\n=== the bracket on the Fp2-tower rate ===")
     print("  Nothing in the campaign runs BLS at scale, so this rate is read off")
     print("  floor-dominated proofs and is the model's largest uncertainty.")
-    g, _ = warm("prove_group-proof", True)
-    s, _ = warm("prove_slot-proof", True)
-    a, _ = warm("prove_stub_aggregation", True)
+    g, _ = warm("prove_group-proof", False)
+    s, _ = warm("prove_slot-proof", False)
+    a, _ = warm("prove_committee-proof", False)
     tower = (UNITS["miller_batch"] + UNITS["g2_subgroup"]
              + UNITS["hash_to_curve"] + UNITS["miller_pair"])
     lo = (UNITS["final_exp"] + 2 * UNITS["pair_validation"]) / (s - g)
     hi = tower / (g - a)
     print(f"    slot minus group, inside one AIR instance {lo:>14,.0f} units/s   too fast")
-    print(f"    group minus aggregation stub              {hi:>14,.0f} units/s   too slow")
+    print(f"    group minus the tiny committee proof      {hi:>14,.0f} units/s   too slow")
     print(f"    least squares on both                     {BLS_UNITS_PER_S:>14,.0f} units/s   <- used")
 
     print("\n=== what the model says about the pipeline ===")

@@ -13,19 +13,25 @@ set -euo pipefail
 #   bench n=220k 866,953,297 units -> 1030.0 s
 #   fit: time = 333.4 s + units / 1,244,523
 #
-# GPU result (RTX 5090, Zisk 1.0.0-alpha, 2026-08-18). 29 sizes, 3 warm proves
-# each, n = 10,000 .. 1,000,000. Raw data in data/gpu_bench/, fit reproduced by
-# `python3 scripts/fit_gpu_bench.py`.
+# GPU result (RTX 5090, 2026-08-18). 29 sizes, 3 warm proves each,
+# n = 10,000 .. 1,000,000. Raw data in data/gpu_bench/ (v1.0.0-alpha) and
+# data/gpu_bench_v1.1.0/; fits reproduced by `python3 scripts/fit_gpu_bench.py`.
 #
 # Regress on VARIABLE, not TOTAL: TOTAL contains the BASE constant, so fitting
 # against it assumes the thing you are trying to measure.
 #
-#   prover's `Proof generated`   floor 4.940 s +/- 0.096
-#                                slope 69,714,770 +/- 420,107 units/s   rms 0.328 s
-#   wall clock per invocation    floor 18.470 s +/- 0.273
-#                                slope 69,965,637 +/- 1,199,943 units/s rms 0.931 s
-#   empty guest, measured direct 4.843 s +/- 0.028   <- the floor, not extrapolated
-#   per-invocation overhead      13.49 s (87 proves) <- what a warm prover saves
+#                                v1.0.0-alpha            v1.1.0-alpha
+#   `Proof generated` floor      4.940 s +/- 0.096       2.367 s +/- 0.049
+#                     slope      69,714,770 units/s      233,988,033 units/s
+#   wall clock        floor      18.470 s +/- 0.273      8.168 s +/- 0.128
+#   empty guest, direct          4.843 s +/- 0.028       2.429 s +/- 0.040
+#   per-invocation overhead      13.49 s                 5.80 s
+#
+# The 3.36x slope is NOT 3.36x throughput. v1.1.0-alpha re-based POSEIDON_COST
+# from 14*75 to 14*392 so it matches the Poseidon AIR's real column count, which
+# multiplies this guest's cost units by exactly 2.669 at every size. Only 1.26x
+# is throughput. The unambiguous figure is wall clock on identical work: n=10,000
+# proves in 2.92 s against 5.29 s, n=1,000,000 in 32.29 s against 107.38 s.
 #
 # This supersedes the earlier `time = 19.5 s + units / 67,452,592`. That slope
 # was 3.4% low, and its 19.5 s intercept was never a proving floor: it is 13.5 s
@@ -50,11 +56,16 @@ set -euo pipefail
 #
 # Usage: ./scripts/gpu_bench.sh
 #
-# Requires: NVIDIA driver >= 525.60.13, ~120 GB free disk, ~32 GB RAM.
+# Requires: NVIDIA driver >= 525.60.13, ~150 GB free disk, ~32 GB RAM.
 #
-# Disk is the easy thing to underestimate. The downloaded proving key is 26 GB,
-# but the first `setup`/`prove` regenerates constant trees into it and it grows
-# to ~85 GB. Each program's setup adds a further ~3 GB to ~/.zisk/cache.
+# Disk is the easy thing to underestimate. On v1.1.0-alpha the downloaded
+# proving key is 31 GB, and the first `setup`/`prove` regenerates constant trees
+# into it until it reaches ~105 GB (v1.0.0-alpha: 26 GB -> ~85 GB). Four ELFs
+# then add 13 GB of ~/.zisk/cache.
+#
+# ziskup's `cargo-zisk toolchain install` links the ZisK rust toolchain into
+# rustup, so **rustup must be installed before ziskup runs**. Without it ziskup
+# aborts before fetching the proving key and the box looks set up but is not.
 #
 # Run it under `setsid nohup ./scripts/gpu_bench.sh > gpu_bench.log 2>&1 &` and
 # tail the log. Setup plus two proofs takes tens of minutes, and an ssh session
@@ -62,9 +73,9 @@ set -euo pipefail
 #
 # Timings on a fresh RTX 5090 box, for planning a rental:
 #   apt + rustup + ziskup --provingkey   ~16 min  (3.2 GB download)
-#   cargo-zisk setup, per ELF             ~6.4 min for the first one
-#   first prove                            ~99 s  (INITIALIZING_PROOFMAN 71.7 s)
-#   warm prove, small workload             ~19 s wall
+#   cargo-zisk setup, first ELF            ~4.6 min (one-time const-tree regen)
+#   cargo-zisk setup, each ELF after       ~14 s
+#   warm prove, small workload             ~10 s wall on v1.1.0-alpha
 # Disk: 3.2 GB compressed -> 34 GB unpacked -> 72 GB after the first setup.
 #
 # MEASUREMENT PROTOCOL. `time cargo-zisk prove` measures three things at once
@@ -86,7 +97,7 @@ set -euo pipefail
 # do not fit on one card; see BENCHMARKS.md. `cargo-zisk prove` does expose
 # `-m/--minimal-memory` and `-x/--max-witness-stored <bytes>` if you want to try.
 
-ZISK_VERSION="1.0.0-alpha"
+ZISK_VERSION="1.1.0-alpha"
 SLOT_ELF=target/elf/riscv64ima-zisk-zkvm-elf/release/zkasper-slot-proof-guest
 BENCH_ELF=target/elf/riscv64ima-zisk-zkvm-elf/release/zkasper-bench-guest
 
@@ -120,9 +131,15 @@ echo "=== 1. System dependencies ==="
 # mem-planner-cpp:
 #     cub/agent/agent_reduce_by_key.cuh(210): error: no instance of function
 #     template "cuda::std::__4::equal_to<void>::operator()" matches the argument list
-# That is zisk v1.0.0-alpha against CUDA 12.8 CCCL, not anything about this
+# That was zisk v1.0.0-alpha against CUDA 12.8 CCCL, not anything about this
 # repo. Use an older CUDA image if you need the in-process prover; the prebuilt
 # cargo-zisk from ziskup is unaffected and is what this script uses.
+#
+# UNRETESTED on v1.1.0-alpha. The v1.1.0-alpha campaign ran on
+# nvidia/cuda:12.6.3-devel-ubuntu24.04 and never exercised the 12.8 path.
+# `state-machines/mem-cpp/cu/count_and_plan.cu` was rewritten between the tags
+# (224 lines, part of "porting mops to GPU"), so the failure may well be gone —
+# but nobody has checked. Assume 12.4/12.6 until someone does.
 sudo apt-get update -qq
 for pkg in \
   build-essential curl git jq xz-utils nasm python3 ca-certificates \

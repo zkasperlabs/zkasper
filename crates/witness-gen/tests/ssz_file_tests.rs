@@ -1028,7 +1028,7 @@ async fn test_ssz_file_streaming_schedule() {
     // The measured stage floor, and what the two superseded cost-unit floors
     // were worth in seconds at the rate they were quoted against.
     const FLOORS: [(&str, f64); 3] = [
-        ("measured 7.18s", 7.176),
+        ("measured 3.64s", 3.640),
         ("293.6M units = 4.85s", 293_601_280.0 / 67_452_592.0 + 0.5),
         ("789M units = 12.20s", 789_000_000.0 / 67_452_592.0 + 0.5),
     ];
@@ -1065,7 +1065,7 @@ async fn test_ssz_file_streaming_schedule() {
     let chosen = streaming::schedule(
         &units,
         total_active_balance,
-        &policy(7.176, 4, LanePool::Fungible),
+        &policy(3.640, 4, LanePool::Fungible),
     );
     eprintln!(
         "\n=== measured floor, 4-card budget: T = {:.0}s, T2 = {:.0}s, T2-T = {:.1}s on {} card(s) ===",
@@ -1108,7 +1108,7 @@ async fn test_ssz_file_streaming_schedule() {
         "{:>8} {:>8} {:>7} {:>6} {:>9} {:>7}  groups",
         "floor", "T2-T", "inline", "cards", "prover", "proofs",
     );
-    for stage_floor_s in [2.0, 4.843, 7.176, 10.0, 12.2, 15.0, 20.0, 30.0] {
+    for stage_floor_s in [2.0, 2.429, 3.640, 4.843, 7.176, 10.0, 12.2, 20.0] {
         let schedule = streaming::schedule(
             &units,
             total_active_balance,
@@ -1134,7 +1134,7 @@ async fn test_ssz_file_streaming_schedule() {
         "{:>12} {:>8} {:>7} {:>6} {:>9}  groups",
         "units/s", "T2-T", "inline", "cards", "prover",
     );
-    for rate in [121_351_898.0, 207_400_000.0, 400e6, 663_293_070.0] {
+    for rate in [161_587_339.0, 200_000_000.0, 267_760_528.0, 400e6] {
         let schedule = streaming::schedule(
             &units,
             total_active_balance,
@@ -1143,7 +1143,7 @@ async fn test_ssz_file_streaming_schedule() {
                     bls_units_per_second: rate,
                     ..ProverModel::default()
                 },
-                ..policy(7.176, 4, LanePool::Fungible)
+                ..policy(3.640, 4, LanePool::Fungible)
             },
         );
         eprintln!(
@@ -1173,7 +1173,7 @@ async fn test_ssz_file_streaming_schedule() {
                     recursion_verify_s,
                     ..ProverModel::default()
                 },
-                ..policy(7.176, 4, LanePool::Fungible)
+                ..policy(3.640, 4, LanePool::Fungible)
             },
         );
         eprintln!(
@@ -1204,7 +1204,7 @@ async fn test_ssz_file_streaming_schedule() {
             &StreamPolicy {
                 threshold_numerator: numerator,
                 threshold_denominator: 100,
-                ..policy(7.176, 4, LanePool::Fungible)
+                ..policy(3.640, 4, LanePool::Fungible)
             },
         );
         let share = schedule.plan.attesting_balance as f64 / total_active_balance as f64;
@@ -1231,7 +1231,7 @@ async fn test_ssz_file_streaming_schedule() {
                 total_active_balance,
                 &StreamPolicy {
                     committee_chunks: chunks,
-                    ..policy(7.176, lanes, LanePool::Fungible)
+                    ..policy(3.640, lanes, LanePool::Fungible)
                 },
             );
             if schedule.committee_overrun_s() == 0.0 || lanes == 8 {

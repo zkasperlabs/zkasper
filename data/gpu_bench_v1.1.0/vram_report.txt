@@ -1,0 +1,3 @@
+[INFO] PilStark:   - Pinned host memory per GPU: 2.000000 GB
+[INFO] PilStark: GPU 0: Allocated 29.347325 GB (28.296217 GB unified + 1.051108 GB const pols)
+[INFO] PilStark: Minimum free memory available for GPU usage: 30.781128 GB

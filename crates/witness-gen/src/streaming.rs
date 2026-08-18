@@ -163,10 +163,15 @@ fn contiguous_nodes(leaves: f64, depth: u32) -> f64 {
 pub struct ProverModel {
     /// Seconds any zkasper guest pays before it computes anything.
     ///
-    /// MEASURED: the aggregation guest with recursion removed — 34,002 executed
-    /// steps — proves in 7.176 s +/- 0.084 over three warm runs. An *empty*
-    /// guest is 4.843 s, so 2.33 s of this is the AIRs a poseidon2-and-Fp12
-    /// guest instantiates and an empty one does not.
+    /// MEASURED on Zisk v1.1.0-alpha: the committee proof over a 64-member
+    /// witness — 21,680 executed steps — proves in 3.640 s +/- 0.053 over three
+    /// warm runs. An *empty* guest is 2.429 s, so 1.21 s of this is the AIRs a
+    /// poseidon2 guest instantiates and an empty one does not.
+    ///
+    /// It was 7.176 s on v1.0.0-alpha, measured on the aggregation guest with
+    /// recursion removed. That guest can no longer stand in: stubbing
+    /// `verify_child` leaves a later assert failing on the fixture's stub
+    /// children, and a panicking guest never returns from `ziskemu`.
     pub stage_floor_s: f64,
     /// Seconds per validator opened out of the accumulator: its leaf, one curve
     /// addition, and the 2,311 executed steps of walking its witness.
@@ -174,6 +179,14 @@ pub struct ProverModel {
     /// DERIVED from the attester sweep, whose OLS slope over 2,048 .. 154,000
     /// attesters is 878.2 us +/- 6.5, less one internal node for the contiguous
     /// range it opened.
+    ///
+    /// STILL v1.0.0-alpha, and deliberately so. The sweep cannot be reproduced:
+    /// a group-proof witness is now a slot *complement*, so `gen-test-witness
+    /// group-proof n` returns the same 728 bytes at every `n` and there is
+    /// nothing to regress against. Every other measured constant improved
+    /// between the two versions, so carrying this one forward unchanged is the
+    /// conservative choice — it can only make the schedule look worse than it
+    /// is. Re-measuring it needs a fixture that varies the absentee count.
     pub per_validator_s: f64,
     /// Seconds per committee member: the same leaf and the same curve addition,
     /// out of a witness the guest does not parse.
@@ -191,24 +204,40 @@ pub struct ProverModel {
     /// self-describing records cost 829 of the 1,157 steps a member took. The
     /// 328 that left took another 74 when `bls::PointSum` stopped copying the
     /// running sum into a syscall struct and back.
+    ///
+    /// STILL v1.0.0-alpha, for the same reason as `per_validator_s` — it is
+    /// derived from that sweep's rate. Under `ziskemu -X` on v1.1.0-alpha a
+    /// member is 208.0 steps and 36,406 cost units against 254.0 and 30,127, so
+    /// the work fell 18% while its price rose 21%; converting that to seconds
+    /// needs a committee sweep on hardware, which this campaign did not run.
+    /// Carrying it forward unchanged is conservative.
     pub per_member_s: f64,
     /// Seconds per internal accumulator node above the opened leaves.
     ///
-    /// MEASURED: the 29-point poseidon2 sweep gives 69,714,770 cost units/s on
-    /// poseidon2 work, and an accumulator node is 3,033 of them.
+    /// MEASURED: the 29-point poseidon2 sweep gives 233,988,033 cost units/s on
+    /// poseidon2 work, and an accumulator node is 7,462 of them. Both numbers
+    /// grew against v1.0.0-alpha's 69,714,770 and 3,033 because
+    /// `POSEIDON_COST` was re-based to match the Poseidon AIR's 392-column
+    /// width; the node itself got 27% faster in seconds.
     pub acc_node_s: f64,
     /// Cost units of Fp2-tower work a second: hash-to-curve, Miller loops, the
     /// final exponentiation.
     ///
     /// FITTED, and the weakest number here — nothing in the campaign runs BLS at
     /// mainnet scale, so it is a within-family rate read off floor-dominated
-    /// fixtures. The bracket around it is 121M to 663M units/s.
+    /// fixtures. The bracket around it is 162M to 268M units/s on v1.1.0-alpha,
+    /// against 160M to 609M on v1.0.0-alpha.
+    ///
+    /// The rate itself did not move between the two versions. What moved is the
+    /// work: the same Fp2-tower operations cost about a third fewer units, so
+    /// BLS *time* falls with them.
     pub bls_units_per_second: f64,
     /// SNARK compression of the final proof.
     ///
-    /// MEASURED: `GENERATE_VADCOP_FINAL_COMPRESSED_PROOF` is 151-170 ms over
-    /// five warm wraps. The 12.5 s of wall around it is process startup, which
-    /// a long-lived prover does not pay.
+    /// MEASURED: `GENERATE_VADCOP_FINAL_COMPRESSED_PROOF` is 46-52 ms over six
+    /// warm wraps on v1.1.0-alpha, against 151-170 ms on v1.0.0-alpha. The 5.4 s
+    /// of wall around it is process startup, which a long-lived prover does not
+    /// pay.
     pub wrap_s: f64,
     /// Seconds to verify one child proof recursively.
     ///
@@ -223,12 +252,12 @@ pub struct ProverModel {
 impl Default for ProverModel {
     fn default() -> Self {
         Self {
-            stage_floor_s: 7.176,
+            stage_floor_s: 3.640,
             per_validator_s: 834.7e-6,
             per_member_s: 101.2e-6,
-            acc_node_s: 43.5e-6,
-            bls_units_per_second: 207_400_000.0,
-            wrap_s: 0.157,
+            acc_node_s: 31.9e-6,
+            bls_units_per_second: 200_000_000.0,
+            wrap_s: 0.048,
             recursion_verify_s: 0.0,
             acc_depth: zkasper_common::constants::ACC_TREE_DEPTH,
         }
@@ -1509,13 +1538,13 @@ mod tests {
     fn waiting_pays_exactly_while_arrivals_outrun_the_per_leaf_price() {
         let policy = StreamPolicy::default();
         let per_second = 1.0 / policy.prover.per_named_s();
-        assert!((per_second - 558.1).abs() < 0.1, "{per_second} a second");
+        assert!((per_second - 650.8).abs() < 0.1, "{per_second} a second");
 
         assert!(
-            policy.worth_waiting(600, 1.0, 1.0),
-            "600 a second did not wait"
+            policy.worth_waiting(700, 1.0, 1.0),
+            "700 a second did not wait"
         );
-        assert!(!policy.worth_waiting(500, 1.0, 1.0), "500 a second waited");
+        assert!(!policy.worth_waiting(600, 1.0, 1.0), "600 a second waited");
         // The burst mainnet epoch 430529 actually crosses in: 17,128 attesters
         // still in flight, 30.7 s of absentee openings, against a wait measured
         // in hundreds of milliseconds.
