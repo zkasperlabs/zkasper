@@ -103,6 +103,7 @@ impl Pipeline {
             Pipeline::Batch => &[
                 Stage::Bootstrap,
                 Stage::EpochDiff,
+                Stage::Committee,
                 Stage::SlotProof,
                 Stage::Justification,
                 Stage::Finalization,
@@ -110,6 +111,7 @@ impl Pipeline {
             Pipeline::Streaming => &[
                 Stage::Bootstrap,
                 Stage::EpochDiff,
+                Stage::Committee,
                 Stage::SlotProof,
                 Stage::Justification,
                 Stage::Finalization,
