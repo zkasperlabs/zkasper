@@ -7,100 +7,23 @@
 //! them, and one final proof that does the marginal slot inline and settles
 //! every signature in the epoch with a single final exponentiation.
 
-use zkasper_common::acc;
+mod common;
+
+use common::{
+    stream_fixture, StreamFixture as Fixture, STREAM_BALANCE_GWEI as BALANCE_GWEI,
+    STREAM_EPOCH as EPOCH,
+};
+
 use zkasper_common::types::*;
-use zkasper_common::ChainConfig;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
-use zkasper_witness_gen::fixture::Epoch;
-use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy};
+use zkasper_witness_gen::streaming::{self, StreamPolicy};
 
+/// Small enough to run in a second. A guest ELF is compiled against the
+/// production depth instead; see `zisk_proof_tests`.
 const ACC_DEPTH: u32 = 4;
-const SLOTS: u64 = 8;
-const PER_SLOT: usize = 2;
-const BALANCE_GWEI: u64 = 32_000_000_000;
-const EPOCH: u64 = 10;
-
-struct Fixture {
-    epoch: Epoch,
-    context: StreamContext,
-    units: Vec<SlotComplement>,
-    finalized_header: BlockHeaderFields,
-    previous: PreviousJustification,
-}
 
 fn fixture() -> Fixture {
-    let epoch = Epoch::new(
-        ChainConfig {
-            acc_tree_depth: ACC_DEPTH,
-            ..ChainConfig::MAINNET
-        },
-        EPOCH,
-        SLOTS,
-        PER_SLOT,
-    );
-
-    // The finalized block is epoch E-1's checkpoint; the circuit opens its
-    // header, so the root has to be the header's own root.
-    let finalized_header = BlockHeaderFields {
-        slot: (EPOCH - 1) * 32,
-        proposer_index: 7,
-        parent_root: [0x06; 32],
-        state_root: [0xAB; 32],
-        body_root: [0x09; 32],
-    };
-    let previous_root = zkasper_common::ssz::block_header_root(
-        finalized_header.slot,
-        finalized_header.proposer_index,
-        &finalized_header.parent_root,
-        &finalized_header.state_root,
-        &finalized_header.body_root,
-    );
-
-    // The diff that carried the accumulator from epoch E-1 to E. Its endpoints
-    // are what tie the finalized epoch's justification to this one's.
-    let previous_accumulator_commitment =
-        acc::commitment(&[9, 9, 9, 9], epoch.total_active_balance);
-    let context = StreamContext {
-        accumulator_commitment: epoch.accumulator_commitment,
-        acc_root: epoch.acc_root,
-        total_active_balance: epoch.total_active_balance,
-        target_epoch: EPOCH,
-        target_root: epoch.target_root,
-        signing_domain: epoch.signing_domain,
-        group_program_vk: [1; 4],
-        aggregate_program_vk: [2; 4],
-        previous_program_vk: [3; 4],
-        epoch_diff_program_vk: [4; 4],
-        committee_program_vk: [5; 4],
-        epoch_diff: EpochDiffOutput {
-            prev_accumulator_commitment: previous_accumulator_commitment,
-            state_root_1: finalized_header.state_root,
-            epoch_1: EPOCH - 1,
-            accumulator_commitment: epoch.accumulator_commitment,
-            acc_root: epoch.acc_root,
-            total_active_balance: epoch.total_active_balance,
-            state_root_2: [0xCD; 32],
-            epoch_2: EPOCH,
-        },
-        epoch_diff_proof: Vec::new(),
-        committee: epoch.committees.output.clone(),
-        committee_proof: Vec::new(),
-        acc_depth: ACC_DEPTH,
-    };
-
-    let units = (0..SLOTS).map(|slot| epoch.complement(slot, &[])).collect();
-
-    Fixture {
-        context,
-        units,
-        finalized_header,
-        previous: PreviousJustification::Batch(JustificationOutput {
-            accumulator_commitment: previous_accumulator_commitment,
-            target_epoch: EPOCH - 1,
-            target_root: previous_root,
-        }),
-        epoch,
-    }
+    stream_fixture(ACC_DEPTH)
 }
 
 /// Run `f` and return the message it panicked with.

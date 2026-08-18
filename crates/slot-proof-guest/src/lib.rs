@@ -165,6 +165,18 @@ pub fn attest(witness: &SlotProofWitness, acc_depth: u32) -> Attested {
 /// strictly increasing, so no validator is subtracted twice and no slot appears
 /// twice. Across groups, the slot mask does the same job for slots — which is
 /// enough, because a committee proof puts each validator in exactly one slot.
+///
+/// That check is not decoration. Summed signatures do *not* imply disjoint
+/// signers: `e(2·pkᵥ + rest, H(m)) · e(−G, sigᵥ + sigᵥ + rest)` verifies
+/// perfectly well, so any scheme that adds signatures has to prove the sets
+/// behind them are disjoint rather than assume it. The enumerated side does
+/// prove it, by the strictly-increasing index check. The derived side does not
+/// have to: `agg_pk` is `committee.pubkey` *minus* a nonnegative sum of opened
+/// keys, and no such subtraction can produce a key with a coefficient of two —
+/// arriving at `2·pkᵥ + rest` would take a relation among distinct validator
+/// public keys, which is the assumption this whole file already rests on. A
+/// host that hands over two overlapping aggregates of one message therefore
+/// gets a proof that does not verify, not one that over-counts.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_attestations(
     slots: &[SlotComplementWitness],

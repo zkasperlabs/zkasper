@@ -17,5 +17,7 @@ pub mod witness_bootstrap;
 pub mod witness_epoch_diff;
 pub mod witness_justification;
 pub mod witness_slot_proof;
+#[cfg(feature = "zisk-prover")]
+pub mod zisk_prover;
 
 pub use epoch_state::EpochState;

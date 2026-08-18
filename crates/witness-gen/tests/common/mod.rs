@@ -8,13 +8,21 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 
+use zkasper_common::acc;
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
-use zkasper_common::types::{Checkpoint, ValidatorData};
+use zkasper_common::types::{
+    BlockHeaderFields, Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification,
+    ValidatorData,
+};
+use zkasper_common::ChainConfig;
 
+use zkasper_witness_gen::attestation_collector::SlotComplement;
 use zkasper_witness_gen::beacon_api::{
     AttestationResponse, BeaconApi, ChainStatusApi, CommitteeResponse, FinalityCheckpoints,
     HeaderResponse, ValidatorResponse,
 };
+use zkasper_witness_gen::fixture::Epoch;
+use zkasper_witness_gen::streaming::StreamContext;
 
 /// A mock beacon API that returns synthetic data for testing.
 pub struct MockBeaconApi {
@@ -37,6 +45,9 @@ pub struct MockBeaconApi {
     /// Continuous mode is supposed to stop fetching blocks the moment the 2/3
     /// threshold is crossed, which is only observable by what it asked for.
     pub attestation_requests: Mutex<Vec<String>>,
+    /// Head header, when a test moves it between ticks. Takes precedence over
+    /// `headers["head"]`.
+    pub head: Mutex<Option<HeaderResponse>>,
 }
 
 impl MockBeaconApi {
@@ -51,6 +62,7 @@ impl MockBeaconApi {
             genesis_validators_root: [0xAA; 32],
             fork_version: [0x04, 0x00, 0x00, 0x00],
             attestation_requests: Mutex::new(Vec::new()),
+            head: Mutex::new(None),
         }
     }
 
@@ -90,6 +102,15 @@ impl MockBeaconApi {
                 })
                 .collect(),
         );
+    }
+
+    /// Move the head, the way a node does between polls.
+    ///
+    /// Streaming only exists across ticks, and what changes between them is how
+    /// much of the epoch the node has published, so a test that never moves the
+    /// head is testing catch-up rather than streaming.
+    pub fn set_head(&self, header: HeaderResponse) {
+        *self.head.lock().unwrap() = Some(header);
     }
 
     /// Report the same finality checkpoints for every state id.
@@ -159,6 +180,11 @@ impl BeaconApi for MockBeaconApi {
     }
 
     async fn get_header(&self, block_id: &str) -> Result<HeaderResponse> {
+        if block_id == "head" {
+            if let Some(header) = self.head.lock().unwrap().clone() {
+                return Ok(header);
+            }
+        }
         self.headers
             .get(block_id)
             .cloned()
@@ -215,6 +241,104 @@ pub fn header_root(header: &HeaderResponse) -> [u8; 32] {
         &header.state_root,
         &header.body_root,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Streaming fixture
+// ---------------------------------------------------------------------------
+
+pub const STREAM_SLOTS: u64 = 8;
+pub const STREAM_PER_SLOT: usize = 2;
+pub const STREAM_BALANCE_GWEI: u64 = 32_000_000_000;
+pub const STREAM_EPOCH: u64 = 10;
+
+/// One epoch of a synthetic chain, shaped for the streaming pipeline.
+///
+/// Sixteen validators in eight committees of two, real BLS signatures. The
+/// accumulator depth is a parameter because the circuit tests want a tree small
+/// enough to run in a second, while anything proven by a real guest ELF has to
+/// use the depth that ELF was compiled with.
+pub struct StreamFixture {
+    pub epoch: Epoch,
+    pub context: StreamContext,
+    pub units: Vec<SlotComplement>,
+    pub finalized_header: BlockHeaderFields,
+    pub previous: PreviousJustification,
+}
+
+pub fn stream_fixture(acc_depth: u32) -> StreamFixture {
+    let epoch = Epoch::new(
+        ChainConfig {
+            acc_tree_depth: acc_depth,
+            ..ChainConfig::MAINNET
+        },
+        STREAM_EPOCH,
+        STREAM_SLOTS,
+        STREAM_PER_SLOT,
+    );
+
+    // The finalized block is epoch E-1's checkpoint; the circuit opens its
+    // header, so the root has to be the header's own root.
+    let finalized_header = BlockHeaderFields {
+        slot: (STREAM_EPOCH - 1) * 32,
+        proposer_index: 7,
+        parent_root: [0x06; 32],
+        state_root: [0xAB; 32],
+        body_root: [0x09; 32],
+    };
+    let previous_root = zkasper_common::ssz::block_header_root(
+        finalized_header.slot,
+        finalized_header.proposer_index,
+        &finalized_header.parent_root,
+        &finalized_header.state_root,
+        &finalized_header.body_root,
+    );
+
+    // The diff that carried the accumulator from epoch E-1 to E. Its endpoints
+    // are what tie the finalized epoch's justification to this one's.
+    let previous_accumulator_commitment =
+        acc::commitment(&[9, 9, 9, 9], epoch.total_active_balance);
+    let context = StreamContext {
+        accumulator_commitment: epoch.accumulator_commitment,
+        acc_root: epoch.acc_root,
+        total_active_balance: epoch.total_active_balance,
+        target_epoch: STREAM_EPOCH,
+        target_root: epoch.target_root,
+        signing_domain: epoch.signing_domain,
+        group_program_vk: [1; 4],
+        aggregate_program_vk: [2; 4],
+        previous_program_vk: [3; 4],
+        epoch_diff_program_vk: [4; 4],
+        committee_program_vk: [5; 4],
+        epoch_diff: EpochDiffOutput {
+            prev_accumulator_commitment: previous_accumulator_commitment,
+            state_root_1: finalized_header.state_root,
+            epoch_1: STREAM_EPOCH - 1,
+            accumulator_commitment: epoch.accumulator_commitment,
+            acc_root: epoch.acc_root,
+            total_active_balance: epoch.total_active_balance,
+            state_root_2: [0xCD; 32],
+            epoch_2: STREAM_EPOCH,
+        },
+        epoch_diff_proof: Vec::new(),
+        committee: epoch.committees.output.clone(),
+        committee_proof: Vec::new(),
+        acc_depth,
+    };
+
+    StreamFixture {
+        units: (0..STREAM_SLOTS)
+            .map(|slot| epoch.complement(slot, &[]))
+            .collect(),
+        context,
+        finalized_header,
+        previous: PreviousJustification::Batch(JustificationOutput {
+            accumulator_commitment: previous_accumulator_commitment,
+            target_epoch: STREAM_EPOCH - 1,
+            target_root: previous_root,
+        }),
+        epoch,
+    }
 }
 
 /// Compute the synthetic state root from a set of validator responses.

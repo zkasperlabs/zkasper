@@ -223,25 +223,42 @@ Output:
 
 ```
 zkasper-out/
-  status.json              # accumulator, checkpoints, per-stage timings
+  status.json              # accumulator, checkpoints, per-stage and per-epoch timings
   epoch-000123456/
     epoch_diff.bin
     committee.bin
-    slot_proof_<slot>.bin
+    slot_proof_<slot>.bin  # --mode batch
     justification.bin
     finalization.bin
+    group_<n>.bin          # --mode streaming
+    aggregate_<n>.bin
+    stream_final.bin
 ```
 
 `--once` catches up to the node's head and exits. `--bootstrap-slot` picks a
 different starting state. `--signing-domain` overrides the domain otherwise
 derived from the node's fork and genesis.
 
-**It generates witnesses, it does not prove.** Proving is behind the `Prover`
-trait in `crates/witness-gen/src/prover.rs` — witness in, `(public output,
-proof)` out. The default implementation runs each guest's logic natively and
-returns an empty proof, so every witness written has been checked by the same
-circuit that will later prove it. A prover that drives `cargo-zisk` implements
-the same trait; nothing else changes.
+Proving is behind the `Prover` trait in `crates/witness-gen/src/prover.rs` —
+witness in, `(public output, proof)` out — and there are two implementations.
+`--prover native`, the default, runs each guest's logic natively and returns an
+empty proof, so every witness written has been checked by the same circuit that
+will later prove it, and no proving hardware is needed. `--prover zisk` produces
+real proofs from one embedded `zisk-sdk` client that is initialised once and kept
+warm for the life of the process; add `--gpu` to prove on a GPU. It is behind a
+cargo feature because it pulls in the whole Zisk proving stack:
+
+```sh
+./scripts/build_guests.sh
+cargo build --release --features zisk-prover
+zkasperd --beacon-url ... --mode streaming --prover zisk --gpu
+```
+
+`--mode streaming` proves the epoch as attestations arrive — a group per poll,
+folded into a running aggregate, closed by one proof over the attestation that
+crossed the threshold — and records the measured `T2 - T` per epoch in
+`status.json` under `recent_latencies`. `--mode batch`, the default, proves each
+slot and folds the epoch once it is over.
 
 Restarts are safe. The accumulator is a chain, so `crates/witness-gen/src/store.rs`
 writes atomically, checksums what it writes, rehashes the tree on load and
