@@ -115,7 +115,18 @@ use crate::prover::{NativeProver, Proof, ProveCost, Prover, Stage};
 
 /// Bumped when a frame changes meaning. A client and a server that disagree are
 /// turned away at the handshake rather than at the first proof.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// **[`Stage`] is part of the wire.** Bincode encodes an enum as its
+/// discriminant index, so adding or removing a variant silently renumbers every
+/// stage after it: a server built before the change advertises "2" meaning one
+/// stage and a client built after it reads "2" as another. Nothing detects that
+/// — the frame parses, the stage list looks plausible, and the client binds the
+/// wrong program's verification key.
+///
+/// Version 2 is that change: `Stage::Bootstrap` was removed, which renumbered
+/// everything. **Bump this whenever `Stage` gains or loses a variant**, so the
+/// two ends refuse each other instead of misreading each other.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Cap on one frame. The committee witness is about 115 MB; nothing else is
 /// close, and a length that claims more is a bad peer rather than a big proof.

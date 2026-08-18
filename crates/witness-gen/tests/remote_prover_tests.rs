@@ -475,9 +475,16 @@ fn refuses_a_server_without_the_stages_this_run_needs() {
 
 /// The version is in the handshake so a mismatch is one clear failure at
 /// startup rather than a frame that deserializes into something plausible.
+///
+/// This assertion is a canary rather than a fact worth testing: it fails when
+/// someone changes the version, which is the moment to check that they had to.
+/// `Stage` is the trap. Bincode writes an enum as its discriminant index, so
+/// removing a variant renumbers every stage after it and an old server's
+/// "committee" becomes a new client's something-else — a frame that parses
+/// into a plausible lie. Removing `Stage::Bootstrap` is why this is 2.
 #[test]
 fn the_protocol_version_is_checked() {
-    assert_eq!(PROTOCOL_VERSION, 1);
+    assert_eq!(PROTOCOL_VERSION, 2);
 }
 
 /// Against a real prover server, holding a real warm prover.
