@@ -6,7 +6,7 @@
 pub mod mock_node;
 pub mod stub_api;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -47,6 +47,9 @@ pub struct MockBeaconApi {
     pub finality: HashMap<String, FinalityCheckpoints>,
     pub genesis_validators_root: [u8; 32],
     pub fork_version: [u8; 4],
+    /// Slots whose state this node will not serve, as a checkpoint-synced node
+    /// stops serving what its split slot has moved past.
+    pub unservable_states: HashSet<u64>,
     /// Every block_id `get_block_attestations` was called with, in order.
     ///
     /// Continuous mode is supposed to stop fetching blocks the moment the 2/3
@@ -71,6 +74,7 @@ impl MockBeaconApi {
             finality: HashMap::new(),
             genesis_validators_root: [0xAA; 32],
             fork_version: [0x04, 0x00, 0x00, 0x00],
+            unservable_states: HashSet::new(),
             attestation_requests: Mutex::new(Vec::new()),
             head: Mutex::new(None),
             reorged_to: Mutex::new(None),
@@ -141,6 +145,14 @@ impl ChainStatusApi for MockBeaconApi {
 #[async_trait::async_trait]
 impl BeaconApi for MockBeaconApi {
     async fn get_validators(&self, state_id: &str) -> Result<Vec<ValidatorResponse>> {
+        // Word for word what a beacon node says, because that is the string the
+        // daemon matches to tell a pruned state from a real fault.
+        if let Ok(slot) = state_id.parse::<u64>() {
+            anyhow::ensure!(
+                !self.unservable_states.contains(&slot),
+                "404 Not Found: NOT_FOUND: beacon state at slot {slot}",
+            );
+        }
         self.validators
             .get(state_id)
             .cloned()
