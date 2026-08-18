@@ -106,11 +106,23 @@ echo "=== 1. System dependencies ==="
 # this script builds guests only and consumes pre-staged inputs (see step 4).
 #
 # It is NOT unresolvable, despite what this comment used to claim: on
-# nvidia/cuda:12.8.1-devel-ubuntu24.04 `apt-get install -y libssl-dev` succeeds
+# nvidia/cuda:12.8.1-devel-ubuntu24.04 apt-get install -y libssl-dev succeeds
 # (verified 2026-08-18, it pulls openssl 3.0.13-0ubuntu3.12 over 3.0.13-0ubuntu3.5).
-# Install it if you want the host `witness-gen` crate on the box, which you do
-# for `cargo test --features zisk-prover` — the warm in-process prover is the
-# only way to measure per-proof latency without process startup in the number.
+#
+# BUILDING --features zisk-prover ON THIS IMAGE. It compiles zisk and
+# pil2-proofman from source, which needs four more packages that the guest-only
+# path does not:
+#     libssl-dev nlohmann-json3-dev libsodium-dev protobuf-compiler libprotobuf-dev
+# (libsodium23 is the runtime; the build wants sodium.h. protobuf-compiler alone
+# is not enough - prost needs the well-known .proto files from libprotobuf-dev.)
+#
+# With all five installed the build still FAILS on CUDA 12.8.1, in
+# mem-planner-cpp:
+#     cub/agent/agent_reduce_by_key.cuh(210): error: no instance of function
+#     template "cuda::std::__4::equal_to<void>::operator()" matches the argument list
+# That is zisk v1.0.0-alpha against CUDA 12.8 CCCL, not anything about this
+# repo. Use an older CUDA image if you need the in-process prover; the prebuilt
+# cargo-zisk from ziskup is unaffected and is what this script uses.
 sudo apt-get update -qq
 for pkg in \
   build-essential curl git jq xz-utils nasm python3 ca-certificates \
