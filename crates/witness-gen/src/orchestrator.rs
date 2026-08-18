@@ -205,6 +205,21 @@ impl OrchestratorConfig {
     }
 }
 
+/// Whether `error` means the node has thrown away a state this run still needs.
+///
+/// A checkpoint-synced node serves states from its finalized split forward, and
+/// the split moves every epoch — measured on 2026-08-18, the window was about
+/// the last 60 to 100 slots. An accumulator that falls behind therefore asks for
+/// a state that no longer exists, and no number of restarts brings it back: the
+/// window only moves further away. The daemon bootstraps forward instead of
+/// exiting.
+///
+/// Matched on the message because that is what a beacon node gives. The daemon
+/// leans on the same string being distinctive that an operator does.
+fn is_pruned_state(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("NOT_FOUND: beacon state at slot")
+}
+
 /// What one tick did. Returned so callers — and tests — can see the pipeline
 /// move without reading the log.
 #[derive(Clone, Debug, Default)]
@@ -615,7 +630,53 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     /// One unit of work: justify the epoch the accumulator sits on, or move the
     /// accumulator to the next one.
+    ///
+    /// A tick that failed because the node has thrown the state away is not an
+    /// error the caller can do anything with, so it is handled here: see
+    /// [`is_pruned_state`].
     pub async fn tick(&mut self) -> Result<Tick> {
+        match self.tick_once().await {
+            Err(e) if is_pruned_state(&e) => {
+                warn!(
+                    epoch = self.snapshot.state.cursor_epoch,
+                    error = %format!("{e:#}"),
+                    "the node no longer serves the state this epoch needs; \
+                     bootstrapping forward to one it does",
+                );
+                self.rebootstrap().await?;
+                Ok(Tick {
+                    head_slot: self.head_slot,
+                    advanced_to: Some(self.snapshot.state.cursor_epoch),
+                    ..Tick::default()
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// Start again from a state the node still has.
+    ///
+    /// This breaks the accumulator chain: the epoch it restarts on is anchored
+    /// on a bootstrap rather than on the epoch before it. That is the price of
+    /// staying alive, and it is the same price the supervisor's `rm -f` paid
+    /// more slowly and after several failed restarts.
+    async fn rebootstrap(&mut self) -> Result<()> {
+        let (snapshot, timing) = Self::bootstrap(
+            &self.api,
+            &self.config,
+            &self.sink,
+            &*self.prover,
+            self.publish.as_ref(),
+        )
+        .await?;
+        self.snapshot = snapshot;
+        self.pending = None;
+        self.streaming = None;
+        self.record(timing);
+        self.store.save(&self.snapshot)
+    }
+
+    async fn tick_once(&mut self) -> Result<Tick> {
         self.refresh_chain_view().await?;
 
         let mut tick = Tick {

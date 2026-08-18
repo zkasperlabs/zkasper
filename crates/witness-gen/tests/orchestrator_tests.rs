@@ -365,6 +365,52 @@ async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
     );
 }
 
+/// The node throws the state away while the daemon is behind it.
+///
+/// A checkpoint-synced node serves states from its finalized split forward and
+/// the split moves every epoch, so an accumulator that has fallen behind asks
+/// for a state that is gone. Restarting cannot bring it back — the window only
+/// moves further away — and the daemon used to exit, which is a crashloop.
+/// It bootstraps forward instead.
+#[tokio::test]
+async fn test_bootstraps_forward_when_the_node_has_thrown_the_state_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+
+    // Justify epoch 10 and move the accumulator onto epoch 11.
+    let mut daemon = open(dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
+    daemon.tick().await.unwrap();
+    daemon.tick().await.unwrap();
+    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
+
+    // Reopen against a node that has stopped serving epoch 11's boundary state,
+    // which is what the diff onto epoch 12 needs. It still holds the epoch it
+    // reports as finalized, as a node always does.
+    let mut mock = chain.mock(LAST_EPOCH * SPE + 3);
+    mock.unservable_states.insert((FIRST_EPOCH + 1) * SPE);
+    let mut daemon = Orchestrator::open(
+        mock,
+        config(dir.path()),
+        Box::new(NativeProver::new(TEST_CONFIG)),
+    )
+    .await
+    .unwrap();
+
+    // The tick reports progress rather than dying, and the accumulator restarts
+    // on an epoch the node can still serve.
+    let tick = daemon
+        .tick()
+        .await
+        .expect("a pruned state is not a fatal error");
+    assert_eq!(tick.advanced_to, Some(FIRST_EPOCH));
+    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH);
+    assert_eq!(
+        daemon.state().bootstrap_epoch,
+        FIRST_EPOCH,
+        "it bootstrapped again rather than resuming a chain it cannot extend",
+    );
+}
+
 #[tokio::test]
 async fn test_resumes_after_a_crash_mid_epoch() {
     let dir = tempfile::tempdir().unwrap();
