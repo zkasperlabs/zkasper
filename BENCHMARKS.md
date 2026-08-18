@@ -333,11 +333,26 @@ The two differ by 137M cost units and by **0.18 s**. Both are floor-dominated,
 which is the same quantisation result as the bench guest seen from a different
 angle: below an AIR-instance boundary, cost units buy very little time.
 
-`aggregation` and `stream-final` **could not be proved**. Their witnesses carry
-stub child proofs, `verify_child` rejects an empty proof inside a guest, and the
-`assert!` around it panics - a panicking guest never returns from `ziskemu`, so
-both time out rather than reporting a cost. This is a property of the fixture,
-not of the circuits, and it goes away with real child proofs.
+`aggregation` and `stream-final` **could not be proved as shipped**. Their
+witnesses carry stub child proofs, `verify_child` rejects an empty proof inside
+a guest, and the `assert!` around it panics - a panicking guest never returns
+from `ziskemu`, so both time out rather than reporting a cost. This is a
+property of the fixture, not of the circuits.
+
+Rebuilding them with that one rejection removed (`verify_child` returning true
+for an empty proof) makes them run, and gives a **lower bound** that excludes
+all recursive verification:
+
+| stage, recursion removed | STEPS | VARIABLE | TOTAL | wall, warm |
+|---|---:|---:|---:|---:|
+| aggregation | 34,002 | 3,309,296 | 296,910,576 | 20.0-20.9 s |
+| stream-final | 2,376,988 | 275,264,815 | 568,866,095 | 21.7-22.1 s |
+
+Aggregation without recursion is **3.3M cost units** - it is nothing but the
+floor. Whatever an aggregation proof really costs is almost entirely the
+recursive verification of its children, which is exactly the term this fixture
+cannot exercise. Do not read these as stage costs; read them as evidence that
+the interesting cost is the part that is missing.
 
 ### Wrapping is startup, not compression
 
