@@ -22,6 +22,7 @@ use zkasper_witness_gen::beacon_api::{
     HeaderResponse, ValidatorResponse,
 };
 use zkasper_witness_gen::fixture::Epoch;
+use zkasper_witness_gen::gossip::AttestationSource;
 use zkasper_witness_gen::streaming::StreamContext;
 
 /// A mock beacon API that returns synthetic data for testing.
@@ -48,6 +49,9 @@ pub struct MockBeaconApi {
     /// Head header, when a test moves it between ticks. Takes precedence over
     /// `headers["head"]`.
     pub head: Mutex<Option<HeaderResponse>>,
+    /// Block root every `block_id` resolves to, when a test reorgs the chain
+    /// under a daemon that is already collecting against the old one.
+    pub reorged_to: Mutex<Option<[u8; 32]>>,
 }
 
 impl MockBeaconApi {
@@ -63,6 +67,7 @@ impl MockBeaconApi {
             fork_version: [0x04, 0x00, 0x00, 0x00],
             attestation_requests: Mutex::new(Vec::new()),
             head: Mutex::new(None),
+            reorged_to: Mutex::new(None),
         }
     }
 
@@ -113,6 +118,11 @@ impl MockBeaconApi {
         *self.head.lock().unwrap() = Some(header);
     }
 
+    /// Reorg every checkpoint onto `root`, or back onto the real chain.
+    pub fn set_reorg(&self, root: Option<[u8; 32]>) {
+        *self.reorged_to.lock().unwrap() = root;
+    }
+
     /// Report the same finality checkpoints for every state id.
     pub fn set_finality(&mut self, finalized_epoch: u64, root: [u8; 32]) {
         let checkpoint = Checkpoint {
@@ -133,7 +143,10 @@ impl MockBeaconApi {
 #[async_trait::async_trait]
 impl ChainStatusApi for MockBeaconApi {
     async fn get_block_root(&self, block_id: &str) -> Result<Option<[u8; 32]>> {
-        Ok(self.block_roots.get(block_id).copied())
+        match *self.reorged_to.lock().unwrap() {
+            Some(root) => Ok(Some(root)),
+            None => Ok(self.block_roots.get(block_id).copied()),
+        }
     }
 
     async fn get_genesis_validators_root(&self) -> Result<[u8; 32]> {
@@ -351,4 +364,37 @@ fn compute_state_root_from_validators(validators: &[ValidatorResponse], depth: u
     let (ssz_data_root, _) = build_validators_ssz_tree(&validator_roots, depth, &[]);
     let (state_root, _) = make_state_proof(&ssz_data_root, validators.len() as u64);
     state_root
+}
+
+/// An attestation source a test publishes to by hand.
+///
+/// The real one is a task holding the node's event stream open; what the
+/// orchestrator sees of either is the same drain, so a test can drive gossip
+/// arrival exactly and without a beacon node.
+#[derive(Clone, Default)]
+pub struct FakeGossip(std::sync::Arc<Mutex<Vec<AttestationResponse>>>);
+
+impl FakeGossip {
+    /// Gossip these, as if the node had just validated them.
+    pub fn publish(&self, attestations: Vec<AttestationResponse>) {
+        self.0.lock().unwrap().extend(attestations);
+    }
+}
+
+impl AttestationSource for FakeGossip {
+    fn drain(&self) -> Vec<AttestationResponse> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+
+    fn took_reorg(&self) -> bool {
+        false
+    }
+
+    fn took_gap(&self) -> bool {
+        false
+    }
+
+    fn counters(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }

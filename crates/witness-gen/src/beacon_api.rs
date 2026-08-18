@@ -217,10 +217,22 @@ pub struct ValidatorResponse {
     pub withdrawable_epoch: u64,
 }
 
+/// The one validator an Electra `SingleAttestation` names, and the committee it
+/// sits in. Resolving it needs no bitfield, which is why the bitfields are left
+/// empty when this is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleAttester {
+    pub committee_index: u64,
+    pub attester_index: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttestationResponse {
     pub aggregation_bits: Vec<u8>,
     pub committee_bits: Vec<u8>,
+    /// Set when the node published this on the `single_attestation` topic
+    /// rather than as an aggregate. See [`crate::gossip`].
+    pub single_attester: Option<SingleAttester>,
     pub data_slot: u64,
     pub data_index: u64,
     pub data_beacon_block_root: [u8; 32],
@@ -363,6 +375,26 @@ pub fn parse_attestation_entry(entry: &serde_json::Value) -> Result<AttestationR
         data_target_epoch: parse_u64_str(&data["target"], "epoch")?,
         data_target_root: parse_hex_bytes32(&data["target"], "root")?,
         signature: parse_hex_bytes96(entry, "signature")?,
+        single_attester: None,
+    })
+}
+
+/// One `SingleAttestation`, as Electra publishes unaggregated attestations.
+///
+/// It carries the same `AttestationData` an aggregate does — so it shares a
+/// message with them and costs the proof nothing extra — plus the one validator
+/// index that signed, in place of two bitfields.
+pub fn parse_single_attestation_entry(entry: &serde_json::Value) -> Result<AttestationResponse> {
+    Ok(AttestationResponse {
+        single_attester: Some(SingleAttester {
+            committee_index: parse_u64_str(entry, "committee_index")?,
+            attester_index: parse_u64_str(entry, "attester_index")?,
+        }),
+        ..parse_attestation_entry(&serde_json::json!({
+            "aggregation_bits": "0x",
+            "data": entry["data"],
+            "signature": entry["signature"],
+        }))?
     })
 }
 

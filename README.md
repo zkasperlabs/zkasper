@@ -126,18 +126,39 @@ the schedule:
 - **Groups shrink geometrically** toward the threshold, so the last one is a
   single slot rather than a fixed eight.
 - **The epoch stops at the threshold**, measured by accumulated weight. On the
-  real mainnet epoch in the test suite that skips 39% of the aggregates.
+  real mainnet epoch in the test suite that skips 31% of the aggregates.
 - **The tail is collapsed**: one proof verifies the aggregate, does the marginal
   slot inline, settles every signature, checks 2/3, and emits the finalization —
   instead of four proofs in series.
 
 Scheduled against a real mainnet epoch — 430529, 2,212,730 validators — on
-measured RTX 5090 times, `T2 - T` is **25.6s on one card**. Five proofs run in
-the epoch and only one of them is after the last attestation: 13.5s of final
-proof and 0.2s of wrap, with the other 12s spent waiting for the crossing slot's
-block to arrive. The same tail modelled in isolation is 9.1s, three quarters of
-which is the measured 7.18s floor every proof pays whatever it computes. Against
-that, fixed groups of eight enumerating every attester is 311s.
+measured RTX 5090 times, `T2 - T` is **9.1s on one card**. Six proofs run in the
+epoch and only one of them is after the last attestation: 9.0s of final proof and
+0.2s of wrap, three quarters of which is the measured 7.18s floor every proof
+pays whatever it computes. Against that, fixed groups of eight enumerating every
+attester is 311s.
+
+The threshold is what decides whether that number is 9.1s or 25.6s. Epoch 430529
+crosses 2/3 inside its slot 21, at 68.52% of the stake — 1.85 points of headroom
+— and a slot carries about 3.1%, so any threshold from 66% to 68% ends the epoch
+there and anything from 69% up waits a whole extra slot:
+
+```
+ margin     T2-T   slots    balance  over 2/3
+    67%     9.1s      22     68.52%     1.85%
+    68%     9.1s      22     68.52%     1.85%
+    69%    25.6s      23     71.63%     4.97%
+    70%    25.6s      23     71.63%     4.97%
+    75%    45.1s      25     77.78%    11.12%
+```
+
+The default is 2/3 exactly — the circuit's own rule and no margin on top. There
+used to be one because a slot's contribution was an estimate that deduplication
+across slots could shrink; `slots_mask` puts a validator in exactly one slot and
+`marginal_balance` is committee balance minus absentee balance, so it is exact
+and a margin can only ever waste a proof, never make an unsound one. What guards
+the thin headroom is not margin but detection: a checkpoint that reorgs out is a
+retry, never a publication (`crates/witness-gen/src/orchestrator.rs`).
 
 Those are seconds, not cost units, and that is deliberate: measured throughput
 on the campaign's own guests spans 18M to 246M Zisk cost units per second, so no
@@ -221,11 +242,39 @@ cargo run --release --bin zkasperd -- --beacon-url http://localhost:5052 \
 ```
 
 Per epoch it runs one epoch diff to advance the accumulator and one committee
-proof to sum that epoch's committees, then streams slot proofs as blocks arrive
-— closing an attestation slot once the next block has been scanned — and fires
-the justification the moment the counted balance crosses 2/3, around slot 22 of a
-mainnet epoch rather than at the epoch boundary. Blocks past that point are never
-fetched. A finalization follows whenever two consecutive epochs justify.
+proof to sum that epoch's committees, then streams slot proofs as attestations
+arrive and fires the justification the moment the counted balance crosses 2/3,
+around slot 22 of a mainnet epoch rather than at the epoch boundary. Nothing past
+that point is proven. A finalization follows whenever two consecutive epochs
+justify.
+
+### Beacon node requirements
+
+`--mode streaming` follows attestations on the node's event stream,
+`/eth/v1/events?topics=attestation,single_attestation,chain_reorg`, and this is
+an operational dependency rather than an optimisation:
+
+- **The node must subscribe to every attestation subnet** —
+  `--subscribe-all-subnets` on Lighthouse, `--subscribe-all-subnets` on Prysm and
+  Teku, `--subscribeAllSubnets` on Lodestar, `--subscribe-all-subnets` on Nimbus.
+  A default node only joins the subnets its own validators need plus a rotating
+  backbone, so its `single_attestation` topic is a *partial* view of gossip. The
+  `attestation` topic carries aggregates, which travel a global topic and are
+  complete on any node; unaggregated attestations arrive a third of a slot
+  earlier, and only a fully subscribed node sees all of them.
+- **`/eth/v2/debug/beacon/states/{id}` must be enabled.** Bootstrap reads the
+  whole `BeaconState` as SSZ from it. Hosted providers usually disable it,
+  because it is a several-hundred-megabyte response.
+- **`/eth/v1/beacon/states/{id}/committees` is trusted for the shuffle.** Nothing
+  in the host or the circuit recomputes it; the committee proof only needs the
+  buckets to be disjoint and to cover what it opens. A node that lies produces
+  buckets that are disjoint but wrong, and the signatures then fail to verify —
+  so a dishonest node costs liveness, not soundness.
+
+`--no-gossip` falls back to reading attestations out of blocks. That is a slot
+behind the chain by construction and is there for a node that will not serve the
+event stream; the stream is also the source blocks repair after an outage, which
+the daemon does automatically and reports in `status.json` under `gossip`.
 
 Output:
 
@@ -262,11 +311,24 @@ cargo build --release --features zisk-prover
 zkasperd --beacon-url ... --mode streaming --prover zisk --gpu
 ```
 
-`--mode streaming` proves the epoch as attestations arrive — a group per poll,
+`--mode streaming` proves the epoch as attestations arrive — a group per slot,
 folded into a running aggregate, closed by one proof over the attestation that
 crossed the threshold — and records the measured `T2 - T` per epoch in
 `status.json` under `recent_latencies`. `--mode batch`, the default, proves each
 slot and folds the epoch once it is over.
+
+The trigger is `--threshold-numerator`/`--threshold-denominator`, 2/3 by default:
+the circuit's own rule and no margin on top, because `slots_mask` makes a slot's
+contribution exact rather than an estimate that could shrink. A higher setting
+only ever costs latency — weight arrives a committee at a time, about 3.1% of the
+stake, so a margin that pushes the crossing into the next slot costs a whole
+slot. What the daemon does *not* do is fire on the instant the threshold is
+crossed: a slot proof opens the validators that did not attest, so every
+attestation still in flight is an extra accumulator leaf at 1.79 ms. It keeps
+waiting while arrivals run above 558 validators a second — the rate at which one
+more second of waiting pays for itself — and fires the interval they do not, up
+to `--max-trigger-wait-millis`. `--trigger-interval-millis` sets how often that
+is re-evaluated, and so the resolution of the firing instant.
 
 Restarts are safe. The accumulator is a chain, so `crates/witness-gen/src/store.rs`
 writes atomically, checksums what it writes, rehashes the tree on load and

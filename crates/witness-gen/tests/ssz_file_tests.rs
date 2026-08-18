@@ -1187,19 +1187,23 @@ async fn test_ssz_file_streaming_schedule() {
         );
     }
 
-    // The trigger margin. `T` is 2/3 either way, so a margin that pushes the
-    // crossing into the next slot shows up here as a whole slot of latency.
+    // What a margin above 2/3 costs. `T` is 2/3 either way, so a margin that
+    // pushes the crossing into the next slot shows up here as a whole slot of
+    // latency — which is why the default threshold is 2/3 and no more. 66% is
+    // below the circuit's rule and is here to show that the schedule stops
+    // early rather than pretending: it plans fewer slots than the proof needs.
     eprintln!("\n=== sensitivity to the trigger margin, measured floor, 4-card budget ===");
     eprintln!(
         "{:>7} {:>8} {:>7} {:>10} {:>9}",
         "margin", "T2-T", "slots", "balance", "over 2/3",
     );
-    for numerator in [67u64, 68, 69, 70, 72, 75] {
+    for numerator in [66u64, 67, 68, 69, 70, 72, 75] {
         let schedule = streaming::schedule(
             &units,
             total_active_balance,
             &StreamPolicy {
                 threshold_numerator: numerator,
+                threshold_denominator: 100,
                 ..policy(7.176, 4, LanePool::Fungible)
             },
         );

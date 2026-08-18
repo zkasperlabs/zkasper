@@ -149,7 +149,20 @@ impl SlotStream {
     /// primary message for the derived key to pair against, and a slot that
     /// contributes nothing is better left uncounted than counted at zero.
     pub fn close(&mut self, slot: u64) -> Option<SlotComplement> {
-        let aggregates = self.pending.remove(&slot)?;
+        let complement = self.peek(slot)?;
+        self.pending.remove(&slot);
+        Some(complement)
+    }
+
+    /// What closing `slot` right now would produce, without closing it.
+    ///
+    /// The trigger runs this several times a second on the slot gossip is
+    /// filling: every arrival moves a committee member out of `absentees` and
+    /// into the derived key, so `marginal_balance` climbs and `named_indices`
+    /// shrinks as the slot converges. Both are what the trigger is choosing
+    /// between — weight it has against work it would pay for.
+    pub fn peek(&self, slot: u64) -> Option<SlotComplement> {
+        let aggregates = self.pending.get(&slot)?;
         let slot_in_epoch = slot % self.slots_per_epoch;
         let committee = self.committees.aggregate(slot_in_epoch)?.clone();
         let members = &self.committees.members[slot_in_epoch as usize];
@@ -235,6 +248,12 @@ impl SlotStream {
         })
     }
 
+    /// Drop a slot the caller has already taken a [`Self::peek`] of, so that
+    /// later arrivals for it are not collected all over again.
+    pub fn forget(&mut self, slot: u64) {
+        self.pending.remove(&slot);
+    }
+
     /// Attestation slots that have been fed and not yet closed.
     pub fn open_slots(&self) -> Vec<u64> {
         self.pending.keys().copied().collect()
@@ -312,6 +331,19 @@ fn resolve_attesting_validators(
     committees: &EpochCommittees,
 ) -> Result<Vec<u64>> {
     let mut result = Vec::new();
+
+    // An Electra `SingleAttestation` names its one signer outright. It is still
+    // checked against the committee, because a signer the committee proof did
+    // not open is a leaf the complement cannot subtract.
+    if let Some(single) = att.single_attester {
+        let committee = committees
+            .committee(att.data_slot, single.committee_index)
+            .context("committee not found")?;
+        if committee.contains(&single.attester_index) {
+            result.push(single.attester_index);
+        }
+        return Ok(result);
+    }
 
     if att.committee_bits.is_empty() {
         // Pre-Electra: a single committee identified by data_index.

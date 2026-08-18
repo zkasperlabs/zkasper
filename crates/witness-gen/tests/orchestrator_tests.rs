@@ -17,7 +17,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{header_root, make_header, MockBeaconApi};
+use common::{header_root, make_header, FakeGossip, MockBeaconApi};
 
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
@@ -165,6 +165,7 @@ fn attestation_from(
         data_target_epoch: epoch,
         data_target_root: target_root,
         signature,
+        single_attester: None,
     }
 }
 
@@ -427,6 +428,128 @@ async fn test_streams_an_epoch_and_measures_its_latency() {
     );
     assert_eq!(latency["tail"], 1, "one attestation on the critical path");
     assert!(latency["t2_minus_t_millis"].is_number());
+}
+
+/// The streaming pipeline proves an epoch out of gossip, without waiting for the
+/// blocks that carry it.
+///
+/// This is the whole point of the event stream. An attestation for slot `s` is
+/// gossiped during `s` and included in the block at `s+1` or later, so a daemon
+/// that reads blocks is a slot behind by construction. Here every attestation is
+/// published in its own slot and no block past the epoch boundary is ever asked
+/// for — the epoch is justified from gossip alone.
+#[tokio::test]
+async fn test_streams_an_epoch_from_gossip_without_reading_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = generate_keys(VALIDATORS);
+    let (mock, domain) = build_chain(&keys, (FIRST_EPOCH + 1) * SPE);
+
+    let config = OrchestratorConfig {
+        pipeline: Pipeline::Streaming,
+        ..config(dir.path())
+    };
+    let gossip = FakeGossip::default();
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens")
+        .with_gossip(Box::new(gossip.clone()));
+    daemon.catch_up().await.unwrap();
+
+    let stream_epoch = FIRST_EPOCH + 1;
+    let boundary = stream_epoch * SPE;
+    let target_root = checkpoint_root(stream_epoch, &keys);
+    let source_root = checkpoint_root(stream_epoch - 1, &keys);
+
+    // Validator i attests to slot boundary + i, and it is gossiped in that slot
+    // rather than in the block after it.
+    let mut ticks = Vec::new();
+    for (i, key) in keys.iter().enumerate().take(SLOTS_TO_THRESHOLD as usize) {
+        let slot = boundary + i as u64;
+        gossip.publish(vec![attestation_from(
+            key,
+            slot,
+            stream_epoch,
+            target_root,
+            source_root,
+            domain,
+        )]);
+        daemon.api().set_head(make_header(
+            slot,
+            &validators_at(stream_epoch, &keys),
+            TEST_DEPTH,
+        ));
+        ticks.extend(daemon.catch_up().await.unwrap());
+    }
+
+    assert_eq!(
+        ticks.iter().filter_map(|t| t.justified).collect::<Vec<_>>(),
+        vec![stream_epoch],
+    );
+    let past_the_boundary: Vec<String> = daemon
+        .api()
+        .requested_blocks()
+        .into_iter()
+        .filter(|id| id.parse::<u64>().is_ok_and(|slot| slot > boundary))
+        .collect();
+    assert!(
+        past_the_boundary.is_empty(),
+        "the epoch was read out of blocks after all: {past_the_boundary:?}",
+    );
+}
+
+/// A checkpoint that reorgs out under a streaming epoch is a retry, never a
+/// publication.
+///
+/// This is what makes firing at 2/3 safe. At the circuit's own threshold there
+/// is no headroom: one slot carries about 3.1% of the stake, so a one-slot reorg
+/// drops the epoch below what the circuit will accept, and a daemon that
+/// published anyway would be publishing a proof of a checkpoint the chain no
+/// longer has. The root is therefore re-resolved before anything is written, and
+/// the epoch reopens against whatever is canonical now.
+#[tokio::test]
+async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = generate_keys(VALIDATORS);
+    let (mock, _) = build_chain(&keys, (FIRST_EPOCH + 1) * SPE);
+
+    let config = OrchestratorConfig {
+        pipeline: Pipeline::Streaming,
+        ..config(dir.path())
+    };
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens");
+    daemon.catch_up().await.unwrap();
+
+    let stream_epoch = FIRST_EPOCH + 1;
+    let boundary = stream_epoch * SPE;
+
+    // The chain reorgs while the epoch is being collected: every checkpoint now
+    // resolves to a root nobody attested to.
+    daemon.api().set_reorg(Some([0xEE; 32]));
+    let mut ticks = Vec::new();
+    for slot in boundary..=boundary + SLOTS_TO_THRESHOLD {
+        daemon.api().set_head(make_header(
+            slot,
+            &validators_at(stream_epoch, &keys),
+            TEST_DEPTH,
+        ));
+        ticks.extend(daemon.catch_up().await.unwrap());
+    }
+
+    assert!(
+        ticks.iter().all(|t| t.justified.is_none()),
+        "a checkpoint that reorged out was justified anyway",
+    );
+    assert_eq!(daemon.state().justified_through, Some(FIRST_EPOCH));
+
+    // Back on the canonical chain, the same epoch is proven on the next tick.
+    daemon.api().set_reorg(None);
+    let ticks = daemon.catch_up().await.unwrap();
+    assert_eq!(
+        ticks.iter().filter_map(|t| t.justified).collect::<Vec<_>>(),
+        vec![stream_epoch],
+    );
 }
 
 #[tokio::test]

@@ -397,6 +397,7 @@ fn aggregate(
         data_target_epoch: epoch.epoch,
         data_target_root: epoch.target_root,
         signature: epoch.sign(signers, &epoch.signing_root(slot_in_epoch, head)),
+        single_attester: None,
     }
 }
 

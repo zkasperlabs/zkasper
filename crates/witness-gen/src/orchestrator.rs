@@ -17,13 +17,29 @@
 //!
 //! BENCHMARKS.md argues for proving slot groups as attestations arrive and
 //! firing the aggregation the moment the 2/3 threshold crosses — around slot 22
-//! to 24 of a mainnet epoch — rather than waiting for the epoch to end. Both
+//! of a mainnet epoch — rather than waiting for the epoch to end. Both
 //! aggregators here are written that way: they hold the running dedup set and
-//! attesting balance across ticks, consume whatever slots the node has published
-//! so far, and stop the instant the threshold is crossed. Slots past that point
-//! are never fetched.
+//! attesting balance across ticks, consume whatever the node has published so
+//! far, and stop the instant the threshold is crossed. Slots past that point are
+//! never proven.
 //!
-//! [`Pipeline`] picks what happens to those slots. [`Pipeline::Batch`] proves one
+//! # The streaming pipeline reads gossip, not blocks
+//!
+//! An attestation is gossiped in the slot it is made and included in a block one
+//! or more slots later, so [`Pipeline::Batch`]'s block walk is a slot behind the
+//! chain by construction. [`Pipeline::Streaming`] follows
+//! [`crate::gossip`] instead and keeps the block walk for what it is good for:
+//! filling the gap after a stream outage, and being the whole source in the
+//! fixture-replay tests.
+//!
+//! That moves the trigger from a slot boundary to an instant, which is what
+//! makes *when* to fire a decision rather than a consequence. A slot still
+//! filling is priced as if it closed now — its missing members are absentees —
+//! so the weight is honest at every instant and what waiting buys is a cheaper
+//! proof. [`StreamAggregator::worth_waiting`] takes that trade, one trigger
+//! interval at a time.
+//!
+//! [`Pipeline`] picks what happens to the slots. [`Pipeline::Batch`] proves one
 //! slot proof each and folds them into a justification once the epoch is over,
 //! which is three proofs deep and simple. [`Pipeline::Streaming`] proves a group
 //! per tick, folds each into a running aggregate as it finishes, and collapses
@@ -62,12 +78,13 @@ use zkasper_common::ChainConfig;
 use crate::acc_tree::AccTree;
 use crate::artifacts::{
     hex_digest, now_unix, now_unix_millis, AccStatus, ArtifactRef, ArtifactSink, CheckpointStatus,
-    EpochLatency, StageTiming, Status,
+    EpochLatency, GossipStatus, StageTiming, Status,
 };
 use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
 use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
+use crate::gossip::{AttestationSource, EventStreamSource};
 use crate::prover::{Proof, Prover, Stage};
 use crate::store::{
     EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState, StreamFinalRecord,
@@ -136,12 +153,20 @@ pub struct OrchestratorConfig {
     pub signing_domain: Option<[u8; 32]>,
     /// How long to wait after a tick that could make no further progress.
     pub poll_interval: Duration,
+    /// How often a streaming epoch re-reads gossip and re-evaluates the trigger.
+    /// Sets the resolution of `T2 − T`: the daemon cannot fire between two
+    /// evaluations, so this is the granularity of "the instant enough arrived".
+    pub trigger_interval: Duration,
     /// How many epochs past the target to keep looking for its attestations.
     pub attestation_lookahead_epochs: u64,
     pub pipeline: Pipeline,
-    /// When the streaming pipeline stops collecting. Above 2/3 by default; see
-    /// [`crate::streaming`] on margin.
+    /// When the streaming pipeline stops collecting, and how long the trigger
+    /// may hold past it. See [`crate::streaming`].
     pub stream_policy: StreamPolicy,
+    /// Beacon node to follow attestation gossip from. `None` sources
+    /// attestations from blocks instead, which is a slot later and is only what
+    /// the fixture-replay tests want.
+    pub gossip_url: Option<String>,
 }
 
 impl OrchestratorConfig {
@@ -154,9 +179,11 @@ impl OrchestratorConfig {
             bootstrap_slot: None,
             signing_domain: None,
             poll_interval: Duration::from_secs(4),
+            trigger_interval: Duration::from_millis(200),
             attestation_lookahead_epochs: 2,
             pipeline: Pipeline::default(),
             stream_policy: StreamPolicy::default(),
+            gossip_url: None,
         }
     }
 }
@@ -230,10 +257,20 @@ struct StreamAggregator {
     /// This epoch's committee proof, which every group counts against.
     committees: Arc<EpochCommittees>,
     stream: SlotStream,
-    /// Next slot to ask the node for.
+    /// Next block to ask the node for while repairing from blocks.
     next_slot: u64,
     /// One past the last slot worth scanning for this checkpoint.
     scan_end: u64,
+    /// Whether gossip has a hole in it that blocks have to fill. True when the
+    /// epoch opens, because the daemon did not hear the gossip that happened
+    /// before it got there, and again whenever the stream drops.
+    gap: bool,
+    /// Whether the node has reported a reorg that this epoch has not checked.
+    reorged: bool,
+    /// The last reading of the slot gossip was filling: when it was taken, which
+    /// slot, and how many accumulator leaves it would have opened. The trigger
+    /// is the difference between two of these.
+    last_filling: Option<(Instant, u64, usize)>,
     /// Attestation slots closed so far, in order.
     units: Vec<SlotComplement>,
     /// How many of them a group proof already covers.
@@ -261,9 +298,21 @@ struct GroupProof {
     proof: Proof,
 }
 
+/// What one evaluation of the trigger sees.
+struct Held {
+    /// Attested balance: closed units and still-filling slots together.
+    balance: u64,
+    /// The slot gossip is still filling that the proof would have to carry, and
+    /// the accumulator leaves it would open if the trigger fired now. Waiting
+    /// buys the difference between two readings of it; nothing else moves.
+    filling: Option<(u64, usize)>,
+    /// Every slot gossip has reached, priced as if it closed now.
+    open: Vec<SlotComplement>,
+}
+
 impl StreamAggregator {
-    fn exhausted(&self) -> bool {
-        self.next_slot >= self.scan_end
+    fn exhausted(&self, head_slot: u64) -> bool {
+        head_slot >= self.scan_end
     }
 
     /// Index of the unit that carries the epoch over the scheduling threshold.
@@ -273,7 +322,79 @@ impl StreamAggregator {
     /// epoch ends.
     fn crossing(&self, policy: &StreamPolicy) -> Option<usize> {
         let plan = streaming::plan(&self.units, self.context.total_active_balance, policy);
-        plan.threshold_reached.then(|| plan.tail[0])
+        plan.threshold_reached
+            .then(|| plan.groups.concat().into_iter().chain(plan.tail).max())
+            .flatten()
+    }
+
+    /// Price every slot gossip has reached as if it closed this instant.
+    ///
+    /// A slot contributes whole — `slots_mask` counts it once — so the members
+    /// whose attestations are still in flight are counted as the absentees they
+    /// would be. The weight is therefore honest at any instant, and what waiting
+    /// buys is a cheaper proof rather than a valid one.
+    fn held(&self, spe: u64, head_slot: u64, policy: &StreamPolicy) -> Held {
+        let epoch = self.context.target_epoch;
+        let open: Vec<SlotComplement> = self
+            .stream
+            .open_slots()
+            .into_iter()
+            .filter(|slot| *slot >= epoch * spe && *slot < (epoch + 1) * spe)
+            .filter_map(|slot| self.stream.peek(slot))
+            .collect();
+
+        let target = policy.target_balance(self.context.total_active_balance);
+        let mut balance = 0u64;
+        let mut crossing = None;
+        for (i, unit) in self.units.iter().chain(&open).enumerate() {
+            balance += unit.marginal_balance;
+            if crossing.is_none() && balance as u128 >= target {
+                crossing = Some(i);
+            }
+        }
+
+        // A slot is finished with once something later has arrived: gossip for a
+        // later attestation slot, or a chain head past it. A straggler included
+        // after that is an absentee, which costs a little weight and no
+        // soundness — so only the frontier is still worth waiting on, and only
+        // while the threshold still needs it.
+        let frontier = open.last().map_or(head_slot, |u| u.slot.max(head_slot));
+        let filling = open
+            .last()
+            .filter(|unit| unit.slot >= frontier)
+            .filter(|_| crossing.is_none_or(|c| c + 1 == self.units.len() + open.len()))
+            .map(|unit| (unit.slot, unit.named_indices.len()));
+
+        Held {
+            balance,
+            filling,
+            open,
+        }
+    }
+
+    /// Whether the last interval of waiting shortened the proof by more than it
+    /// cost, which is the whole of the firing decision once the weight is there.
+    ///
+    /// No reading to compare against — nothing still filling, or a different
+    /// slot than last time — means fire. There is nothing in flight to wait for,
+    /// and a daemon that opened an epoch already past the threshold must not
+    /// invent a wait it never observed.
+    fn worth_waiting(&self, policy: &StreamPolicy, filling: Option<(u64, usize)>) -> bool {
+        let (Some((at, was, before)), Some((slot, named))) = (self.last_filling, filling) else {
+            return false;
+        };
+        was == slot
+            && policy.worth_waiting(
+                before.saturating_sub(named),
+                at.elapsed().as_secs_f64(),
+                self.waited_s(),
+            )
+    }
+
+    /// Seconds since `T`, which is what the cap on waiting is measured against.
+    fn waited_s(&self) -> f64 {
+        self.crossed_unix_millis
+            .map_or(0.0, |t| now_unix_millis().saturating_sub(t) as f64 / 1000.0)
     }
 }
 
@@ -286,9 +407,15 @@ pub struct Orchestrator<A> {
     snapshot: Snapshot,
     pending: Option<EpochAggregator>,
     streaming: Option<StreamAggregator>,
+    /// Attestation gossip, when the daemon was given a node to follow it from.
+    gossip: Option<Box<dyn AttestationSource>>,
     recent: VecDeque<StageTiming>,
     latencies: VecDeque<EpochLatency>,
     head_slot: u64,
+    /// When the chain view was last refreshed. The trigger runs several times a
+    /// second and the node's head does not move that fast, so the two are not
+    /// the same clock.
+    viewed: Option<Instant>,
     node_finalized: Option<Checkpoint>,
     genesis_validators_root: Option<[u8; 32]>,
 }
@@ -339,6 +466,10 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         snapshot: Snapshot,
     ) -> Self {
         Self {
+            gossip: config
+                .gossip_url
+                .as_deref()
+                .map(|url| Box::new(EventStreamSource::connect(url)) as Box<dyn AttestationSource>),
             api,
             config,
             store,
@@ -350,9 +481,20 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             recent: VecDeque::new(),
             latencies: VecDeque::new(),
             head_slot: 0,
+            viewed: None,
             node_finalized: None,
             genesis_validators_root: None,
         }
+    }
+
+    /// Follow attestations from `source` instead of the node's event stream.
+    ///
+    /// The daemon only ever asks a source for whatever arrived since last time,
+    /// so this is where a forked node, an in-process feed or a test's own
+    /// arrival schedule goes in.
+    pub fn with_gossip(mut self, source: Box<dyn AttestationSource>) -> Self {
+        self.gossip = Some(source);
+        self
     }
 
     pub fn state(&self) -> &StoreState {
@@ -368,10 +510,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     // -----------------------------------------------------------------
 
     /// Follow the chain until stopped.
+    ///
+    /// A streaming epoch in flight is re-evaluated on the trigger's clock rather
+    /// than the poll's: the whole point is to fire the instant enough has
+    /// arrived, and a four-second poll would round that off to four seconds.
     pub async fn run(&mut self) -> Result<()> {
         loop {
             self.catch_up().await?;
-            tokio::time::sleep(self.config.poll_interval).await;
+            tokio::time::sleep(match self.streaming {
+                Some(_) => self.config.trigger_interval,
+                None => self.config.poll_interval,
+            })
+            .await;
         }
     }
 
@@ -416,7 +566,20 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         Ok(tick)
     }
 
+    /// Ask the node where it is, at most once a poll interval.
+    ///
+    /// The trigger ticks several times a second and the head moves once a slot,
+    /// so refreshing on every tick would be two round trips per evaluation to
+    /// learn nothing.
     async fn refresh_chain_view(&mut self) -> Result<()> {
+        if self
+            .viewed
+            .is_some_and(|at| at.elapsed() < self.config.poll_interval)
+        {
+            return Ok(());
+        }
+        self.viewed = Some(Instant::now());
+
         self.head_slot = self
             .api
             .get_header("head")
@@ -995,63 +1158,82 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         };
 
         let _span = info_span!("stream", target_epoch).entered();
-        let target = self
-            .config
-            .stream_policy
-            .target_balance(aggregator.context.total_active_balance);
+        let spe = self.config.chain.slots_per_epoch;
 
-        // Collect whatever the node has published since the last tick, and note
-        // the moment the collected weight is enough to justify. That moment is
-        // `T`: everything after it is latency a consumer sees.
-        while aggregator.crossed_unix_millis.is_none()
-            && !aggregator.exhausted()
-            && aggregator.next_slot <= self.head_slot
-        {
-            let slot = aggregator.next_slot;
-            aggregator.next_slot += 1;
-
-            if let Ok(attestations) = self.api.get_block_attestations(&slot.to_string()).await {
-                aggregator.stream.ingest(&attestations)?;
+        // Gossip is the source. Blocks repair what an outage swallowed, and are
+        // the whole source when there is no stream — the fixture-replay tests.
+        match &self.gossip {
+            Some(source) => {
+                aggregator.stream.ingest(&source.drain())?;
+                aggregator.reorged |= source.took_reorg();
+                if source.took_gap() {
+                    // An outage does not say what it swallowed, so the repair
+                    // rescans the epoch rather than resuming from a cursor.
+                    warn!(target_epoch, "gossip gap; repairing this epoch from blocks");
+                    aggregator.next_slot = target_epoch * spe;
+                    aggregator.gap = true;
+                }
             }
-
-            // A slot's attestations start arriving in the block after it, so
-            // closing it one slot behind the chain is as early as it can be
-            // closed. A straggler included later becomes an absentee, which
-            // costs a little weight and no soundness.
-            let Some(attestation_slot) = slot.checked_sub(1) else {
-                continue;
-            };
-            if attestation_slot < target_epoch * self.config.chain.slots_per_epoch {
-                continue;
-            }
-            let Some(unit) = aggregator.stream.close(attestation_slot) else {
-                continue;
-            };
-
-            aggregator.attesting_balance += unit.marginal_balance;
-            aggregator.units.push(unit);
-            if aggregator.attesting_balance as u128 >= target {
-                aggregator.crossed_unix_millis = Some(now_unix_millis());
-            }
+            None => aggregator.gap = true,
+        }
+        if aggregator.gap {
+            self.repair_from_blocks(&mut aggregator).await?;
         }
 
-        let crossing = aggregator.crossing(&self.config.stream_policy);
-        let provable = crossing.unwrap_or(aggregator.units.len());
+        // A reorg can take the checkpoint out from under an epoch that is
+        // already half collected. Everything counted so far attested to a root
+        // that is no longer canonical, so the epoch restarts against the new one
+        // rather than proving the old one. Doing it here, off a node event,
+        // keeps the round trip away from the critical path.
+        if std::mem::take(&mut aggregator.reorged)
+            && self.checkpoint_root(target_epoch).await? != aggregator.context.target_root
+        {
+            warn!(
+                target_epoch,
+                "the checkpoint reorged out; reopening the epoch"
+            );
+            return Ok(());
+        }
 
-        // Below the threshold every unit in hand is one the final proof will not
-        // touch, so it can be proven and folded now, off the critical path. At
-        // the threshold whatever is left over belongs to the final proof, which
-        // verifies it directly rather than paying for another fold.
-        if crossing.is_none() {
-            if aggregator.proved < provable {
-                let group = self.prove_group(&aggregator, aggregator.proved..provable, tick)?;
+        let policy = self.config.stream_policy.clone();
+        let total = aggregator.context.total_active_balance;
+        let held = aggregator.held(spe, self.head_slot, &policy);
+
+        // `T`: the first moment the daemon holds what the circuit would accept.
+        // Everything after it is latency a consumer sees, the trigger's own wait
+        // included, which is what keeps that wait honest.
+        if held.balance as u128 >= policy.quorum_balance(total)
+            && aggregator.crossed_unix_millis.is_none()
+        {
+            aggregator.crossed_unix_millis = Some(now_unix_millis());
+        }
+
+        let fire = held.balance as u128 >= policy.target_balance(total)
+            && !aggregator.worth_waiting(&policy, held.filling);
+        aggregator.last_filling = held
+            .filling
+            .map(|(slot, named)| (Instant::now(), slot, named));
+
+        if !fire {
+            // Slots gossip has finished with are proven and folded now, off the
+            // critical path. The one it is still filling is left open: closing it
+            // would count everyone still in flight as an absentee.
+            let complete = held.open.len() - usize::from(held.filling.is_some());
+            for unit in held.open.into_iter().take(complete) {
+                aggregator.stream.forget(unit.slot);
+                aggregator.attesting_balance += unit.marginal_balance;
+                aggregator.units.push(unit);
+            }
+            if aggregator.proved < aggregator.units.len() {
+                let group =
+                    self.prove_group(&aggregator, aggregator.proved..aggregator.units.len(), tick)?;
                 self.fold_group(&mut aggregator, group)?;
             }
-            if aggregator.exhausted() {
+            if aggregator.exhausted(self.head_slot) {
                 warn!(
                     target_epoch,
                     attesting_balance = aggregator.attesting_balance,
-                    total_active_balance = aggregator.context.total_active_balance,
+                    total_active_balance = total,
                     "checkpoint never reached the threshold; giving up on this epoch",
                 );
                 self.snapshot.state.attempted_epoch = Some(target_epoch);
@@ -1063,10 +1245,43 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             return Ok(());
         }
 
-        let late = (aggregator.proved < provable)
-            .then(|| self.prove_group(&aggregator, aggregator.proved..provable, tick))
+        // Fire. Everything gossip has reached is closed, and the plan decides
+        // how much of it the final proof carries inline; slots past the crossing
+        // are simply never proven.
+        for unit in held.open {
+            aggregator.stream.forget(unit.slot);
+            aggregator.attesting_balance += unit.marginal_balance;
+            aggregator.units.push(unit);
+        }
+        let crossing = aggregator
+            .crossing(&policy)
+            .context("the threshold moved out from under the trigger")?;
+        let late = (aggregator.proved < crossing)
+            .then(|| self.prove_group(&aggregator, aggregator.proved..crossing, tick))
             .transpose()?;
-        self.close_stream_epoch(aggregator, late, provable, tick)
+        self.close_stream_epoch(aggregator, late, crossing, tick)
+            .await
+    }
+
+    /// Fill in from blocks what gossip did not deliver.
+    ///
+    /// Only two things need it: an epoch that opened after its own attestations
+    /// were gossiped, and a stream that dropped. Both are repairs — the union of
+    /// a block and a gossip view of a slot is the gossip view, because the
+    /// collector converges on an attester set rather than a list.
+    async fn repair_from_blocks(&mut self, aggregator: &mut StreamAggregator) -> Result<()> {
+        while aggregator.next_slot <= self.head_slot && aggregator.next_slot < aggregator.scan_end {
+            let slot = aggregator.next_slot;
+            aggregator.next_slot += 1;
+
+            // A slot with no block is not an error; neither is one whose
+            // attestations all point somewhere else.
+            if let Ok(attestations) = self.api.get_block_attestations(&slot.to_string()).await {
+                aggregator.stream.ingest(&attestations)?;
+            }
+        }
+        aggregator.gap = false;
+        Ok(())
     }
 
     /// Open an epoch against the accumulator, the diff that carried it here, and
@@ -1158,6 +1373,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             stream,
             next_slot: target_epoch * spe,
             scan_end: (target_epoch + self.config.attestation_lookahead_epochs) * spe,
+            // The epoch's earlier slots were gossiped before the daemon reached
+            // it, so it starts by repairing them out of blocks.
+            gap: true,
+            reorged: false,
+            last_filling: None,
             units: Vec::new(),
             proved: 0,
             attesting_balance: 0,
@@ -1271,7 +1491,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
     /// The only proof on the critical path: the marginal attestation, the one
     /// final exponentiation, and the previous epoch's justification, at once.
-    fn close_stream_epoch(
+    async fn close_stream_epoch(
         &mut self,
         aggregator: StreamAggregator,
         late: Option<GroupProof>,
@@ -1279,6 +1499,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         tick: &mut Tick,
     ) -> Result<()> {
         let started = Instant::now();
+        let fired_unix_millis = now_unix_millis();
         let target_epoch = aggregator.context.target_epoch;
         let tail: Vec<&SlotComplement> = vec![&aggregator.units[crossing]];
 
@@ -1327,6 +1548,19 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             artifact,
         ));
 
+        // A proof of a checkpoint the chain no longer has is worse than no proof
+        // at all, so the root is re-resolved before anything is published. This
+        // is after `T2` by construction — the proof exists — so it costs
+        // publication latency and never a stale publication.
+        if self.checkpoint_root(target_epoch).await? != aggregator.context.target_root {
+            warn!(
+                target_epoch,
+                "the checkpoint reorged out while the final proof ran; discarding it",
+            );
+            self.streaming = None;
+            return Ok(());
+        }
+
         // `T` is when the daemon held enough attestations; if it was already
         // holding them when the epoch opened — a catch-up, not a live follow —
         // there is no latency to report and reporting one would flatter it.
@@ -1334,14 +1568,19 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             let latency = EpochLatency {
                 epoch: target_epoch,
                 threshold_unix_millis,
+                fired_unix_millis,
                 proof_unix_millis,
                 t2_minus_t_millis: proof_unix_millis.saturating_sub(threshold_unix_millis),
+                wait_millis: fired_unix_millis.saturating_sub(threshold_unix_millis),
+                tail_named: tail.iter().map(|u| u.named_indices.len()).sum(),
                 folded_groups: aggregator.folded_groups,
                 late_groups,
                 tail: tail.len(),
             };
             info!(
                 t2_minus_t_millis = latency.t2_minus_t_millis,
+                wait_millis = latency.wait_millis,
+                tail_named = latency.tail_named,
                 folded_groups = latency.folded_groups,
                 late_groups = latency.late_groups,
                 "measured T2 - T",
@@ -1460,6 +1699,13 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             node_finalized: self.node_finalized.as_ref().map(CheckpointStatus::from),
             recent_stages: self.recent.iter().cloned().collect(),
             recent_latencies: self.latencies.iter().cloned().collect(),
+            gossip: self.gossip.as_ref().map(|source| {
+                let (attestations, reconnects) = source.counters();
+                GossipStatus {
+                    attestations,
+                    reconnects,
+                }
+            }),
         })
     }
 }

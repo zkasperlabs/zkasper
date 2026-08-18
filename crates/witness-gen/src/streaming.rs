@@ -56,16 +56,36 @@
 //! active set, and the guest was spending 94% of it deserialising a witness it
 //! was handed in its own memory layout. One card, one chunk, inside the epoch.
 //!
-//! # Margin
+//! # The threshold is 2/3, because the estimate it hedged against is gone
 //!
-//! [`StreamPolicy::threshold_numerator`] is the *scheduling* threshold and
-//! defaults above 2/3, because attestations already collected can turn out not
-//! to count. The circuit enforces exactly 2/3 and does not know what margin the
-//! schedule used, so a margin that is too thin costs a retry, never soundness.
-//! It is not free: weight arrives one slot's committee at a time, about 3.1% of
-//! the stake, so any margin that pushes the crossing into the next slot costs a
-//! whole slot. [`Schedule::threshold_s`] is measured at 2/3 regardless, so that
-//! cost shows up in `T2 − T` rather than hiding in the choice of `T`.
+//! [`StreamPolicy::threshold_numerator`] used to default above 2/3, because the
+//! attesting balance a slot contributed was an estimate that deduplication
+//! across slots could shrink. It is not one any more: `slots_mask` puts a
+//! validator in exactly one slot, and `marginal_balance` is committee balance
+//! minus absentee balance, which is exact. The circuit enforces 2/3 and rejects
+//! anything under it, so a thin margin can only ever waste a proof, never make
+//! an unsound one — and it is expensive, because weight arrives a committee at a
+//! time, 3.1% of the stake, so a margin that pushes the crossing into the next
+//! slot costs a whole slot. The default is therefore 2/3 exactly, and the
+//! numerator and denominator are configuration rather than constants.
+//!
+//! # Firing early is not free, which is what makes the trigger a choice
+//!
+//! Complement proving inverts the usual latency trade. A slot proof opens the
+//! validators that did *not* attest, so an attestation still in flight when the
+//! trigger fires is one more absentee to open — at
+//! [`ProverModel::per_named_s`], 1.79 ms each. Mainnet epoch 430529 crosses 2/3
+//! 42.7% of the way through slot 21's arrivals, with 17,128 of that slot's
+//! attesters still in flight: firing on the instant would buy back the wait and
+//! pay 30.7 s of extra proving for it.
+//!
+//! So there are two moments, and the objective is the second: the earliest
+//! instant the circuit would accept, and the instant that minimises `T2`.
+//! [`StreamPolicy::worth_waiting`] is the rule between them — keep waiting while
+//! the last interval's arrivals shortened the proof by more than the interval
+//! cost, which is 558 attesters a second at the measured per-leaf price.
+//! [`Schedule::threshold_s`] is measured at 2/3 regardless, so any wait shows up
+//! in `T2 − T` rather than hiding in the choice of `T`.
 
 use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
@@ -224,6 +244,18 @@ impl ProverModel {
         leaves * self.per_validator_s + scattered_nodes(leaves, depth) * self.acc_node_s
     }
 
+    /// Seconds the proof spends on one more *named* validator: its accumulator
+    /// leaf, and the internal nodes only it touches.
+    ///
+    /// This is the price of firing early, and the only number the trigger needs.
+    /// A scattered leaf touches every level above it — `scattered_nodes` is
+    /// linear in the leaf count at any density a slot reaches — so at mainnet's
+    /// depth-22 accumulator it is 834.7 us of validator plus 22 x 43.5 us of
+    /// node, or 1.79 ms. One second of waiting is worth 558 attesters.
+    pub fn per_named_s(&self) -> f64 {
+        self.per_validator_s + self.acc_depth as f64 * self.acc_node_s
+    }
+
     /// The same, when the leaves are one index range and the guest reads them
     /// in place rather than deserialising them — which is the committee proof
     /// and only the committee proof.
@@ -343,9 +375,14 @@ pub enum LanePool {
 #[derive(Clone, Debug)]
 pub struct StreamPolicy {
     /// Stop collecting once this fraction of the total active balance has
-    /// attested. Above 2/3 by default; see the module docs on margin.
+    /// attested. 2/3 by default — the circuit's own rule, and no more; see the
+    /// module docs.
     pub threshold_numerator: u64,
     pub threshold_denominator: u64,
+    /// How long the trigger may hold past the threshold while in-flight
+    /// attestations are still shortening the proof. See
+    /// [`StreamPolicy::worth_waiting`]; this is the guard on it, not the rule.
+    pub max_wait_s: f64,
     /// Wall-clock between block arrivals. What turns a partition into a
     /// schedule: a group cannot start before the last slot it covers closed.
     pub seconds_per_slot: f64,
@@ -366,8 +403,9 @@ pub struct StreamPolicy {
 impl Default for StreamPolicy {
     fn default() -> Self {
         Self {
-            threshold_numerator: 70,
-            threshold_denominator: 100,
+            threshold_numerator: 2,
+            threshold_denominator: 3,
+            max_wait_s: 6.0,
             seconds_per_slot: 12.0,
             slots_per_epoch: 32,
             lanes: 3,
@@ -388,8 +426,26 @@ impl StreamPolicy {
 
     /// Balance the circuit itself insists on, which is what "enough
     /// attestations exist" means and so what `T` is measured at.
-    fn quorum_balance(&self, total_active_balance: u64) -> u128 {
+    pub fn quorum_balance(&self, total_active_balance: u64) -> u128 {
         (total_active_balance as u128 * 2).div_ceil(3)
+    }
+
+    /// Whether the last interval of waiting paid for itself.
+    ///
+    /// The objective is the earliest *postable* proof, not the earliest proof
+    /// start, and complement proving separates the two: `interval_s` of waiting
+    /// delays the start by exactly that, and removes `removed` absentees the
+    /// final proof would otherwise have opened at [`ProverModel::per_named_s`]
+    /// each. So the wait is worth taking while arrivals run above 558 validators
+    /// a second, and the trigger fires the interval they do not — which is the
+    /// burst draining, not a fixed delay. `waited_s`, the whole wait so far, is
+    /// only the guard against a source that trickles for ever.
+    ///
+    /// Nothing here models when attestations arrive. The rule reads the rate off
+    /// the last interval, so a chain that gossips earlier or later than mainnet
+    /// moves the firing instant without moving this code.
+    pub fn worth_waiting(&self, removed: usize, interval_s: f64, waited_s: f64) -> bool {
+        waited_s < self.max_wait_s && removed as f64 * self.prover.per_named_s() > interval_s
     }
 
     /// Lanes each stage may run on, in the order it should prefer them.
@@ -1318,8 +1374,8 @@ mod tests {
         }
     }
 
-    /// One slot per unit, each worth 4% of the stake: the threshold at 70%
-    /// crosses at slot 17, and nothing past it is planned.
+    /// One slot per unit, each worth 4% of the stake: 2/3 crosses at slot 16,
+    /// and nothing past it is planned.
     fn even_epoch() -> Vec<SlotComplement> {
         (0..32).map(|s| unit(s, 4, 200)).collect()
     }
@@ -1350,7 +1406,7 @@ mod tests {
         );
         assert_eq!(
             schedule.plan.groups.concat().len() + schedule.plan.tail.len(),
-            18,
+            17,
         );
     }
 
@@ -1440,8 +1496,36 @@ mod tests {
     fn nothing_past_the_threshold_is_planned() {
         let plan = plan(&even_epoch(), 100, &StreamPolicy::default());
         let last = plan.groups.concat().into_iter().chain(plan.tail).max();
-        assert_eq!(last, Some(17));
-        assert_eq!(plan.attesting_balance, 72);
+        assert_eq!(last, Some(16));
+        assert_eq!(plan.attesting_balance, 68);
+    }
+
+    /// The trigger's whole argument in the units it is made of: an arrival rate
+    /// above one validator per `per_named_s` shortens the proof by more than the
+    /// wait costs, and below it does not.
+    #[test]
+    fn waiting_pays_exactly_while_arrivals_outrun_the_per_leaf_price() {
+        let policy = StreamPolicy::default();
+        let per_second = 1.0 / policy.prover.per_named_s();
+        assert!((per_second - 558.1).abs() < 0.1, "{per_second} a second");
+
+        assert!(
+            policy.worth_waiting(600, 1.0, 1.0),
+            "600 a second did not wait"
+        );
+        assert!(!policy.worth_waiting(500, 1.0, 1.0), "500 a second waited");
+        // The burst mainnet epoch 430529 actually crosses in: 17,128 attesters
+        // still in flight, 30.7 s of absentee openings, against a wait measured
+        // in hundreds of milliseconds.
+        assert!(policy.worth_waiting(17_128, 0.3, 0.3));
+    }
+
+    /// The guard, not the rule: a source that keeps trickling attestations must
+    /// not be able to hold the epoch open for ever.
+    #[test]
+    fn the_wait_is_capped_however_fast_they_arrive() {
+        let policy = StreamPolicy::default();
+        assert!(!policy.worth_waiting(1_000_000, 0.2, policy.max_wait_s));
     }
 
     /// A quarter of the validators offline: the threshold is never reached, and

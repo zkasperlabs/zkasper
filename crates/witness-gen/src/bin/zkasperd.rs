@@ -23,6 +23,7 @@ use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::BeaconApiClient;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
 use zkasper_witness_gen::prover::{NativeProver, Prover};
+use zkasper_witness_gen::streaming::StreamPolicy;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Chain {
@@ -96,6 +97,34 @@ struct Cli {
     /// Seconds to wait after a poll that found nothing new
     #[arg(long, default_value_t = 4)]
     poll_seconds: u64,
+
+    /// How often a streaming epoch re-reads gossip and re-evaluates the trigger.
+    /// The daemon cannot fire between two evaluations, so this is the resolution
+    /// of "the instant enough attestations arrived".
+    #[arg(long, default_value_t = 200)]
+    trigger_interval_millis: u64,
+
+    /// Fraction of the total active balance the streaming trigger waits for,
+    /// as a numerator over --threshold-denominator. The circuit enforces 2/3 and
+    /// rejects anything under it, so a higher setting only ever costs latency —
+    /// weight arrives a committee at a time, about 3.1% of the stake, so a
+    /// margin that pushes the crossing into the next slot costs a whole slot.
+    #[arg(long, default_value_t = 2)]
+    threshold_numerator: u64,
+
+    #[arg(long, default_value_t = 3)]
+    threshold_denominator: u64,
+
+    /// Longest the trigger may hold past the threshold while in-flight
+    /// attestations are still making the final proof shorter.
+    #[arg(long, default_value_t = 6000)]
+    max_trigger_wait_millis: u64,
+
+    /// Read attestations from blocks rather than from the node's event stream.
+    /// A slot later by construction; only for a node that will not serve
+    /// `/eth/v1/events`.
+    #[arg(long)]
+    no_gossip: bool,
 
     /// How many epochs past a checkpoint to keep looking for its attestations
     #[arg(long, default_value_t = 2)]
@@ -183,8 +212,19 @@ async fn main() -> Result<()> {
             .map(parse_hex_bytes32)
             .transpose()?,
         poll_interval: Duration::from_secs(cli.poll_seconds),
+        trigger_interval: Duration::from_millis(cli.trigger_interval_millis),
         attestation_lookahead_epochs: cli.attestation_lookahead_epochs,
         pipeline,
+        stream_policy: StreamPolicy {
+            threshold_numerator: cli.threshold_numerator,
+            threshold_denominator: cli.threshold_denominator,
+            max_wait_s: cli.max_trigger_wait_millis as f64 / 1000.0,
+            ..StreamPolicy::default()
+        },
+        // Only the streaming pipeline has a trigger to be early for; the batch
+        // path walks blocks either way.
+        gossip_url: (pipeline == Pipeline::Streaming && !cli.no_gossip)
+            .then(|| cli.beacon_url.clone()),
         ..OrchestratorConfig::new(cli.chain.config(), cli.chain.name())
     };
 

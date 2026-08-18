@@ -80,8 +80,20 @@ impl StageTiming {
 pub struct EpochLatency {
     pub epoch: u64,
     pub threshold_unix_millis: u64,
+    /// When the trigger actually started the final proof. Never before
+    /// `threshold_unix_millis`, and later than it whenever waiting for in-flight
+    /// attestations was the cheaper way to a postable proof.
+    pub fired_unix_millis: u64,
     pub proof_unix_millis: u64,
     pub t2_minus_t_millis: u64,
+    /// The part of `t2_minus_t_millis` that was the trigger holding back rather
+    /// than the prover working. Reading it against `tail_named` is what says
+    /// whether the wait bought what the model says it should have.
+    pub wait_millis: u64,
+    /// Accumulator leaves the final proof opened for its inline tail — the
+    /// absentees the wait did not remove. Every one of them is
+    /// `ProverModel::per_named_s` on the critical path.
+    pub tail_named: usize,
     /// Group proofs folded into the running aggregate before `T`.
     pub folded_groups: usize,
     /// Groups the final proof had to verify itself, because they arrived too
@@ -146,6 +158,19 @@ pub struct Status {
     pub recent_stages: Vec<StageTiming>,
     /// Measured `T2 - T` for the epochs this daemon streamed, newest last.
     pub recent_latencies: Vec<EpochLatency>,
+    /// Attestation gossip, when the daemon is following it. Absent means the
+    /// daemon is reading blocks, and is a slot behind the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gossip: Option<GossipStatus>,
+}
+
+/// What the attestation event stream has delivered.
+#[derive(Clone, Debug, Serialize)]
+pub struct GossipStatus {
+    pub attestations: u64,
+    /// Reconnections. Each one is a hole in gossip that blocks had to repair, so
+    /// a number that climbs says the epochs around it were not sourced live.
+    pub reconnects: u64,
 }
 
 /// Writes artifacts under an output directory.
