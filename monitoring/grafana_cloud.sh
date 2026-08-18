@@ -43,11 +43,21 @@ printf '%s' "$token" > "$secret"
 # Push, not pull: this box has no inbound access, so it reaches out. Every
 # series carries the external_labels above, which is what tells one daemon's
 # metrics from another's.
+#
+# The free tier is a budget of 10k active series. zkasperd is about 1,600 of them
+# and the host is 2,600, of which 620 are the state of every systemd unit on a
+# box that runs three services. Dropping that one family is the difference
+# between a quarter of the budget and a fifth, and nothing here would ever
+# graph it.
 remote_write:
   - url: $url
     basic_auth:
       username: $username
       password_file: $secret
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: node_systemd_unit_state
+        action: drop
 EOF
 } > /etc/prometheus/prometheus.yml
 promtool check config /etc/prometheus/prometheus.yml
