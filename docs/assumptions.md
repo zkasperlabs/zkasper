@@ -402,3 +402,24 @@ look worse than it is.
 **Cost units are not comparable across Zisk versions.** v1.1.0-alpha re-priced
 `POSEIDON_COST` by 5.23x without changing the work. Compare wall clock, or
 re-measure.
+
+### The on-chain wrap reintroduces a trusted setup
+
+The Zisk STARK is transparent. The PLONK wrap that puts a proof on chain is not.
+It needs a structured reference string, distributed as `provingKeySnark` -- a
+~21.9 GB `final.zkey` with the `recursivef` setup -- fetched from a Google Cloud
+bucket and checked against a published MD5. Neither the Zisk tree nor `ziskup`
+references a ceremony transcript, and nothing in the toolchain regenerates the
+key. Anyone who verifies a wrapped zkasper proof therefore trusts a setup they
+cannot audit and did not witness.
+
+The SRS is universal, so the *statement* is not part of what is trusted. What the
+key fixes is the circuit: `recursivef`, `final`, and the constant
+`rootCVadcopFinal` that names the VADCOP final verification key. A different Zisk
+release is a different key and a different on-chain verifier.
+
+Nothing that runs today depends on this. The wrap is not on the live path, and
+`zkasper-solana` expects Groth16, which Zisk v1.1.0-alpha cannot produce at all
+-- its `SnarkProtocol` enum is `{ Fflonk, Plonk }`. The assumption is written
+down now because it arrives with the wrap, not with the pipeline, and it is the
+one trust assumption a reader would not predict from the rest of this page.
