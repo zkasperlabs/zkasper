@@ -57,11 +57,16 @@
 //! outputs and proofs and do not care which order they were produced in — so
 //! handing the prover to a pool of GPUs is a change to this file only.
 
+mod config;
+mod pipeline;
+
+pub use config::OrchestratorConfig;
+pub use pipeline::Pipeline;
+
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use tracing::{info, info_span, instrument, warn};
@@ -73,7 +78,6 @@ use zkasper_common::types::{
     GroupProofOutput, JustificationOutput, PreviousJustification, SlotProofOutput,
     SlotProofWitness,
 };
-use zkasper_common::ChainConfig;
 
 use crate::acc_tree::AccTree;
 use crate::artifacts::{
@@ -106,110 +110,6 @@ const LIVE_EPOCHS: f64 = 2.0;
 
 /// How many epochs' measured `T2 - T` the manifest keeps.
 const RECENT_LATENCIES: usize = 16;
-
-/// Which pipeline an epoch is proven with.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Pipeline {
-    /// One slot proof per slot, folded into a justification once the epoch is
-    /// over, paired with the previous epoch's into a finalization.
-    #[default]
-    Batch,
-    /// Group proofs as attestations arrive, folded into a running aggregate,
-    /// closed by one proof over the attestation that crossed the threshold.
-    Streaming,
-}
-
-impl Pipeline {
-    /// Stages a prover has to be able to produce for this pipeline.
-    ///
-    /// Streaming still needs the batch stages: the first epoch after a bootstrap
-    /// has nothing to finalize and goes through them.
-    pub fn stages(self) -> &'static [Stage] {
-        match self {
-            Pipeline::Batch => &[
-                Stage::Bootstrap,
-                Stage::EpochDiff,
-                Stage::Committee,
-                Stage::SlotProof,
-                Stage::Justification,
-                Stage::Finalization,
-            ],
-            Pipeline::Streaming => &[
-                Stage::Bootstrap,
-                Stage::EpochDiff,
-                Stage::Committee,
-                Stage::SlotProof,
-                Stage::Justification,
-                Stage::Finalization,
-                Stage::Group,
-                Stage::Aggregate,
-                Stage::StreamFinal,
-            ],
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OrchestratorConfig {
-    pub chain: ChainConfig,
-    /// Chain name, recorded in the store so it cannot be pointed at another one.
-    pub chain_name: String,
-    pub db_path: PathBuf,
-    pub output_dir: PathBuf,
-    /// Slot to bootstrap from. Defaults to the node's finalized checkpoint.
-    pub bootstrap_slot: Option<u64>,
-    /// Overrides the domain otherwise derived from the node's fork and genesis.
-    pub signing_domain: Option<[u8; 32]>,
-    /// How long to wait after a tick that could make no further progress.
-    pub poll_interval: Duration,
-    /// How often a streaming epoch re-reads gossip and re-evaluates the trigger.
-    /// Sets the resolution of `T2 − T`: the daemon cannot fire between two
-    /// evaluations, so this is the granularity of "the instant enough arrived".
-    pub trigger_interval: Duration,
-    /// How many epochs past the target to keep looking for its attestations.
-    pub attestation_lookahead_epochs: u64,
-    pub pipeline: Pipeline,
-    /// When the streaming pipeline stops collecting, and how long the trigger
-    /// may hold past it. See [`crate::streaming`].
-    pub stream_policy: StreamPolicy,
-    /// Beacon node to follow attestation gossip from. `None` sources
-    /// attestations from blocks instead, which is a slot later and is only what
-    /// the fixture-replay tests want.
-    pub gossip_url: Option<String>,
-    /// File a submitter appends postings to, as JSON lines. `None` means
-    /// nothing is posting these proofs to a chain, which is the default.
-    pub postings_path: Option<PathBuf>,
-    /// The root the caller resolved `chain_name` from, published beside it so a
-    /// reader can check the label rather than take it. `None` leaves the
-    /// orchestrator to fetch it when a signing domain first needs it.
-    pub genesis_validators_root: Option<[u8; 32]>,
-    /// What an hour of this deployment's proving hardware costs. A deployment
-    /// fact the daemon cannot observe, published so a reader can price the
-    /// prover milliseconds it does measure. Nothing here multiplies by it.
-    pub prover_usd_per_hour: Option<f64>,
-}
-
-impl OrchestratorConfig {
-    pub fn new(chain: ChainConfig, chain_name: impl Into<String>) -> Self {
-        Self {
-            chain,
-            chain_name: chain_name.into(),
-            db_path: PathBuf::from("zkasper.db"),
-            output_dir: PathBuf::from("zkasper-out"),
-            bootstrap_slot: None,
-            signing_domain: None,
-            poll_interval: Duration::from_secs(4),
-            trigger_interval: Duration::from_millis(200),
-            attestation_lookahead_epochs: 2,
-            pipeline: Pipeline::default(),
-            stream_policy: StreamPolicy::default(),
-            gossip_url: None,
-            postings_path: None,
-            genesis_validators_root: None,
-            prover_usd_per_hour: None,
-        }
-    }
-}
 
 /// Whether `error` means the node has thrown away a state this run still needs.
 ///
