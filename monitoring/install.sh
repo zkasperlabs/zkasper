@@ -38,15 +38,24 @@ promtool check config /etc/prometheus/prometheus.yml
 
 # Poll the GPU provider often enough that a card left running is caught in
 # minutes, and rarely enough that the account's rate limit never notices.
+#
+# The exporter is copied out of the repository rather than run from it. A cron
+# entry pointing into a checkout breaks the moment that checkout is a worktree
+# that gets cleaned up, a branch that gets switched, or a directory that gets
+# moved — and it breaks silently, which is the one failure mode a cost alert
+# must not have. Re-run this script after editing the exporter.
+exporter=/usr/local/bin/zkasper-vast-exporter
+install -m 0755 "$here/vast_exporter.py" "$exporter"
+
 cron=/etc/cron.d/zkasper-vast-exporter
 cat > "$cron" <<EOF
 # What the GPU account is renting, into node_exporter's textfile collector.
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
-*/2 * * * * root $here/vast_exporter.py >> /var/log/zkasper-vast-exporter.log 2>&1
+*/2 * * * * root $exporter >> /var/log/zkasper-vast-exporter.log 2>&1
 EOF
 chmod 0644 "$cron"
-"$here/vast_exporter.py"
+"$exporter"
 
 systemctl restart prometheus-node-exporter
 systemctl reload prometheus || systemctl restart prometheus
