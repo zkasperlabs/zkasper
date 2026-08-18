@@ -7,6 +7,9 @@ members = [
     "crates/slot-proof-guest",
     "crates/justification-guest",
     "crates/finalization-guest",
+    "crates/group-proof-guest",
+    "crates/aggregation-guest",
+    "crates/stream-final-guest",
     "crates/bench-guest",
 ]
 resolver = "2"

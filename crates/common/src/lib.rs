@@ -4,7 +4,9 @@ extern crate alloc;
 
 pub mod acc;
 pub mod bls;
+pub mod dedup;
 pub mod merkle;
+pub mod miller;
 #[cfg(feature = "count-ops")]
 pub mod op_counter;
 pub mod recursion;

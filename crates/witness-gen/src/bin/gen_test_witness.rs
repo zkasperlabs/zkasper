@@ -508,6 +508,115 @@ fn gen_finalization(output_path: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming: group, aggregation, final
+// ---------------------------------------------------------------------------
+
+/// Run the streaming pipeline over two aggregates and keep every witness it fed
+/// to a circuit.
+///
+/// The three streaming witnesses have to agree with each other — a group's
+/// Miller accumulator is bound by the aggregate that folds it, and the
+/// aggregate's counted-set root by the proof that closes the epoch — so they are
+/// generated from one run rather than assembled separately.
+fn gen_stream(output_path: &str, stage: &str) {
+    use zkasper_common::types::{EpochDiffOutput, PreviousJustification};
+    use zkasper_witness_gen::streaming::{self, StreamPolicy, StreamUnit};
+
+    let data = build_slot_test_data();
+    let epoch = 100u64;
+    let target_root = [0x07u8; 32];
+
+    // The epoch this one finalizes, and the diff that carried the accumulator
+    // from there to here.
+    let finalized_header = BlockHeaderFields {
+        slot: (epoch - 1) * CONFIG.slots_per_epoch,
+        proposer_index: 1234,
+        parent_root: [0x06u8; 32],
+        state_root: [0xABu8; 32],
+        body_root: [0x09u8; 32],
+    };
+    let previous_root = zkasper_common::ssz::block_header_root(
+        finalized_header.slot,
+        finalized_header.proposer_index,
+        &finalized_header.parent_root,
+        &finalized_header.state_root,
+        &finalized_header.body_root,
+    );
+    let previous_commitment =
+        acc::commitment(&data.acc_root, data.total_active_balance - 1_000_000_000);
+
+    let context = streaming::StreamContext {
+        accumulator_commitment: data.commitment,
+        acc_root: data.acc_root,
+        total_active_balance: data.total_active_balance,
+        target_epoch: epoch,
+        target_root,
+        signing_domain: data.signing_domain,
+        group_program_vk: [0; 4],
+        aggregate_program_vk: [0; 4],
+        previous_program_vk: [0; 4],
+        epoch_diff_program_vk: [0; 4],
+        epoch_diff: EpochDiffOutput {
+            prev_accumulator_commitment: previous_commitment,
+            state_root_1: finalized_header.state_root,
+            epoch_1: epoch - 1,
+            accumulator_commitment: data.commitment,
+            acc_root: data.acc_root,
+            total_active_balance: data.total_active_balance,
+            state_root_2: [0xCDu8; 32],
+            epoch_2: epoch,
+        },
+        epoch_diff_proof: Vec::new(),
+        acc_depth: CONFIG.acc_tree_depth,
+    };
+
+    // Two aggregates, half the validators each: the first is a group, the second
+    // carries the epoch over the threshold and is proven inline by the final
+    // proof.
+    let mut seen = std::collections::BTreeSet::new();
+    let units: Vec<StreamUnit> = [(0u64, [0usize, 1]), (1, [2, 3])]
+        .into_iter()
+        .map(|(slot, members)| {
+            let witness = build_slot_witness(
+                &data,
+                epoch,
+                target_root,
+                epoch * CONFIG.slots_per_epoch + slot,
+                &members,
+                &mut seen,
+            );
+            StreamUnit::new(slot, witness.attestations.into_iter().next().unwrap())
+        })
+        .collect();
+
+    let plan = streaming::plan(&units, data.total_active_balance, &StreamPolicy::default());
+    let run = streaming::run_native(
+        &context,
+        &data.tree,
+        &units,
+        &plan,
+        PreviousJustification::Batch(JustificationOutput {
+            accumulator_commitment: previous_commitment,
+            target_epoch: epoch - 1,
+            target_root: previous_root,
+        }),
+        finalized_header,
+    );
+
+    let bytes = match stage {
+        "group-proof" => bincode::serialize(&run.group_witnesses[0]).unwrap(),
+        "aggregation" => bincode::serialize(&run.aggregate_witnesses[0]).unwrap(),
+        "stream-final" => bincode::serialize(&run.final_witness).unwrap(),
+        other => panic!("unknown streaming stage {other}"),
+    };
+    std::fs::write(output_path, &bytes).unwrap();
+    eprintln!(
+        "wrote {stage} witness: {} bytes -> {output_path}",
+        bytes.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -515,7 +624,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
         eprintln!(
-            "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|justification|finalization> <output-path>"
+            "usage: gen-test-witness <bootstrap|epoch-diff|slot-proof|justification|finalization|\
+             group-proof|aggregation|stream-final> <output-path>"
         );
         std::process::exit(1);
     }
@@ -526,6 +636,7 @@ fn main() {
         "slot-proof" => gen_slot_proof(&args[2]),
         "justification" => gen_justification(&args[2]),
         "finalization" => gen_finalization(&args[2]),
+        stage @ ("group-proof" | "aggregation" | "stream-final") => gen_stream(&args[2], stage),
         other => {
             eprintln!("unknown proof type: {other}");
             std::process::exit(1);

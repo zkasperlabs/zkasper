@@ -14,9 +14,13 @@ COST = {
     "decompress": 49_311,
     "g1_add": 2_428,
     "g1_add_complete": 67_854,   # previous path, for the comparison
-    "hash_to_curve": 18_594_336,
-    "miller": 39_299_490,
-    "final_exp": 169_455_773,
+    "hash_to_curve": 18_594_521,
+    # Marginal Miller loop and the fixed cost of the batch that holds it, split
+    # apart in BENCHMARKS.md. The old single figure of 39,299,490 folded the
+    # per-pair validation of `pairing_check_safe_bls12_381` into the loop.
+    "miller": 33_222_822,
+    "miller_batch": 39_633_399,
+    "final_exp": 132_665_557,
     "proof_base": 293_601_280,
 }
 
@@ -49,6 +53,7 @@ def epoch_cost(validators, attestations_per_slot, leaf_cost, decompress_per_atte
     pubkeys = per_slot_attesters * (add_cost + (COST["decompress"] if decompress_per_attester else 0))
     bls = (
         attestations_per_slot * COST["hash_to_curve"]
+        + COST["miller_batch"]
         + (attestations_per_slot + 1) * COST["miller"]
         + COST["final_exp"]
     )

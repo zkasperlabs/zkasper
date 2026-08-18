@@ -703,3 +703,177 @@ async fn test_ssz_file_gnosis_state_root() {
 
     eprintln!("gnosis state at slot {slot}, {num_validators} validators — state root OK");
 }
+
+// ---------------------------------------------------------------------------
+// Streaming pipeline over the same mainnet epoch
+// ---------------------------------------------------------------------------
+
+/// The streaming schedule against epoch 430529's real attestations.
+///
+/// Same data as `test_ssz_file_finality`, proven the way the pipeline actually
+/// proves it: groups that shrink toward the threshold, a running aggregate that
+/// folds them as they finish, and one final proof that verifies the marginal
+/// aggregate inline and runs the epoch's single final exponentiation.
+///
+/// What it is here to catch is everything the synthetic fixtures cannot — real
+/// aggregate shapes, real duplicate attesters across slots, real participation
+/// — and to print what the schedule chose, which is the number the cost model
+/// is about.
+#[tokio::test]
+#[ignore = "downloads ~320MB"]
+async fn test_ssz_file_streaming_finality() {
+    use zkasper_common::types::{
+        BlockHeaderFields, EpochDiffOutput, JustificationOutput, PreviousJustification,
+    };
+    use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy, StreamUnit};
+
+    init_tracing();
+    const CONFIG: ChainConfig = ChainConfig::MAINNET;
+
+    let path2 = ensure_state(&STATE_2);
+    let mut api = SszFileApi::load(&[(&path2, STATE_2.expected_root)], &ChainConfig::MAINNET);
+    let slot = 13_776_928u64;
+    let epoch = slot / CONFIG.slots_per_epoch;
+
+    let finality_path = ensure_file(FINALITY_DATA);
+    let (target_epoch, target_root) = api.load_finality_data(&finality_path);
+    assert_eq!(target_epoch, epoch);
+
+    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
+        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
+            .await
+            .unwrap();
+
+    let raw_ssz = &api.get_state(&slot.to_string()).raw_ssz;
+    let signing_domain = zkasper_common::bls::compute_domain(
+        &zkasper_common::bls::DOMAIN_BEACON_ATTESTER,
+        &ssz_state::extract_fork_version(raw_ssz),
+        &ssz_state::extract_genesis_validators_root(raw_ssz),
+    );
+
+    let slots = zkasper_witness_gen::witness_slot_proof::build_per_slot(
+        &api,
+        &CONFIG,
+        &tree,
+        target_epoch,
+        target_root,
+        total_active_balance,
+        signing_domain,
+    )
+    .await
+    .unwrap();
+
+    // One unit per aggregate attestation, in the order the chain published them.
+    let units: Vec<StreamUnit> = slots
+        .iter()
+        .flat_map(|s| {
+            s.witness
+                .attestations
+                .iter()
+                .map(move |a| StreamUnit::new(s.slot, a.clone()))
+        })
+        .collect();
+
+    // The previous epoch's justification, and the diff that carried the
+    // accumulator into this one. Their proofs are empty, which is what native
+    // recursion accepts; their public values are what the circuit binds.
+    let finalized_header = BlockHeaderFields {
+        slot: (target_epoch - 1) * CONFIG.slots_per_epoch,
+        proposer_index: 1,
+        parent_root: [0x06; 32],
+        state_root: [0xAB; 32],
+        body_root: [0x09; 32],
+    };
+    let previous_root = zkasper_common::ssz::block_header_root(
+        finalized_header.slot,
+        finalized_header.proposer_index,
+        &finalized_header.parent_root,
+        &finalized_header.state_root,
+        &finalized_header.body_root,
+    );
+    let previous_commitment = zkasper_common::acc::commitment(&[7, 7, 7, 7], total_active_balance);
+    let commitment = zkasper_common::acc::commitment(&tree.root(), total_active_balance);
+
+    let context = StreamContext {
+        accumulator_commitment: commitment,
+        acc_root: tree.root(),
+        total_active_balance,
+        target_epoch,
+        target_root,
+        signing_domain,
+        group_program_vk: [1; 4],
+        aggregate_program_vk: [2; 4],
+        previous_program_vk: [3; 4],
+        epoch_diff_program_vk: [4; 4],
+        epoch_diff: EpochDiffOutput {
+            prev_accumulator_commitment: previous_commitment,
+            state_root_1: finalized_header.state_root,
+            epoch_1: target_epoch - 1,
+            accumulator_commitment: commitment,
+            acc_root: tree.root(),
+            total_active_balance,
+            state_root_2: [0xCD; 32],
+            epoch_2: target_epoch,
+        },
+        epoch_diff_proof: Vec::new(),
+        acc_depth: CONFIG.acc_tree_depth,
+    };
+
+    let policy = StreamPolicy::default();
+    let plan = streaming::plan(&units, total_active_balance, &policy);
+    assert!(
+        plan.threshold_reached,
+        "epoch 430529 did not reach the scheduling threshold",
+    );
+
+    let proven_units = plan.groups.concat().len() + plan.tail.len();
+    let tail_attesters: usize = plan
+        .tail
+        .iter()
+        .map(|&i| units[i].attestation.attesting_validators.len())
+        .sum();
+    eprintln!(
+        "units={} proven={} ({:.0}% skipped), groups={:?}, tail attesters={tail_attesters}",
+        units.len(),
+        proven_units,
+        (1.0 - proven_units as f64 / units.len() as f64) * 100.0,
+        plan.groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+    );
+    eprintln!(
+        "attesting_balance={} ({:.1}% of stake)",
+        plan.attesting_balance,
+        plan.attesting_balance as f64 / total_active_balance as f64 * 100.0,
+    );
+
+    let run = streaming::run_native(
+        &context,
+        &tree,
+        &units,
+        &plan,
+        PreviousJustification::Batch(JustificationOutput {
+            accumulator_commitment: previous_commitment,
+            target_epoch: target_epoch - 1,
+            target_root: previous_root,
+        }),
+        finalized_header.clone(),
+    );
+
+    assert_eq!(run.final_output.justified_epoch, target_epoch);
+    assert_eq!(run.final_output.justified_root, target_root);
+    assert_eq!(run.final_output.finalized_epoch, target_epoch - 1);
+    assert_eq!(run.final_output.next_accumulator_commitment, commitment);
+    assert_eq!(run.final_output.accumulator_commitment, previous_commitment);
+    assert_eq!(
+        run.final_output.finalized_state_root,
+        finalized_header.state_root,
+    );
+
+    // The critical path: one proof, one aggregate's worth of attestation work.
+    assert_eq!(run.final_witness.tail.len(), plan.tail.len());
+    assert!(run.final_witness.groups.is_empty());
+    eprintln!(
+        "streaming finality proven: {} group proofs, {} folds, 1 final proof",
+        run.group_outputs.len(),
+        run.aggregate_outputs.len(),
+    );
+}

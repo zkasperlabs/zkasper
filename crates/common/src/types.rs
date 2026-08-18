@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
@@ -357,6 +358,276 @@ impl FinalizationOutput {
             .u64(self.finalized_epoch)
             .bytes32(&self.finalized_root)
             .bytes32(&self.finalized_state_root)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming proof types
+// ---------------------------------------------------------------------------
+
+/// A Miller-loop accumulator in transit.
+///
+/// 72 limbs is past what serde derives for arrays, and past what a proof can
+/// commit publicly, so it travels as private witness bound by a digest.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct MillerAccumulator(#[serde(with = "BigArray")] pub crate::bls::Fp12);
+
+impl Default for MillerAccumulator {
+    fn default() -> Self {
+        Self(crate::bls::FP12_ONE)
+    }
+}
+
+/// Public outputs of a group proof.
+///
+/// A group proof is a slot proof that covers one or more slots and stops short
+/// of the final exponentiation. Everything except `miller_commitment` means what
+/// it does in [`SlotProofOutput`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupProofOutput {
+    pub accumulator_commitment: Digest,
+    pub target_epoch: u64,
+    pub target_root: [u8; 32],
+    pub attesting_balance: u64,
+    pub counted_validators_commitment: Digest,
+    pub num_counted_validators: u64,
+    /// [`crate::acc::commit_fp12`] of this group's Miller-loop accumulator. The
+    /// signatures are *not* verified here — they are verified by whichever proof
+    /// finally runs the exponentiation over the product of every group's
+    /// accumulator.
+    pub miller_commitment: Digest,
+}
+
+/// Public outputs of an aggregation proof: the running state of one epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateOutput {
+    pub accumulator_commitment: Digest,
+    /// Accumulator the *previous* epoch was justified against, taken from the
+    /// epoch diff that links the two.
+    ///
+    /// Verified once, by the fold that opens the epoch, because the diff is
+    /// known at the epoch boundary — long before the last attestation. Carrying
+    /// it here is what keeps that recursive verification off the critical path;
+    /// the final proof only compares it against the justification it is turning
+    /// into a finalization.
+    pub previous_accumulator_commitment: Digest,
+    /// The beacon state the previous epoch's accumulator was built from, from
+    /// the same diff. The final proof pins the finalized block's state root to
+    /// it, which is what lets a consumer check the accumulator chain against the
+    /// finalizations it sees.
+    pub anchor_state_root: [u8; 32],
+    pub target_epoch: u64,
+    pub target_root: [u8; 32],
+    /// Attesting balance accumulated so far, already deduplicated.
+    pub attesting_balance: u64,
+    /// Root of the counted-set tree — which validators have been counted.
+    pub dedup_root: Digest,
+    pub num_counted_validators: u64,
+    /// Commitment to the product of every folded group's Miller accumulator.
+    pub miller_commitment: Digest,
+}
+
+/// Witness for an aggregation proof: extend a running aggregate with finished
+/// group proofs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AggregateWitness {
+    // -- public inputs --
+    pub accumulator_commitment: Digest,
+    pub target_epoch: u64,
+    pub target_root: [u8; 32],
+
+    /// Verification key of the group-proof program.
+    pub group_program_vk: crate::recursion::ProgramVk,
+    /// Verification key of this program, so an aggregate can extend an aggregate.
+    pub aggregate_program_vk: crate::recursion::ProgramVk,
+    /// Verification key of the epoch-diff program.
+    pub epoch_diff_program_vk: crate::recursion::ProgramVk,
+
+    /// The diff that carried the accumulator from the previous epoch to this
+    /// one. Required when `previous` is absent — the fold that opens an epoch is
+    /// the one that establishes the link — and ignored afterwards, since later
+    /// folds inherit it.
+    pub epoch_diff: Option<EpochDiffOutput>,
+    pub epoch_diff_proof: Vec<u64>,
+
+    /// The aggregate being extended. `None` opens the epoch: the counted set is
+    /// empty and the Miller accumulator is 1.
+    pub previous: Option<AggregateOutput>,
+    pub previous_proof: Vec<u64>,
+    /// Miller accumulator behind `previous.miller_commitment`.
+    pub previous_miller: MillerAccumulator,
+
+    /// Groups being folded in, with their proofs and Miller accumulators.
+    pub groups: Vec<GroupProofOutput>,
+    pub group_proofs: Vec<Vec<u64>>,
+    pub group_millers: Vec<MillerAccumulator>,
+    /// Sorted counted indices behind each group's `counted_validators_commitment`.
+    pub counted_indices_per_group: Vec<Vec<u64>>,
+
+    /// Opening of the counted-set tree over every index being added.
+    pub dedup_proof: crate::dedup::DedupProof,
+}
+
+/// A justification of the previous epoch, whichever program proved it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PreviousJustification {
+    /// Produced by `justification-guest`, which folds whole-epoch slot proofs.
+    Batch(JustificationOutput),
+    /// Produced by `stream-final-guest` — the previous epoch of this pipeline.
+    Stream(Box<StreamFinalOutput>),
+}
+
+impl PreviousJustification {
+    /// Accumulator the justification it carries was proven against.
+    pub fn accumulator_commitment(&self) -> Digest {
+        match self {
+            Self::Batch(o) => o.accumulator_commitment,
+            Self::Stream(o) => o.next_accumulator_commitment,
+        }
+    }
+
+    pub fn target_epoch(&self) -> u64 {
+        match self {
+            Self::Batch(o) => o.target_epoch,
+            Self::Stream(o) => o.justified_epoch,
+        }
+    }
+
+    pub fn target_root(&self) -> [u8; 32] {
+        match self {
+            Self::Batch(o) => o.target_root,
+            Self::Stream(o) => o.justified_root,
+        }
+    }
+
+    pub fn public_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Batch(o) => o.public_bytes(),
+            Self::Stream(o) => o.public_bytes(),
+        }
+    }
+}
+
+/// Public outputs of the final proof of an epoch.
+///
+/// Carries both what it justified and what that justification finalizes, so the
+/// next epoch's final proof can consume this one directly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFinalOutput {
+    /// Accumulator the finalized epoch was justified against. Same meaning, and
+    /// same position in the encoding, as [`FinalizationOutput`]'s.
+    pub accumulator_commitment: Digest,
+    /// Accumulator the justified epoch was proven against, linked to the one
+    /// above by the epoch diff this pipeline verified while streaming.
+    pub next_accumulator_commitment: Digest,
+    pub finalized_epoch: u64,
+    pub finalized_root: [u8; 32],
+    /// Beacon state root of the finalized block, opened from its header. See
+    /// [`FinalizationOutput::finalized_state_root`].
+    pub finalized_state_root: [u8; 32],
+    /// The checkpoint this proof justified, published so the next epoch's final
+    /// proof can consume this one as its previous justification.
+    pub justified_epoch: u64,
+    pub justified_root: [u8; 32],
+}
+
+/// Witness for the final proof of an epoch.
+///
+/// This is the only proof on the critical path, so it holds everything that
+/// cannot be known before the last attestation arrives and nothing that can.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamFinalWitness {
+    // -- public inputs --
+    pub accumulator_commitment: Digest,
+    pub target_epoch: u64,
+    pub target_root: [u8; 32],
+    pub signing_domain: [u8; 32],
+
+    // -- private --
+    pub acc_root: Digest,
+    pub total_active_balance: u64,
+
+    pub group_program_vk: crate::recursion::ProgramVk,
+    pub aggregate_program_vk: crate::recursion::ProgramVk,
+    pub previous_program_vk: crate::recursion::ProgramVk,
+    pub epoch_diff_program_vk: crate::recursion::ProgramVk,
+
+    /// The epoch diff linking the previous epoch's accumulator to this one's.
+    /// Only needed when there is no aggregate to inherit it from.
+    pub epoch_diff: Option<EpochDiffOutput>,
+    pub epoch_diff_proof: Vec<u64>,
+
+    /// Running aggregate for this epoch. `None` means the whole epoch is being
+    /// proven inline, which only makes sense for tiny chains and tests.
+    pub aggregate: Option<AggregateOutput>,
+    pub aggregate_proof: Vec<u64>,
+    pub aggregate_miller: MillerAccumulator,
+
+    /// Group proofs that finished too late to be folded into `aggregate`.
+    pub groups: Vec<GroupProofOutput>,
+    pub group_proofs: Vec<Vec<u64>>,
+    pub group_millers: Vec<MillerAccumulator>,
+    pub counted_indices_per_group: Vec<Vec<u64>>,
+
+    /// The marginal attestations that carry the epoch over the threshold,
+    /// proven here rather than in a group proof of their own. One proof stage
+    /// saved is one per-proof floor and one recursion saved from the only
+    /// latency that matters.
+    pub tail: Vec<AttestationWitness>,
+    pub tail_acc_multi_proof: AccMultiProof,
+
+    /// Opening of the counted-set tree over every index counted here.
+    pub dedup_proof: crate::dedup::DedupProof,
+
+    /// The previous epoch's justification, which this proof turns into a
+    /// finalization.
+    pub previous_justification: PreviousJustification,
+    pub previous_justification_proof: Vec<u64>,
+    /// Header of the block being finalized, checked against its root.
+    pub finalized_header: BlockHeaderFields,
+}
+
+impl GroupProofOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .u64(self.target_epoch)
+            .bytes32(&self.target_root)
+            .u64(self.attesting_balance)
+            .digest(&self.counted_validators_commitment)
+            .u64(self.num_counted_validators)
+            .digest(&self.miller_commitment)
+            .finish()
+    }
+}
+
+impl AggregateOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .digest(&self.previous_accumulator_commitment)
+            .bytes32(&self.anchor_state_root)
+            .u64(self.target_epoch)
+            .bytes32(&self.target_root)
+            .u64(self.attesting_balance)
+            .digest(&self.dedup_root)
+            .u64(self.num_counted_validators)
+            .digest(&self.miller_commitment)
+            .finish()
+    }
+}
+
+impl StreamFinalOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .digest(&self.next_accumulator_commitment)
+            .u64(self.finalized_epoch)
+            .bytes32(&self.finalized_root)
+            .bytes32(&self.finalized_state_root)
+            .u64(self.justified_epoch)
+            .bytes32(&self.justified_root)
             .finish()
     }
 }

@@ -3,3 +3,4 @@
 /crates/onchain-verifier/lib/
 /crates/onchain-verifier/out/
 /crates/onchain-verifier/cache/
+scripts/__pycache__/

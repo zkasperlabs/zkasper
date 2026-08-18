@@ -1,9 +1,25 @@
 //! Where proving plugs in.
 //!
 //! The orchestrator never talks to a prover directly, only to [`Prover`]:
-//! witness in, `(public output, proof)` out. That is the whole contract, and it
-//! is the same shape a real Zisk prover has — build the ELF, run
-//! `cargo-zisk prove`, read back the proof words and the committed publics.
+//! witness in, `(public output, proof)` out.
+//!
+//! # One prover, many proofs
+//!
+//! Every method takes `&self`, and that is load-bearing rather than incidental.
+//! Measured on an RTX 5090 against Zisk 1.0.0-alpha, a proof costs 19.52 s
+//! before it computes anything — process startup and 30 GB of GPU allocation —
+//! against 67,452,592 cost units per second once it is running. The SNARK wrap
+//! makes the same point more sharply: `cargo-zisk wrap --minimal -g` takes
+//! 18.4 s of which **0.192 s** is the compression.
+//!
+//! The streaming pipeline exists to make `T2 - T` one proof and a wrap. At
+//! 0.75B cost units that is 11 s of real work, so two cold starts would be
+//! four times the thing they are wrapped around, and the difference between
+//! advertising 12 s and 50 s. An implementation must therefore hold the GPU
+//! allocation open across proofs — one long-running process, or a pool of them,
+//! serving many calls. Shelling out to `cargo-zisk` per proof is not an
+//! acceptable implementation of this trait, and the trait is shaped so that it
+//! does not have to be: `&self`, `Send + Sync`, no per-call setup hook.
 //!
 //! Until there is a GPU to run it on, [`NativeProver`] implements the trait by
 //! running the guest's verification logic natively and returning an empty proof.
@@ -21,17 +37,24 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use anyhow::{anyhow, Result};
 
 use zkasper_common::acc::Digest;
+use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    BootstrapWitness, EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness,
-    JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
+    AggregateOutput, AggregateWitness, BootstrapWitness, EpochDiffOutput, EpochDiffWitness,
+    FinalizationOutput, FinalizationWitness, GroupProofOutput, JustificationOutput,
+    JustificationWitness, SlotProofOutput, SlotProofWitness, StreamFinalOutput, StreamFinalWitness,
 };
 use zkasper_common::ChainConfig;
 
 /// A serialized Zisk proof, as the u64 words a parent proof verifies.
 pub type Proof = Vec<u64>;
 
-/// The five proof stages, in the order the pipeline runs them.
+/// The proof stages, in the order the pipeline runs them.
+///
+/// `SlotProof`, `Justification` and `Finalization` are the whole-epoch path:
+/// prove every slot, fold them once the epoch is over, pair two justifications.
+/// `Group`, `Aggregate` and `StreamFinal` are the streaming path, which proves
+/// the same thing as attestations arrive and collapses the tail into one proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Bootstrap,
@@ -39,6 +62,9 @@ pub enum Stage {
     SlotProof,
     Justification,
     Finalization,
+    Group,
+    Aggregate,
+    StreamFinal,
 }
 
 impl Stage {
@@ -49,6 +75,9 @@ impl Stage {
             Stage::SlotProof => "slot_proof",
             Stage::Justification => "justification",
             Stage::Finalization => "finalization",
+            Stage::Group => "group",
+            Stage::Aggregate => "aggregate",
+            Stage::StreamFinal => "stream_final",
         }
     }
 }
@@ -87,6 +116,20 @@ pub trait Prover: Send + Sync {
         &self,
         witness: &FinalizationWitness,
     ) -> Result<(FinalizationOutput, Proof)>;
+
+    /// A group of slots, proven without finishing the pairing.
+    ///
+    /// Returns the Miller-loop accumulator alongside the output, because it is
+    /// 576 bytes and the output is 256: the parent proof takes it as witness and
+    /// checks it against the commitment in the output.
+    fn prove_group(&self, witness: &SlotProofWitness) -> Result<(GroupProofOutput, Fp12, Proof)>;
+
+    fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)>;
+
+    fn prove_stream_final(
+        &self,
+        witness: &StreamFinalWitness,
+    ) -> Result<(StreamFinalOutput, Proof)>;
 }
 
 /// Runs the guest logic natively and returns an empty proof.
@@ -171,6 +214,42 @@ impl Prover for NativeProver {
     ) -> Result<(FinalizationOutput, Proof)> {
         let output = run_circuit(Stage::Finalization, || {
             zkasper_finalization_guest::verify_finalization(witness)
+        })?;
+        Ok((output, Proof::new()))
+    }
+
+    fn prove_group(&self, witness: &SlotProofWitness) -> Result<(GroupProofOutput, Fp12, Proof)> {
+        let (output, miller) = run_circuit(Stage::Group, || {
+            (
+                zkasper_slot_proof_guest::verify_group_proof_with_depth(
+                    witness,
+                    self.config.acc_tree_depth,
+                ),
+                zkasper_slot_proof_guest::attest(witness, self.config.acc_tree_depth).miller,
+            )
+        })?;
+        Ok((output, miller, Proof::new()))
+    }
+
+    fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)> {
+        let output = run_circuit(Stage::Aggregate, || {
+            zkasper_aggregation_guest::verify_aggregate_with_depth(
+                witness,
+                zkasper_common::dedup::tree_depth(self.config.acc_tree_depth),
+            )
+        })?;
+        Ok((output, Proof::new()))
+    }
+
+    fn prove_stream_final(
+        &self,
+        witness: &StreamFinalWitness,
+    ) -> Result<(StreamFinalOutput, Proof)> {
+        let output = run_circuit(Stage::StreamFinal, || {
+            zkasper_stream_final_guest::verify_stream_final_with_depth(
+                witness,
+                self.config.acc_tree_depth,
+            )
         })?;
         Ok((output, Proof::new()))
     }

@@ -18,8 +18,8 @@ use ziskos::syscalls::{
 };
 use ziskos::zisklib::scalar_mul_bls12_381;
 use ziskos::zisklib::{
-    add_complete_safe_bls12_381, decompress_bls12_381, hash_to_curve_g2_bls12_381, neg_bls12_381,
-    pairing_check_safe_bls12_381,
+    add_complete_safe_bls12_381, decompress_bls12_381, hash_to_curve_g2_bls12_381,
+    is_on_subgroup_twist_bls12_381, neg_bls12_381, pairing_check_safe_bls12_381,
 };
 use zkasper_common::acc;
 use zkasper_common::ssz;
@@ -71,6 +71,23 @@ const MODE_SHUFFLE_SELFTEST: u32 = 15;
 const MODE_SHUFFLE_FAST: u32 = 17;
 /// Native-only: assert the tuned shuffle matches the reference element-for-element.
 const MODE_SHUFFLE_FAST_SELFTEST: u32 = 18;
+
+/// One Fp12 multiplication: folding another proof's Miller accumulator into the
+/// running one, which is what the streaming pipeline does instead of a pairing.
+const MODE_FP12_MUL: u32 = 20;
+/// The final exponentiation on its own, with no Miller loop in front of it.
+const MODE_FINAL_EXP: u32 = 21;
+/// `n` is the batch size: Miller loops only, no final exponentiation. Comparing
+/// two batch sizes gives the marginal Miller loop; comparing against
+/// MODE_PAIRING_BATCH at the same size gives the final exponentiation.
+const MODE_MILLER_BATCH: u32 = 22;
+/// Committing a Miller accumulator so it can cross a proof boundary.
+const MODE_COMMIT_FP12: u32 = 23;
+/// A one-pair Miller loop per iteration: the batch's fixed cost — 63 Fp12
+/// squarings shared by every pair — plus one marginal loop.
+const MODE_MILLER_ONE: u32 = 24;
+/// G2 subgroup check, which every batch pays once on its summed signature.
+const MODE_G2_SUBGROUP: u32 = 25;
 
 const SHUFFLE_ROUND_COUNT: u8 = 90;
 
@@ -190,6 +207,65 @@ fn run(mode: u32, n: usize) -> u64 {
                 g2.push(q);
             }
             pairing_check_safe_bls12_381(&g1, &g2).expect("pairing") as u64
+        }
+
+        MODE_FP12_MUL => {
+            let f = miller_fixture(2);
+            let mut acc = f;
+            for _ in 0..n {
+                acc = zkasper_common::bls::fp12_mul(&acc, &f);
+            }
+            acc[0]
+        }
+
+        MODE_FINAL_EXP => {
+            let f = miller_fixture(2);
+            let mut out = 0u64;
+            for i in 0..n {
+                // Perturb the input so nothing can be hoisted out of the loop.
+                let mut g = f;
+                g[0] ^= i as u64;
+                out ^= zkasper_common::bls::final_exp_is_one(&g) as u64;
+            }
+            out
+        }
+
+        MODE_MILLER_BATCH => miller_fixture(n)[0],
+
+        MODE_MILLER_ONE => {
+            let (g, _) = decompress_bls12_381(&G1_GENERATOR_COMPRESSED).expect("decompress");
+            let neg_g = neg_bls12_381(&g);
+            let q = hash_to_curve_g2_bls12_381(b"zkasper-bench", zkasper_common::bls::ETH_BLS_DST);
+            let mut out = 0u64;
+            for i in 0..n {
+                let p = if i % 2 == 0 { g } else { neg_g };
+                out ^= zkasper_common::miller::miller_loop_batch(&[p], &[q])[0];
+            }
+            out
+        }
+
+        MODE_G2_SUBGROUP => {
+            // Two genuine subgroup points, alternated so nothing is hoisted out
+            // of the loop and every call is a real accepting check.
+            let points = [
+                hash_to_curve_g2_bls12_381(b"zkasper-bench-a", zkasper_common::bls::ETH_BLS_DST),
+                hash_to_curve_g2_bls12_381(b"zkasper-bench-b", zkasper_common::bls::ETH_BLS_DST),
+            ];
+            let mut out = 0u64;
+            for i in 0..n {
+                out ^= is_on_subgroup_twist_bls12_381(&points[i % 2]) as u64;
+            }
+            out
+        }
+
+        MODE_COMMIT_FP12 => {
+            let mut f = miller_fixture(2);
+            let mut out = 0u64;
+            for i in 0..n {
+                f[0] ^= i as u64;
+                out ^= zkasper_common::acc::commit_fp12(&f)[0];
+            }
+            out
         }
 
         MODE_G1_ADD_RAW => {
@@ -339,6 +415,22 @@ fn run(mode: u32, n: usize) -> u64 {
 
         _ => panic!("unknown mode {mode}"),
     }
+}
+
+/// A Miller-loop accumulator over `n` alternating pairs, which multiplies to one
+/// after the final exponentiation.
+fn miller_fixture(n: usize) -> [u64; 72] {
+    let (g, _) = decompress_bls12_381(&G1_GENERATOR_COMPRESSED).expect("decompress");
+    let neg_g = neg_bls12_381(&g);
+    let q = hash_to_curve_g2_bls12_381(b"zkasper-bench", zkasper_common::bls::ETH_BLS_DST);
+
+    let mut g1 = alloc::vec::Vec::with_capacity(n);
+    let mut g2 = alloc::vec::Vec::with_capacity(n);
+    for i in 0..n {
+        g1.push(if i % 2 == 0 { g } else { neg_g });
+        g2.push(q);
+    }
+    zkasper_common::miller::miller_loop_batch(&g1, &g2)
 }
 
 // ---------------------------------------------------------------------------

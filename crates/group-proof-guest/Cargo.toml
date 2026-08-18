@@ -1,0 +1,18 @@
+[package]
+name = "zkasper-group-proof-guest"
+version.workspace = true
+edition.workspace = true
+
+# The circuit lives in `slot-proof-guest`, which the group proof shares every
+# phase with except whether it finishes the pairing. This package exists so the
+# two get separate ELFs, and separate verification keys.
+[[bin]]
+name = "zkasper-group-proof-guest"
+path = "src/main.rs"
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }

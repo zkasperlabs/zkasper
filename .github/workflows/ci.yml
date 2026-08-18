@@ -66,7 +66,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Generate test witnesses for all proof types
         run: |
-          for proof in bootstrap epoch-diff slot-proof justification finalization; do
+          for proof in bootstrap epoch-diff slot-proof justification finalization \
+                       group-proof aggregation stream-final; do
             cargo run --release --bin gen-test-witness -- "$proof" "/tmp/${proof}_input.bin"
           done
 
@@ -89,7 +90,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        proof-type: [bootstrap, epoch-diff, slot-proof, justification, finalization]
+        # The aggregation and stream-final guests are left out deliberately:
+        # their test witnesses carry stub child proofs, which a guest rejects,
+        # and a panicking guest does not return from ziskemu.
+        proof-type: [bootstrap, epoch-diff, slot-proof, group-proof, justification, finalization]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

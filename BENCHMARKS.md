@@ -23,11 +23,47 @@ python3 scripts/bench.py --build
 | G1 decompress — one public key | 49,311 | `arith384_mod` |
 | G1 add — `add_complete_safe_bls12_381` | 67,854 | `bls12_381_curve_add` |
 | G1 add — raw `syscall_bls12_381_curve_add` | 2,428 | `bls12_381_curve_add` |
-| hash-to-curve G2 | 18,594,336 | Fp2 tower |
-| Miller loop (marginal) | 39,299,490 | Fp2 tower |
-| final exponentiation | 169,455,773 | Fp2 tower |
-| pairing check, 2 pairs | 248,054,754 | Fp2 tower |
+| hash-to-curve G2 | 18,594,521 | Fp2 tower |
+| Miller loop, marginal pair | 33,222,822 | Fp2 tower |
+| Miller loop, fixed per batch | 39,633,399 | Fp2 tower |
+| final exponentiation | 132,665,557 | Fp2 tower |
+| Fp12 multiply | 737,503 | Fp2 tower |
+| `acc::commit_fp12` | 78,002 | `poseidon2` |
+| G2 subgroup check | 8,219,617 | Fp2 tower |
+| pairing check, 2 pairs (`pairing_check_safe`) | 248,054,847 | Fp2 tower |
 | **per-proof floor (BASE)** | **293,601,280** | — |
+
+### The pairing numbers were three things in a trench coat
+
+The old table split a two-pair `pairing_check_safe_bls12_381` into "Miller loop
+39,299,490" and "final exponentiation 169,455,773" by measuring the marginal
+pair and subtracting. Both halves were wrong, in opposite directions, and their
+sum was right — which is why nothing caught it until the streaming pipeline
+needed to pay for the halves separately. Measured directly, one pair of a
+multi-pairing is really:
+
+| | cost |
+|---|---:|
+| Miller loop, per pair | 33,222,822 |
+| ...plus what `pairing_check_safe` adds per pair | 6,076,715 |
+| Miller loop, fixed per batch (63 Fp12 squarings) | 39,633,399 |
+| final exponentiation, once per batch | 132,665,557 |
+
+The per-pair extra is on-curve, canonical-form and subgroup validation, and it
+is not needed: public keys come out of accumulator leaves that commit to them,
+message points come out of `hash_to_curve` with the cofactor cleared, and the
+only input an attacker chooses freely — the summed signature — is subgroup
+checked explicitly for 8,219,617. Driving the Miller loop directly saves that
+6,076,715 per pair on top of everything the split buys.
+
+The fixed 39,633,399 is the 63 squarings of `f` that every pair in a batch
+shares, which is why a batch is worth having and why splitting an epoch into
+seven groups costs seven of them rather than one.
+
+Reconciling: 39,633,399 + 2 x 33,222,822 + 2 x 6,076,715 + 132,665,557 =
+250,898,030, against the 248,054,847 a two-pair check actually costs. The 1.1%
+left over is the batch's own vector handling, which the marginal measurement
+attributes to the pair.
 
 ## What the numbers decided
 
@@ -174,3 +210,126 @@ decompressions, about 197K against a 575M total. The saving is per attester, so
 it only shows up at a scale this fixture does not reach; that is what
 `scripts/mainnet_cost.py` is for. What the run does show is that the proof is
 half floor and the accumulator work is 0.01% of the total.
+
+
+## Streaming: what `T2 - T` costs
+
+`T` is when the chain has published enough attestations to justify a checkpoint.
+`T2` is when a proof of it exists. Everything else about proving cost is a
+budget question; this is the only latency a bridge sees.
+
+The pipeline is built so that the only thing between them is one proof:
+
+| | fixed groups of 8 | streaming |
+|---|---:|---:|
+| proofs after the last attestation | 3 + wrap | 1 + wrap |
+| last group's attestation work | 8 slots | 1 aggregate |
+| final exponentiations in the epoch | one per group | **one** |
+| attestations proven | the whole epoch | up to the threshold |
+
+Four changes get there, and they are worth different amounts.
+
+**Splitting the Miller loop from the final exponentiation.** A group proof
+computes its Miller loops and publishes a commitment to the resulting Fp12
+accumulator; the proof that closes the epoch multiplies them and runs one final
+exponentiation. Worth 132,665,557 per group in *total* cost — about 1B across a
+seven-group epoch. It is **not** what shortens the critical path: the final
+proof verifies the marginal aggregate inline, so it needs a final exponentiation
+either way. Groups that each finished their own pairing would have the same
+`T2 - T` and cost ~2% more.
+
+**Geometrically shrinking groups.** Groups of 12, 6, 3, 1, 1, 1 slots instead of
+four groups of 8. This is the change that moves the critical path, and it moves
+it by the most: eight slots of work become one aggregate's worth. On the real
+mainnet epoch below the schedule chose groups of 37, 15, 10, 2, 1, 3 and 1
+aggregates.
+
+**Stopping at the threshold.** Measured accumulated weight, not a slot number,
+with a margin above 2/3 that only the schedule knows — the circuit enforces
+exactly 2/3, so a thin margin costs a retry and never soundness.
+
+**Collapsing the tail.** One proof verifies the running aggregate, does the
+marginal aggregate inline, runs the final exponentiation, checks the threshold
+and emits the finalization. Saves three per-proof floors and, far more
+importantly on a GPU, three prover invocations.
+
+### Measured, on a real mainnet epoch
+
+`cargo test --release --test ssz_file_tests test_ssz_file_streaming_finality --
+--ignored`, epoch 430529, 2,212,730 validators, 37.17M ETH active:
+
+```
+units=115 proven=70 (39% skipped), groups=[37, 15, 10, 2, 1, 3, 1]
+tail attesters=26813, attesting_balance=71.6% of stake
+7 group proofs, 7 folds, 1 final proof
+```
+
+39% of the epoch's aggregates are never proven at all, and the proof that runs
+after the last attestation covers one aggregate of 26,813 attesters.
+
+### The number
+
+`scripts/streaming_cost.py`, measured constants, the marginal aggregate sized
+from that run:
+
+| | fixed groups of 8 | streaming |
+|---|---:|---:|
+| critical path | 8.597B | **1.418B** |
+| CPU (333.4s + cost/1,244,523 per proof) | 7,908s | **1,473s** |
+| GPU cold (19.52s per invocation) | 205.7s | **60.3s** |
+| GPU warm (allocation held open) | 129.6s | **22.2s** |
+
+**6.1x** in cost units, **5.8x** in GPU wall-clock.
+
+GPU figures use 67,452,592 cost units per second, measured on an RTX 5090
+against Zisk 1.0.0-alpha, plus one wrap invocation at 0.192s of actual
+compression.
+
+**Warm and cold are different products.** The 19.52s "fixed cost" of a proof is
+process startup and 30 GB of GPU allocation, not proving — the wrap measurement
+makes this unmistakable: 18.4s wall-clock around 0.192s of work. Two cold
+invocations are 39s of nothing, which is why the pipeline is only under 30
+seconds on a prover that stays up. `crates/witness-gen/src/prover.rs` documents
+this as a requirement of the trait rather than a deployment note.
+
+### Where the remaining 1.418B is
+
+| | | share |
+|---|---:|---:|
+| accumulator membership, marginal aggregate | 0.709B | 50.0% |
+| per-proof floor | 0.294B | 20.7% |
+| hash-to-curve, Miller loops, subgroup check | 0.133B | 9.4% |
+| final exponentiation | 0.133B | 9.4% |
+| counted-set opening | 0.084B | 5.9% |
+| public key aggregation | 0.065B | 4.6% |
+| Fp12 multiply and commitment | 0.001B | 0.1% |
+
+The critical path is now dominated by opening 26,813 accumulator leaves for the
+one aggregate that crosses the threshold — 0.602B of it internal nodes, 0.107B
+leaves — and not by the pairing, which is what dominated before. Two things follow. A chain with smaller aggregates has a shorter
+critical path for free, since the marginal unit is one aggregate and its size is
+whatever the block builder chose. And the next real win is proving membership
+for a *superset* of the likely marginal attesters before `T`, leaving the final
+proof to select from it: that is the only remaining term that is large and not
+irreducible.
+
+## Composite: the streaming guests
+
+Built for `riscv64ima-zisk-zkvm-elf` and run on the 4-validator test witness:
+
+```
+group proof   STEPS 1,180,802   VARIABLE 135,183,320   BASE 293,601,280   TOTAL 428,784,600
+slot proof    STEPS 2,405,933   VARIABLE 282,009,180   BASE 293,601,280   TOTAL 575,610,460
+```
+
+Same attestations, same membership proof; the group proof is 146,825,860
+cheaper because it does not finish the pairing. That is the final exponentiation
+(132,665,557) plus the per-pair validation the direct Miller loop skips
+(2 x 6,076,715), to within a rounding error.
+
+The aggregation and stream-final guests cannot be measured this way: their
+witnesses carry stub child proofs, and `verify_child` rejects an empty proof
+inside a guest, so they panic — and a panicking guest does not return from
+`ziskemu`. The justification and finalization guests have always had this
+property; it is a property of the fixture, not of the circuits, and it goes away
+with real child proofs.

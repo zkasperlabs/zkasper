@@ -1,0 +1,23 @@
+[package]
+name = "zkasper-stream-final-guest"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "zkasper_stream_final_guest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zkasper-stream-final-guest"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
+zkasper-aggregation-guest = { path = "../aggregation-guest" }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }

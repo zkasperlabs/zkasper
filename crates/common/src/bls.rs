@@ -12,9 +12,11 @@ use ziskos::syscalls::{
 };
 use ziskos::zisklib::{
     add_complete_safe_bls12_381, add_complete_safe_twist_bls12_381, decompress_bls12_381,
-    decompress_twist_bls12_381, hash_to_curve_g2_bls12_381, is_on_subgroup_twist_bls12_381,
-    neg_bls12_381, pairing_check_safe_bls12_381,
+    decompress_twist_bls12_381, final_exp_bls12_381, hash_to_curve_g2_bls12_381,
+    is_on_subgroup_twist_bls12_381, is_one, mul_fp12_bls12_381, neg_bls12_381,
 };
+
+use crate::miller::miller_loop_batch;
 
 use crate::acc::G1Point;
 
@@ -139,62 +141,11 @@ pub fn decompress_pubkey(compressed: &[u8; 48]) -> Option<G1Point> {
     Some(point)
 }
 
-/// FastAggregateVerify: one aggregate signature over one message signed by all
-/// of `pubkeys`.
-///
-/// Checks `e(-aggregate_pubkey, H(msg)) * e(G1, signature) == 1`, which is one
-/// hash-to-curve, two Miller loops and one final exponentiation regardless of
-/// how many keys were aggregated.
-pub fn fast_aggregate_verify(
-    pubkeys: &[G1Point],
-    signing_root: &[u8; 32],
-    signature: &[u8; 96],
-) -> bool {
-    if pubkeys.is_empty() {
-        return false;
-    }
-
-    let Some(agg) = aggregate_points(pubkeys) else {
-        return false;
-    };
-
-    let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(signature) else {
-        return false;
-    };
-    if sig_is_infinity || !is_on_subgroup_twist_bls12_381(&sig) {
-        return false;
-    }
-
-    #[cfg(feature = "count-ops")]
-    {
-        crate::op_counter::inc_hash_to_curve(1);
-        crate::op_counter::inc_miller_loop(2);
-        crate::op_counter::inc_final_exp(1);
-    }
-
-    let q = hash_to_curve_g2_bls12_381(signing_root, ETH_BLS_DST);
-    let neg_agg = neg_bls12_381(&agg);
-
-    matches!(
-        pairing_check_safe_bls12_381(&[neg_agg, G1_GENERATOR], &[q, sig]),
-        Ok(true)
-    )
-}
-
-/// Verify an aggregate signature, panicking on failure.
-pub fn verify_aggregate_signature(
-    pubkeys: &[G1Point],
-    signing_root: &[u8; 32],
-    signature: &[u8; 96],
-) {
-    assert!(
-        fast_aggregate_verify(pubkeys, signing_root, signature),
-        "BLS aggregate signature verification failed"
-    );
-}
-
 /// Identity element of G2.
 const G2_IDENTITY: [u64; 24] = [0; 24];
+
+/// Identity element of G1.
+const G1_IDENTITY: [u64; 12] = [0; 12];
 
 /// One attestation's signature check: a committee, the message they signed, and
 /// their aggregate signature.
@@ -205,24 +156,87 @@ pub struct SignedMessage<'a> {
     pub signature: &'a [u8; 96],
 }
 
-/// Verify many attestations with a single multi-pairing.
+// ---------------------------------------------------------------------------
+// The pairing, split into its two halves
+// ---------------------------------------------------------------------------
+
+/// An element of Fp12: twelve base-field coefficients, six 64-bit limbs each.
 ///
-/// Checking each attestation on its own costs two Miller loops and a final
-/// exponentiation. The final exponentiation is by far the most expensive part
-/// and only has to happen once, so folding `n` attestations into one check
-/// costs `n + 1` Miller loops and a single final exponentiation:
+/// This is what a multi-pairing looks like *before* the final exponentiation,
+/// and it is the value a streaming group proof hands to its parent. 576 bytes,
+/// which is more than the 256 a proof can commit publicly, so it travels as
+/// private witness and is bound by [`crate::acc::commit_fp12`].
+pub type Fp12 = [u64; 72];
+
+/// Multiplicative identity of Fp12 — an empty Miller-loop accumulator.
+pub const FP12_ONE: Fp12 = {
+    let mut one = [0u64; 72];
+    one[0] = 1;
+    one
+};
+
+/// Multiply two Miller-loop accumulators.
 ///
-/// ```text
-/// prod_i e(-aggregate_pubkey_i, H(msg_i)) * e(G1, sum_i signature_i) == 1
-/// ```
+/// `∏ᵢ e(Pᵢ,Qᵢ) = FinalExp(∏ᵢ MillerLoop(Pᵢ,Qᵢ))`, so accumulators computed by
+/// different proofs over disjoint pair sets combine with a plain Fp12
+/// multiplication and one shared final exponentiation. This is the operation
+/// that lets the expensive half of every signature check happen before the last
+/// attestation arrives.
+pub fn fp12_mul(a: &Fp12, b: &Fp12) -> Fp12 {
+    #[cfg(feature = "count-ops")]
+    crate::op_counter::inc_fp12_mul(1);
+
+    mul_fp12_bls12_381(a, b)
+}
+
+/// Final exponentiation, and the check that the multi-pairing came out at 1.
 ///
-/// Messages must be pairwise distinct, which is what stops a rogue-key attack
-/// from cancelling one attestation against another. Attestations within a slot
-/// carry different `AttestationData`, so their signing roots differ; the check
-/// is enforced here rather than assumed.
-pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
+/// 169,455,773 against 39,299,490 for a Miller loop: this is 81% of a two-pair
+/// pairing check and it is paid once, however many pairs the accumulator
+/// covers. Deferring it to a single proof at the end of the epoch is the whole
+/// point of the split.
+pub fn final_exp_is_one(f: &Fp12) -> bool {
+    #[cfg(feature = "count-ops")]
+    crate::op_counter::inc_final_exp(1);
+
+    is_one(&final_exp_bls12_381(f))
+}
+
+/// The Miller-loop half of [`verify_attestation_batch`]: everything except the
+/// final exponentiation.
+///
+/// Returns `∏ᵢ ML(-aggregate_pubkeyᵢ, H(msgᵢ)) · ML(G1, Σᵢ signatureᵢ)` over the
+/// messages given. The caller multiplies accumulators from other groups into
+/// this one and runs [`final_exp_is_one`] over the product exactly once.
+///
+/// Each group pays its own `ML(G1, Σ signature)` term rather than carrying a
+/// running G2 signature sum between proofs, which costs one extra Miller loop
+/// per group and keeps every group self-contained: nothing but an Fp12 crosses
+/// a proof boundary.
+///
+/// # Validation
+///
+/// `pairing_check_safe_bls12_381` re-derives canonical-form, on-curve and
+/// subgroup checks for every input. Going straight to the Miller loop drops
+/// them, so what replaces each one is stated here:
+///
+/// - **Public keys** are on-curve and canonical because they come out of an
+///   accumulator leaf that commits to them, and the sum of on-curve points is
+///   on-curve. They are not subgroup-checked, deliberately: the consensus spec
+///   checks proof of possession once at deposit time, and a component outside
+///   the r-torsion pairs to 1 against a G2 element of order r, so it cannot
+///   affect the equation.
+/// - **Message points** come from `hash_to_curve_g2`, which clears the cofactor,
+///   so they are in G2 by construction.
+/// - **The signature sum** is the one input an attacker controls freely, and it
+///   *is* subgroup-checked, right here. Without it a signature outside G2 could
+///   satisfy the equation without a discrete log.
+/// - **Identity inputs** are rejected rather than skipped: a Miller loop over an
+///   identity point is undefined, and `pairing_check_safe` silently dropping the
+///   pair would weaken what the remaining pairs have to prove.
+pub fn miller_accumulator(messages: &[SignedMessage]) -> Option<Fp12> {
     if messages.is_empty() {
-        return false;
+        return None;
     }
 
     // Group by signing root, then fold each group into one pairing input.
@@ -247,19 +261,17 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
 
     for m in messages {
         if m.pubkeys.is_empty() {
-            return false;
+            return None;
         }
-        let Some(agg) = aggregate_points(m.pubkeys) else {
-            return false;
-        };
+        let agg = aggregate_points(m.pubkeys)?;
         let Ok((sig, sig_is_infinity)) = decompress_twist_bls12_381(m.signature) else {
-            return false;
+            return None;
         };
         if sig_is_infinity {
-            return false;
+            return None;
         }
         let Ok(sum) = add_complete_safe_twist_bls12_381(&signature_sum, &sig) else {
-            return false;
+            return None;
         };
         signature_sum = sum;
 
@@ -267,7 +279,7 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
             Some(i) => {
                 // Same message as an earlier aggregate: fold the public keys.
                 let Ok(merged) = add_complete_safe_bls12_381(&aggs[i], &agg) else {
-                    return false;
+                    return None;
                 };
                 aggs[i] = merged;
             }
@@ -280,13 +292,19 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
 
     // The individual signatures need no subgroup check of their own: the
     // equation only ever involves their sum, so checking the sum is what binds.
-    if !is_on_subgroup_twist_bls12_381(&signature_sum) {
-        return false;
+    #[cfg(feature = "count-ops")]
+    crate::op_counter::inc_g2_subgroup(1);
+
+    if signature_sum == G2_IDENTITY || !is_on_subgroup_twist_bls12_381(&signature_sum) {
+        return None;
     }
 
     let mut g1_points: Vec<[u64; 12]> = Vec::with_capacity(roots.len() + 1);
     let mut g2_points: Vec<[u64; 24]> = Vec::with_capacity(roots.len() + 1);
     for (root, agg) in roots.iter().zip(&aggs) {
+        if *agg == G1_IDENTITY {
+            return None;
+        }
         #[cfg(feature = "count-ops")]
         crate::op_counter::inc_hash_to_curve(1);
         g1_points.push(neg_bls12_381(agg));
@@ -298,12 +316,60 @@ pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
 
     #[cfg(feature = "count-ops")]
     {
+        crate::op_counter::inc_miller_batch(1);
         crate::op_counter::inc_miller_loop(g1_points.len() as u64);
-        crate::op_counter::inc_final_exp(1);
     }
 
-    matches!(
-        pairing_check_safe_bls12_381(&g1_points, &g2_points),
-        Ok(true)
-    )
+    Some(miller_loop_batch(&g1_points, &g2_points))
+}
+
+/// Verify many attestations with a single multi-pairing.
+///
+/// Checking each attestation on its own costs two Miller loops and a final
+/// exponentiation. The final exponentiation is by far the most expensive part
+/// and only has to happen once, so folding `n` attestations into one check
+/// costs `n + 1` Miller loops and a single final exponentiation:
+///
+/// ```text
+/// prod_i e(-aggregate_pubkey_i, H(msg_i)) * e(G1, sum_i signature_i) == 1
+/// ```
+///
+/// This is [`miller_accumulator`] followed immediately by [`final_exp_is_one`],
+/// for callers that verify a whole batch in one proof. Streaming callers keep
+/// the two apart.
+pub fn verify_attestation_batch(messages: &[SignedMessage]) -> bool {
+    match miller_accumulator(messages) {
+        Some(f) => final_exp_is_one(&f),
+        None => false,
+    }
+}
+
+/// FastAggregateVerify: one aggregate signature over one message signed by all
+/// of `pubkeys`.
+///
+/// Checks `e(-aggregate_pubkey, H(msg)) * e(G1, signature) == 1`, which is one
+/// hash-to-curve, two Miller loops and one final exponentiation regardless of
+/// how many keys were aggregated.
+pub fn fast_aggregate_verify(
+    pubkeys: &[G1Point],
+    signing_root: &[u8; 32],
+    signature: &[u8; 96],
+) -> bool {
+    verify_attestation_batch(&[SignedMessage {
+        pubkeys,
+        signing_root,
+        signature,
+    }])
+}
+
+/// Verify an aggregate signature, panicking on failure.
+pub fn verify_aggregate_signature(
+    pubkeys: &[G1Point],
+    signing_root: &[u8; 32],
+    signature: &[u8; 96],
+) {
+    assert!(
+        fast_aggregate_verify(pubkeys, signing_root, signature),
+        "BLS aggregate signature verification failed"
+    );
 }

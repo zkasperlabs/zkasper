@@ -26,11 +26,29 @@ pub mod cost {
     /// Decompress one 48-byte public key. Only bootstrap and epoch-diff pay it.
     pub const DECOMPRESS: u64 = 49_311;
     /// Hash one message to G2.
-    pub const HASH_TO_CURVE: u64 = 18_594_336;
-    /// One Miller loop — the marginal cost of adding a pair to a multi-pairing.
-    pub const MILLER_LOOP: u64 = 39_299_490;
-    /// Final exponentiation, paid once per multi-pairing however many pairs it has.
-    pub const FINAL_EXP: u64 = 169_455_773;
+    pub const HASH_TO_CURVE: u64 = 18_594_521;
+    /// The marginal cost of adding a pair to a multi-Miller-loop.
+    ///
+    /// Measured against zkasper's own loop, which does not re-validate its
+    /// inputs. Through `pairing_check_safe_bls12_381` the same pair costs
+    /// 39,299,537, the extra 6,076,715 being on-curve and subgroup checks the
+    /// accumulator has already established.
+    pub const MILLER_LOOP: u64 = 33_222_822;
+    /// What any multi-Miller-loop costs before its first pair: 63 Fp12
+    /// squarings, shared by every pair in the batch.
+    pub const MILLER_BATCH: u64 = 39_633_399;
+    /// Final exponentiation, paid once per multi-pairing however many pairs it
+    /// has — and, with the streaming split, once per *epoch* rather than once
+    /// per proof.
+    pub const FINAL_EXP: u64 = 132_665_557;
+    /// One Fp12 multiplication: folding another proof's Miller-loop accumulator
+    /// into the running one. 180x cheaper than the final exponentiation it
+    /// defers, which is the whole trade.
+    pub const FP12_MUL: u64 = 737_503;
+    /// Committing a Miller accumulator so it can cross a proof boundary.
+    pub const COMMIT_FP12: u64 = 78_002;
+    /// G2 subgroup check on a batch's summed signature.
+    pub const G2_SUBGROUP: u64 = 8_219_617;
 
     /// Cost floor every proof pays regardless of what it computes. Roughly one
     /// pairing check, which is why small proofs are almost all overhead.
@@ -78,6 +96,10 @@ counters! {
     pubkey_aggregate => inc_pubkey_aggregate, PUBKEY_AGGREGATE;
     hash_to_curve => inc_hash_to_curve, HASH_TO_CURVE;
     miller_loop => inc_miller_loop, MILLER_LOOP;
+    miller_batch => inc_miller_batch, MILLER_BATCH;
+    fp12_mul => inc_fp12_mul, FP12_MUL;
+    commit_fp12 => inc_commit_fp12, COMMIT_FP12;
+    g2_subgroup => inc_g2_subgroup, G2_SUBGROUP;
     final_exp => inc_final_exp, FINAL_EXP;
     decompress => inc_decompress, DECOMPRESS;
     recursive_verify => inc_recursive_verify_n, RECURSIVE_VERIFY;
@@ -103,6 +125,10 @@ impl OpCounts {
             + self.pubkey_aggregate * cost::PUBKEY_AGGREGATE
             + self.hash_to_curve * cost::HASH_TO_CURVE
             + self.miller_loop * cost::MILLER_LOOP
+            + self.miller_batch * cost::MILLER_BATCH
+            + self.fp12_mul * cost::FP12_MUL
+            + self.commit_fp12 * cost::COMMIT_FP12
+            + self.g2_subgroup * cost::G2_SUBGROUP
             + self.final_exp * cost::FINAL_EXP
     }
 
@@ -112,6 +138,10 @@ impl OpCounts {
             + self.pubkey_aggregate * cost::PUBKEY_AGGREGATE
             + self.hash_to_curve * cost::HASH_TO_CURVE
             + self.miller_loop * cost::MILLER_LOOP
+            + self.miller_batch * cost::MILLER_BATCH
+            + self.fp12_mul * cost::FP12_MUL
+            + self.commit_fp12 * cost::COMMIT_FP12
+            + self.g2_subgroup * cost::G2_SUBGROUP
             + self.final_exp * cost::FINAL_EXP;
         let total = self.cost();
         if total == 0 {
@@ -126,8 +156,8 @@ impl core::fmt::Display for OpCounts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "poseidon2={} acc_leaf={} sha256f={} decompress={} pubkeys={} h2c={} miller={} \
-             final_exp={} recursion={} => cost {}",
+            "poseidon2={} acc_leaf={} sha256f={} decompress={} pubkeys={} h2c={} miller={}+{} \
+             fp12_mul={} final_exp={} recursion={} => cost {}",
             self.poseidon2,
             self.acc_leaf,
             self.sha256f,
@@ -135,6 +165,8 @@ impl core::fmt::Display for OpCounts {
             self.pubkey_aggregate,
             self.hash_to_curve,
             self.miller_loop,
+            self.miller_batch,
+            self.fp12_mul,
             self.final_exp,
             self.recursive_verify,
             self.cost(),

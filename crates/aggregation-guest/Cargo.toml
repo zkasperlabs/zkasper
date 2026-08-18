@@ -1,0 +1,21 @@
+[package]
+name = "zkasper-aggregation-guest"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "zkasper_aggregation_guest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zkasper-aggregation-guest"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }

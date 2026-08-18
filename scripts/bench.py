@@ -30,10 +30,19 @@ MODES = [
     (10, "G1 add (raw precompile)",  200,  400),
     (7, "hash-to-curve G2",           50,  100),
     (8, "pairing check (2 Miller)",   10,   20),
+    (20, "fp12 multiply",             200,  400),
+    (21, "final exponentiation",       10,   20),
+    (23, "commit_fp12",               200,  400),
+    (24, "Miller loop, batch of one",  10,   20),
+    (25, "G2 subgroup check",          10,   20),
 ]
 
 # `n` is the batch size here, so the delta is the cost of one extra Miller loop.
 BATCH = (9, "marginal Miller loop", 2, 10)
+
+# Same, with the final exponentiation left off: the streaming pipeline's group
+# proofs stop here, so this is what they actually pay per attestation.
+BATCH_MILLER_ONLY = (22, "marginal Miller loop (no final exp)", 2, 10)
 
 
 def run(mode, n):
@@ -127,6 +136,13 @@ def main():
     final_exp = pairing2 - 2 * miller
     print(f"{label:<28} {'':>10} {miller:>12,.0f} {'':>12}")
     print(f"{'final exponentiation':<28} {'':>10} {final_exp:>12,.0f} {'':>12}  (pairing check minus 2 Miller loops)")
+
+    mode, label, lo, hi = BATCH_MILLER_ONLY
+    a, b = run(mode, lo), run(mode, hi)
+    miller_split = (b["variable"] - a["variable"]) / (hi - lo)
+    print(f"{label:<28} {'':>10} {miller_split:>12,.0f} {'':>12}  (zkasper's own loop)")
+    print(f"{'  agrees with zisklib':<28} {'':>10} {'':>12} {'':>12}  "
+          f"{abs(miller_split - miller) / miller * 100:.2f}% apart")
     print()
 
     poseidon = next(c for l, _, c, _ in rows if l.startswith("acc::compress")) - baseline_cost

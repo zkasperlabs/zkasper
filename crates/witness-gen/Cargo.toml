@@ -30,6 +30,8 @@ zkasper-epoch-diff-guest = { path = "../epoch-diff-guest" }
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }
 zkasper-finalization-guest = { path = "../finalization-guest" }
+zkasper-aggregation-guest = { path = "../aggregation-guest" }
+zkasper-stream-final-guest = { path = "../stream-final-guest" }
 serde = { workspace = true, features = ["std"] }
 serde_json = "1"
 bincode = { workspace = true }
@@ -55,6 +57,8 @@ zkasper-epoch-diff-guest = { path = "../epoch-diff-guest", features = ["count-op
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }
 zkasper-finalization-guest = { path = "../finalization-guest" }
+zkasper-aggregation-guest = { path = "../aggregation-guest" }
+zkasper-stream-final-guest = { path = "../stream-final-guest" }
 zkasper-common = { path = "../common", features = ["test-utils", "count-ops"] }
 blst = "0.3"
 tempfile = "3"

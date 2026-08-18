@@ -21,6 +21,7 @@ const DOMAIN_NODE: u64 = 0;
 const DOMAIN_LEAF: u64 = 1;
 const DOMAIN_COMMITMENT: u64 = 2;
 const DOMAIN_INDEX_LIST: u64 = 3;
+const DOMAIN_FP12: u64 = 4;
 
 #[inline(always)]
 fn permute(state: &mut [u64; 16]) {
@@ -142,6 +143,41 @@ pub fn commit_indices(sorted_indices: &[u64]) -> Digest {
         if i >= sorted_indices.len() {
             break;
         }
+    }
+    [st[0], st[1], st[2], st[3]]
+}
+
+/// Commitment to a Miller-loop accumulator.
+///
+/// An Fp12 element is 72 u64 limbs — 576 bytes, against the 256 a Zisk proof
+/// can commit publicly. The accumulator therefore travels between proofs as
+/// private witness and this digest is what the child commits to and the parent
+/// checks it against.
+///
+/// Limbs are full 64-bit words and Goldilocks elements are not, so each limb
+/// is split into two 32-bit halves before absorption: 144 elements, eight per
+/// permutation, 18 permutations for the whole element.
+pub fn commit_fp12(f: &crate::bls::Fp12) -> Digest {
+    #[cfg(feature = "count-ops")]
+    crate::op_counter::inc_commit_fp12(1);
+
+    let mut st = [0u64; 16];
+    st[15] = DOMAIN_FP12;
+
+    let mut half = 0usize;
+    while half < 2 * f.len() {
+        let mut rate = [0u64; 8];
+        for (i, slot) in rate.iter_mut().enumerate() {
+            let h = half + i;
+            *slot = if h & 1 == 0 {
+                f[h / 2] & 0xFFFF_FFFF
+            } else {
+                f[h / 2] >> 32
+            };
+        }
+        st[0..8].copy_from_slice(&rate);
+        permute_uncounted(&mut st);
+        half += 8;
     }
     [st[0], st[1], st[2], st[3]]
 }
