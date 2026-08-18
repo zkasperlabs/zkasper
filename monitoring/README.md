@@ -32,6 +32,11 @@ sudo ./monitoring/grafana_cloud.sh    # once the account exists
 
 `install.sh` is idempotent and keeps any `remote_write` block already there.
 
+**One box, two daemons.** `--metrics-addr` defaults to `127.0.0.1:9464` and a
+second daemon will fail to bind it and crash-loop — loudly, which is right, but
+only if you know to expect it. Give the second one `--metrics-addr
+127.0.0.1:9465` and uncomment its target in `prometheus.yml`.
+
 ## What `/metrics` exposes
 
 Namespaced `zkasper_`, in base units, with `_total` on every counter and a
