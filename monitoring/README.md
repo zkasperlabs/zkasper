@@ -68,7 +68,7 @@ histogram wherever the distribution is the point.
 
 | Metric | |
 |---|---|
-| `zkasper_t2_minus_t_seconds` | From holding the attestation that crossed 2/3 to holding a proof of it. **A histogram, because the distribution over hundreds of epochs is the whole point** — a gauge of the last epoch is exactly what a point-in-time check already gives. |
+| `zkasper_t2_minus_t_seconds{follow}` | From holding the attestation that crossed 2/3 to holding a proof of it. **A histogram, because the distribution over hundreds of epochs is the whole point** — a gauge of the last epoch is exactly what a point-in-time check already gives. **Read `follow="live"`**: see below. |
 | `zkasper_trigger_wait_seconds` | The part of that which was the trigger holding back rather than the prover working. |
 | `zkasper_tail_named` | Absentees the final proof opened inline. What makes `T2 − T` large, and what moves when the trigger rule is retuned. Read against `trigger_wait`: the wait is only paying for itself if this falls. |
 | `zkasper_groups_folded_total` | Groups folded before the threshold, the shape the design aims at. |
@@ -138,6 +138,24 @@ latency the project quotes.
 
 It records nothing on a witness-only run — an empty proof is not a verification
 — so the histogram stays empty until a real proof exists to time.
+
+### Why the latency is split by `follow`
+
+The first epoch after a bootstrap or a restart is opened mid-flight. It folds
+nothing before the trigger, so its final proof carries the whole epoch inline —
+the first one this pipeline measured took **185 s against a steady-state 1.2 to
+7 s**. Mixed into one histogram those samples move every quantile and cannot be
+separated again afterwards.
+
+So `follow="live"` is an epoch with at least one group folded before the
+threshold, which is the manifest's own rule for when a latency is real, and
+`follow="catchup"` is everything else. Quote the first; watch the second for
+getting worse. The same label is on `zkasper_trigger_wait_seconds` and
+`zkasper_tail_named`, because they are read against it.
+
+This split exists because the metric found it. The histogram's first live sample
+was a catch-up that landed in `+Inf`, which is also why the ladder now runs to
+five minutes rather than thirty seconds.
 
 ### What is on disk
 
