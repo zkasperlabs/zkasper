@@ -5,7 +5,7 @@
 //! needed to prove the validators field (index 11) against the state root.
 
 use anyhow::{Context, Result};
-use zkasper_common::ssz::sha256_pair;
+use zkasper_common::ssz::{sha256_pair, SLOTS_PER_HISTORICAL_ROOT};
 use zkasper_common::{ChainConfig, ConsensusFork};
 
 /// Result of parsing the SSZ state: proof siblings + computed state root.
@@ -30,6 +30,11 @@ const STATE_TREE_DEPTH: usize = 6;
 
 /// Indices of variable-size fields in the BeaconState (same for Electra and Fulu).
 const VARIABLE_FIELD_INDICES: [usize; 12] = [7, 9, 11, 12, 15, 16, 21, 24, 27, 34, 35, 36];
+
+/// The two ring buffers of slot history, and how many slots they hold.
+const BLOCK_ROOTS_FIELD: usize = 5;
+const STATE_ROOTS_FIELD: usize = 6;
+const HISTORICAL_ROOT_COUNT: usize = SLOTS_PER_HISTORICAL_ROOT as usize;
 
 /// Fixed-portion sizes for the first 37 fields (Electra). Fulu appends one more.
 const FIELD_FIXED_SIZES_ELECTRA: [usize; 37] = [
@@ -167,6 +172,109 @@ pub fn compute_state_root(raw_ssz: &[u8], config: &ChainConfig) -> Result<([u8; 
 
     let (state_root, _siblings) = build_state_tree_and_extract(&field_htrs, 11);
     Ok((state_root, num_validators))
+}
+
+/// What a state records about one slot it has passed.
+pub struct BoundaryProof {
+    /// Root of the state the entries were opened from.
+    pub state_root: [u8; 32],
+    /// `block_roots[slot % 8192]`: the last block at or before that slot.
+    pub block_root: [u8; 32],
+    /// `state_roots[slot % 8192]`: the state at the end of that slot.
+    pub boundary_state_root: [u8; 32],
+    /// Siblings for each, bottom-up: 13 through the vector, 6 through the state.
+    pub block_roots_siblings: Vec<[u8; 32]>,
+    pub state_roots_siblings: Vec<[u8; 32]>,
+}
+
+/// Open what this state records for `slot` out of its two ring buffers.
+///
+/// This is how the finalized epoch's boundary is read when its first slot is
+/// empty: a skipped slot has no header to take a state root off, but every
+/// state that passed the slot recorded one.
+///
+/// `validators_htr` is the one field expensive enough to be worth passing in;
+/// without it the whole registry is hashed again.
+pub fn parse_boundary_proof(
+    raw_ssz: &[u8],
+    validators_htr: Option<[u8; 32]>,
+    config: &ChainConfig,
+    slot: u64,
+) -> Result<BoundaryProof> {
+    let state_slot = extract_slot(raw_ssz);
+    anyhow::ensure!(
+        slot < state_slot && state_slot - slot <= SLOTS_PER_HISTORICAL_ROOT,
+        "the state at slot {state_slot} does not record slot {slot}",
+    );
+
+    let fork = config.fork_at_slot(state_slot);
+    let count = field_count(fork);
+    let ranges = parse_field_ranges(raw_ssz, fork)?;
+    let ring = (slot % SLOTS_PER_HISTORICAL_ROOT) as usize;
+
+    let entry = |field: usize| {
+        let (start, _) = ranges[field];
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&raw_ssz[start + ring * 32..start + ring * 32 + 32]);
+        root
+    };
+    let vector = |field: usize| {
+        let (start, end) = ranges[field];
+        vector_root_and_proof(&raw_ssz[start..end], HISTORICAL_ROOT_COUNT, ring)
+    };
+    let (block_roots_htr, mut block_roots_siblings) = vector(BLOCK_ROOTS_FIELD);
+    let (state_roots_htr, mut state_roots_siblings) = vector(STATE_ROOTS_FIELD);
+
+    let mut field_htrs = [[0u8; 32]; STATE_TREE_LEAVES];
+    for (i, htr) in field_htrs.iter_mut().enumerate().take(count) {
+        let (start, end) = ranges[i];
+        *htr = match i {
+            BLOCK_ROOTS_FIELD => block_roots_htr,
+            STATE_ROOTS_FIELD => state_roots_htr,
+            11 => match validators_htr {
+                Some(known) => known,
+                None => {
+                    let data = &raw_ssz[start..end];
+                    compute_validators_htr(data, (data.len() / SSZ_VALIDATOR_SIZE) as u64)?
+                }
+            },
+            _ => compute_field_htr(i, &raw_ssz[start..end], config),
+        };
+    }
+
+    let (state_root, block_field_siblings) =
+        build_state_tree_and_extract(&field_htrs, BLOCK_ROOTS_FIELD);
+    let (_, state_field_siblings) = build_state_tree_and_extract(&field_htrs, STATE_ROOTS_FIELD);
+    block_roots_siblings.extend(block_field_siblings);
+    state_roots_siblings.extend(state_field_siblings);
+
+    Ok(BoundaryProof {
+        state_root,
+        block_root: entry(BLOCK_ROOTS_FIELD),
+        boundary_state_root: entry(STATE_ROOTS_FIELD),
+        block_roots_siblings,
+        state_roots_siblings,
+    })
+}
+
+/// Merkle root of a `Vector[Root, count]`, with the sibling path to one entry.
+fn vector_root_and_proof(data: &[u8], count: usize, index: usize) -> ([u8; 32], Vec<[u8; 32]>) {
+    let mut level: Vec<[u8; 32]> = (0..count)
+        .map(|i| {
+            let mut chunk = [0u8; 32];
+            chunk.copy_from_slice(&data[i * 32..(i + 1) * 32]);
+            chunk
+        })
+        .collect();
+
+    let mut siblings = Vec::new();
+    let mut idx = index;
+    while level.len() > 1 {
+        siblings.push(level[idx ^ 1]);
+        level = level.chunks(2).map(|p| sha256_pair(&p[0], &p[1])).collect();
+        idx >>= 1;
+    }
+    (level[0], siblings)
 }
 
 /// Read the slot (field 2) directly from raw SSZ — always at offset 40 (8 + 32).
@@ -391,7 +499,7 @@ fn compute_validators_htr(data: &[u8], num_validators: u64) -> Result<[u8; 32]> 
 // -----------------------------------------------------------------------
 
 /// Build a depth-6 tree from 64 field HTRs and extract siblings for the given index.
-fn build_state_tree_and_extract(
+pub(crate) fn build_state_tree_and_extract(
     leaves: &[[u8; 32]; STATE_TREE_LEAVES],
     index: usize,
 ) -> ([u8; 32], Vec<[u8; 32]>) {

@@ -46,7 +46,11 @@ fn make_header(slot: u64, validators: &[ValidatorResponse]) -> HeaderResponse {
     let validator_roots = build_validator_roots(validators);
     let (ssz_data_root, _) =
         build_validators_ssz_tree(&validator_roots, CONFIG.validators_tree_depth, &[]);
-    let (state_root, _) = make_state_proof(&ssz_data_root, validators.len() as u64);
+    let (state_root, _) = make_state_proof(
+        &ssz_data_root,
+        validators.len() as u64,
+        &zkasper_witness_gen::state_diff::SlotHistory::default(),
+    );
     HeaderResponse {
         slot,
         proposer_index: 0,
@@ -309,26 +313,13 @@ fn gen_justification(output_path: &str) {
 
 fn gen_finalization(output_path: &str) {
     let data = fixture(2);
-    let epoch_e = 100u64;
-    let epoch_e1 = 101u64;
-    // The finalized root must be the header's own root, since the circuit now
-    // opens the header to recover the beacon state root that anchors the
-    // accumulator. Derive the root from the header rather than inventing one.
-    let finalized_header = BlockHeaderFields {
-        slot: epoch_e * 32,
-        proposer_index: 1234,
-        parent_root: [0x06u8; 32],
-        state_root: [0xABu8; 32],
-        body_root: [0x09u8; 32],
-    };
-    let target_root_e = zkasper_common::ssz::block_header_root(
-        finalized_header.slot,
-        finalized_header.proposer_index,
-        &finalized_header.parent_root,
-        &finalized_header.state_root,
-        &finalized_header.body_root,
-    );
-    let target_root_e1 = [0x08u8; 32];
+    let epoch_e = data.epoch - 1;
+    let epoch_e1 = data.epoch;
+    // The finalized root is the checkpoint at epoch E's boundary, and the state
+    // root that anchors the accumulator is what E+1's checkpoint state records
+    // for that slot — two different things whenever the slot is empty.
+    let target_root_e = data.previous_root;
+    let target_root_e1 = data.target_root;
 
     // Epoch E+1 is justified against a *different* accumulator: one validator's
     // effective balance moved over the epoch transition, which is the normal
@@ -336,7 +327,7 @@ fn gen_finalization(output_path: &str) {
     let commitment_e1 = acc::commitment(&data.acc_root, data.total_active_balance - 1_000_000_000);
     let epoch_diff_output = EpochDiffOutput {
         prev_accumulator_commitment: data.accumulator_commitment,
-        state_root_1: finalized_header.state_root,
+        state_root_1: data.previous_state_root,
         epoch_1: epoch_e,
         accumulator_commitment: commitment_e1,
         acc_root: data.acc_root,
@@ -359,7 +350,7 @@ fn gen_finalization(output_path: &str) {
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
         epoch_diff_program_vk: [0; 4],
-        finalized_header,
+        boundary: data.boundary,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]], // stub proofs
         epoch_diff_output,
@@ -395,20 +386,6 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
 
     // The epoch this one finalizes, and the diff that carried the accumulator
     // from there to here.
-    let finalized_header = BlockHeaderFields {
-        slot: (epoch - 1) * CONFIG.slots_per_epoch,
-        proposer_index: 1234,
-        parent_root: [0x06u8; 32],
-        state_root: [0xABu8; 32],
-        body_root: [0x09u8; 32],
-    };
-    let previous_root = zkasper_common::ssz::block_header_root(
-        finalized_header.slot,
-        finalized_header.proposer_index,
-        &finalized_header.parent_root,
-        &finalized_header.state_root,
-        &finalized_header.body_root,
-    );
     let previous_commitment =
         acc::commitment(&data.acc_root, data.total_active_balance - 1_000_000_000);
 
@@ -426,7 +403,7 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
         committee_program_vk: [0; 4],
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_commitment,
-            state_root_1: finalized_header.state_root,
+            state_root_1: data.previous_state_root,
             epoch_1: epoch - 1,
             accumulator_commitment: data.accumulator_commitment,
             acc_root: data.acc_root,
@@ -455,9 +432,9 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
         PreviousJustification::Batch(JustificationOutput {
             accumulator_commitment: previous_commitment,
             target_epoch: epoch - 1,
-            target_root: previous_root,
+            target_root: data.previous_root,
         }),
-        finalized_header,
+        data.boundary.clone(),
     );
 
     let bytes = match stage {

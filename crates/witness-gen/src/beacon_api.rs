@@ -301,6 +301,17 @@ impl HeaderResponse {
             body_root: self.body_root,
         }
     }
+
+    /// The block root this header hashes to.
+    pub fn root(&self) -> [u8; 32] {
+        zkasper_common::ssz::block_header_root(
+            self.slot,
+            self.proposer_index,
+            &self.parent_root,
+            &self.state_root,
+            &self.body_root,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

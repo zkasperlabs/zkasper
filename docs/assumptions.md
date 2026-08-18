@@ -29,6 +29,15 @@ The same argument is stated in `crates/common/src/types.rs`,
 The Solidity verifier stores `latestFinalizedStateRoot` and does not yet
 cross-check it against the diff chain.
 
+The state root a finalization publishes is the one at the epoch's first slot,
+opened out of the justified checkpoint's `state_roots`. It is not the finalized
+block's own state root, and the two differ whenever that slot is empty: the
+checkpoint is then an earlier block, and the boundary state is what the empty
+slots advanced its post-state to. The published value is always the state the
+accumulator was built from, which is what the rule above needs. The same opening
+takes `block_roots` at that slot and requires it to be the finalized root, so the
+checkpoint and the state come from one chain rather than two.
+
 ### The bootstrap state is the root of trust
 
 Bootstrap builds the accumulator from one beacon state that the operator chose.
@@ -203,15 +212,6 @@ One slot carries about 3.1% of the stake, and the epoch that crosses the
 threshold has about 1.85 points of headroom over 2/3. A one-slot reorg of the
 crossing block therefore removes more stake than the headroom holds. Detection
 is what guards this, not margin.
-
-### An epoch whose first slot is empty cannot be finalized
-
-The accumulator is built from the state at the epoch boundary. The finalized
-header names that state only when a block sits on the boundary slot. The
-finalization proof rejects the pair otherwise. Failing to prove such an epoch is
-the correct outcome. The alternative is a proof whose state root names a
-different state than the accumulator used. Covering the empty case needs the
-boundary state root proven out of the `state_roots` list of the finalized state.
 
 ### Under-counting is safe and it happens
 

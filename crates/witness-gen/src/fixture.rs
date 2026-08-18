@@ -18,7 +18,8 @@ use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_AT
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
 use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::types::{
-    AttestationWitness, BlsPubkey, BlsSignature, SlotComplementWitness, ValidatorData,
+    AttestationWitness, BlockHeaderFields, BlsPubkey, BlsSignature, BoundaryAnchor,
+    SlotComplementWitness, ValidatorData,
 };
 use zkasper_common::ChainConfig;
 
@@ -42,6 +43,15 @@ pub struct Epoch {
     pub acc_root: Digest,
     pub total_active_balance: u64,
     pub accumulator_commitment: Digest,
+    /// Checkpoint root of `epoch - 1`, the epoch a finalization finalizes.
+    pub previous_root: [u8; 32],
+    /// State at the end of `epoch - 1`'s first slot, which the accumulator was
+    /// built from. Not the same value as the checkpoint block's own state root
+    /// when that slot is empty — which is the whole reason the anchor exists.
+    pub previous_state_root: [u8; 32],
+    /// The opening a finalization of `epoch - 1` needs, out of this epoch's
+    /// checkpoint state.
+    pub boundary: BoundaryAnchor,
 }
 
 impl Epoch {
@@ -51,6 +61,32 @@ impl Epoch {
     /// `s * per_slot .. (s + 1) * per_slot` — a partition, which is all the
     /// committee proof needs it to be.
     pub fn new(config: ChainConfig, epoch: u64, slots: u64, per_slot: usize) -> Self {
+        let boundary = (epoch - 1) * config.slots_per_epoch;
+        Self::build(config, epoch, slots, per_slot, boundary)
+    }
+
+    /// The same, with the finalized epoch's first slot skipped.
+    ///
+    /// Its checkpoint is then the block two slots earlier, and the boundary
+    /// state is what the empty slots advanced that block's post-state to — a
+    /// state no header names.
+    pub fn with_empty_boundary(
+        config: ChainConfig,
+        epoch: u64,
+        slots: u64,
+        per_slot: usize,
+    ) -> Self {
+        let boundary = (epoch - 1) * config.slots_per_epoch;
+        Self::build(config, epoch, slots, per_slot, boundary - 2)
+    }
+
+    fn build(
+        config: ChainConfig,
+        epoch: u64,
+        slots: u64,
+        per_slot: usize,
+        previous_block_slot: u64,
+    ) -> Self {
         let balance = 32_000_000_000u64;
         let keys: Vec<blst::min_pk::SecretKey> = (0..slots as usize * per_slot)
             .map(|i| {
@@ -116,9 +152,56 @@ impl Epoch {
         )
         .expect("build committees");
 
+        // The epoch this one finalizes, and the state its checkpoint produced.
+        // Both are recorded by this epoch's own checkpoint state, which is what
+        // the finalization opens them out of.
+        let boundary_slot = (epoch - 1) * config.slots_per_epoch;
+        let previous_root = zkasper_common::ssz::block_header_root(
+            previous_block_slot,
+            7,
+            &[0x06; 32],
+            &[0xAB; 32],
+            &[0x09; 32],
+        );
+        let previous_state_root = if previous_block_slot == boundary_slot {
+            [0xAB; 32]
+        } else {
+            // The empty slots after the block advanced its post-state to this.
+            [0xEE; 32]
+        };
+        let opened = crate::state_diff::make_boundary_proof(
+            &[0u8; 32],
+            0,
+            &crate::state_diff::SlotHistory {
+                slot: boundary_slot,
+                block_root: previous_root,
+                state_root: previous_state_root,
+            },
+        );
+        let justified_header = BlockHeaderFields {
+            slot: epoch * config.slots_per_epoch,
+            proposer_index: 3,
+            parent_root: [0x0A; 32],
+            state_root: opened.state_root,
+            body_root: [0x0B; 32],
+        };
+
         Self {
             epoch,
-            target_root: [0x07; 32],
+            target_root: zkasper_common::ssz::block_header_root(
+                justified_header.slot,
+                justified_header.proposer_index,
+                &justified_header.parent_root,
+                &justified_header.state_root,
+                &justified_header.body_root,
+            ),
+            previous_root,
+            previous_state_root,
+            boundary: BoundaryAnchor {
+                justified_header,
+                block_roots_siblings: opened.block_roots_siblings,
+                state_roots_siblings: opened.state_roots_siblings,
+            },
             source_root: [0x01; 32],
             signing_domain: compute_domain(&DOMAIN_BEACON_ATTESTER, &[0x04, 0, 0, 0], &[0xAA; 32]),
             keys,

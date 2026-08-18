@@ -382,7 +382,10 @@ impl Prover for ZiskProver {
         witness: &FinalizationWitness,
     ) -> Result<(FinalizationOutput, Proof)> {
         let output = run_circuit(Stage::Finalization, || {
-            zkasper_finalization_guest::verify_finalization(witness)
+            zkasper_finalization_guest::verify_finalization_with_slots(
+                witness,
+                self.chain.slots_per_epoch,
+            )
         })?;
         let proof = self.prove(Stage::Finalization, witness, &output.public_bytes())?;
         Ok((output, proof))
@@ -415,9 +418,10 @@ impl Prover for ZiskProver {
         witness: &StreamFinalWitness,
     ) -> Result<(StreamFinalOutput, Proof)> {
         let output = run_circuit(Stage::StreamFinal, || {
-            zkasper_stream_final_guest::verify_stream_final_with_depth(
+            zkasper_stream_final_guest::verify_stream_final_with(
                 witness,
                 self.chain.acc_tree_depth,
+                self.chain.slots_per_epoch,
             )
         })?;
         let proof = self.prove(Stage::StreamFinal, witness, &output.public_bytes())?;

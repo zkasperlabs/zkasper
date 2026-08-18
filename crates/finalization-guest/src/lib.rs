@@ -5,6 +5,14 @@ use zkasper_common::types::{FinalizationOutput, FinalizationWitness};
 /// Verify a finalization: two consecutive justification proofs, plus the epoch
 /// diff that links the accumulators they were proved against.
 pub fn verify_finalization(witness: &FinalizationWitness) -> FinalizationOutput {
+    verify_finalization_with_slots(witness, zkasper_common::constants::SLOTS_PER_EPOCH)
+}
+
+/// Finalization verification on a chain whose epoch is not 32 slots long.
+pub fn verify_finalization_with_slots(
+    witness: &FinalizationWitness,
+    slots_per_epoch: u64,
+) -> FinalizationOutput {
     use zkasper_common::recursion::verify_child;
 
     assert_eq!(
@@ -92,52 +100,31 @@ pub fn verify_finalization(witness: &FinalizationWitness) -> FinalizationOutput 
         diff.epoch_2, just_e1.target_epoch,
     );
 
-    // Open the finalized block's header to recover its beacon state root.
+    // Open epoch E's boundary out of the state of epoch E+1's checkpoint.
     //
     // This is what anchors the accumulator chain. epoch-diff proves a registry
     // delta between two claimed state roots but never proves the second is the
     // canonical successor of the first, so a prover can branch the accumulator
-    // onto a fabricated validator set. Publishing the state root of a block that
-    // 2/3 of the real validator set attested to lets a consumer reject any
-    // branch: an attacker would need a real supermajority to name their
+    // onto a fabricated validator set. Publishing the state root of a boundary
+    // that 2/3 of the real validator set attested past lets a consumer reject
+    // any branch: an attacker would need a real supermajority to name their
     // fabricated state, which is the assumption the whole system already rests
     // on.
-    let h = &witness.finalized_header;
-    assert_eq!(
-        zkasper_common::ssz::block_header_root(
-            h.slot,
-            h.proposer_index,
-            &h.parent_root,
-            &h.state_root,
-            &h.body_root,
-        ),
-        just_e.target_root,
-        "finalized header does not hash to the finalized root",
-    );
-
-    // ...and that state root must be the one the accumulator entered epoch E
-    // with.
     //
     // `diff.state_root_1` is the state E's accumulator was built from, which —
     // because diffs chain end to start — is the same value the diff that
     // advanced *into* E published as its `state_root_2`. Pinning it to the
-    // finalized header's state root is what makes the anchoring rule checkable
-    // by a client: the state root a finalization names for epoch E is exactly
-    // the one the accumulator chain passed through at E, so the two can be
-    // compared without a third source.
-    //
-    // It also costs something, and the cost is worth stating. The two agree
-    // only when the epoch's first slot holds a block, because that block's
-    // post-state *is* the epoch-boundary state. When the slot is empty the
-    // checkpoint root is an earlier block whose state root predates the epoch
-    // transition, and this assertion rejects the pair. Failing to prove such an
-    // epoch is the correct outcome: the alternative is a proof whose state root
-    // names a different state than the accumulator used, which fails at every
-    // consumer instead, silently and later.
-    assert_eq!(
-        diff.state_root_1, h.state_root,
-        "epoch {}'s accumulator was built from a different state than the finalized block produced",
+    // boundary the justified chain recorded is what makes the anchoring rule
+    // checkable by a client: the state root a finalization names for epoch E is
+    // exactly the one the accumulator chain passed through at E, so the two can
+    // be compared without a third source.
+    zkasper_common::ssz::open_boundary(
+        &witness.boundary,
         just_e.target_epoch,
+        &just_e.target_root,
+        &just_e1.target_root,
+        &diff.state_root_1,
+        slots_per_epoch,
     );
 
     // Finalized epoch is E, root is E's target root
@@ -146,6 +133,6 @@ pub fn verify_finalization(witness: &FinalizationWitness) -> FinalizationOutput 
         next_accumulator_commitment: just_e1.accumulator_commitment,
         finalized_epoch: just_e.target_epoch,
         finalized_root: just_e.target_root,
-        finalized_state_root: h.state_root,
+        finalized_state_root: diff.state_root_1,
     }
 }

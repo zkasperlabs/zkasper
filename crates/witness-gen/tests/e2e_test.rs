@@ -6,6 +6,7 @@
 mod common;
 
 use common::{make_header, validator_data_to_response, MockBeaconApi};
+use zkasper_witness_gen::state_diff::SlotHistory;
 
 use zkasper_common::acc;
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
@@ -228,7 +229,12 @@ fn test_e2e_full_pipeline() {
         .collect();
 
     let mut mock = MockBeaconApi::new();
-    let header_e = make_header(bootstrap_slot, &responses, TEST_DEPTH);
+    let header_e = make_header(
+        bootstrap_slot,
+        &responses,
+        TEST_DEPTH,
+        &SlotHistory::default(),
+    );
     // Epoch E's checkpoint is the block at its first slot, so its root is that
     // header's own root. The finalization circuit opens the header and checks
     // it against the root the attesters signed.
@@ -353,11 +359,19 @@ fn test_e2e_full_pipeline() {
         .map(|(i, v)| validator_data_to_response(v, i as u64))
         .collect();
 
-    let header_e1 = make_header(slot_e1_0, &responses_e1, TEST_DEPTH);
+    // Epoch E+1's state records what epoch E's boundary produced, which is what
+    // the finalization opens the anchor out of.
+    let history_e = SlotHistory {
+        slot: bootstrap_slot,
+        block_root: target_root_e,
+        state_root: header_e.state_root,
+    };
+    let header_e1 = make_header(slot_e1_0, &responses_e1, TEST_DEPTH, &history_e);
     let target_root_e1 = common::header_root(&header_e1);
     mock.validators
         .insert(slot_e1_0.to_string(), responses_e1.clone());
-    mock.headers.insert(slot_e1_0.to_string(), header_e1);
+    mock.headers
+        .insert(slot_e1_0.to_string(), header_e1.clone());
 
     let old_state = zkasper_witness_gen::EpochState::empty(bootstrap_slot, 4);
     let mut tree_e1 = tree.clone();
@@ -488,15 +502,17 @@ fn test_e2e_full_pipeline() {
     let finalization_witness = FinalizationWitness {
         justification_program_vk: [0; 4],
         epoch_diff_program_vk: [0; 4],
-        finalized_header: header_e.fields(),
+        boundary: common::make_boundary(&header_e1, &responses_e1, TEST_DEPTH, &history_e),
         justification_outputs: vec![just_e_output, just_e1_output],
         justification_proofs: vec![vec![], vec![]],
         epoch_diff_output: diff,
         epoch_diff_proof: vec![],
     };
 
-    let finalization_output =
-        zkasper_finalization_guest::verify_finalization(&finalization_witness);
+    let finalization_output = zkasper_finalization_guest::verify_finalization_with_slots(
+        &finalization_witness,
+        TEST_CONFIG.slots_per_epoch,
+    );
 
     assert_eq!(finalization_output.accumulator_commitment, commitment);
     assert_eq!(

@@ -240,37 +240,107 @@ pub fn build_validator_roots(validators: &[ValidatorResponse]) -> Vec<[u8; 32]> 
 // State proof (BeaconState top-level tree)
 // ---------------------------------------------------------------------------
 
-/// Build a synthetic state proof from a validators data tree root.
+/// The one slot a synthetic state records in its two ring buffers.
 ///
-/// Computes `validators_root = list_hash_tree_root(data_root, length)`,
-/// then walks up a depth-6 BeaconState container tree at field index 11,
-/// returning `(state_root, siblings)`.
+/// A real state records every slot it has passed; a synthetic one only has to
+/// record the boundary a finalization will open out of it, which is the
+/// preceding epoch's. The default is the all-zero history a bootstrap starts
+/// from, and every state after it carries what the state before it produced —
+/// the same induction the real chain runs, so the two agree slot for slot.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SlotHistory {
+    pub slot: u64,
+    pub block_root: [u8; 32],
+    pub state_root: [u8; 32],
+}
+
+/// Build a synthetic BeaconState tree from a validators data tree root.
 ///
-/// The siblings are deterministic placeholders. For production use with a
-/// real beacon node, these would be extracted from the full SSZ state.
-pub fn make_state_proof(data_tree_root: &[u8; 32], list_length: u64) -> ([u8; 32], Vec<[u8; 32]>) {
+/// Everything but `validators`, `block_roots` and `state_roots` is a
+/// deterministic placeholder. For production use with a real beacon node the
+/// whole tree comes out of the SSZ state instead.
+pub fn make_state_proof(
+    data_tree_root: &[u8; 32],
+    list_length: u64,
+    history: &SlotHistory,
+) -> ([u8; 32], Vec<[u8; 32]>) {
+    use zkasper_common::constants::BEACON_STATE_VALIDATORS_FIELD_INDEX;
+
+    let leaves = synthetic_state_leaves(data_tree_root, list_length, history);
+    crate::ssz_state::build_state_tree_and_extract(
+        &leaves,
+        BEACON_STATE_VALIDATORS_FIELD_INDEX as usize,
+    )
+}
+
+/// Open a synthetic state's ring buffers the way [`crate::ssz_state::parse_boundary_proof`]
+/// opens a real one's.
+pub fn make_boundary_proof(
+    data_tree_root: &[u8; 32],
+    list_length: u64,
+    history: &SlotHistory,
+) -> crate::ssz_state::BoundaryProof {
+    let leaves = synthetic_state_leaves(data_tree_root, list_length, history);
+    let (state_root, block_field_siblings) =
+        crate::ssz_state::build_state_tree_and_extract(&leaves, BLOCK_ROOTS_FIELD);
+    let (_, state_field_siblings) =
+        crate::ssz_state::build_state_tree_and_extract(&leaves, STATE_ROOTS_FIELD);
+
+    let mut block_roots_siblings = ring_siblings();
+    let mut state_roots_siblings = ring_siblings();
+    block_roots_siblings.extend(block_field_siblings);
+    state_roots_siblings.extend(state_field_siblings);
+
+    crate::ssz_state::BoundaryProof {
+        state_root,
+        block_root: history.block_root,
+        boundary_state_root: history.state_root,
+        block_roots_siblings,
+        state_roots_siblings,
+    }
+}
+
+const BLOCK_ROOTS_FIELD: usize = 5;
+const STATE_ROOTS_FIELD: usize = 6;
+const RING_DEPTH: usize = 13;
+
+/// The 64 field leaves of a synthetic BeaconState.
+fn synthetic_state_leaves(
+    data_tree_root: &[u8; 32],
+    list_length: u64,
+    history: &SlotHistory,
+) -> [[u8; 32]; 64] {
     use zkasper_common::constants::BEACON_STATE_VALIDATORS_FIELD_INDEX;
     use zkasper_common::ssz::list_hash_tree_root;
 
-    let validators_root = list_hash_tree_root(data_tree_root, list_length);
-    let depth = 6;
-    let mut siblings = Vec::with_capacity(depth);
-    let mut current = validators_root;
-    let mut idx = BEACON_STATE_VALIDATORS_FIELD_INDEX;
-
-    for d in 0..depth {
-        let mut sibling = [0u8; 32];
-        sibling[0] = d as u8;
-        sibling[1] = 0xBE;
-        siblings.push(sibling);
-
-        if idx & 1 == 0 {
-            current = sha256_pair(&current, &sibling);
-        } else {
-            current = sha256_pair(&sibling, &current);
-        }
-        idx >>= 1;
+    let mut leaves = [[0u8; 32]; 64];
+    for (i, leaf) in leaves.iter_mut().enumerate() {
+        leaf[0] = i as u8;
+        leaf[1] = 0xBE;
     }
+    leaves[BLOCK_ROOTS_FIELD] = ring_root(history.slot, &history.block_root);
+    leaves[STATE_ROOTS_FIELD] = ring_root(history.slot, &history.state_root);
+    leaves[BEACON_STATE_VALIDATORS_FIELD_INDEX as usize] =
+        list_hash_tree_root(data_tree_root, list_length);
+    leaves
+}
 
-    (current, siblings)
+/// Root of a `Vector[Root, 8192]` holding `entry` at `slot` and zero elsewhere.
+fn ring_root(slot: u64, entry: &[u8; 32]) -> [u8; 32] {
+    zkasper_common::ssz::compute_ssz_merkle_root(
+        entry,
+        slot % zkasper_common::ssz::SLOTS_PER_HISTORICAL_ROOT,
+        &ring_siblings(),
+    )
+}
+
+/// The zero subtrees that surround the one entry such a vector holds.
+fn ring_siblings() -> Vec<[u8; 32]> {
+    let mut zeros = Vec::with_capacity(RING_DEPTH);
+    let mut zero = [0u8; 32];
+    for _ in 0..RING_DEPTH {
+        zeros.push(zero);
+        zero = sha256_pair(&zero, &zero);
+    }
+    zeros
 }

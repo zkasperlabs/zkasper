@@ -281,7 +281,10 @@ impl Prover for NativeProver {
         witness: &FinalizationWitness,
     ) -> Result<(FinalizationOutput, Proof)> {
         let output = run_circuit(Stage::Finalization, || {
-            zkasper_finalization_guest::verify_finalization(witness)
+            zkasper_finalization_guest::verify_finalization_with_slots(
+                witness,
+                self.config.slots_per_epoch,
+            )
         })?;
         Ok((output, Proof::new()))
     }
@@ -311,9 +314,10 @@ impl Prover for NativeProver {
         witness: &StreamFinalWitness,
     ) -> Result<(StreamFinalOutput, Proof)> {
         let output = run_circuit(Stage::StreamFinal, || {
-            zkasper_stream_final_guest::verify_stream_final_with_depth(
+            zkasper_stream_final_guest::verify_stream_final_with(
                 witness,
                 self.config.acc_tree_depth,
+                self.config.slots_per_epoch,
             )
         })?;
         Ok((output, Proof::new()))

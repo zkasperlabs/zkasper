@@ -21,7 +21,7 @@ use zkasper_common::types::{
 };
 
 use zkasper_witness_gen::beacon_api::ValidatorResponse;
-use zkasper_witness_gen::state_diff::find_mutations;
+use zkasper_witness_gen::state_diff::{find_mutations, SlotHistory};
 
 // -----------------------------------------------------------------------
 // state_diff unit tests
@@ -171,7 +171,7 @@ async fn test_bootstrap_round_trip() {
         .collect();
 
     let mut mock = MockBeaconApi::new();
-    let header = make_header(slot, &responses, TEST_DEPTH);
+    let header = make_header(slot, &responses, TEST_DEPTH, &SlotHistory::default());
     mock.validators.insert(slot.to_string(), responses.clone());
     mock.headers.insert(slot.to_string(), header);
 
@@ -222,8 +222,8 @@ async fn test_epoch_diff_round_trip() {
         .collect();
 
     let mut mock = MockBeaconApi::new();
-    let header_1 = make_header(slot_1, &responses_1, TEST_DEPTH);
-    let header_2 = make_header(slot_2, &responses_2, TEST_DEPTH);
+    let header_1 = make_header(slot_1, &responses_1, TEST_DEPTH, &SlotHistory::default());
+    let header_2 = make_header(slot_2, &responses_2, TEST_DEPTH, &SlotHistory::default());
     mock.validators
         .insert(slot_1.to_string(), responses_1.clone());
     mock.validators
@@ -307,8 +307,8 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
         .collect();
 
     let mut mock = MockBeaconApi::new();
-    let header_1 = make_header(slot_1, &responses_1, TEST_DEPTH);
-    let header_2 = make_header(slot_2, &responses_2, TEST_DEPTH);
+    let header_1 = make_header(slot_1, &responses_1, TEST_DEPTH, &SlotHistory::default());
+    let header_2 = make_header(slot_2, &responses_2, TEST_DEPTH, &SlotHistory::default());
     mock.validators
         .insert(slot_1.to_string(), responses_1.clone());
     mock.validators
@@ -583,7 +583,7 @@ fn linked_accumulators() -> (acc::Digest, acc::Digest, EpochDiffOutput) {
         prev_accumulator_commitment: commitment_e,
         // Matches the finalized block's state root: the accumulator for epoch E
         // is built from the state that block produced.
-        state_root_1: fin_header().state_root,
+        state_root_1: fin().boundary_state_root,
         epoch_1: 100,
         accumulator_commitment: commitment_e1,
         acc_root,
@@ -602,7 +602,7 @@ fn finalization_witness(
     FinalizationWitness {
         justification_program_vk: [0; 4],
         epoch_diff_program_vk: [0; 4],
-        finalized_header: fin_header(),
+        boundary: fin().anchor,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
         epoch_diff_output,
@@ -622,7 +622,7 @@ fn test_finalization_round_trip() {
     let just_e1 = JustificationOutput {
         accumulator_commitment: commitment_e1,
         target_epoch: 101,
-        target_root: [8u8; 32],
+        target_root: fin().justified_root,
     };
 
     let output = zkasper_finalization_guest::verify_finalization(&finalization_witness(
@@ -633,7 +633,96 @@ fn test_finalization_round_trip() {
     assert_eq!(output.next_accumulator_commitment, commitment_e1);
     assert_eq!(output.finalized_epoch, 100);
     assert_eq!(output.finalized_root, fin_root());
-    assert_eq!(output.finalized_state_root, fin_header().state_root);
+    assert_eq!(output.finalized_state_root, fin().boundary_state_root);
+}
+
+/// An epoch whose first slot is empty finalizes like any other.
+///
+/// Its checkpoint is the block two slots earlier, so the boundary state is not
+/// that block's post-state — the empty slots advanced it. The finalization
+/// therefore names a state root no header carries, which is what opening the
+/// justified checkpoint's `state_roots` is for. Reading it off the finalized
+/// header, as this proof used to, rejected the pair instead.
+#[test]
+fn test_finalization_across_an_empty_first_slot() {
+    let empty = boundary(3198, [0xEEu8; 32]);
+    assert_ne!(
+        empty.boundary_state_root,
+        fin().boundary_state_root,
+        "the empty case has to differ from the block's own state root",
+    );
+
+    let (commitment_e, commitment_e1, mut diff) = linked_accumulators();
+    diff.state_root_1 = empty.boundary_state_root;
+
+    let output = zkasper_finalization_guest::verify_finalization(&FinalizationWitness {
+        justification_program_vk: [0; 4],
+        epoch_diff_program_vk: [0; 4],
+        boundary: empty.anchor,
+        justification_outputs: vec![
+            JustificationOutput {
+                accumulator_commitment: commitment_e,
+                target_epoch: 100,
+                target_root: empty.finalized_root,
+            },
+            JustificationOutput {
+                accumulator_commitment: commitment_e1,
+                target_epoch: 101,
+                target_root: empty.justified_root,
+            },
+        ],
+        justification_proofs: vec![vec![], vec![]],
+        epoch_diff_output: diff,
+        epoch_diff_proof: vec![],
+    });
+
+    assert_eq!(output.finalized_epoch, 100);
+    assert_eq!(output.finalized_root, empty.finalized_root);
+    assert_eq!(output.finalized_state_root, empty.boundary_state_root);
+}
+
+/// A finalized root the justified chain does not have at the boundary is not a
+/// checkpoint of that chain, whatever a justification proof says about it.
+#[test]
+#[should_panic(expected = "not the block at the boundary of the justified chain")]
+fn test_finalization_rejects_a_checkpoint_from_another_chain() {
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
+
+    let just_e = JustificationOutput {
+        accumulator_commitment: commitment_e,
+        target_epoch: 100,
+        // A real header root, from a block the justified chain never had there.
+        target_root: boundary(3198, [0xEEu8; 32]).finalized_root,
+    };
+    let just_e1 = JustificationOutput {
+        accumulator_commitment: commitment_e1,
+        target_epoch: 101,
+        target_root: fin().justified_root,
+    };
+
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
+}
+
+/// The opening only means anything against the checkpoint the attesters signed.
+#[test]
+#[should_panic(expected = "justified header does not hash to the justified root")]
+fn test_finalization_rejects_a_boundary_opened_off_another_state() {
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
+
+    let just_e = JustificationOutput {
+        accumulator_commitment: commitment_e,
+        target_epoch: 100,
+        target_root: fin_root(),
+    };
+    let just_e1 = JustificationOutput {
+        accumulator_commitment: commitment_e1,
+        target_epoch: 101,
+        // The epoch was justified for one checkpoint; the anchor hangs off
+        // another one's state.
+        target_root: boundary(3198, [0xEEu8; 32]).justified_root,
+    };
+
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
 }
 
 #[test]
@@ -650,7 +739,7 @@ fn test_finalization_rejects_non_consecutive_epochs() {
     let just_e2 = JustificationOutput {
         accumulator_commitment: commitment_e1,
         target_epoch: 102,
-        target_root: [8u8; 32],
+        target_root: fin().justified_root,
     };
 
     zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e2, diff));
@@ -671,7 +760,7 @@ fn test_finalization_rejects_a_diff_from_another_accumulator() {
     let just_e1 = JustificationOutput {
         accumulator_commitment: commitment_e1,
         target_epoch: 101,
-        target_root: [8u8; 32],
+        target_root: fin().justified_root,
     };
 
     zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
@@ -690,7 +779,7 @@ fn test_finalization_rejects_a_diff_to_another_accumulator() {
     let just_e1 = JustificationOutput {
         accumulator_commitment: [99u64; 4],
         target_epoch: 101,
-        target_root: [8u8; 32],
+        target_root: fin().justified_root,
     };
 
     zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
@@ -711,14 +800,14 @@ fn test_finalization_rejects_a_diff_labelled_with_other_epochs() {
     let just_e1 = JustificationOutput {
         accumulator_commitment: commitment_e1,
         target_epoch: 101,
-        target_root: [8u8; 32],
+        target_root: fin().justified_root,
     };
 
     zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
 }
 
 #[test]
-#[should_panic(expected = "built from a different state than the finalized block produced")]
+#[should_panic(expected = "built from a different state than the boundary")]
 fn test_finalization_rejects_an_accumulator_built_off_another_state() {
     let (commitment_e, commitment_e1, mut diff) = linked_accumulators();
     diff.state_root_1 = [0x77u8; 32];
@@ -731,7 +820,7 @@ fn test_finalization_rejects_an_accumulator_built_off_another_state() {
     let just_e1 = JustificationOutput {
         accumulator_commitment: commitment_e1,
         target_epoch: 101,
-        target_root: [8u8; 32],
+        target_root: fin().justified_root,
     };
 
     zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
@@ -773,7 +862,7 @@ fn test_full_justification_to_finalization_pipeline() {
 
     // Build justification for epoch 101, against the accumulator the diff
     // produced rather than the one epoch 100 used.
-    let epoch_101_root = [8u8; 32];
+    let epoch_101_root = fin().justified_root;
     let just_witness_101 = JustificationWitness {
         slot_program_vk: [0; 4],
         committee_program_vk: [0; 4],
@@ -824,23 +913,67 @@ fn make_response(index: u8, balance_eth: u64) -> ValidatorResponse {
 /// Fixed header used by finalization tests, plus the root it hashes to.
 /// The circuit opens the header and checks it against the finalized root, so
 /// tests must derive the root rather than invent one.
-fn fin_header() -> zkasper_common::types::BlockHeaderFields {
-    zkasper_common::types::BlockHeaderFields {
-        slot: 3200,
-        proposer_index: 7,
-        parent_root: [0x06u8; 32],
-        state_root: [0xABu8; 32],
-        body_root: [0x09u8; 32],
+/// Epoch 100's boundary, as epoch 101's checkpoint state records it.
+struct Boundary {
+    /// Root of the last block at or before slot 3200.
+    finalized_root: [u8; 32],
+    /// State at the end of slot 3200, which the accumulator was built from.
+    boundary_state_root: [u8; 32],
+    /// Root of epoch 101's checkpoint block, which the opening hangs off.
+    justified_root: [u8; 32],
+    anchor: zkasper_common::types::BoundaryAnchor,
+}
+
+/// `previous_block_slot` is where epoch 100's checkpoint block actually sits:
+/// the boundary itself when it holds a block, an earlier slot when it is empty.
+fn boundary(previous_block_slot: u64, boundary_state_root: [u8; 32]) -> Boundary {
+    let finalized_root = zkasper_common::ssz::block_header_root(
+        previous_block_slot,
+        7,
+        &[0x06u8; 32],
+        &[0xABu8; 32],
+        &[0x09u8; 32],
+    );
+    let opened = zkasper_witness_gen::state_diff::make_boundary_proof(
+        &[0u8; 32],
+        0,
+        &SlotHistory {
+            slot: 3200,
+            block_root: finalized_root,
+            state_root: boundary_state_root,
+        },
+    );
+    let justified_header = zkasper_common::types::BlockHeaderFields {
+        slot: 3232,
+        proposer_index: 3,
+        parent_root: [0x0Au8; 32],
+        state_root: opened.state_root,
+        body_root: [0x0Bu8; 32],
+    };
+    Boundary {
+        finalized_root,
+        boundary_state_root,
+        justified_root: zkasper_common::ssz::block_header_root(
+            justified_header.slot,
+            justified_header.proposer_index,
+            &justified_header.parent_root,
+            &justified_header.state_root,
+            &justified_header.body_root,
+        ),
+        anchor: zkasper_common::types::BoundaryAnchor {
+            justified_header,
+            block_roots_siblings: opened.block_roots_siblings,
+            state_roots_siblings: opened.state_roots_siblings,
+        },
     }
 }
 
+/// The ordinary case: the epoch's first slot holds a block, so the boundary
+/// state is that block's post-state.
+fn fin() -> Boundary {
+    boundary(3200, [0xABu8; 32])
+}
+
 fn fin_root() -> [u8; 32] {
-    let h = fin_header();
-    zkasper_common::ssz::block_header_root(
-        h.slot,
-        h.proposer_index,
-        &h.parent_root,
-        &h.state_root,
-        &h.body_root,
-    )
+    fin().finalized_root
 }

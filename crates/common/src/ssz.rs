@@ -9,7 +9,7 @@
 use ziskos::syscalls::{syscall_sha256_f, SyscallSha256Params};
 
 use crate::merkle;
-use crate::types::{SszMultiProof, ValidatorData};
+use crate::types::{BoundaryAnchor, SszMultiProof, ValidatorData};
 
 /// SHA-256 initial hash values.
 const IV: [u32; 8] = [
@@ -215,6 +215,113 @@ pub fn block_header_root(
     let n2 = sha256_pair(body_root, &zero);
     let n3 = sha256_pair(&zero, &zero);
     sha256_pair(&sha256_pair(&n0, &n1), &sha256_pair(&n2, &n3))
+}
+
+/// Slots of history a `BeaconState` keeps: `SLOTS_PER_HISTORICAL_ROOT`.
+pub const SLOTS_PER_HISTORICAL_ROOT: u64 = 8192;
+
+/// `BeaconState` field indices of the two ring buffers, spec field order
+/// (phase0/beacon-chain.md).
+const BLOCK_ROOTS_FIELD: u64 = 5;
+const STATE_ROOTS_FIELD: u64 = 6;
+
+/// Depth of a `Vector[Root, 8192]`, plus the six levels of the 64-leaf state
+/// tree above it.
+const HISTORY_PROOF_DEPTH: usize = 13 + 6;
+
+/// Recompute the `BeaconState` root that holds `entry` for `slot` in one of the
+/// two ring buffers.
+///
+/// Both are `Vector[Root, SLOTS_PER_HISTORICAL_ROOT]`, so an entry sits thirteen
+/// levels under one leaf of the state's own 64-leaf tree, and the index through
+/// the joined tree is the field's leaf index followed by the slot's place in the
+/// ring.
+fn state_root_from_history(
+    field: u64,
+    slot: u64,
+    entry: &[u8; 32],
+    siblings: &[[u8; 32]],
+) -> [u8; 32] {
+    assert_eq!(
+        siblings.len(),
+        HISTORY_PROOF_DEPTH,
+        "history proof is not the depth of a BeaconState ring buffer",
+    );
+    compute_ssz_merkle_root(
+        entry,
+        field * SLOTS_PER_HISTORICAL_ROOT + slot % SLOTS_PER_HISTORICAL_ROOT,
+        siblings,
+    )
+}
+
+/// Open the finalized epoch's boundary out of the justified checkpoint's state.
+///
+/// The finalized checkpoint's own header cannot do this. A checkpoint root is
+/// the last block at or *before* the epoch's first slot, so when that slot is
+/// empty the state the accumulator was built from is not that block's
+/// post-state — it is the state the empty slots advanced it to, and no header
+/// carries it. The justified checkpoint is the one block after the boundary
+/// that this proof already trusts, because 2/3 of the stake signed its root as
+/// their target, and a state records every slot it has passed: `block_roots`
+/// gives the checkpoint at the boundary and `state_roots` gives the state at the
+/// end of it, both defined for a skipped slot.
+///
+/// Opening the checkpoint root as well as the state root is what keeps the pair
+/// together. Without it the finalized root would come from one chain and the
+/// state root from another, and the proof would name a state the finalized
+/// block never produced.
+pub fn open_boundary(
+    anchor: &BoundaryAnchor,
+    finalized_epoch: u64,
+    finalized_root: &[u8; 32],
+    justified_root: &[u8; 32],
+    boundary_state_root: &[u8; 32],
+    slots_per_epoch: u64,
+) {
+    let h = &anchor.justified_header;
+    assert_eq!(
+        block_header_root(
+            h.slot,
+            h.proposer_index,
+            &h.parent_root,
+            &h.state_root,
+            &h.body_root,
+        ),
+        *justified_root,
+        "justified header does not hash to the justified root",
+    );
+
+    // A state records slot `n` from `n + 1` on and keeps it for 8192 slots. Both
+    // ends matter: below the first the entry has not been written, above the
+    // second it has been overwritten by a slot 8192 later, and either way the
+    // ring index would open something other than the boundary asked for. On a
+    // real chain the justified checkpoint is at most one epoch past it.
+    let boundary_slot = finalized_epoch * slots_per_epoch;
+    assert!(
+        h.slot > boundary_slot && h.slot - boundary_slot <= SLOTS_PER_HISTORICAL_ROOT,
+        "the justified checkpoint's state does not record the boundary it is asked to open",
+    );
+
+    assert_eq!(
+        state_root_from_history(
+            BLOCK_ROOTS_FIELD,
+            boundary_slot,
+            finalized_root,
+            &anchor.block_roots_siblings,
+        ),
+        h.state_root,
+        "the finalized checkpoint is not the block at the boundary of the justified chain",
+    );
+    assert_eq!(
+        state_root_from_history(
+            STATE_ROOTS_FIELD,
+            boundary_slot,
+            boundary_state_root,
+            &anchor.state_roots_siblings,
+        ),
+        h.state_root,
+        "the finalized epoch's accumulator was built from a different state than the boundary",
+    );
 }
 
 /// Pad a u64 value to a 32-byte LE SSZ chunk.

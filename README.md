@@ -118,7 +118,8 @@ Done:
   aggregate.
 - Streaming pipeline: geometric groups, a threshold trigger, and a collapsed
   tail.
-- Finalization across a real mainnet epoch boundary, on the native prover.
+- Finalization across a real mainnet epoch boundary, on the native prover,
+  including one whose first slot the chain skipped.
 - A measured cost model over every stage.
 
 Open:
@@ -127,8 +128,6 @@ Open:
   measured per-stage times.
 - Recursive verification is unmeasured. It is a model parameter that defaults to
   zero.
-- An epoch whose first slot is empty cannot be finalized. The boundary state
-  root must be proven out of the finalized state `state_roots` list.
 - The Solidity verifier is not integrated with the Zisk proof format.
 - Bootstrap is one proof, and it is not chunked.
 

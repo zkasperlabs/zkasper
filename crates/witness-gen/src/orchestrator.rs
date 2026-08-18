@@ -69,7 +69,7 @@ use tracing::{info, info_span, warn};
 use zkasper_common::acc::Digest;
 use zkasper_common::bls::{compute_domain, fp12_mul, Fp12, DOMAIN_BEACON_ATTESTER, FP12_ONE};
 use zkasper_common::types::{
-    AggregateOutput, BlockHeaderFields, Checkpoint, CommitteeOutput, FinalizationWitness,
+    AggregateOutput, BoundaryAnchor, Checkpoint, CommitteeOutput, FinalizationWitness,
     GroupProofOutput, JustificationOutput, PreviousJustification, SlotProofOutput,
     SlotProofWitness,
 };
@@ -284,10 +284,10 @@ struct StreamAggregator {
     aggregate_miller: Fp12,
     folded_groups: usize,
     /// The epoch this one finalizes, captured when the epoch opened so that
-    /// neither it nor the header below is fetched on the critical path.
+    /// neither it nor the boundary below is opened on the critical path.
     previous: PreviousJustification,
     previous_proof: Proof,
-    finalized_header: BlockHeaderFields,
+    boundary: BoundaryAnchor,
     opened_unix_millis: u64,
     /// Unix ms at which the daemon held enough attestations to justify — `T`.
     crossed_unix_millis: Option<u64>,
@@ -1185,21 +1185,24 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             return Ok(None);
         }
 
-        // The finalized block's header, addressed by its own root. Fetching by
-        // root rather than by slot is what makes this work for a checkpoint
-        // whose first slot was skipped.
-        let header = self
-            .api
-            .get_header(&crate::artifacts::hex0x(&previous.output.target_root))
-            .await
-            .with_context(|| format!("fetch the header of epoch {epoch}'s checkpoint block"))?;
+        let boundary = crate::boundary::build(
+            &self.api,
+            &self.config.chain,
+            &current.output.target_root,
+            epoch,
+            &previous.output.target_root,
+            &epoch_diff.output.state_root_1,
+            &self.snapshot.epoch_state,
+        )
+        .await
+        .with_context(|| format!("open the boundary of epoch {epoch}"))?;
 
         let started = Instant::now();
         self.begin(Stage::Finalization, current.output.target_epoch, None, None);
         let witness = FinalizationWitness {
             justification_program_vk: self.prover.program_vk(Stage::Justification),
             epoch_diff_program_vk: self.prover.program_vk(Stage::EpochDiff),
-            finalized_header: header.fields(),
+            boundary,
             justification_outputs: vec![previous.output.clone(), current.output.clone()],
             justification_proofs: vec![previous.proof.clone(), current.proof.clone()],
             epoch_diff_output: epoch_diff.output,
@@ -1487,11 +1490,17 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 .previous_justification(target_epoch)
                 .context("no justification for the previous epoch to finalize")?;
 
-        let header = self
-            .api
-            .get_header(&crate::artifacts::hex0x(&previous.target_root()))
-            .await
-            .context("fetch the header of the epoch being finalized")?;
+        let boundary = crate::boundary::build(
+            &self.api,
+            &self.config.chain,
+            &target_root,
+            previous.target_epoch(),
+            &previous.target_root(),
+            &epoch_diff.output.state_root_1,
+            &self.snapshot.epoch_state,
+        )
+        .await
+        .context("open the boundary of the epoch being finalized")?;
 
         let state = &self.snapshot.state;
         let context = StreamContext {
@@ -1552,7 +1561,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             folded_groups: 0,
             previous,
             previous_proof,
-            finalized_header: header.fields(),
+            boundary,
             opened_unix_millis: now_unix_millis(),
             crossed_unix_millis: None,
         })
@@ -1716,7 +1725,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             &tail,
             aggregator.previous.clone(),
             aggregator.previous_proof.clone(),
-            aggregator.finalized_header.clone(),
+            aggregator.boundary.clone(),
         );
 
         let (output, proof) = self.prover.prove_stream_final(&witness)?;

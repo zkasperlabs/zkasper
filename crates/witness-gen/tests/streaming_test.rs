@@ -65,7 +65,7 @@ fn run(fixture: &Fixture, plan: &streaming::StreamPlan) -> streaming::StreamRun 
         &fixture.units,
         plan,
         fixture.previous.clone(),
-        fixture.finalized_header.clone(),
+        fixture.epoch.boundary.clone(),
     )
 }
 
@@ -95,7 +95,7 @@ fn streaming_pipeline_justifies_and_finalizes() {
     assert_eq!(run.final_output.finalized_epoch, EPOCH - 1);
     assert_eq!(
         run.final_output.finalized_state_root,
-        fixture.finalized_header.state_root,
+        fixture.epoch.previous_state_root,
     );
     // Both endpoints are published, and they are the epoch diff's — the registry
     // moves between epochs, so a consumer has to be able to check each against
@@ -113,6 +113,64 @@ fn streaming_pipeline_justifies_and_finalizes() {
     let aggregate = run.aggregate_outputs.last().unwrap();
     assert_eq!(aggregate.slots_mask, 0b11111);
     assert_eq!(aggregate.attesting_balance, 10 * BALANCE_GWEI);
+}
+
+/// An epoch whose first slot is empty finalizes like any other.
+///
+/// Its checkpoint is then the last block *before* the boundary, and the state
+/// the accumulator was built from is what the empty slots advanced that block's
+/// post-state to — a state no header names. Reading the anchor off the finalized
+/// header, which is what this proof used to do, cannot see it at all: the two
+/// values differ, and the epoch was rejected. Opening both out of the justified
+/// checkpoint's ring buffers is what makes them separable.
+#[test]
+fn an_empty_first_slot_still_finalizes() {
+    let fixture = common::stream_fixture_empty_boundary(ACC_DEPTH);
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+    let run = run(&fixture, &folded(&plan));
+
+    assert_eq!(run.final_output.finalized_epoch, EPOCH - 1);
+    assert_eq!(run.final_output.finalized_root, fixture.epoch.previous_root);
+
+    // The anchor is the boundary state, not the checkpoint block's own, and the
+    // two are genuinely different values here.
+    assert_eq!(
+        run.final_output.finalized_state_root,
+        fixture.epoch.previous_state_root,
+    );
+    assert_ne!(
+        fixture.epoch.previous_state_root,
+        common::stream_fixture(ACC_DEPTH).epoch.previous_state_root,
+    );
+}
+
+/// The anchor has to be the boundary the justified chain recorded, not one the
+/// prover picked.
+#[test]
+fn an_accumulator_built_off_another_state_is_rejected() {
+    let fixture = common::stream_fixture_empty_boundary(ACC_DEPTH);
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+
+    // Anchor the epoch on the checkpoint block's own state root — the value the
+    // proof used to take, and the wrong one whenever the boundary is empty.
+    let mut forged = fixture;
+    forged.context.epoch_diff.state_root_1 = [0xAB; 32];
+
+    let message = rejection("an accumulator off another state was accepted", || {
+        run(&forged, &folded(&plan));
+    });
+    assert!(
+        message.contains("built from a different state than the boundary"),
+        "unexpected failure: {message}",
+    );
 }
 
 /// The point of the whole design: a group proof succeeds without proving

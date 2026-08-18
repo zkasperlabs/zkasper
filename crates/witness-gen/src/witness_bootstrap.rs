@@ -97,7 +97,13 @@ pub async fn build(
             proof.siblings
         } else {
             // Synthetic fallback for mock-based tests
-            let (computed_state_root, siblings) = make_state_proof(&ssz_data_root, num_validators);
+            // A bootstrap is the base of the chain of synthetic states: nothing
+            // came before it, so it records no boundary.
+            let (computed_state_root, siblings) = make_state_proof(
+                &ssz_data_root,
+                num_validators,
+                &crate::state_diff::SlotHistory::default(),
+            );
             anyhow::ensure!(
                 computed_state_root == state_root,
                 "synthetic state root does not match header"

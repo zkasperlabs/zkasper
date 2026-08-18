@@ -47,6 +47,19 @@ pub fn verify_stream_final_with_depth(
     witness: &StreamFinalWitness,
     acc_depth: u32,
 ) -> StreamFinalOutput {
+    verify_stream_final_with(
+        witness,
+        acc_depth,
+        zkasper_common::constants::SLOTS_PER_EPOCH,
+    )
+}
+
+/// The same, on a chain whose epoch is not 32 slots long.
+pub fn verify_stream_final_with(
+    witness: &StreamFinalWitness,
+    acc_depth: u32,
+    slots_per_epoch: u64,
+) -> StreamFinalOutput {
     assert_eq!(
         acc::commitment(&witness.acc_root, witness.total_active_balance),
         witness.accumulator_commitment,
@@ -246,34 +259,26 @@ pub fn verify_stream_final_with_depth(
         "the finalized epoch was justified against an accumulator the epoch diff does not start from",
     );
 
-    // Open the finalized block's header to recover its beacon state root.
+    // Open the finalized epoch's boundary out of this epoch's checkpoint state.
     //
     // This is what anchors the accumulator chain. epoch-diff proves a registry
     // delta between two claimed state roots but never proves the second is the
     // canonical successor of the first, so a prover can branch the accumulator
-    // onto a fabricated validator set. Publishing the state root of a block that
-    // 2/3 of the real validator set attested to lets a consumer reject any
-    // branch.
-    let h = &witness.finalized_header;
-    assert_eq!(
-        zkasper_common::ssz::block_header_root(
-            h.slot,
-            h.proposer_index,
-            &h.parent_root,
-            &h.state_root,
-            &h.body_root,
-        ),
-        previous.target_root(),
-        "finalized header does not hash to the finalized root",
-    );
-
-    // ...and that state root must be the one the previous epoch's accumulator
-    // was built from, which the epoch diff published as `state_root_1`. Pinning
-    // them together is what lets a client check the accumulator chain against
-    // the finalizations it sees, without a third source.
-    assert_eq!(
-        anchor_state_root, h.state_root,
-        "the finalized epoch's accumulator was built from a different state than its block produced",
+    // onto a fabricated validator set. Publishing the state root of a boundary
+    // that 2/3 of the real validator set attested past lets a consumer reject
+    // any branch.
+    //
+    // The state opened is the one the previous epoch's accumulator was built
+    // from, which the epoch diff published as `state_root_1`. Pinning them
+    // together is what lets a client check the accumulator chain against the
+    // finalizations it sees, without a third source.
+    zkasper_common::ssz::open_boundary(
+        &witness.boundary,
+        previous.target_epoch(),
+        &previous.target_root(),
+        &witness.target_root,
+        &anchor_state_root,
+        slots_per_epoch,
     );
 
     StreamFinalOutput {
@@ -281,7 +286,7 @@ pub fn verify_stream_final_with_depth(
         next_accumulator_commitment: witness.accumulator_commitment,
         finalized_epoch: previous.target_epoch(),
         finalized_root: previous.target_root(),
-        finalized_state_root: h.state_root,
+        finalized_state_root: anchor_state_root,
         justified_epoch: witness.target_epoch,
         justified_root: witness.target_root,
     }

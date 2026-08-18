@@ -91,7 +91,7 @@ use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    AccMultiProof, AggregateOutput, AggregateWitness, BlockHeaderFields, CommitteeOutput,
+    AccMultiProof, AggregateOutput, AggregateWitness, BoundaryAnchor, CommitteeOutput,
     EpochDiffOutput, GroupProofOutput, MillerAccumulator, PreviousJustification, SlotProofWitness,
     StreamFinalWitness,
 };
@@ -1213,7 +1213,7 @@ pub fn final_witness(
     tail: &[&SlotComplement],
     previous_justification: PreviousJustification,
     previous_justification_proof: Vec<u64>,
-    finalized_header: BlockHeaderFields,
+    boundary: BoundaryAnchor,
 ) -> StreamFinalWitness {
     StreamFinalWitness {
         accumulator_commitment: context.accumulator_commitment,
@@ -1251,7 +1251,7 @@ pub fn final_witness(
         tail_committee_multi_proof: committee_multi_proof(committees, tail),
         previous_justification,
         previous_justification_proof,
-        finalized_header,
+        boundary,
     }
 }
 
@@ -1289,7 +1289,7 @@ pub fn run_native(
     units: &[SlotComplement],
     plan: &StreamPlan,
     previous_justification: PreviousJustification,
-    finalized_header: BlockHeaderFields,
+    boundary: BoundaryAnchor,
 ) -> StreamRun {
     let mut group_witnesses = Vec::new();
     let mut group_outputs = Vec::new();
@@ -1354,7 +1354,7 @@ pub fn run_native(
         &tail,
         previous_justification,
         Vec::new(),
-        finalized_header,
+        boundary,
     );
 
     let final_output = zkasper_stream_final_guest::verify_stream_final_with_depth(

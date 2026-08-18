@@ -347,6 +347,34 @@ pub struct BlockHeaderFields {
     pub body_root: [u8; 32],
 }
 
+/// The finalized epoch's boundary, opened out of the justified checkpoint's
+/// state.
+///
+/// A checkpoint root is the last block at or *before* the epoch's first slot,
+/// so when that slot is empty the checkpoint is an earlier block and the
+/// boundary state is not its post-state: the state advanced through the empty
+/// slots after it. Reading the boundary off a block header therefore only works
+/// when the boundary slot holds a block, which is where a proof that reads it
+/// off one stops dead — roughly once every hundred epochs on mainnet.
+///
+/// A beacon state records both values for every slot it has passed:
+/// `block_roots[n % 8192]` is the last block at or before slot `n`, and
+/// `state_roots[n % 8192]` is the state at the end of it. Both are defined for
+/// a skipped slot, where a header is not. The justified checkpoint is the one
+/// block after the boundary that 2/3 of the stake signed for, so its state is
+/// the only one after the boundary this proof already trusts, and it is what
+/// the two openings are rooted in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BoundaryAnchor {
+    /// Header of the justified checkpoint block, checked against the root its
+    /// epoch was justified for.
+    pub justified_header: BlockHeaderFields,
+    /// Siblings opening `block_roots[boundary_slot % 8192]`, bottom-up.
+    pub block_roots_siblings: Vec<[u8; 32]>,
+    /// Siblings opening `state_roots[boundary_slot % 8192]`, bottom-up.
+    pub state_roots_siblings: Vec<[u8; 32]>,
+}
+
 /// Public outputs of a finalization proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizationOutput {
@@ -357,7 +385,7 @@ pub struct FinalizationOutput {
     pub next_accumulator_commitment: Digest,
     pub finalized_epoch: u64,
     pub finalized_root: [u8; 32],
-    /// Beacon state root of the finalized block, opened from its header.
+    /// Beacon state root at the first slot of the finalized epoch.
     ///
     /// This anchors the accumulator to the canonical chain. `epoch-diff` proves
     /// a registry delta between two states but cannot prove the second is the
@@ -369,8 +397,11 @@ pub struct FinalizationOutput {
     ///
     /// The circuit checks this against the epoch diff's `state_root_1`, so it is
     /// the same beacon state the diff advancing *into* the finalized epoch
-    /// published as its `state_root_2`: the post-state of the block at the
-    /// epoch's first slot. A consumer can compare the two values directly.
+    /// published as its `state_root_2`. A consumer can compare the two values
+    /// directly. It is opened from the justified checkpoint's `state_roots`
+    /// rather than read off the finalized block's header, so an epoch whose
+    /// first slot is empty names the state the accumulator actually used. See
+    /// [`BoundaryAnchor`].
     pub finalized_state_root: [u8; 32],
 }
 
@@ -381,8 +412,8 @@ pub struct FinalizationWitness {
     pub justification_program_vk: crate::recursion::ProgramVk,
     /// Verification key of the epoch-diff program.
     pub epoch_diff_program_vk: crate::recursion::ProgramVk,
-    /// Header of the finalized block, checked against `finalized_root`.
-    pub finalized_header: BlockHeaderFields,
+    /// The finalized epoch's boundary, opened out of the justified checkpoint.
+    pub boundary: BoundaryAnchor,
     /// Justification outputs for epochs E and E+1.
     pub justification_outputs: Vec<JustificationOutput>,
     /// Zisk proof words for each justification (empty in native testing mode).
@@ -704,8 +735,8 @@ pub struct StreamFinalWitness {
     /// finalization.
     pub previous_justification: PreviousJustification,
     pub previous_justification_proof: Vec<u64>,
-    /// Header of the block being finalized, checked against its root.
-    pub finalized_header: BlockHeaderFields,
+    /// The finalized epoch's boundary, opened out of the justified checkpoint.
+    pub boundary: BoundaryAnchor,
 }
 
 impl GroupProofOutput {

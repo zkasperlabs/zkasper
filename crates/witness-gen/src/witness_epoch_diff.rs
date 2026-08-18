@@ -14,7 +14,7 @@ use crate::epoch_state::EpochState;
 use crate::ssz_state;
 use crate::state_diff::{
     build_validators_ssz_tree, find_mutations, make_state_proof, validator_response_to_data,
-    validator_response_to_field_leaves, validator_response_to_pubkey_chunks,
+    validator_response_to_field_leaves, validator_response_to_pubkey_chunks, SlotHistory,
 };
 
 /// Build an EpochDiffWitness and update the AccTree in place.
@@ -140,7 +140,7 @@ pub async fn build(
             );
             (proof.state_root, proof.siblings)
         } else {
-            make_state_proof(&old_data_root, num_validators_1)
+            make_state_proof(&old_data_root, num_validators_1, &SlotHistory::default())
         };
 
         // New state proof: always compute fresh
@@ -173,7 +173,21 @@ pub async fn build(
                 "the node does not serve the debug state endpoint; \
                  anchoring this epoch on a synthetic state root",
             );
-            make_state_proof(&new_data_root, num_validators_2)
+            // A synthetic state still records the boundary before it, because
+            // that is what the finalization of the epoch it opens will open.
+            let block_root = match api.get_header(&slot_1.to_string()).await {
+                Ok(header) => header.root(),
+                Err(_) => [0u8; 32],
+            };
+            make_state_proof(
+                &new_data_root,
+                num_validators_2,
+                &SlotHistory {
+                    slot: slot_1,
+                    block_root,
+                    state_root: sr1,
+                },
+            )
         };
 
         (sr1, ss1, sr2, ss2)

@@ -308,6 +308,78 @@ async fn test_ssz_file_bootstrap() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: the boundary opening, against a real skipped slot
+// ---------------------------------------------------------------------------
+
+/// Open a real mainnet epoch boundary out of a real mainnet state, including one
+/// whose first slot the chain skipped.
+///
+/// The state at slot 13,776,928 carries 8192 slots of history, and eight of the
+/// 256 epoch boundaries in that window are empty — about the once-per-hundred
+/// rate a live run sees. Slot 13,776,864 is one of them: `block_roots` there
+/// names an earlier block, so the checkpoint's own state root is not the
+/// boundary state root, and a proof that reads the anchor off the header cannot
+/// name the state the accumulator was built from. Both values come out of the
+/// same state here, and the circuit takes them.
+#[tokio::test]
+#[ignore = "downloads ~320MB"]
+async fn test_ssz_file_empty_boundary() {
+    use zkasper_common::types::BoundaryAnchor;
+
+    init_tracing();
+    const CONFIG: ChainConfig = ChainConfig::MAINNET;
+
+    let path2 = ensure_state(&STATE_2);
+    let api = SszFileApi::load(&[(&path2, STATE_2.expected_root)], &CONFIG);
+    let slot = 13_776_928u64;
+    let state = api.get_state(&slot.to_string());
+
+    // The state's `state_roots` are the states of the slots it passed, which the
+    // other test file pins independently: slot 13,776,608 produced the state
+    // this repository ships as STATE_1.
+    let earlier = ssz_state::parse_boundary_proof(&state.raw_ssz, None, &CONFIG, 13_776_608)
+        .expect("open slot 13,776,608");
+    assert_eq!(
+        hex::encode(earlier.boundary_state_root),
+        STATE_1.expected_root,
+        "state_roots does not hold the state that slot produced",
+    );
+
+    for (boundary_slot, empty) in [(13_776_896u64, false), (13_776_864u64, true)] {
+        let opened = ssz_state::parse_boundary_proof(&state.raw_ssz, None, &CONFIG, boundary_slot)
+            .unwrap_or_else(|e| panic!("open slot {boundary_slot}: {e}"));
+        assert_eq!(opened.state_root, state.header.state_root);
+
+        // A block at the boundary has the boundary state as its own post-state.
+        // A skipped one cannot: its checkpoint is an earlier block, whose state
+        // root the boundary state is a later version of.
+        let previous =
+            ssz_state::parse_boundary_proof(&state.raw_ssz, None, &CONFIG, boundary_slot - 1)
+                .unwrap();
+        assert_eq!(
+            opened.block_root == previous.block_root,
+            empty,
+            "slot {boundary_slot} is not the emptiness the test expects",
+        );
+
+        // And the circuit accepts the pair, with the epoch labels the boundary
+        // slot implies.
+        zkasper_common::ssz::open_boundary(
+            &BoundaryAnchor {
+                justified_header: state.header.fields(),
+                block_roots_siblings: opened.block_roots_siblings,
+                state_roots_siblings: opened.state_roots_siblings,
+            },
+            boundary_slot / CONFIG.slots_per_epoch,
+            &opened.block_root,
+            &state.header.root(),
+            &opened.boundary_state_root,
+            CONFIG.slots_per_epoch,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test: epoch diff witness generation + guest verification
 // ---------------------------------------------------------------------------
 
@@ -768,7 +840,7 @@ async fn test_ssz_file_gnosis_state_root() {
 #[ignore = "downloads ~320MB"]
 async fn test_ssz_file_streaming_finality() {
     use zkasper_common::types::{
-        BlockHeaderFields, EpochDiffOutput, JustificationOutput, PreviousJustification,
+        BoundaryAnchor, EpochDiffOutput, JustificationOutput, PreviousJustification,
     };
     use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy};
 
@@ -826,20 +898,29 @@ async fn test_ssz_file_streaming_finality() {
     // The previous epoch's justification, and the diff that carried the
     // accumulator into this one. Their proofs are empty, which is what native
     // recursion accepts; their public values are what the circuit binds.
-    let finalized_header = BlockHeaderFields {
-        slot: (target_epoch - 1) * CONFIG.slots_per_epoch,
-        proposer_index: 1,
-        parent_root: [0x06; 32],
-        state_root: [0xAB; 32],
-        body_root: [0x09; 32],
-    };
-    let previous_root = zkasper_common::ssz::block_header_root(
-        finalized_header.slot,
-        finalized_header.proposer_index,
-        &finalized_header.parent_root,
-        &finalized_header.state_root,
-        &finalized_header.body_root,
+    //
+    // What the previous epoch's checkpoint and boundary state actually were is
+    // not invented here: both are read out of this state's own ring buffers,
+    // which is where the circuit will open them from.
+    let justified_header = api.get_state(&slot.to_string()).header.clone();
+    assert_eq!(
+        justified_header.root(),
+        target_root,
+        "the block at the boundary is not the checkpoint the chain justified",
     );
+    let opened = ssz_state::parse_boundary_proof(
+        raw_ssz,
+        None,
+        &CONFIG,
+        (target_epoch - 1) * CONFIG.slots_per_epoch,
+    )
+    .unwrap();
+    let boundary = BoundaryAnchor {
+        justified_header: justified_header.fields(),
+        block_roots_siblings: opened.block_roots_siblings,
+        state_roots_siblings: opened.state_roots_siblings,
+    };
+    let previous_root = opened.block_root;
     let previous_commitment = zkasper_common::acc::commitment(&[7, 7, 7, 7], total_active_balance);
     let commitment = zkasper_common::acc::commitment(&tree.root(), total_active_balance);
 
@@ -856,7 +937,7 @@ async fn test_ssz_file_streaming_finality() {
         epoch_diff_program_vk: [4; 4],
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_commitment,
-            state_root_1: finalized_header.state_root,
+            state_root_1: opened.boundary_state_root,
             epoch_1: target_epoch - 1,
             accumulator_commitment: commitment,
             acc_root: tree.root(),
@@ -908,7 +989,7 @@ async fn test_ssz_file_streaming_finality() {
             target_epoch: target_epoch - 1,
             target_root: previous_root,
         }),
-        finalized_header.clone(),
+        boundary,
     );
 
     assert_eq!(run.final_output.justified_epoch, target_epoch);
@@ -918,7 +999,7 @@ async fn test_ssz_file_streaming_finality() {
     assert_eq!(run.final_output.accumulator_commitment, previous_commitment);
     assert_eq!(
         run.final_output.finalized_state_root,
-        finalized_header.state_root,
+        opened.boundary_state_root,
     );
 
     // The critical path: one proof, and only the tail's complement work done

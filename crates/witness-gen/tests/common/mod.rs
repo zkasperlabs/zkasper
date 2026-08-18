@@ -16,8 +16,7 @@ use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_AT
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
 use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::types::{
-    BlockHeaderFields, Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification,
-    ValidatorData,
+    Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification, ValidatorData,
 };
 use zkasper_common::ChainConfig;
 
@@ -29,6 +28,7 @@ use zkasper_witness_gen::beacon_api::{
 };
 use zkasper_witness_gen::fixture::Epoch;
 use zkasper_witness_gen::gossip::AttestationSource;
+use zkasper_witness_gen::state_diff::SlotHistory;
 use zkasper_witness_gen::streaming::StreamContext;
 
 /// A mock beacon API that returns synthetic data for testing.
@@ -208,14 +208,47 @@ pub fn validator_data_to_response(data: &ValidatorData, index: u64) -> Validator
 }
 
 /// Build a HeaderResponse with a computed state root.
-pub fn make_header(slot: u64, validators: &[ValidatorResponse], depth: u32) -> HeaderResponse {
-    let state_root = compute_state_root_from_validators(validators, depth);
+pub fn make_header(
+    slot: u64,
+    validators: &[ValidatorResponse],
+    depth: u32,
+    history: &SlotHistory,
+) -> HeaderResponse {
+    let state_root = compute_state_root_from_validators(validators, depth, history);
     HeaderResponse {
         slot,
         proposer_index: slot % 8,
         state_root,
         parent_root: [0u8; 32],
         body_root: [0u8; 32],
+    }
+}
+
+/// The opening a finalization needs, out of the justified checkpoint's state.
+///
+/// `history` is what that state records for the boundary being finalized: the
+/// checkpoint root there and the state root it produced.
+pub fn make_boundary(
+    justified: &HeaderResponse,
+    validators: &[ValidatorResponse],
+    depth: u32,
+    history: &SlotHistory,
+) -> zkasper_common::types::BoundaryAnchor {
+    use zkasper_witness_gen::state_diff::{
+        build_validator_roots, build_validators_ssz_tree, make_boundary_proof,
+    };
+
+    let validator_roots = build_validator_roots(validators);
+    let (ssz_data_root, _) = build_validators_ssz_tree(&validator_roots, depth, &[]);
+    let opened = make_boundary_proof(&ssz_data_root, validators.len() as u64, history);
+    assert_eq!(
+        opened.state_root, justified.state_root,
+        "the opening is not out of the justified checkpoint's own state",
+    );
+    zkasper_common::types::BoundaryAnchor {
+        justified_header: justified.fields(),
+        block_roots_siblings: opened.block_roots_siblings,
+        state_roots_siblings: opened.state_roots_siblings,
     }
 }
 
@@ -345,7 +378,28 @@ impl SyntheticChain {
             slot,
             &self.validators_at(slot / self.config.slots_per_epoch),
             self.config.validators_tree_depth,
+            &self.history_at(slot),
         )
+    }
+
+    /// What the state at `slot` records about the epoch boundary before it.
+    ///
+    /// A real state carries 8192 slots of history; a synthetic one only has to
+    /// carry the boundary a finalization will open out of it. The daemon runs
+    /// the same induction — each epoch diff records what the diff before it
+    /// produced — so the two agree slot for slot, starting from the bootstrap,
+    /// which records nothing because nothing came before it.
+    fn history_at(&self, slot: u64) -> SlotHistory {
+        let spe = self.config.slots_per_epoch;
+        if slot <= self.first_epoch * spe {
+            return SlotHistory::default();
+        }
+        let previous = self.header_at(slot - spe);
+        SlotHistory {
+            slot: slot - spe,
+            block_root: header_root(&previous),
+            state_root: previous.state_root,
+        }
     }
 
     /// The checkpoint root for `epoch`: the root of the block at its first slot.
@@ -490,12 +544,11 @@ pub struct StreamFixture {
     pub epoch: Epoch,
     pub context: StreamContext,
     pub units: Vec<SlotComplement>,
-    pub finalized_header: BlockHeaderFields,
     pub previous: PreviousJustification,
 }
 
 pub fn stream_fixture(acc_depth: u32) -> StreamFixture {
-    let epoch = Epoch::new(
+    stream_fixture_from(Epoch::new(
         ChainConfig {
             acc_tree_depth: acc_depth,
             ..ChainConfig::MAINNET
@@ -503,24 +556,24 @@ pub fn stream_fixture(acc_depth: u32) -> StreamFixture {
         STREAM_EPOCH,
         STREAM_SLOTS,
         STREAM_PER_SLOT,
-    );
+    ))
+}
 
-    // The finalized block is epoch E-1's checkpoint; the circuit opens its
-    // header, so the root has to be the header's own root.
-    let finalized_header = BlockHeaderFields {
-        slot: (STREAM_EPOCH - 1) * 32,
-        proposer_index: 7,
-        parent_root: [0x06; 32],
-        state_root: [0xAB; 32],
-        body_root: [0x09; 32],
-    };
-    let previous_root = zkasper_common::ssz::block_header_root(
-        finalized_header.slot,
-        finalized_header.proposer_index,
-        &finalized_header.parent_root,
-        &finalized_header.state_root,
-        &finalized_header.body_root,
-    );
+/// The same epoch, with the boundary it finalizes left empty.
+pub fn stream_fixture_empty_boundary(acc_depth: u32) -> StreamFixture {
+    stream_fixture_from(Epoch::with_empty_boundary(
+        ChainConfig {
+            acc_tree_depth: acc_depth,
+            ..ChainConfig::MAINNET
+        },
+        STREAM_EPOCH,
+        STREAM_SLOTS,
+        STREAM_PER_SLOT,
+    ))
+}
+
+fn stream_fixture_from(epoch: Epoch) -> StreamFixture {
+    let acc_depth = epoch.config.acc_tree_depth;
 
     // The diff that carried the accumulator from epoch E-1 to E. Its endpoints
     // are what tie the finalized epoch's justification to this one's.
@@ -540,7 +593,7 @@ pub fn stream_fixture(acc_depth: u32) -> StreamFixture {
         committee_program_vk: [5; 4],
         epoch_diff: EpochDiffOutput {
             prev_accumulator_commitment: previous_accumulator_commitment,
-            state_root_1: finalized_header.state_root,
+            state_root_1: epoch.previous_state_root,
             epoch_1: STREAM_EPOCH - 1,
             accumulator_commitment: epoch.accumulator_commitment,
             acc_root: epoch.acc_root,
@@ -559,25 +612,28 @@ pub fn stream_fixture(acc_depth: u32) -> StreamFixture {
             .map(|slot| epoch.complement(slot, &[]))
             .collect(),
         context,
-        finalized_header,
         previous: PreviousJustification::Batch(JustificationOutput {
             accumulator_commitment: previous_accumulator_commitment,
             target_epoch: STREAM_EPOCH - 1,
-            target_root: previous_root,
+            target_root: epoch.previous_root,
         }),
         epoch,
     }
 }
 
 /// Compute the synthetic state root from a set of validator responses.
-fn compute_state_root_from_validators(validators: &[ValidatorResponse], depth: u32) -> [u8; 32] {
+fn compute_state_root_from_validators(
+    validators: &[ValidatorResponse],
+    depth: u32,
+    history: &SlotHistory,
+) -> [u8; 32] {
     use zkasper_witness_gen::state_diff::{
         build_validator_roots, build_validators_ssz_tree, make_state_proof,
     };
 
     let validator_roots = build_validator_roots(validators);
     let (ssz_data_root, _) = build_validators_ssz_tree(&validator_roots, depth, &[]);
-    let (state_root, _) = make_state_proof(&ssz_data_root, validators.len() as u64);
+    let (state_root, _) = make_state_proof(&ssz_data_root, validators.len() as u64, history);
     state_root
 }
 
