@@ -428,22 +428,28 @@ They are handled, they log a warning, and they resolve themselves:
   silently and produce no other symptom.
 - `no state to read the fork version from; taking head's`
 
-### A one-line health check
+### The health check
+
+`scripts/health.py` applies every threshold above and prints one line per check.
+It exits 0 when clear, 1 when something needs action and 2 when the manifest
+cannot be read, so it drives an alert directly.
 
 ```sh
-python3 - <<'PY'
-import json, time
-d = json.load(open('/mnt/ssd/zkasper-run/out/status.json'))
-age = int(time.time()) - d['updated_unix']
-g = d.get('gossip') or {}
-late = sum(l['late_groups'] for l in d.get('recent_latencies', []))
-ok = age < 120 and g.get('dropped', 1) == 0 and late == 0
-print(('OK  ' if ok else 'BAD '),
-      f"age={age}s epoch={d['accumulator']['epoch']} "
-      f"justified={d.get('justified_through')} "
-      f"dropped={g.get('dropped')} reconnects={g.get('reconnects')} late={late}")
-PY
+./scripts/health.py /mnt/ssd/zkasper-run/out/status.json
 ```
+
+```
+      updated 0 s ago
+      accumulator epoch 469375
+      justified through 469374
+      gossip 358402 attestations, 0 reconnects, 0 dropped
+      T2-T over 3 epochs: min 1177 median 5007 max 5118 ms
+OK
+```
+
+The counters are monotonic since process start and reset on restart, so a
+climbing `reconnects` only shows up by diffing scrapes. Store what step 10
+appends and read the trend from there.
 
 ---
 
