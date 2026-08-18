@@ -744,9 +744,9 @@ Three things follow:
    intermediate array. What does pay is arity: a 4-ary accumulator absorbs four
    digests in the permutation a 2-ary node spends on two, which takes the
    internal nodes from one a leaf to a third of one and measures **25,965 units
-   a member, 13% off**. It also halves the tree's depth, which is what every
-   scattered absentee opening in the pipeline pays. It is not landed: it changes
-   the accumulator every other proof binds.
+   a member, 13% off**. It also halves the levels a scattered absentee opening
+   hashes, against three auxiliaries a level instead of one. It is not landed:
+   it changes the accumulator every other proof binds.
 
 ### Measuring a committee strategy in a minute
 
