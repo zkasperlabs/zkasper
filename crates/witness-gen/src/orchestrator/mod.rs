@@ -58,6 +58,7 @@
 //! handing the prover to a pool of GPUs is a change to this file only.
 
 mod accumulator;
+mod batch;
 mod chain_view;
 mod config;
 mod engine;
@@ -74,11 +75,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use tracing::{info, info_span, instrument, warn};
 
-use zkasper_common::acc::Digest;
 use zkasper_common::bls::{fp12_mul, Fp12, FP12_ONE};
 use zkasper_common::types::{
-    AggregateOutput, BoundaryAnchor, Checkpoint, CommitteeOutput, FinalizationWitness,
-    GroupProofOutput, PreviousJustification, SlotProofOutput, SlotProofWitness,
+    AggregateOutput, BoundaryAnchor, Checkpoint, GroupProofOutput, PreviousJustification,
 };
 
 use crate::acc_tree::AccTree;
@@ -87,20 +86,21 @@ use crate::artifacts::{
     StageTiming,
 };
 use crate::attestation_collector::{SlotComplement, SlotStream};
-use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
+use crate::beacon_api::{BeaconApi, ChainStatusApi};
 use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
 use crate::prover::{Proof, Prover, Stage};
 use crate::publish::{self, ClosedEpoch, EpochProgress, Publisher};
-use crate::store::{JustificationRecord, Snapshot, Store, StoreState, StreamFinalRecord};
+use crate::store::{Snapshot, Store, StoreState, StreamFinalRecord};
 
 use crate::streaming::{self, Filling, StreamContext, StreamPolicy};
-use crate::witness_justification;
 use accumulator::{bootstrap, is_pruned_state};
+use batch::BatchPipeline;
 use chain_view::ChainView;
-use engine::{write_proof, Engine};
-use reporter::{acc_status, justified_checkpoint, percent_of, Reporter};
+use engine::{write_proof, Engine, OpenEpoch};
+use pipeline::EpochPipeline;
+use reporter::{acc_status, percent_of, Reporter};
 
 /// How many stage timings the manifest keeps.
 const RECENT_STAGES: usize = 64;
@@ -132,43 +132,6 @@ impl Tick {
             || !self.slots_proved.is_empty()
             || self.justified.is_some()
             || self.gave_up_on.is_some()
-    }
-}
-
-/// One epoch's justification, part-built.
-///
-/// Lives across ticks: slots are folded in as the node publishes them, and the
-/// epoch finishes the moment the counted balance crosses 2/3.
-struct EpochAggregator {
-    target_epoch: u64,
-    target_root: [u8; 32],
-    signing_domain: [u8; 32],
-    /// Accumulator the slot proofs are bound to, captured when the epoch opened.
-    acc_root: Digest,
-    acc_commitment: Digest,
-    total_active_balance: u64,
-    /// This epoch's committee proof, which every slot proof counts against.
-    committees: Arc<EpochCommittees>,
-    committee_output: CommitteeOutput,
-    committee_proof: Proof,
-    stream: SlotStream,
-    /// Next slot to ask the node for.
-    next_slot: u64,
-    /// One past the last slot worth scanning for this checkpoint.
-    scan_end: u64,
-    attesting_balance: u64,
-    slot_outputs: Vec<SlotProofOutput>,
-    slot_proofs: Vec<Proof>,
-}
-
-impl EpochAggregator {
-    /// Casper's 2/3 rule, in u128 so a mainnet-sized balance cannot overflow.
-    fn threshold_reached(&self) -> bool {
-        self.attesting_balance as u128 * 3 >= self.total_active_balance as u128 * 2
-    }
-
-    fn exhausted(&self) -> bool {
-        self.next_slot >= self.scan_end
     }
 }
 
@@ -357,7 +320,7 @@ pub struct Orchestrator<A> {
     /// The node, the prover, the accumulator, and where results go — the half
     /// of the daemon that does not care which pipeline is running.
     engine: Engine<A>,
-    pending: Option<EpochAggregator>,
+    batch: BatchPipeline,
     streaming: Option<StreamAggregator>,
 }
 
@@ -435,7 +398,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 prover,
                 snapshot,
             },
-            pending: None,
+            batch: BatchPipeline::default(),
             streaming: None,
         }
     }
@@ -524,7 +487,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// opened against, so an accumulator that moves — forward by a diff, or
     /// sideways by a bootstrap — invalidates all of it.
     fn forget_epoch(&mut self) {
-        self.pending = None;
+        self.batch.forget();
         self.streaming = None;
     }
 
@@ -543,7 +506,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             if self.engine.config.pipeline == Pipeline::Streaming && self.can_stream() {
                 self.drive_stream(&mut tick).await?;
             } else {
-                self.drive_aggregation(&mut tick).await?;
+                self.batch.drive(&mut self.engine, &mut tick).await?;
             }
         } else {
             let next = self.engine.snapshot.state.cursor_epoch + 1;
@@ -556,582 +519,6 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
 
         self.publish_status()?;
         Ok(tick)
-    }
-
-    // -----------------------------------------------------------------
-    // Stages: slot proofs, justification, finalization
-    // -----------------------------------------------------------------
-
-    async fn drive_aggregation(&mut self, tick: &mut Tick) -> Result<()> {
-        let target_epoch = self.engine.snapshot.state.cursor_epoch;
-        let spe = self.engine.config.chain.slots_per_epoch;
-
-        let mut aggregator = match self.pending.take() {
-            Some(aggregator) if aggregator.target_epoch == target_epoch => aggregator,
-            _ => self.open_epoch(target_epoch).await?,
-        };
-
-        let _span = info_span!("aggregate", target_epoch).entered();
-
-        while !aggregator.threshold_reached()
-            && !aggregator.exhausted()
-            && aggregator.next_slot <= self.engine.chain.head_slot()
-        {
-            let slot = aggregator.next_slot;
-            aggregator.next_slot += 1;
-
-            // A slot with no block is not an error; neither is one whose
-            // attestations all point somewhere else.
-            if let Ok(attestations) = self
-                .engine
-                .api
-                .get_block_attestations(&slot.to_string())
-                .await
-            {
-                aggregator.stream.ingest(&attestations)?;
-            }
-
-            // Attestations for slot `s` are included from block `s+1` onwards,
-            // so closing `s` once `s+1` has been scanned keeps the schedule one
-            // slot behind the chain. A straggler included later becomes an
-            // absentee, which costs a little weight and no soundness.
-            let Some(attestation_slot) = slot.checked_sub(1) else {
-                continue;
-            };
-            if attestation_slot < target_epoch * spe || attestation_slot >= (target_epoch + 1) * spe
-            {
-                continue;
-            }
-            let Some(complement) = aggregator.stream.close(attestation_slot) else {
-                continue;
-            };
-
-            let _span = info_span!(
-                "stage",
-                stage = "slot_proof",
-                epoch = target_epoch,
-                slot = attestation_slot,
-            )
-            .entered();
-            self.engine.chain.observe_start_delay(
-                &self.engine.config,
-                Stage::SlotProof,
-                target_epoch,
-                attestation_slot,
-            );
-            let started = Instant::now();
-            // Numbered as well as slotted. A slot proof is a repeat of a stage
-            // inside one epoch, and a consumer that keys stages by
-            // (epoch, stage, index) folds every unnumbered repeat onto one row —
-            // which lost 21 of an epoch's 22 slot proofs, and with them most of
-            // what the epoch cost.
-            let index = aggregator.slot_proofs.len();
-            self.engine.report.begin(
-                Stage::SlotProof,
-                target_epoch,
-                Some(attestation_slot),
-                Some(index),
-            );
-            let witness = SlotProofWitness {
-                accumulator_commitment: aggregator.acc_commitment,
-                committee_root: aggregator.committee_output.committee_root,
-                target_epoch,
-                target_root: aggregator.target_root,
-                signing_domain: aggregator.signing_domain,
-                acc_root: aggregator.acc_root,
-                total_active_balance: aggregator.total_active_balance,
-                acc_multi_proof: self
-                    .engine
-                    .snapshot
-                    .tree
-                    .build_multi_proof(&complement.named_indices),
-                committee_multi_proof: aggregator
-                    .committees
-                    .multi_proof(&[complement.witness.slot_in_epoch]),
-                slots: vec![complement.witness],
-            };
-
-            let (output, proof) =
-                self.engine.prover.prove_slot(&witness).with_context(|| {
-                    format!("slot proof for attestation slot {attestation_slot}")
-                })?;
-
-            let artifact = self.engine.sink.write_witness(
-                target_epoch,
-                &format!("slot_proof_{attestation_slot}"),
-                &witness,
-            )?;
-            write_proof(
-                &self.engine.sink,
-                target_epoch,
-                &format!("slot_proof_{attestation_slot}"),
-                &proof,
-            )?;
-
-            aggregator.attesting_balance += output.attesting_balance;
-            aggregator.slot_outputs.push(output);
-            aggregator.slot_proofs.push(proof);
-
-            let millis = started.elapsed().as_millis() as u64;
-            info!(
-                slot = attestation_slot,
-                absentees = witness.slots[0].absentees.len(),
-                attesting_balance = aggregator.attesting_balance,
-                pct = percent_of(
-                    aggregator.attesting_balance,
-                    aggregator.total_active_balance
-                ),
-                millis,
-                "slot proof",
-            );
-            self.engine.report.record(
-                StageTiming::new(
-                    Stage::SlotProof,
-                    target_epoch,
-                    started,
-                    self.engine.prover.last_cost(),
-                    artifact,
-                )
-                .at_slot(attestation_slot)
-                .at_index(index)
-                .with_proof(aggregator.slot_proofs.last().expect("just pushed")),
-            );
-            tick.slots_proved.push(attestation_slot);
-        }
-
-        if aggregator.threshold_reached() {
-            self.close_epoch(aggregator, tick).await?;
-        } else if aggregator.exhausted() {
-            // Two epochs of blocks went by without 2/3 voting for this
-            // checkpoint. The chain did not justify it, so neither can we.
-            warn!(
-                target_epoch,
-                attesting_balance = aggregator.attesting_balance,
-                total_active_balance = aggregator.total_active_balance,
-                "checkpoint never reached the 2/3 threshold; giving up on this epoch",
-            );
-            if let Some(publish) = self.engine.report.publisher() {
-                publish.epoch_abandoned(target_epoch, "never reached the threshold");
-            }
-            crate::metrics::epoch_abandoned("threshold");
-            self.pending = None;
-            self.engine.snapshot.state.attempted_epoch = Some(target_epoch);
-            self.engine.store.save(&self.engine.snapshot)?;
-            tick.gave_up_on = Some(target_epoch);
-        } else {
-            // Waiting for the node to publish more blocks. Keep the partial
-            // aggregation so the next tick resumes mid-epoch.
-            self.pending = Some(aggregator);
-        }
-        Ok(())
-    }
-
-    /// Start a new epoch's aggregation against the accumulator as it stands.
-    async fn open_epoch(&mut self, target_epoch: u64) -> Result<EpochAggregator> {
-        let spe = self.engine.config.chain.slots_per_epoch;
-        let target_root = self
-            .engine
-            .chain
-            .checkpoint_root(&self.engine.api, &self.engine.config, target_epoch)
-            .await?;
-        let signing_domain = self
-            .engine
-            .chain
-            .signing_domain(&self.engine.api, &self.engine.config, target_epoch)
-            .await?;
-        let validators = self
-            .engine
-            .api
-            .get_validators(&(target_epoch * spe).to_string())
-            .await
-            .context("fetch validators for the target epoch")?;
-
-        let (committees, committee_output, committee_proof) =
-            self.prove_committee(target_epoch, &validators).await?;
-
-        let stream = SlotStream::new(
-            &self.engine.config.chain,
-            committees.clone(),
-            target_epoch,
-            target_root,
-        );
-
-        if let Some(publish) = self.engine.report.publisher() {
-            publish.epoch_opened(
-                target_epoch,
-                &target_root,
-                target_epoch.saturating_sub(1),
-                self.engine.snapshot.state.total_active_balance,
-                serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
-            );
-        }
-        info!(
-            target_epoch,
-            target_root = %crate::artifacts::hex0x(&target_root),
-            committee_root = %hex_digest(&committee_output.committee_root),
-            "opened epoch",
-        );
-
-        Ok(EpochAggregator {
-            target_epoch,
-            target_root,
-            signing_domain,
-            acc_root: self.engine.snapshot.state.acc_root,
-            acc_commitment: self.engine.snapshot.state.acc_commitment,
-            total_active_balance: self.engine.snapshot.state.total_active_balance,
-            committees,
-            committee_output,
-            committee_proof,
-            stream,
-            next_slot: target_epoch * spe,
-            scan_end: (target_epoch + self.engine.config.attestation_lookahead_epochs) * spe,
-            attesting_balance: 0,
-            slot_outputs: Vec::new(),
-            slot_proofs: Vec::new(),
-        })
-    }
-
-    /// Prove the epoch's committees, and time it like every other stage.
-    #[instrument(
-        name = "stage",
-        skip_all,
-        fields(stage = "committee", epoch = target_epoch),
-    )]
-    async fn prove_committee(
-        &mut self,
-        target_epoch: u64,
-        validators: &[ValidatorResponse],
-    ) -> Result<(Arc<EpochCommittees>, CommitteeOutput, Proof)> {
-        // The schedule wants this finished before the epoch it serves opens, so
-        // the epoch's own first slot is the latest it should ever start.
-        self.engine.chain.observe_start_delay(
-            &self.engine.config,
-            Stage::Committee,
-            target_epoch,
-            target_epoch * self.engine.config.chain.slots_per_epoch,
-        );
-        let started = Instant::now();
-        self.engine
-            .report
-            .begin(Stage::Committee, target_epoch, None, None);
-        let committees = Arc::new(self.build_committees(target_epoch, validators).await?);
-        let (output, proof) = self.engine.prover.prove_committee(&committees.witness)?;
-        if output != committees.output {
-            bail!(
-                "committee circuit disagrees with the host committee tree at epoch {target_epoch}"
-            );
-        }
-        let artifact =
-            self.engine
-                .sink
-                .write_witness(target_epoch, "committee", &committees.witness)?;
-        write_proof(&self.engine.sink, target_epoch, "committee", &proof)?;
-        self.engine.report.record(
-            StageTiming::new(
-                Stage::Committee,
-                target_epoch,
-                started,
-                self.engine.prover.last_cost(),
-                artifact,
-            )
-            .with_proof(&proof),
-        );
-        Ok((committees, output, proof))
-    }
-
-    /// Sum this epoch's committees out of the accumulator.
-    ///
-    /// The shuffle that produced them is the node's; nothing here or in the
-    /// circuit recomputes it, because a wrong assignment cannot be proven
-    /// against the signatures it would have to match. See
-    /// [`zkasper_common::committee`].
-    async fn build_committees(
-        &self,
-        target_epoch: u64,
-        validators: &[ValidatorResponse],
-    ) -> Result<EpochCommittees> {
-        let spe = self.engine.config.chain.slots_per_epoch;
-        let committees = self
-            .engine
-            .api
-            .get_committees(&(target_epoch * spe).to_string(), target_epoch)
-            .await
-            .context("fetch committees")?;
-
-        crate::committee::build(
-            &committees,
-            validators,
-            &self.engine.snapshot.tree,
-            &self.engine.config.chain,
-            target_epoch,
-            target_epoch,
-            self.engine.snapshot.state.total_active_balance,
-        )
-    }
-
-    /// Fold the epoch's slot proofs into a justification, and pair it with the
-    /// previous one into a finalization when the two are consecutive.
-    #[instrument(
-        name = "stage",
-        skip_all,
-        fields(stage = "justification", epoch = aggregator.target_epoch),
-    )]
-    async fn close_epoch(&mut self, aggregator: EpochAggregator, tick: &mut Tick) -> Result<()> {
-        let target_epoch = aggregator.target_epoch;
-        let started = Instant::now();
-        self.engine
-            .report
-            .begin(Stage::Justification, target_epoch, None, None);
-
-        let witness = witness_justification::build(
-            aggregator.slot_outputs,
-            aggregator.slot_proofs,
-            aggregator.acc_commitment,
-            self.engine.prover.program_vk(Stage::SlotProof),
-            self.engine.prover.program_vk(Stage::Committee),
-            aggregator.committee_output,
-            aggregator.committee_proof,
-            target_epoch,
-            aggregator.target_root,
-            aggregator.total_active_balance,
-            aggregator.acc_root,
-        );
-
-        let slots = witness.slot_proof_outputs.len();
-        let (output, proof) = self.engine.prover.prove_justification(&witness)?;
-        let artifact = self
-            .engine
-            .sink
-            .write_witness(target_epoch, "justification", &witness)?;
-        write_proof(&self.engine.sink, target_epoch, "justification", &proof)?;
-
-        let millis = started.elapsed().as_millis() as u64;
-        info!(
-            target_epoch,
-            slots,
-            attesting_balance = aggregator.attesting_balance,
-            millis,
-            "justified",
-        );
-        self.engine.report.record(
-            StageTiming::new(
-                Stage::Justification,
-                target_epoch,
-                started,
-                self.engine.prover.last_cost(),
-                artifact,
-            )
-            .with_proof(&proof),
-        );
-
-        let record = JustificationRecord {
-            output: output.clone(),
-            proof,
-        };
-        let finalized = self.try_finalize(&record).await?;
-
-        // The first epoch of a run has nothing before it to finalize, so its
-        // justification is the only proof it will ever have. Publishing it as
-        // the epoch's proof is what keeps that epoch from sitting open forever.
-        if finalized.is_none() {
-            let cost = self.engine.report.take_cost(target_epoch);
-            if let Some(publish) = self.engine.report.publisher() {
-                let vk = self.engine.prover.program_vk(Stage::Justification);
-                let publics = record.output.public_bytes();
-                let reference = publish::proof_ref(
-                    target_epoch,
-                    Stage::Justification,
-                    &record.proof,
-                    &vk,
-                    &publics,
-                    self.engine
-                        .prover
-                        .program_digest(Stage::Justification)
-                        .as_deref(),
-                );
-                let inputs = publish::justification_public_inputs(&record.output);
-                publish.proof_bytes(
-                    target_epoch,
-                    Stage::Justification,
-                    &record.proof,
-                    &vk,
-                    &publics,
-                );
-                publish.proof_landed(target_epoch, reference.clone(), inputs.clone(), None);
-                publish.epoch_closed(&ClosedEpoch {
-                    epoch: target_epoch,
-                    cost,
-                    target_root: crate::artifacts::hex0x(&record.output.target_root),
-                    finalizes_epoch: target_epoch,
-                    justified: serde_json::to_value(justified_checkpoint(&record.output))?,
-                    finalized: serde_json::Value::Null,
-                    accumulator: serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
-                    latency: None,
-                    proof: reference,
-                    public_inputs: inputs,
-                });
-            }
-        }
-
-        crate::metrics::epoch_justified();
-        self.engine.snapshot.state.justified_through = Some(target_epoch);
-        self.engine.snapshot.state.attempted_epoch = Some(target_epoch);
-        self.engine.snapshot.state.last_justification = Some(record);
-        if let Some(checkpoint) = &finalized {
-            self.engine.snapshot.state.finalized = Some(checkpoint.clone());
-        }
-        self.engine.store.save(&self.engine.snapshot)?;
-
-        tick.justified = Some(target_epoch);
-        tick.finalized = finalized;
-        Ok(())
-    }
-
-    /// Pair the new justification with the previous epoch's, if they can be.
-    ///
-    /// The two are proved against two different accumulators — effective
-    /// balances move at every epoch transition — so the circuit also needs the
-    /// epoch diff that carries one to the other. That is the diff this daemon
-    /// ran between the two justifications, kept in the store for exactly this.
-    async fn try_finalize(&mut self, current: &JustificationRecord) -> Result<Option<Checkpoint>> {
-        let Some(previous) = self.engine.snapshot.state.last_justification.clone() else {
-            return Ok(None);
-        };
-        let epoch = previous.output.target_epoch;
-        if epoch + 1 != current.output.target_epoch {
-            return Ok(None);
-        }
-        let Some(epoch_diff) = self.engine.snapshot.state.last_epoch_diff.clone() else {
-            warn!(
-                epoch,
-                "no epoch diff on record to link the two accumulators"
-            );
-            return Ok(None);
-        };
-        if epoch_diff.output.epoch_1 != epoch
-            || epoch_diff.output.epoch_2 != current.output.target_epoch
-            || epoch_diff.output.prev_accumulator_commitment
-                != previous.output.accumulator_commitment
-            || epoch_diff.output.accumulator_commitment != current.output.accumulator_commitment
-        {
-            warn!(
-                epoch,
-                diff_epoch_1 = epoch_diff.output.epoch_1,
-                diff_epoch_2 = epoch_diff.output.epoch_2,
-                "the epoch diff on record does not link the two justified accumulators",
-            );
-            return Ok(None);
-        }
-
-        let boundary = crate::boundary::build(
-            &self.engine.api,
-            &self.engine.config.chain,
-            &current.output.target_root,
-            epoch,
-            &previous.output.target_root,
-            &epoch_diff.output.state_root_1,
-            &self.engine.snapshot.epoch_state,
-        )
-        .await
-        .with_context(|| format!("open the boundary of epoch {epoch}"))?;
-
-        let _span = info_span!(
-            "stage",
-            stage = "finalization",
-            epoch = current.output.target_epoch,
-        )
-        .entered();
-        let started = Instant::now();
-        self.engine
-            .report
-            .begin(Stage::Finalization, current.output.target_epoch, None, None);
-        let witness = FinalizationWitness {
-            justification_program_vk: self.engine.prover.program_vk(Stage::Justification),
-            epoch_diff_program_vk: self.engine.prover.program_vk(Stage::EpochDiff),
-            boundary,
-            justification_outputs: vec![previous.output.clone(), current.output.clone()],
-            justification_proofs: vec![previous.proof.clone(), current.proof.clone()],
-            epoch_diff_output: epoch_diff.output,
-            epoch_diff_proof: epoch_diff.proof,
-        };
-
-        let (output, proof) = self.engine.prover.prove_finalization(&witness)?;
-        let artifact = self.engine.sink.write_witness(
-            current.output.target_epoch,
-            "finalization",
-            &witness,
-        )?;
-        write_proof(
-            &self.engine.sink,
-            current.output.target_epoch,
-            "finalization",
-            &proof,
-        )?;
-
-        let millis = started.elapsed().as_millis() as u64;
-        info!(
-            finalized_epoch = output.finalized_epoch,
-            finalized_root = %crate::artifacts::hex0x(&output.finalized_root),
-            millis,
-            "finalized",
-        );
-        self.engine.report.record(
-            StageTiming::new(
-                Stage::Finalization,
-                current.output.target_epoch,
-                started,
-                self.engine.prover.last_cost(),
-                artifact,
-            )
-            .with_proof(&proof),
-        );
-
-        let cost = self.engine.report.take_cost(current.output.target_epoch);
-        if let Some(publish) = self.engine.report.publisher() {
-            let epoch = current.output.target_epoch;
-            let vk = self.engine.prover.program_vk(Stage::Finalization);
-            let reference = publish::proof_ref(
-                epoch,
-                Stage::Finalization,
-                &proof,
-                &vk,
-                &output.public_bytes(),
-                self.engine
-                    .prover
-                    .program_digest(Stage::Finalization)
-                    .as_deref(),
-            );
-            let inputs = publish::finalization_public_inputs(&output);
-            publish.proof_bytes(
-                epoch,
-                Stage::Finalization,
-                &proof,
-                &vk,
-                &output.public_bytes(),
-            );
-            publish.proof_landed(epoch, reference.clone(), inputs.clone(), None);
-            publish.epoch_closed(&ClosedEpoch {
-                epoch,
-                cost,
-                target_root: crate::artifacts::hex0x(&current.output.target_root),
-                finalizes_epoch: output.finalized_epoch,
-                justified: serde_json::to_value(justified_checkpoint(&current.output))?,
-                finalized: serde_json::json!({
-                    "epoch": output.finalized_epoch,
-                    "root": crate::artifacts::hex0x(&output.finalized_root),
-                }),
-                accumulator: serde_json::to_value(acc_status(&self.engine.snapshot.state))?,
-                latency: None,
-                proof: reference,
-                public_inputs: inputs,
-            });
-        }
-
-        crate::metrics::epoch_finalized();
-        Ok(Some(Checkpoint {
-            epoch: output.finalized_epoch,
-            root: output.finalized_root,
-        }))
     }
 
     // -----------------------------------------------------------------
@@ -1327,32 +714,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// beacon node lands between `T` and `T2`.
     async fn open_stream_epoch(&mut self, target_epoch: u64) -> Result<StreamAggregator> {
         let spe = self.engine.config.chain.slots_per_epoch;
-        let target_root = self
-            .engine
-            .chain
-            .checkpoint_root(&self.engine.api, &self.engine.config, target_epoch)
-            .await?;
-        let signing_domain = self
-            .engine
-            .chain
-            .signing_domain(&self.engine.api, &self.engine.config, target_epoch)
-            .await?;
-        let validators = self
-            .engine
-            .api
-            .get_validators(&(target_epoch * spe).to_string())
-            .await
-            .context("fetch validators for the target epoch")?;
-
-        let (committees, committee_output, committee_proof) =
-            self.prove_committee(target_epoch, &validators).await?;
-
-        let stream = SlotStream::new(
-            &self.engine.config.chain,
-            committees.clone(),
-            target_epoch,
+        let OpenEpoch {
             target_root,
-        );
+            signing_domain,
+            committees,
+            committee_output,
+            committee_proof,
+            stream,
+        } = self.engine.open_epoch(target_epoch).await?;
 
         let epoch_diff = self
             .engine
