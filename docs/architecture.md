@@ -171,7 +171,9 @@ The daemon re-resolves the checkpoint root when the node reports a reorg.
 ```
 
 The stable machine runs the beacon node and `zkasperd`. The GPU machine runs a
-prover server and nothing else.
+prover server and nothing else. [RUNBOOK.md](../RUNBOOK.md) is the operational
+version of this half: how to provision, install, bootstrap, monitor and recover
+a mainnet deployment.
 
 ## The GPU machine runs a prover and nothing else
 
@@ -256,10 +258,16 @@ zkasper-out/
     stream_final.bin
 ```
 
-The proof bytes go to object storage (R2). The epoch index goes to a key-value
-store (KV or D1). The site and every other consumer read the public API, which
-stores what the daemon posted and never recomputes it. The contract is in
-[api-v1.md](api-v1.md).
+`crates/witness-gen/src/publish.rs` posts every stage to the public API as it
+happens. The daemon is the source of truth and the API is a mirror of it, so a
+slow or unreachable API never holds a proof up. Events go into a bounded queue,
+and a batch that cannot be posted is spooled to disk and drained later.
+
+The API keeps the epoch index in a Durable Object with SQLite storage. Proof
+bytes land in the same store today, and the storage abstraction moves them to
+R2 object storage as soon as the R2 binding is enabled. The site and every
+other consumer read that API, which stores what the daemon posted and never
+recomputes it. The contract is in [api-v1.md](api-v1.md).
 
 ## Restart safety
 

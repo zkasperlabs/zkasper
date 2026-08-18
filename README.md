@@ -127,6 +127,7 @@ Open:
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | the proofs, and the machines they run on |
 | [docs/assumptions.md](docs/assumptions.md) | every trust assumption and accepted risk |
+| [RUNBOOK.md](RUNBOOK.md) | how to provision, run, monitor and recover a mainnet deployment |
 | [BENCHMARKS.md](BENCHMARKS.md) | every cost constant, and what measured it |
 | [docs/gossip.md](docs/gossip.md) | where attestations come from, and what they cost |
 | [docs/api-v1.md](docs/api-v1.md) | the public HTTP API |
