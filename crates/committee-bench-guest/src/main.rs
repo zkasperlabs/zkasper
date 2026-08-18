@@ -1,21 +1,23 @@
 //! Committee-proof bench harness: one variant per run, over a real witness.
 //!
-//! The committee proof is the fleet's whole cost — 878.2 µs ± 6.5 per opened
-//! validator against ~961k of them — and a mainnet run takes an hour, so no
-//! strategy for making it cheaper can be evaluated against a mainnet run. This
-//! guest takes the same [`CommitteeWitness`] the real guest takes, at whatever
-//! size and accumulator depth `gen-committee-witness` was asked for, and runs
-//! one variant of the verification. `scripts/committee_bench.py` drives it,
-//! subtracts the pairs that isolate a term, and reports steps and cost units
-//! *per validator*, which is the only figure that extrapolates.
+//! The committee proof is the fleet's whole cost — every active validator, once
+//! an epoch — and a mainnet run is 961k of them, so no strategy for making it
+//! cheaper can be evaluated against a mainnet run. This guest takes the same
+//! witness the real guest takes, in the same flat layout
+//! [`zkasper_common::committee::encode`] writes, at whatever size and
+//! accumulator depth `gen-committee-witness` was asked for, and runs one variant
+//! of the verification. `scripts/committee_bench.py` drives it, subtracts the
+//! pairs that isolate a term, and reports steps and cost units *per validator*,
+//! which is the only figure that extrapolates.
 //!
-//! Two kinds of variant live here. The **ablations** (1–4) each remove one term
-//! from the real [`committee::verify`], so subtracting them from variant 0
-//! attributes its cost; they are not proposals and do not prove anything. The
-//! **candidates** (5–7) are whole verifications that must produce the same
-//! committee root as variant 0, which variant 8 checks.
+//! Two kinds of variant live here. The **ablations** each remove one term from
+//! the real [`committee::verify`], so subtracting them from variant 0 attributes
+//! its cost; they are not proposals and do not prove anything. The
+//! **candidates** are whole verifications that must publish the same aggregates
+//! as variant 0, which [`V_SELFTEST`] checks.
 //!
-//! Input is `u32 variant | u32 acc_depth | bincode(CommitteeWitness)`.
+//! Input is `u64 variant | u64 acc_depth | committee words`. Two words of header
+//! rather than two `u32`s so the witness behind it keeps Zisk's alignment.
 
 #![cfg_attr(target_os = "zkvm", no_main)]
 
@@ -25,93 +27,91 @@ use ziskos::syscalls::{
 use ziskos::zisklib::{inv_fp_bls12_381, mul_fp_bls12_381, square_fp_bls12_381, sub_fp_bls12_381};
 
 use zkasper_common::acc::{self, Digest, G1Point};
-use zkasper_common::bls::PointSum;
 use zkasper_common::committee::{self, MAX_SLOTS};
-use zkasper_common::merkle::batch_root;
-use zkasper_common::types::{CommitteeAggregate, CommitteeOutput, CommitteeWitness};
+use zkasper_common::merkle::batch_root_columns;
+use zkasper_common::types::{CommitteeAggregate, CommitteeOutput};
 
 #[cfg(target_os = "zkvm")]
 ziskos::entrypoint!(main);
 
 /// `zkasper_common::committee::verify`, exactly as the real guest calls it.
-const V_VERIFY: u32 = 0;
-/// Deserialize and read every member field, and nothing else: the witness I/O
-/// floor another agent is working on, measured so it can be subtracted out.
-const V_IO: u32 = 1;
+const V_VERIFY: u64 = 0;
+/// Ablation: read every member field and do nothing with them. What is left of
+/// the witness I/O now that the guest reads the input where Zisk put it.
+const V_IO: u64 = 1;
 /// Ablation: everything but the curve additions.
-const V_NO_G1: u32 = 2;
+const V_NO_G1: u64 = 2;
 /// Ablation: everything but the accumulator multi-proof.
-const V_NO_TREE: u32 = 3;
+const V_NO_TREE: u64 = 3;
 /// Ablation: everything but the leaf hashes — the multi-proof runs over the
 /// validator index as a stand-in leaf, so the tree scan is unchanged.
-const V_NO_LEAF: u32 = 4;
-/// Candidate: the same verification with the leaf set built as two parallel
-/// arrays the multi-proof consumes in place, instead of a `Vec<(Digest, u64)>`
-/// that `batch_root` immediately copies apart.
-const V_SPLIT: u32 = 5;
-
-/// Candidate: V_SPLIT over a 4-ary accumulator tree. Poseidon2-16 absorbs four
-/// digests in the one permutation it already spends on two, so the internal
-/// nodes drop from one per leaf to a third of one.
-const V_ARITY4: u32 = 6;
-/// Candidate: V_SPLIT with the bucket sums computed in software — a tree
-/// reduction so every addition at a level is independent, and one Montgomery
-/// batch inversion shared across the level.
-const V_BATCH_INV: u32 = 7;
-/// Every candidate against V_VERIFY's committee root. Cheap enough to run in
-/// the emulator, and the only thing that makes the other numbers mean anything.
-const V_SELFTEST: u32 = 8;
+const V_NO_LEAF: u64 = 4;
+/// Candidate: a 4-ary accumulator tree. Poseidon2-16 absorbs four digests in the
+/// one permutation it already spends on two, so the internal nodes drop from one
+/// per leaf to a third of one.
+const V_ARITY4: u64 = 5;
+/// Candidate: the bucket sums computed in software — a tree reduction so every
+/// addition at a level is independent, and one Montgomery batch inversion shared
+/// across the level.
+const V_BATCH_INV: u64 = 6;
 /// Superseded: the copying curve add `bls::PointSum` used to do, kept so the
 /// harness still reports what handing the precompile the sum in place is worth.
-const V_COPYING_ADD: u32 = 9;
-/// Candidate: V_SPLIT with the leaf's packed point written straight into the
-/// permutation state rather than into an array that is then copied into it.
-const V_LEAN: u32 = 10;
+const V_COPYING_ADD: u64 = 7;
+/// Candidate: the leaf's packed point written straight into the permutation
+/// state rather than into an array that is then copied into it.
+const V_LEAF_IN_PLACE: u64 = 8;
+/// Every candidate against what [`committee::verify`] publishes. Cheap enough to
+/// run in the emulator, and the only thing that makes the other numbers mean
+/// anything.
+const V_SELFTEST: u64 = 9;
+
+/// Words the flat witness spends before the first member, mirroring
+/// [`committee::encode`]: commitment, root, epoch, balance, and the two counts.
+const HEADER_WORDS: usize = 12;
+/// Words one member spends: index, twelve public-key limbs, balance, slot.
+const MEMBER_WORDS: usize = 15;
+/// Words one digest spends.
+const DIGEST_WORDS: usize = 4;
 
 fn main() {
-    let input = zkasper_guest_io::read_witness();
-    let variant = u32::from_le_bytes(input[0..4].try_into().unwrap());
-    let acc_depth = u32::from_le_bytes(input[4..8].try_into().unwrap());
-    let witness: CommitteeWitness = bincode::deserialize(&input[8..]).expect("deserialize witness");
+    let input = zkasper_guest_io::read_words();
+    let variant = input[0];
+    let acc_depth = input[1] as u32;
+    let witness = &input[2..];
 
-    let checksum = run(variant, acc_depth, &witness);
+    let checksum = run(variant, acc_depth, witness);
 
     let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&variant.to_le_bytes());
-    out[4..8].copy_from_slice(&(witness.members.len() as u32).to_le_bytes());
+    out[0..8].copy_from_slice(&variant.to_le_bytes());
     out[8..16].copy_from_slice(&checksum.to_le_bytes());
     zkasper_guest_io::commit(out.to_vec());
 }
 
-fn run(variant: u32, acc_depth: u32, witness: &CommitteeWitness) -> u64 {
+fn run(variant: u64, acc_depth: u32, witness: &[u64]) -> u64 {
     match variant {
         V_VERIFY => committee::verify(witness, acc_depth).committee_root[0],
 
         V_IO => {
             let mut checksum = 0u64;
-            for member in &witness.members {
-                checksum ^= member.validator_index
-                    ^ member.slot_in_epoch
-                    ^ member.active_effective_balance
-                    ^ member.pubkey[0]
-                    ^ member.pubkey[11];
+            for member in members(witness) {
+                checksum ^= member[0] ^ member[1] ^ member[12] ^ member[13] ^ member[14];
             }
             checksum
         }
 
         V_NO_G1 | V_NO_TREE | V_NO_LEAF => ablation(variant, acc_depth, witness),
 
-        V_SPLIT | V_COPYING_ADD | V_LEAN => split(variant, witness, acc_depth).committee_root[0],
         V_ARITY4 => arity4(witness, acc_depth).committee_root[0],
         V_BATCH_INV => batch_inv(witness, acc_depth).committee_root[0],
+        V_COPYING_ADD | V_LEAF_IN_PLACE => scanned(variant, witness, acc_depth).committee_root[0],
 
         V_SELFTEST => {
             let expected = committee::verify(witness, acc_depth);
-            for candidate in [V_SPLIT, V_COPYING_ADD, V_LEAN] {
+            for candidate in [V_COPYING_ADD, V_LEAF_IN_PLACE] {
                 assert_eq!(
-                    split(candidate, witness, acc_depth),
+                    scanned(candidate, witness, acc_depth),
                     expected,
-                    "a split candidate diverges",
+                    "a scan candidate diverges",
                 );
             }
             assert_eq!(
@@ -119,14 +119,10 @@ fn run(variant: u32, acc_depth: u32, witness: &CommitteeWitness) -> u64 {
                 expected,
                 "V_BATCH_INV diverges",
             );
-            // The 4-ary tree is a different tree, so its root is a different
-            // value by construction; what has to agree is the bucket sums it
-            // publishes, which is everything the root is built from.
-            assert_eq!(
-                arity4(witness, acc_depth).accumulator_commitment,
-                expected.accumulator_commitment,
-                "V_ARITY4 diverges",
-            );
+            // The 4-ary tree is a different accumulator, so it is checked
+            // against nothing; what has to agree is the aggregates it publishes,
+            // which is everything the committee root is built from.
+            assert_eq!(arity4(witness, acc_depth), expected, "V_ARITY4 diverges",);
             expected.committee_root[0]
         }
 
@@ -138,52 +134,39 @@ fn run(variant: u32, acc_depth: u32, witness: &CommitteeWitness) -> u64 {
 ///
 /// Deliberately a transcription of `verify` rather than a parameterisation of
 /// it: a flag tested once per validator is itself a per-validator cost, and it
-/// would land in whichever term the branch predictor happened to charge it to.
-fn ablation(variant: u32, acc_depth: u32, witness: &CommitteeWitness) -> u64 {
-    let mut leaves: Vec<(Digest, u64)> = Vec::with_capacity(witness.members.len());
-    let mut sums: Vec<PointSum> = vec![PointSum::default(); MAX_SLOTS as usize];
+/// would land in whichever term the difference happened to charge it to.
+fn ablation(variant: u64, acc_depth: u32, witness: &[u64]) -> u64 {
+    let mut indices: Vec<u64> = Vec::with_capacity(member_count(witness));
+    let mut leaves: Vec<Digest> = Vec::with_capacity(member_count(witness));
+    let mut sums: Vec<Bucket> = vec![None; MAX_SLOTS as usize];
     let mut balances: Vec<u64> = vec![0u64; MAX_SLOTS as usize];
 
-    for member in &witness.members {
-        let leaf = if variant == V_NO_LEAF {
-            [member.validator_index, 0, 0, 0]
+    for member in members(witness) {
+        let pubkey: &G1Point = member[1..13].try_into().expect("a point is twelve limbs");
+        indices.push(member[0]);
+        leaves.push(if variant == V_NO_LEAF {
+            [member[0], 0, 0, 0]
         } else {
-            acc::leaf(&member.pubkey, member.active_effective_balance)
-        };
-        leaves.push((leaf, member.validator_index));
+            acc::leaf(pubkey, member[13])
+        });
 
-        let slot = member.slot_in_epoch as usize;
+        let slot = member[14] as usize;
         if variant != V_NO_G1 {
-            sums[slot].add(&member.pubkey).expect("shared x-coordinate");
+            add_in_place(&mut sums[slot], pubkey).expect("shared x-coordinate");
         }
-        balances[slot] += member.active_effective_balance;
+        balances[slot] += member[13];
     }
 
     if variant == V_NO_TREE {
-        return leaves[0].0[0] ^ balances[0];
+        return leaves[0][0] ^ balances[0];
     }
-    batch_root(
+    batch_root_columns(
         acc::compress,
-        &leaves,
-        &witness.acc_multi_proof.auxiliaries,
+        indices,
+        leaves,
+        auxiliaries(witness),
         acc_depth,
     )[0]
-}
-
-/// The bucket sums and balances every candidate has to produce, and the tree
-/// root they publish.
-///
-/// Split out because the candidates differ only in how they get here; the
-/// soundness argument — read once, in strictly increasing index order, key and
-/// balance out of the same preimage — is identical in all of them and is
-/// enforced by [`committee::verify`] itself in the shared path below.
-fn publish(sums: &[Bucket], balances: &[u64]) -> Digest {
-    let slots: Vec<Option<CommitteeAggregate>> = sums
-        .iter()
-        .zip(balances)
-        .map(|(sum, &balance)| sum.map(|pubkey| CommitteeAggregate { pubkey, balance }))
-        .collect();
-    committee::root(&slots)
 }
 
 /// One slot's running sum, as the candidates hold it: the same `Option<G1Point>`
@@ -191,26 +174,20 @@ fn publish(sums: &[Bucket], balances: &[u64]) -> Digest {
 /// where it lies.
 type Bucket = Option<G1Point>;
 
-/// The public outputs a candidate publishes, so the self-test can compare them.
-fn output(witness: &CommitteeWitness, committee_root: Digest) -> CommitteeOutput {
-    CommitteeOutput {
-        accumulator_commitment: witness.accumulator_commitment,
-        target_epoch: witness.target_epoch,
-        committee_root,
-    }
-}
-
-/// Candidate: parallel arrays instead of a `Vec<(Digest, u64)>`.
-///
-/// `merkle::batch_root` takes `&[(Digest, u64)]` and its first act is to copy
-/// the two halves into separate vectors, so a witness the size of mainnet's
-/// writes 40 bytes per validator and then reads all of it back to write it
-/// again. Building the two arrays in the member loop is the same work with one
-/// pass instead of three.
-fn split(variant: u32, witness: &CommitteeWitness, acc_depth: u32) -> CommitteeOutput {
-    let (idx, val, sums, balances) = scan(variant, witness);
-    let root = batch_root_split(idx, val, &witness.acc_multi_proof.auxiliaries, acc_depth);
-    assert_eq!(root, witness.acc_root, "accumulator root mismatch");
+/// Candidate: the production verification with one term of the scan swapped out.
+fn scanned(variant: u64, witness: &[u64], acc_depth: u32) -> CommitteeOutput {
+    let (indices, leaves, sums, balances) = scan(variant, witness);
+    assert_eq!(
+        batch_root_columns(
+            acc::compress,
+            indices,
+            leaves,
+            auxiliaries(witness),
+            acc_depth
+        ),
+        root(witness),
+        "accumulator root mismatch",
+    );
     output(witness, publish(&sums, &balances))
 }
 
@@ -219,25 +196,28 @@ fn split(variant: u32, witness: &CommitteeWitness, acc_depth: u32) -> CommitteeO
 /// A 4-ary opening consumes a different auxiliary set from a 2-ary one and the
 /// host writes 2-ary ones, so this runs on the fixtures whose opened set is the
 /// index prefix `0..members` — every missing child is then an empty subtree,
-/// whose digest the guest derives itself in `depth` permutations. That is the
+/// whose digest the guest derives itself in one permutation a level. That is the
 /// regime the question is about: the committee proof opens essentially every
-/// leaf, and the auxiliaries are what a *sparse* opening would pay on either
-/// arity, not what separates them.
-fn arity4(witness: &CommitteeWitness, acc_depth: u32) -> CommitteeOutput {
+/// leaf, and the auxiliaries are what a *sparse* opening pays on either arity,
+/// not what separates them.
+fn arity4(witness: &[u64], acc_depth: u32) -> CommitteeOutput {
     assert_eq!(acc_depth % 2, 0, "a 4-ary tree needs an even 2-ary depth");
-    for (position, member) in witness.members.iter().enumerate() {
+    for (position, member) in members(witness).iter().enumerate() {
         assert_eq!(
-            member.validator_index, position as u64,
+            member[0], position as u64,
             "the 4-ary variant needs the opened set to be an index prefix",
         );
     }
 
-    let (idx, val, sums, balances) = scan(V_SPLIT, witness);
-    // Not compared against `acc_root`: a 4-ary tree over the same leaves has a
-    // different root, and the point of the measurement is what it costs to
-    // reach one. Consumed so nothing is optimised away.
-    let root = batch_root4(idx, val, acc_depth / 2);
-    assert_ne!(root, [0; 4], "4-ary root collapsed");
+    let (indices, leaves, sums, balances) = scan(V_VERIFY, witness);
+    // Not compared against the witness's root: a 4-ary tree over the same leaves
+    // has a different root, and what is being measured is the cost of reaching
+    // one. Consumed so nothing is optimised away.
+    assert_ne!(
+        batch_root4(indices, leaves, acc_depth / 2),
+        acc::ZERO,
+        "4-ary root collapsed",
+    );
     output(witness, publish(&sums, &balances))
 }
 
@@ -249,123 +229,147 @@ fn arity4(witness: &CommitteeWitness, acc_depth: u32) -> CommitteeOutput {
 /// denominators are known at once, and one inversion serves the whole level.
 /// The reduction is over the same multiset in the same buckets, so it publishes
 /// the same aggregate.
-fn batch_inv(witness: &CommitteeWitness, acc_depth: u32) -> CommitteeOutput {
-    let mut idx: Vec<u64> = Vec::with_capacity(witness.members.len());
-    let mut val: Vec<Digest> = Vec::with_capacity(witness.members.len());
+fn batch_inv(witness: &[u64], acc_depth: u32) -> CommitteeOutput {
+    let mut indices: Vec<u64> = Vec::with_capacity(member_count(witness));
+    let mut leaves: Vec<Digest> = Vec::with_capacity(member_count(witness));
     let mut buckets: Vec<Vec<G1Point>> = vec![Vec::new(); MAX_SLOTS as usize];
     let mut balances: Vec<u64> = vec![0u64; MAX_SLOTS as usize];
 
     let mut previous: Option<u64> = None;
-    for member in &witness.members {
+    for member in members(witness) {
         if let Some(previous) = previous {
-            assert!(member.validator_index > previous, "members must increase");
+            assert!(member[0] > previous, "members must be strictly increasing");
         }
-        previous = Some(member.validator_index);
-        assert!(member.slot_in_epoch < MAX_SLOTS, "slot out of range");
+        previous = Some(member[0]);
+        assert!(member[14] < MAX_SLOTS, "slot out of range");
 
-        val.push(acc::leaf(&member.pubkey, member.active_effective_balance));
-        idx.push(member.validator_index);
-        let slot = member.slot_in_epoch as usize;
-        buckets[slot].push(member.pubkey);
-        balances[slot] += member.active_effective_balance;
+        let pubkey: &G1Point = member[1..13].try_into().expect("a point is twelve limbs");
+        indices.push(member[0]);
+        leaves.push(acc::leaf(pubkey, member[13]));
+        buckets[member[14] as usize].push(*pubkey);
+        balances[member[14] as usize] += member[13];
     }
 
-    let root = batch_root_split(idx, val, &witness.acc_multi_proof.auxiliaries, acc_depth);
-    assert_eq!(root, witness.acc_root, "accumulator root mismatch");
+    assert_eq!(
+        batch_root_columns(
+            acc::compress,
+            indices,
+            leaves,
+            auxiliaries(witness),
+            acc_depth
+        ),
+        root(witness),
+        "accumulator root mismatch",
+    );
 
     let sums: Vec<Bucket> = buckets.iter_mut().map(reduce_batched).collect();
     output(witness, publish(&sums, &balances))
 }
 
-/// The member loop every candidate shares: one pass, leaves and indices into
-/// parallel arrays, bucket sums and balances out of the same preimage.
-fn scan(
-    variant: u32,
-    witness: &CommitteeWitness,
-) -> (Vec<u64>, Vec<Digest>, Vec<Bucket>, Vec<u64>) {
-    let mut idx: Vec<u64> = Vec::with_capacity(witness.members.len());
-    let mut val: Vec<Digest> = Vec::with_capacity(witness.members.len());
+/// The member loop the candidates share, with the soundness argument intact:
+/// read once, in strictly increasing index order, key and balance out of the one
+/// preimage the accumulator commits to.
+fn scan(variant: u64, witness: &[u64]) -> (Vec<u64>, Vec<Digest>, Vec<Bucket>, Vec<u64>) {
+    let mut indices: Vec<u64> = Vec::with_capacity(member_count(witness));
+    let mut leaves: Vec<Digest> = Vec::with_capacity(member_count(witness));
     let mut sums: Vec<Bucket> = vec![None; MAX_SLOTS as usize];
     let mut balances: Vec<u64> = vec![0u64; MAX_SLOTS as usize];
 
     let mut previous: Option<u64> = None;
-    for member in &witness.members {
+    for member in members(witness) {
         // Strictly increasing is what makes the slot buckets disjoint: a
         // validator read once cannot land in two of them.
         if let Some(previous) = previous {
-            assert!(member.validator_index > previous, "members must increase");
+            assert!(member[0] > previous, "members must be strictly increasing");
         }
-        previous = Some(member.validator_index);
-        assert!(member.slot_in_epoch < MAX_SLOTS, "slot out of range");
+        previous = Some(member[0]);
+        assert!(member[14] < MAX_SLOTS, "slot out of range");
 
         // Key and balance come out of the one preimage the accumulator commits
         // to, so nothing can inflate the balance side on its own.
-        val.push(if variant == V_LEAN {
-            leaf_in_place(&member.pubkey, member.active_effective_balance)
+        let pubkey: &G1Point = member[1..13].try_into().expect("a point is twelve limbs");
+        indices.push(member[0]);
+        leaves.push(if variant == V_LEAF_IN_PLACE {
+            leaf_in_place(pubkey, member[13])
         } else {
-            acc::leaf(&member.pubkey, member.active_effective_balance)
+            acc::leaf(pubkey, member[13])
         });
-        idx.push(member.validator_index);
-        let slot = member.slot_in_epoch as usize;
+
+        let slot = member[14] as usize;
         let add = if variant == V_COPYING_ADD {
             add_copying
         } else {
             add_in_place
         };
-        add(&mut sums[slot], &member.pubkey).expect("shared x-coordinate");
-        balances[slot] += member.active_effective_balance;
+        add(&mut sums[slot], pubkey).expect("shared x-coordinate");
+        balances[slot] += member[13];
     }
-    (idx, val, sums, balances)
+    (indices, leaves, sums, balances)
 }
 
-/// `merkle::batch_root`'s scan over arrays the caller already built.
-fn batch_root_split(mut idx: Vec<u64>, mut val: Vec<Digest>, aux: &[Digest], depth: u32) -> Digest {
-    let mut next_idx: Vec<u64> = Vec::with_capacity(idx.len());
-    let mut next_val: Vec<Digest> = Vec::with_capacity(val.len());
-    let mut cursor = 0usize;
+// ---------------------------------------------------------------------------
+// The flat witness, as `zkasper_common::committee::encode` lays it out
+// ---------------------------------------------------------------------------
 
-    for _ in 0..depth {
-        next_idx.clear();
-        next_val.clear();
-
-        let mut i = 0usize;
-        while i < idx.len() {
-            let k = idx[i];
-            let (left, right) = if k & 1 == 0 {
-                let left = val[i];
-                if i + 1 < idx.len() && idx[i + 1] == k + 1 {
-                    i += 2;
-                    (left, val[i - 1])
-                } else {
-                    i += 1;
-                    (left, take(aux, &mut cursor))
-                }
-            } else {
-                let left = take(aux, &mut cursor);
-                i += 1;
-                (left, val[i - 1])
-            };
-            next_idx.push(k >> 1);
-            next_val.push(acc::compress(&left, &right));
-        }
-
-        core::mem::swap(&mut idx, &mut next_idx);
-        core::mem::swap(&mut val, &mut next_val);
-    }
-
-    assert_eq!(cursor, aux.len(), "unconsumed auxiliaries");
-    assert_eq!(val.len(), 1, "did not converge to a single root");
-    val[0]
+fn member_count(witness: &[u64]) -> usize {
+    witness[10] as usize
 }
 
-/// The same scan with four children to a node.
+fn root(witness: &[u64]) -> Digest {
+    witness[4..8].try_into().expect("a digest is four words")
+}
+
+fn members(witness: &[u64]) -> &[[u64; MEMBER_WORDS]] {
+    records(&witness[HEADER_WORDS..HEADER_WORDS + member_count(witness) * MEMBER_WORDS])
+}
+
+fn auxiliaries(witness: &[u64]) -> &[[u64; DIGEST_WORDS]] {
+    records(&witness[HEADER_WORDS + member_count(witness) * MEMBER_WORDS..])
+}
+
+/// Reinterpret a run of words as the fixed-stride records it holds.
+///
+/// Sound for any `[u64; N]`: it is `N` words with no padding, its alignment is a
+/// `u64`'s, and every bit pattern is a valid one.
+fn records<const N: usize>(words: &[u64]) -> &[[u64; N]] {
+    let (prefix, records, suffix) = unsafe { words.align_to::<[u64; N]>() };
+    assert!(
+        prefix.is_empty() && suffix.is_empty(),
+        "witness is not a whole number of records",
+    );
+    records
+}
+
+fn publish(sums: &[Bucket], balances: &[u64]) -> Digest {
+    let slots: Vec<Option<CommitteeAggregate>> = sums
+        .iter()
+        .zip(balances)
+        .map(|(sum, &balance)| sum.map(|pubkey| CommitteeAggregate { pubkey, balance }))
+        .collect();
+    committee::root(&slots)
+}
+
+fn output(witness: &[u64], committee_root: Digest) -> CommitteeOutput {
+    CommitteeOutput {
+        accumulator_commitment: witness[0..4].try_into().expect("a digest is four words"),
+        target_epoch: witness[8],
+        committee_root,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pieces the candidates swap in
+// ---------------------------------------------------------------------------
+
+/// The multi-proof scan with four children to a node.
 ///
 /// Poseidon2's state is sixteen Goldilocks elements and a digest is four, so a
 /// node absorbs four children in the permutation a 2-ary node spends on two.
 /// There is no room left for the domain separator `acc::compress` carries; what
-/// stands in for it is that the tree is fixed-depth and fixed-shape, so the
-/// verifier applies the leaf function at exactly one level and this one above
-/// it, and a leaf preimage is never offered where a node preimage is expected.
+/// would have to stand in for it is that the tree is fixed-depth and
+/// fixed-shape, so the verifier applies the leaf function at exactly one level
+/// and this one above it, and a leaf preimage is never offered where a node
+/// preimage is expected.
 fn batch_root4(mut idx: Vec<u64>, mut val: Vec<Digest>, depth: u32) -> Digest {
     let mut next_idx: Vec<u64> = Vec::with_capacity(idx.len());
     let mut next_val: Vec<Digest> = Vec::with_capacity(val.len());
@@ -381,10 +385,7 @@ fn batch_root4(mut idx: Vec<u64>, mut val: Vec<Digest>, depth: u32) -> Digest {
         let mut i = 0usize;
         while i < idx.len() {
             let parent = idx[i] >> 2;
-            let mut state = [0u64; 16];
-            for child in 0..4 {
-                state[4 * child..4 * child + 4].copy_from_slice(&empty);
-            }
+            let mut state = fill4(&empty);
             while i < idx.len() && idx[i] >> 2 == parent {
                 let child = (idx[i] & 3) as usize;
                 state[4 * child..4 * child + 4].copy_from_slice(&val[i]);
@@ -394,12 +395,7 @@ fn batch_root4(mut idx: Vec<u64>, mut val: Vec<Digest>, depth: u32) -> Digest {
             next_val.push(node4(&mut state));
         }
 
-        let mut state = [0u64; 16];
-        for child in 0..4 {
-            state[4 * child..4 * child + 4].copy_from_slice(&empty);
-        }
-        empty = node4(&mut state);
-
+        empty = node4(&mut fill4(&empty));
         core::mem::swap(&mut idx, &mut next_idx);
         core::mem::swap(&mut val, &mut next_val);
     }
@@ -409,12 +405,21 @@ fn batch_root4(mut idx: Vec<u64>, mut val: Vec<Digest>, depth: u32) -> Digest {
 }
 
 #[inline]
+fn fill4(digest: &Digest) -> [u64; 16] {
+    let mut state = [0u64; 16];
+    for child in 0..4 {
+        state[4 * child..4 * child + 4].copy_from_slice(digest);
+    }
+    state
+}
+
+#[inline]
 fn node4(state: &mut [u64; 16]) -> Digest {
     unsafe { syscall_poseidon2(state as *mut [u64; 16]) };
     [state[0], state[1], state[2], state[3]]
 }
 
-/// `bls::PointSum::add`, transcribed, so the copies it makes can be measured.
+/// `bls::PointSum::add` as it used to be, so the copies it made can be measured.
 fn add_copying(sum: &mut Bucket, point: &G1Point) -> Option<()> {
     let Some(current) = sum.as_mut() else {
         *sum = Some(*point);
@@ -442,16 +447,7 @@ fn add_copying(sum: &mut Bucket, point: &G1Point) -> Option<()> {
     Some(())
 }
 
-/// The same addition without the copies.
-///
-/// `SyscallPoint384` is `#[repr(C)] { x: [u64; 6], y: [u64; 6] }`, which is the
-/// layout `G1Point` already has, so the precompile can be pointed at the running
-/// sum and at the witness's key where they lie. What [`add_copying`] does
-/// instead is build two `SyscallPoint384`s field by field and copy the result
-/// back: 48 loads and 24 stores around a syscall that is 1,896 cost units.
-///
-/// The precondition is unchanged and still checked: a shared x-coordinate means
-/// `p1 == p2` or `p1 == -p2`, and the precompile is undefined on both.
+/// The same addition without the copies, which is what `bls::PointSum` now does.
 fn add_in_place(sum: &mut Bucket, point: &G1Point) -> Option<()> {
     let Some(current) = sum.as_mut() else {
         *sum = Some(*point);
@@ -460,8 +456,6 @@ fn add_in_place(sum: &mut Bucket, point: &G1Point) -> Option<()> {
     if current[0..6] == point[0..6] {
         return None;
     }
-    // Same size, same alignment, no padding, and every bit pattern is a valid
-    // inhabitant of both types.
     syscall_bls12_381_curve_add(&mut SyscallBls12_381CurveAddParams {
         p1: unsafe { &mut *(current.as_mut_ptr() as *mut SyscallPoint384) },
         p2: unsafe { &*(point.as_ptr() as *const SyscallPoint384) },
@@ -472,9 +466,8 @@ fn add_in_place(sum: &mut Bucket, point: &G1Point) -> Option<()> {
 /// `acc::leaf` with the packed point written into the permutation state.
 ///
 /// `acc::pack_point` fills a thirteen-element array which `acc::leaf` then
-/// copies into the state — thirteen stores, thirteen loads and thirteen stores
-/// for a permutation that costs 1,050. Same preimage, same digest, which the
-/// self-test pins against `acc::leaf`.
+/// copies into the state. Same preimage, same digest, which the self-test pins
+/// against `acc::leaf`.
 fn leaf_in_place(point: &G1Point, active_effective_balance: u64) -> Digest {
     const PACK_BITS: u32 = 60;
     let mut st = [0u64; 16];
@@ -496,19 +489,12 @@ fn leaf_in_place(point: &G1Point, active_effective_balance: u64) -> Digest {
     [st[0], st[1], st[2], st[3]]
 }
 
-#[inline]
-fn take(aux: &[Digest], cursor: &mut usize) -> Digest {
-    let v = *aux.get(*cursor).expect("auxiliaries exhausted");
-    *cursor += 1;
-    v
-}
-
 /// Sum a bucket by binary reduction, one batched inversion per level.
 ///
 /// This is the shape Montgomery's trick needs: at a level the `m/2` additions
 /// are independent, so their `m/2` denominators are known before any of them is
 /// used and a single inversion unwinds into all of them.
-fn reduce_batched(points: &mut Vec<G1Point>) -> Option<G1Point> {
+fn reduce_batched(points: &mut Vec<G1Point>) -> Bucket {
     if points.is_empty() {
         return None;
     }

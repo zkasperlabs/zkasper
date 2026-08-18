@@ -44,19 +44,18 @@ VARIANTS = [
     (2, "no curve adds", "ablation"),
     (3, "no accumulator tree", "ablation"),
     (4, "no leaf hashes", "ablation"),
-    (5, "split leaf arrays", "candidate"),
-    (6, "4-ary accumulator", "candidate"),
-    (7, "batch-inverted adds", "candidate"),
-    (9, "copying add, superseded", "candidate"),
-    (10, "split + in-place leaf", "candidate"),
+    (5, "4-ary accumulator", "candidate"),
+    (6, "batch-inverted adds", "candidate"),
+    (7, "copying add, superseded", "candidate"),
+    (8, "leaf packed in place", "candidate"),
 ]
 
-SELFTEST = 8
+SELFTEST = 9
 MAX_STEPS = 200_000_000
 
 
 def fixture(active, depth, registry=None, slots=32):
-    """Generate, and cache, one witness. Returns the raw bincode bytes."""
+    """Generate, and cache, one witness. Returns the flat words as bytes."""
     registry = active if registry is None else registry
     os.makedirs(FIXTURES, exist_ok=True)
     path = os.path.join(FIXTURES, f"c_{active}_{registry}_{depth}_{slots}.bin")
@@ -72,7 +71,7 @@ def fixture(active, depth, registry=None, slots=32):
 
 def run(variant, depth, witness):
     """One emulator run. `None` if the guest rejected the input."""
-    payload = struct.pack("<II", variant, depth) + witness
+    payload = struct.pack("<QQ", variant, depth) + witness
     blob = struct.pack("<Q", len(payload)) + payload
     blob += b"\x00" * (-len(blob) % 8)
     path = os.path.join(FIXTURES, "input.bin")

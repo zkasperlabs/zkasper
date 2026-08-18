@@ -128,7 +128,9 @@ fn main() {
     )
     .expect("build committees");
 
-    let bytes = bincode::serialize(&committees.witness).expect("serialize");
+    let bytes = zkasper_common::committee::to_bytes(&zkasper_common::committee::encode(
+        &committees.witness,
+    ));
     std::fs::write(out, &bytes).expect("write witness");
     println!(
         "{out}: {} members, {} auxiliaries, depth {acc_depth}, {} bytes",

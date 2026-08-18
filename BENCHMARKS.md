@@ -677,26 +677,37 @@ at 16,000 / 32,000 / 64,000 members, linear to five figures:
 | | steps/member | cost units/member |
 |---|---:|---:|
 | bincode witness | 1,157.0 | 111,318 |
-| flat witness, read in place | **328.0** | **36,473** |
+| flat witness, read in place | 328.0 | 36,473 |
+| curve add takes the sum in place | **254.0** | **30,127** |
 
 `crates/common/src/committee.rs` now defines the layout the host writes and the
 guest indexes; nothing about what is proven changed, and the strictly-increasing
 check that makes the slot buckets disjoint is still the same check in the same
-pass. At the attester sweep's rate for this work class that is 125 µs a member
-against 405 µs, and the proof as a whole:
+pass.
+
+The third row is the marshalling around the addition rather than the witness.
+`SyscallPoint384` is `#[repr(C)] { x: [u64; 6], y: [u64; 6] }`, which is the
+layout `G1Point` already has, so `bls::PointSum` was building two of them field
+by field and copying the result back — 48 loads and 24 stores around a syscall
+that is 1,896 cost units. Pointing the precompile at the running sum and at the
+key where they lie is 74 steps a member, and the same saving lands on every key
+a slot proof names.
+
+At the attester sweep's rate for this work class that is 101 µs a member against
+405 µs, and the proof as a whole:
 
 | | seconds | share |
 |---|---:|---:|
-| committee proof | 169 | **78%** |
-| stage floors, the epoch's own five proofs | 28.7 | 13% |
-| distinct messages (64 of them) | 16.1 | 7% |
+| committee proof | 146 | **74%** |
+| stage floors, the epoch's own five proofs | 28.7 | 15% |
+| distinct messages (64 of them) | 16.1 | 8% |
 | final exponentiation | 0.64 | 0.3% |
-| naming absentees | ~5 | 2% |
-| | **216** | |
+| naming absentees | ~5 | 3% |
+| | **196** | |
 
 Three things follow:
 
-1. **The fleet is one card.** 169 s of committee proof lands inside the 384 s
+1. **The fleet is one card.** 146 s of committee proof lands inside the 384 s
    epoch that owes it, in one chunk, on the card the deadline work already has
    idle. Chunking is still supported and still correct — bucket sums add and a
    validator lands in one index range — but nothing needs it.
@@ -714,13 +725,75 @@ Three things follow:
    over the pipeline's most nested witness would buy about 1% of a proof.
 
 3. **What is left of the committee proof is not framing any more.** Of the
-   36,473 units a member still costs, the precompiles it exists to run — one
-   leaf hash, one internal node, one curve addition — are 4,161. The rest is
-   `acc::leaf`'s repacking of a 768-bit point into 60-bit Goldilocks windows and
-   the limb marshalling around `syscall_bls12_381_curve_add`, which copies 24
-   words in and 12 out per addition for a precompile that could take the point
-   where it lies. That is the next win, and it is worth about 15% of a proof
-   that now fits.
+   30,127 units a member still costs, the precompiles it exists to run — one
+   leaf hash, one internal node, one curve addition — are 4,161, or 14%. The
+   rest is `acc::leaf`'s repacking of a 768-bit point into 60-bit Goldilocks
+   windows and the multi-proof's scan bookkeeping. `scripts/committee_bench.py`
+   attributes it, at 1,024 -> 2,048 members and depth 12:
+
+   | | cost units/member | share |
+   |---|---:|---:|
+   | accumulator multi-proof | 10,801 | 36% |
+   | leaf hash | 11,210 | 37% |
+   | curve addition | 5,405 | 18% |
+   | witness I/O, what is left of it | 1,281 | 4% |
+   | balances, asserts, the 32-leaf tree | 1,219 | 4% |
+
+   Writing the packed point straight into the permutation state was measured and
+   is **worth nothing** — 30,568 against 30,127, LLVM already elides the
+   intermediate array. What does pay is arity: a 4-ary accumulator absorbs four
+   digests in the permutation a 2-ary node spends on two, which takes the
+   internal nodes from one a leaf to a third of one and measures **25,965 units
+   a member, 13% off**. It also halves the tree's depth, which is what every
+   scattered absentee opening in the pipeline pays. It is not landed: it changes
+   the accumulator every other proof binds.
+
+### Measuring a committee strategy in a minute
+
+`scripts/committee_bench.py` runs `crates/committee-bench-guest` under
+`ziskemu -X` over a witness `gen-committee-witness` builds at a size, an
+accumulator depth and a registry-to-active ratio a person picks, and subtracts
+two sizes so everything that does not scale cancels. Every candidate is a whole
+verification checked against `committee::verify`'s own output by
+`--selftest`, so an "optimisation" that changes the answer cannot be reported as
+one. Marginal cost is flat to 1.2% from 256 to 8,192 members, and the
+production guest at 16,000 / 32,000 / 64,000 reproduces the bench guest's
+figure to 0.7%, which is what licenses the extrapolation to 961k.
+
+Three questions it closed:
+
+**Accumulator depth does not matter.** Per-member cost at depths 12, 16, 20 and
+22 is 254 steps and 29,916 units, identical to the last unit. The committee
+proof opens an index range, so the levels above it are a constant, not a term.
+An `ACC_TREE_DEPTH` cheaper than 22 buys the committee proof nothing.
+
+**Montgomery's batch inversion is a 3.75x pessimisation.** Sharing one inversion
+across a level of a binary reduction is the classic win when an inversion costs
+what a hundred multiplications cost. In Zisk it costs what *one* does:
+`arith384_mod` and `bls12_381_curve_add` are the same `ARITH_EQ_384` operation
+at 1,896 cost units, and `inv_fp_bls12_381` is a hinted inverse plus one
+multiplication to check it. A whole affine addition is one precompile; doing it
+in software is ten, and batching the inversion makes it twelve. Measured:
+**112,272 units a member against 29,916**, with 11.94 `arith384_mod` calls a
+member where the precompile path has one.
+
+**The inactive gaps are what is left to attack.** The registry holds 2,212,792
+entries and the proof opens 960,974 of them, so the opened set is not one run.
+With the inactive validators spread evenly, every factor of two of scatter costs
+**one more internal node, 101 steps and 10,795 cost units a member**:
+
+| active share of the registry | steps/member | cost units/member |
+|---|---:|---:|
+| all of it | 254 | 29,916 |
+| 1 in 2 | 355 | 40,712 |
+| 1 in 4 | 456 | 51,507 |
+
+Mainnet's ratio is 2.30, so uniform scatter would be +43%. Real exits cluster at
+low indices and pending validators at high ones, so the true figure is somewhere
+below that and is an empirical question about a real state, not a modelling one
+— `gen-committee-witness` takes the ratio as an argument for exactly that
+reason. It is the largest remaining term and the only one that argues for
+indexing the accumulator by active index rather than registry index.
 
 ## Composite: real slot proof
 

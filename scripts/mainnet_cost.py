@@ -137,7 +137,7 @@ def main():
     print("  model charged it the whole registry rather than the active set,")
     print("  and the guest spent 94% of the proof deserialising a witness Zisk")
     print("  had already handed it as aligned words. It reads them in place")
-    print("  now — 328 executed steps a member, not 1,157.\n")
+    print("  now — 254 executed steps a member, not 1,157.\n")
 
 
 if __name__ == "__main__":

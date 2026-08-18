@@ -9,6 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 zkasper-common = { path = "../common", default-features = false }
-serde = { workspace = true }
-bincode = { workspace = true }
 ziskos = { workspace = true }
