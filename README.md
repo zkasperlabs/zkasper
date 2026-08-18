@@ -289,6 +289,11 @@ Three reasons, in the order they matter:
 - **Coverage is a cost.** A network aggregator publishes the best cover it has
   seen; an attester missing from it becomes a named absentee in the complement
   proof at 1.79 ms each. Singles let the daemon find those validators itself.
+  Measured on epoch 430529, this is real but small: an attester that the first
+  block to carry its slot missed — a lower bound on what one aggregate pool
+  misses — is 11 validators on the slot 2/3 crosses in (20 ms), 236 across the
+  epoch, and 87 on the worst slot (156 ms). Worth having, and two orders of
+  magnitude less than the four seconds below.
 - **Four seconds.** Unaggregated attestations are published a third of a slot in;
   aggregates two thirds. Since the trigger fires when the arrival burst drains,
   that is four seconds off `T2`.
