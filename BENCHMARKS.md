@@ -317,6 +317,44 @@ one direction for `MAIN`-heavy guests and right only for the poseidon2 workload
 it was fitted on.
 
 
+## The pipeline stages, proved
+
+Fixture witnesses (4 validators) staged from a machine that can build
+`witness-gen`, proved on the RTX 5090. `Proof generated` is the prover own
+figure, wall is the whole `cargo-zisk prove` process. 4 proves each; the first
+is listed separately because it is the only one that is ever cold.
+
+| stage | VARIABLE | TOTAL | `Proof generated` | wall |
+|---|---:|---:|---:|---:|
+| group proof | 135,183,320 | 428,784,600 | 8.01 s +/- 0.03 | 20.1-23.1 s |
+| slot proof | 272,512,030 | 566,113,310 | 8.19 s +/- 0.12 | 19.1-22.2 s |
+
+The two differ by 137M cost units and by **0.18 s**. Both are floor-dominated,
+which is the same quantisation result as the bench guest seen from a different
+angle: below an AIR-instance boundary, cost units buy very little time.
+
+`aggregation` and `stream-final` **could not be proved**. Their witnesses carry
+stub child proofs, `verify_child` rejects an empty proof inside a guest, and the
+`assert!` around it panics - a panicking guest never returns from `ziskemu`, so
+both time out rather than reporting a cost. This is a property of the fixture,
+not of the circuits, and it goes away with real child proofs.
+
+### Wrapping is startup, not compression
+
+`cargo-zisk wrap --minimal -g`, 3 runs per stage, reading
+`GENERATE_VADCOP_FINAL_COMPRESSED_PROOF` out of the log rather than trusting
+`time`:
+
+| stage | wall | of which compression |
+|---|---:|---:|
+| group proof | 13.25 / 12.47 / 11.84 s | 452 / 157 / 151 ms |
+| slot proof | 11.66 / 13.61 / 12.66 s | 152 / 170 / 153 ms |
+
+**About 12.5 s of wall around 0.15 s of work.** Wrapping costs essentially
+nothing; paying for it as a separate process costs 12 s. On a prover that stays
+up it disappears into the noise, which is the whole argument for one.
+
+
 ## What the numbers decided
 
 **The accumulator earns its keep.** An accumulator node is **16.3x** cheaper
