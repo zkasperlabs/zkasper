@@ -38,6 +38,24 @@ accumulator was built from, which is what the rule above needs. The same opening
 takes `block_roots` at that slot and requires it to be the finalized root, so the
 checkpoint and the state come from one chain rather than two.
 
+### A justification proof is one link of a chain, and the flag is the claim
+
+`justification-guest` folds an epoch's slot proofs a few at a time, each link
+verifying its predecessor and the slot proofs added since. The links before the
+last are valid proofs of a partial count, so **the existence of a justification
+proof does not mean the epoch was justified**. What means it is
+`JustificationOutput.justified`, which the circuit *computes* — from a
+`total_active_balance` it rehashed against the accumulator commitment, so the
+gate divides by the balance the accumulator commits to and not one the prover
+named.
+
+**A consumer must require that flag.** Both finalization circuits do, and so
+does the daemon before it publishes a justification on its own. The API
+publishes it beside the attesting balance in the proof's public inputs.
+
+The same holds for the streaming path without a flag: `stream-final-guest`
+asserts the supermajority itself, and only ever exists above it.
+
 ### The bootstrap state is the root of trust
 
 Bootstrap builds the accumulator from one beacon state that the operator chose.
@@ -177,20 +195,6 @@ A zkasper proof therefore claims **that a supermajority attested to the
 target**, which is weaker than the justification rule of the specification. The
 protection against a mismatched source is the slashing rules of the protocol,
 not the proof. Fix this before a bridge secures value.
-
-### The batch justification divides by an unbound balance
-
-`justification-guest` checks the 2/3 threshold against
-`witness.total_active_balance`, which arrives as a free scalar. The guest holds
-no `acc_root`, so it cannot recompute
-`acc::commitment(acc_root, total_active_balance)`, and `JustificationOutput`
-does not publish the balance either.
-
-A prover on the batch path can therefore name a small total and clear the gate.
-The streaming path does bind it: both `slot-proof-guest` and
-`stream-final-guest` assert the commitment over `(acc_root,
-total_active_balance)` before they use either. **Do not secure value with
-`--mode batch`.**
 
 ### Native mode proves nothing cryptographically
 

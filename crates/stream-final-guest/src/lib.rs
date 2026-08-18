@@ -246,6 +246,13 @@ pub fn verify_stream_final_with(
         ),
         "previous justification failed recursive verification",
     );
+    // A batch justification is a link in a fold chain, and the partial links are
+    // valid proofs of a partial count. Only a link that says two thirds is
+    // behind it justifies anything.
+    assert!(
+        previous.is_justified(),
+        "the previous epoch's justification is a partial fold, not a supermajority",
+    );
     assert_eq!(
         previous.target_epoch() + 1,
         witness.target_epoch,

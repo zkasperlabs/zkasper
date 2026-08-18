@@ -40,8 +40,11 @@
 //! interval at a time.
 //!
 //! [`Pipeline`] picks what happens to the slots. [`Pipeline::Batch`] proves one
-//! slot proof each and folds them into a justification once the epoch is over,
-//! which is three proofs deep and simple. [`Pipeline::Streaming`] proves a group
+//! slot proof each and folds them, a couple at a time as they finish, into a
+//! chain of justification links — the same incremental shape the streaming
+//! aggregate has, and for the same reason: a proof that verified every slot of
+//! the epoch at once cost 1,221 s of an epoch's 1,452 on an RTX 5090, and no
+//! proof in this pipeline may grow with the epoch. [`Pipeline::Streaming`] proves a group
 //! per tick, folds each into a running aggregate as it finishes, and collapses
 //! justification, finalization and the epoch's one final exponentiation into a
 //! single proof over the attestation that crossed the threshold — see
@@ -107,11 +110,22 @@ const LIVE_EPOCHS: f64 = 2.0;
 /// How many epochs' measured `T2 - T` the manifest keeps.
 const RECENT_LATENCIES: usize = 16;
 
+/// Slot proofs one link of the justification chain absorbs, by default.
+///
+/// Two, because a link's cost is a floor plus a recursion per child and the
+/// recursion is the expensive half: a link of two verifies three children —
+/// its predecessor and two slot proofs — which is the same shape the streaming
+/// fold has. Widening it trades fewer proofs for a bigger trace in each, and
+/// past a handful of children the trace stops being the linear thing the trade
+/// assumes. `BENCHMARKS.md` has the curve that set this.
+const DEFAULT_JUSTIFICATION_FOLD_WIDTH: usize = 2;
+
 /// Which pipeline an epoch is proven with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pipeline {
-    /// One slot proof per slot, folded into a justification once the epoch is
-    /// over, paired with the previous epoch's into a finalization.
+    /// One slot proof per slot, folded a few at a time into a chain of
+    /// justification links, paired with the previous epoch's into a
+    /// finalization.
     #[default]
     Batch,
     /// Group proofs as attestations arrive, folded into a running aggregate,
@@ -168,6 +182,14 @@ pub struct OrchestratorConfig {
     pub trigger_interval: Duration,
     /// How many epochs past the target to keep looking for its attestations.
     pub attestation_lookahead_epochs: u64,
+    /// How many slot proofs one link of the justification chain absorbs.
+    ///
+    /// The batch path used to fold the whole epoch at once, which is where its
+    /// 1,221 s justification came from. Recursion costs
+    /// [`crate::streaming::ProverModel::recursion_verify_s`] a child and grows
+    /// faster than linearly past a handful of them, so a link stays small and
+    /// the chain stays long. See [`crate::streaming`] for the trade.
+    pub justification_fold_width: usize,
     pub pipeline: Pipeline,
     /// When the streaming pipeline stops collecting, and how long the trigger
     /// may hold past it. See [`crate::streaming`].
@@ -201,6 +223,7 @@ impl OrchestratorConfig {
             poll_interval: Duration::from_secs(4),
             trigger_interval: Duration::from_millis(200),
             attestation_lookahead_epochs: 2,
+            justification_fold_width: DEFAULT_JUSTIFICATION_FOLD_WIDTH,
             pipeline: Pipeline::default(),
             stream_policy: StreamPolicy::default(),
             gossip_url: None,
@@ -252,6 +275,13 @@ impl Tick {
 ///
 /// Lives across ticks: slots are folded in as the node publishes them, and the
 /// epoch finishes the moment the counted balance crosses 2/3.
+///
+/// The fold is incremental. A slot proof joins `unfolded`, and once
+/// [`OrchestratorConfig::justification_fold_width`] of them are waiting they
+/// become one more link of the justification chain — during the epoch, against
+/// attestations that already arrived. What is left when the threshold crosses
+/// is one link over a handful of children rather than one proof over all of
+/// them.
 struct EpochAggregator {
     target_epoch: u64,
     target_root: [u8; 32],
@@ -270,8 +300,16 @@ struct EpochAggregator {
     /// One past the last slot worth scanning for this checkpoint.
     scan_end: u64,
     attesting_balance: u64,
-    slot_outputs: Vec<SlotProofOutput>,
-    slot_proofs: Vec<Proof>,
+    /// The justification chain so far, absent until the first link is proven.
+    justification: Option<JustificationRecord>,
+    /// Slot proofs the chain has not absorbed yet.
+    unfolded: Vec<SlotProofOutput>,
+    unfolded_proofs: Vec<Proof>,
+    /// Slot proofs proven for this epoch, counted rather than kept: it numbers
+    /// their stage timings, and the proofs themselves leave for the chain.
+    slots_proven: usize,
+    /// Links of the justification chain proven so far, numbering theirs.
+    folds: usize,
 }
 
 impl EpochAggregator {
@@ -282,6 +320,20 @@ impl EpochAggregator {
 
     fn exhausted(&self) -> bool {
         self.next_slot >= self.scan_end
+    }
+
+    /// What every link of this epoch's justification chain shares.
+    fn justification_context(&self, prover: &dyn Prover) -> witness_justification::Context {
+        witness_justification::Context {
+            accumulator_commitment: self.acc_commitment,
+            acc_root: self.acc_root,
+            target_epoch: self.target_epoch,
+            target_root: self.target_root,
+            total_active_balance: self.total_active_balance,
+            slot_program_vk: prover.program_vk(Stage::SlotProof),
+            committee_program_vk: prover.program_vk(Stage::Committee),
+            justification_program_vk: prover.program_vk(Stage::Justification),
+        }
     }
 }
 
@@ -992,7 +1044,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             // (epoch, stage, index) folds every unnumbered repeat onto one row —
             // which lost 21 of an epoch's 22 slot proofs, and with them most of
             // what the epoch cost.
-            let index = aggregator.slot_proofs.len();
+            let index = aggregator.slots_proven;
             self.begin(
                 Stage::SlotProof,
                 target_epoch,
@@ -1035,8 +1087,9 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             )?;
 
             aggregator.attesting_balance += output.attesting_balance;
-            aggregator.slot_outputs.push(output);
-            aggregator.slot_proofs.push(proof);
+            aggregator.unfolded.push(output);
+            aggregator.unfolded_proofs.push(proof);
+            aggregator.slots_proven += 1;
 
             let millis = started.elapsed().as_millis() as u64;
             info!(
@@ -1060,9 +1113,17 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 )
                 .at_slot(attestation_slot)
                 .at_index(index)
-                .with_proof(aggregator.slot_proofs.last().expect("just pushed")),
+                .with_proof(aggregator.unfolded_proofs.last().expect("just pushed")),
             );
             tick.slots_proved.push(attestation_slot);
+
+            // Fold what has piled up, unless the epoch is over: the link that
+            // closes it takes the rest, and one link is cheaper than two.
+            if aggregator.unfolded.len() >= self.config.justification_fold_width
+                && !aggregator.threshold_reached()
+            {
+                self.fold_justification(&mut aggregator).await?;
+            }
         }
 
         if aggregator.threshold_reached() {
@@ -1143,9 +1204,91 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             next_slot: target_epoch * spe,
             scan_end: (target_epoch + self.config.attestation_lookahead_epochs) * spe,
             attesting_balance: 0,
-            slot_outputs: Vec::new(),
-            slot_proofs: Vec::new(),
+            justification: None,
+            unfolded: Vec::new(),
+            unfolded_proofs: Vec::new(),
+            slots_proven: 0,
+            folds: 0,
         })
+    }
+
+    /// Absorb the slot proofs waiting on the aggregator into its justification
+    /// chain, and leave the chain one link longer.
+    ///
+    /// This is the whole of the incremental fold. It runs during the epoch
+    /// rather than after it, so by the time the threshold crosses the chain is
+    /// already most of the way built and the link that closes the epoch is the
+    /// same size as every other.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "justification", epoch = aggregator.target_epoch),
+    )]
+    async fn fold_justification(&mut self, aggregator: &mut EpochAggregator) -> Result<()> {
+        let target_epoch = aggregator.target_epoch;
+        let index = aggregator.folds;
+        let started = Instant::now();
+        self.begin(Stage::Justification, target_epoch, None, Some(index));
+
+        let previous = aggregator.justification.take();
+        // Only the link that opens the epoch carries the committee proof; every
+        // later one inherits the root it published.
+        let (committee, committee_proof) = match &previous {
+            Some(_) => (None, Vec::new()),
+            None => (
+                Some(aggregator.committee_output.clone()),
+                aggregator.committee_proof.clone(),
+            ),
+        };
+        let (previous_output, previous_proof) = match previous {
+            Some(record) => (Some(record.output), record.proof),
+            None => (None, Vec::new()),
+        };
+
+        let children = aggregator.unfolded.len();
+        let witness = witness_justification::build(
+            &aggregator.justification_context(self.prover.as_ref()),
+            committee,
+            committee_proof,
+            previous_output,
+            previous_proof,
+            std::mem::take(&mut aggregator.unfolded),
+            std::mem::take(&mut aggregator.unfolded_proofs),
+        );
+
+        let (output, proof) = self
+            .prover
+            .prove_justification(&witness)
+            .with_context(|| format!("justification fold {index} of epoch {target_epoch}"))?;
+        let name = format!("justification_{index}");
+        let artifact = self.sink.write_witness(target_epoch, &name, &witness)?;
+        write_proof(&self.sink, target_epoch, &name, &proof)?;
+
+        let millis = started.elapsed().as_millis() as u64;
+        info!(
+            target_epoch,
+            index,
+            children,
+            attesting_balance = output.attesting_balance,
+            justified = output.justified,
+            millis,
+            "justification fold",
+        );
+        self.record(
+            StageTiming::new(
+                Stage::Justification,
+                target_epoch,
+                started,
+                self.prover.last_cost(),
+                artifact,
+            )
+            .at_index(index)
+            .with_proof(&proof),
+        );
+
+        aggregator.justification = Some(JustificationRecord { output, proof });
+        aggregator.folds += 1;
+        Ok(())
     }
 
     /// Prove the epoch's committees, and time it like every other stage.
@@ -1221,62 +1364,44 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         )
     }
 
-    /// Fold the epoch's slot proofs into a justification, and pair it with the
-    /// previous one into a finalization when the two are consecutive.
-    #[instrument(
-        name = "stage",
-        skip_all,
-        fields(stage = "justification", epoch = aggregator.target_epoch),
-    )]
-    async fn close_epoch(&mut self, aggregator: EpochAggregator, tick: &mut Tick) -> Result<()> {
+    /// Close the epoch's justification chain, and pair it with the previous
+    /// epoch's into a finalization when the two are consecutive.
+    async fn close_epoch(
+        &mut self,
+        mut aggregator: EpochAggregator,
+        tick: &mut Tick,
+    ) -> Result<()> {
         let target_epoch = aggregator.target_epoch;
-        let started = Instant::now();
-        self.begin(Stage::Justification, target_epoch, None, None);
 
-        let witness = witness_justification::build(
-            aggregator.slot_outputs,
-            aggregator.slot_proofs,
-            aggregator.acc_commitment,
-            self.prover.program_vk(Stage::SlotProof),
-            self.prover.program_vk(Stage::Committee),
-            aggregator.committee_output,
-            aggregator.committee_proof,
-            target_epoch,
-            aggregator.target_root,
-            aggregator.total_active_balance,
-            aggregator.acc_root,
-        );
+        // The link that crosses the threshold. Whatever the epoch proved since
+        // the last fold is still waiting, so this always has something to
+        // absorb — the loop stops folding once the balance is there.
+        self.fold_justification(&mut aggregator).await?;
+        let record = aggregator
+            .justification
+            .take()
+            .expect("the closing fold leaves a justification");
 
-        let slots = witness.slot_proof_outputs.len();
-        let (output, proof) = self.prover.prove_justification(&witness)?;
-        let artifact = self
-            .sink
-            .write_witness(target_epoch, "justification", &witness)?;
-        write_proof(&self.sink, target_epoch, "justification", &proof)?;
-
-        let millis = started.elapsed().as_millis() as u64;
+        // The circuit computes the supermajority rather than asserting it, so
+        // that a partial fold can be a valid proof. A closing fold that comes
+        // back unjustified means the host counted a balance the circuit did
+        // not, which is a bug rather than a chain event.
+        if !record.output.justified {
+            bail!(
+                "epoch {target_epoch} closed with {} of {} attesting, which the circuit does \
+                 not call a supermajority",
+                record.output.attesting_balance,
+                aggregator.total_active_balance,
+            );
+        }
         info!(
             target_epoch,
-            slots,
-            attesting_balance = aggregator.attesting_balance,
-            millis,
+            slots = aggregator.slots_proven,
+            folds = aggregator.folds,
+            attesting_balance = record.output.attesting_balance,
             "justified",
         );
-        self.record(
-            StageTiming::new(
-                Stage::Justification,
-                target_epoch,
-                started,
-                self.prover.last_cost(),
-                artifact,
-            )
-            .with_proof(&proof),
-        );
 
-        let record = JustificationRecord {
-            output: output.clone(),
-            proof,
-        };
         let finalized = self.try_finalize(&record).await?;
 
         // The first epoch of a run has nothing before it to finalize, so its

@@ -27,6 +27,10 @@ path = "src/bin/zkasperd.rs"
 name = "zkasper-prover-server"
 path = "src/bin/prover_server.rs"
 
+[[bin]]
+name = "recursion-bench"
+path = "src/bin/recursion_bench.rs"
+
 [dependencies]
 ziskos = { workspace = true }
 zkasper-common = { path = "../common", features = ["test-utils"] }

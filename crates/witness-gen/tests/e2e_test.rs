@@ -322,18 +322,36 @@ fn test_e2e_full_pipeline() {
     // =========================================================
     // Step C: Justification for epoch E
     // =========================================================
-    let just_e_witness = JustificationWitness {
+    // A chain of two links, one slot proof each, which is the shape a real
+    // epoch has: the first carries the committee proof, the second extends it.
+    let mut outputs_e = outputs_e.into_iter();
+    let just_e_open = JustificationWitness {
         slot_program_vk: [0; 4],
         committee_program_vk: [0; 4],
-        committee: committees_e.output.clone(),
+        justification_program_vk: [0; 4],
+        committee: Some(committees_e.output.clone()),
         committee_proof: vec![], // stub proof
+        previous: None,
+        previous_proof: vec![],
         accumulator_commitment: commitment,
         acc_root,
         target_epoch: epoch_e,
         target_root: target_root_e,
         total_active_balance,
-        slot_proof_outputs: outputs_e,
-        slot_proofs: vec![vec![], vec![]], // stub proofs
+        slot_proof_outputs: vec![outputs_e.next().expect("two slot proofs")],
+        slot_proofs: vec![vec![]], // stub proofs
+    };
+    let partial = zkasper_justification_guest::verify_justification(&just_e_open);
+    assert!(
+        !partial.justified,
+        "one of two slots is not a supermajority",
+    );
+
+    let just_e_witness = JustificationWitness {
+        committee: None,
+        previous: Some(partial),
+        slot_proof_outputs: vec![outputs_e.next().expect("two slot proofs")],
+        ..just_e_open
     };
 
     let just_e_output = zkasper_justification_guest::verify_justification(&just_e_witness);
@@ -341,6 +359,7 @@ fn test_e2e_full_pipeline() {
     assert_eq!(just_e_output.accumulator_commitment, commitment);
     assert_eq!(just_e_output.target_epoch, epoch_e);
     assert_eq!(just_e_output.target_root, target_root_e);
+    assert!(just_e_output.justified);
 
     eprintln!("✓ Justification (epoch E) verified");
 
@@ -478,8 +497,11 @@ fn test_e2e_full_pipeline() {
     let just_e1_witness = JustificationWitness {
         slot_program_vk: [0; 4],
         committee_program_vk: [0; 4],
-        committee: committees_e1.output.clone(),
+        justification_program_vk: [0; 4],
+        committee: Some(committees_e1.output.clone()),
         committee_proof: vec![],
+        previous: None,
+        previous_proof: vec![],
         accumulator_commitment: commitment_e1,
         acc_root: acc_root_e1,
         target_epoch: epoch_e1,

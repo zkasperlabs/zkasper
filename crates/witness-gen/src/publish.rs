@@ -544,11 +544,18 @@ pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
 
 /// The claim a batch justification makes on its own, for the one epoch of a run
 /// that has nothing before it to finalize.
+///
+/// `justified` is published because it is the claim: a justification proof is
+/// one link of a fold chain, and the links before the last are valid proofs of
+/// a partial count. A reader that ignored the flag would read a third of the
+/// stake as a supermajority.
 pub fn justification_public_inputs(output: &JustificationOutput) -> Value {
     json!({
         "accumulator_commitment": hex_digest(&output.accumulator_commitment),
         "justified_epoch": output.target_epoch,
         "justified_root": hex0x(&output.target_root),
+        "attesting_balance": output.attesting_balance.to_string(),
+        "justified": output.justified,
     })
 }
 
