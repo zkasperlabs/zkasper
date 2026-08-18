@@ -7,14 +7,24 @@
 //! consumer sees, and it is *not* the cost of proving an epoch — it is the cost
 //! of whatever still depends on the last attestation.
 //!
+//! # The model predicts seconds, because cost units are not a currency
+//!
+//! Everything here used to be denominated in Zisk cost units against one
+//! throughput constant. An RTX 5090 campaign against Zisk v1.0.0-alpha
+//! (`data/gpu_bench/`, `scripts/time_model.py`) disproved that: measured
+//! effective throughput on real guests spans 18M to 249M units/s, and 83.6M
+//! cost units of plain integer work bought 0.06 s. [`ProverModel`] is therefore
+//! denominated in seconds, per work class, and every constant in it names the
+//! measurement that set it.
+//!
 //! # Since complement proving, the floor is the schedule
 //!
 //! A slot proof names absentees rather than attesters, so the hundred-odd
-//! leaves it opens cost about 7M — against a per-proof floor of 789M, and
-//! against 52M for every *distinct message* the slot's aggregates carry.
-//! Epoch 430529 averages 2.8 messages a slot, so minority head votes, not
-//! absentees, are what a slot costs; and the floor is what a *proof* costs.
-//! Two things follow and they point the same way.
+//! leaves it opens cost about 0.15 s — against a **measured** stage floor of
+//! 7.18 s, and against 0.25 s for every *distinct message* the slot's
+//! aggregates carry. Epoch 430529 averages 2.8 messages a slot, so minority
+//! head votes, not absentees, are what a slot costs; and the floor is what a
+//! *proof* costs. Two things follow and they point the same way.
 //!
 //! **Every proof is mostly floor, so there should be as few as possible.** A
 //! group of twenty slots costs about twice a group of one. Group size is barely
@@ -26,18 +36,19 @@
 //! after `T` is a second floor in series with it. So the crossing slot goes
 //! inline into the final proof rather than into a group of its own — and so does
 //! every slot behind it that a group could not have finished in a slot's time,
-//! which is what [`StreamPlan::tail`] is for. At a 789M floor a one-slot group
-//! takes around 16s against a 12s slot, so that is two slots; below about 620M
-//! it is one, and the schedule finds the boundary rather than assuming it.
+//! which is what [`StreamPlan::tail`] is for. At the measured 7.18 s floor a
+//! one-slot group fits inside a 12 s slot and the tail is one slot; a floor
+//! above about 11 s makes it two, and the schedule finds the boundary rather
+//! than assuming it.
 //!
 //! # What the schedule is up against is arrival time, not throughput
 //!
-//! A slot's marginal work is now near a second, against twelve seconds of
+//! A slot's marginal work is well under a second, against twelve seconds of
 //! wall-clock to do it in, so a single warm prover keeps up with the epoch
 //! comfortably. What it cannot do is start before the attestations exist. Extra
 //! GPUs buy the *bulk* of the epoch — and the committee proof the next epoch
 //! needs — but never the end of it, which is why [`Schedule::lanes`] settles low
-//! and [`schedule`] treats `lanes` as a budget it is free not to spend.
+//! for the deadline and is then driven by the committee proof alone.
 //!
 //! # Margin
 //!
@@ -67,11 +78,13 @@ use crate::committee::EpochCommittees;
 // Planning
 // ---------------------------------------------------------------------------
 
-/// Measured Zisk costs, in cost units. See BENCHMARKS.md.
+/// Measured Zisk cost units, used only as *ratios* inside the Fp2 tower.
+///
+/// They are trace area, not time: `scripts/time_model.py` shows the same
+/// constant is wrong by 3.5x in one direction for `MAIN`-heavy guests and right
+/// only for the poseidon2 workload it was fitted on. Within one work class the
+/// ratios still hold, which is the only thing they are asked for here.
 mod cost {
-    pub const ACC_NODE: f64 = 3_033.0;
-    pub const ACC_LEAF: f64 = 3_979.0;
-    pub const G1_ADD: f64 = 2_428.0;
     pub const HASH_TO_CURVE: f64 = 18_594_521.0;
     /// Marginal cost of one more pair in a multi-Miller-loop.
     pub const MILLER_PAIR: f64 = 33_222_822.0;
@@ -85,12 +98,12 @@ mod cost {
     pub const COMMITTEE_DEPTH: u32 = 5;
 }
 
-/// Internal compressions a multi-proof over `leaves` random leaves needs.
+/// Internal compressions a multi-proof over `leaves` *scattered* leaves needs.
 ///
 /// A node at level `k` covers 2^k leaves, so it is touched unless every one of
-/// those slots is empty. Near the bottom almost every touched node is distinct;
-/// higher up the set collapses and the whole level is rebuilt.
-fn batched_nodes(leaves: f64, depth: u32) -> f64 {
+/// those slots is empty. This is the absentee case: a slot's absentees are
+/// spread across the registry, so a hundred of them touch fifteen nodes apiece.
+fn scattered_nodes(leaves: f64, depth: u32) -> f64 {
     let capacity = (1u64 << depth) as f64;
     (1..=depth)
         .map(|k| {
@@ -100,103 +113,141 @@ fn batched_nodes(leaves: f64, depth: u32) -> f64 {
         .sum()
 }
 
-fn open_leaves(leaves: f64, depth: u32) -> f64 {
-    leaves * cost::ACC_LEAF + batched_nodes(leaves, depth) * cost::ACC_NODE
-}
-
-/// Rebuilding the 32-leaf committee tree from its summed buckets.
-fn committee_tree() -> f64 {
-    (1u64 << cost::COMMITTEE_DEPTH) as f64 * cost::ACC_LEAF
-        + ((1u64 << cost::COMMITTEE_DEPTH) - 1) as f64 * cost::ACC_NODE
-}
-
-/// Hash-to-curve, Miller loops and the subgroup check for `messages`.
-fn bls(messages: f64) -> f64 {
-    messages * cost::HASH_TO_CURVE
-        + cost::MILLER_BATCH
-        + (messages + 1.0) * cost::MILLER_PAIR
-        + cost::G2_SUBGROUP
-}
-
-/// What a set of slot complements costs short of the final exponentiation.
+/// The same count when the leaves are one index range.
 ///
-/// `named` is what the group opens against the accumulator: its absentees, one
-/// curve subtraction each, and the signers of any minority head vote, which cost
-/// one addition more apiece than this charges them. `messages` is distinct
-/// signing roots, because the Miller accumulator keys on the root — extra
-/// aggregates over one message cost a G2 add and nothing else.
-fn complement_work(named: f64, slots: f64, messages: f64, acc_depth: u32) -> f64 {
-    open_leaves(named, acc_depth)
-        + named * cost::G1_ADD
-        + open_leaves(slots, cost::COMMITTEE_DEPTH)
-        + bls(messages)
+/// Barely more than one node per leaf at any size, against fifteen for a
+/// scattered hundred. This is the committee proof, whose chunk owns a range of
+/// validator indices — and it is also what the attester sweep measured, which is
+/// why that sweep is linear in attesters to within 1%.
+fn contiguous_nodes(leaves: f64, depth: u32) -> f64 {
+    (1..=depth)
+        .map(|k| (leaves / (1u64 << k) as f64).ceil())
+        .sum()
 }
 
-/// What the prover charges and how fast it discharges it.
+/// What the prover charges, in seconds.
 ///
-/// Parameters rather than constants: `proof_base` is a display value in Zisk
-/// that does not match the shipped AIR layout and is being re-measured, and
-/// `units_per_second` moves with the card. Complement proving left the floor as
-/// most of every proof, so the schedule is now more sensitive to these two than
-/// to anything it can decide, and they belong in the input.
+/// Every field is a measurement or a fit against one, and the campaign that
+/// produced them is in `data/gpu_bench/` with `scripts/time_model.py`
+/// reproducing the numbers. There is deliberately no per-invocation constant:
+/// these are the prover's own `Proof generated` times, and a warm prover pays
+/// exactly them. Adding a fixed cost on top is what the superseded model did
+/// when it charged 19.52 s *and* a per-proof floor, counting the floor twice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProverModel {
-    /// Cost units every proof pays before it does anything.
-    pub proof_base: f64,
-    /// Cost units a warm prover discharges per second.
-    pub units_per_second: f64,
-    /// Seconds a warm prover spends per invocation whatever the cost.
-    pub warm_fixed_s: f64,
-    /// SNARK compression of the final proof, one more invocation.
-    pub wrap_s: f64,
-    /// Cost of verifying one child proof recursively.
+    /// Seconds any zkasper guest pays before it computes anything.
     ///
-    /// Unmeasured — `scripts/bench.py` has no figure for it and the rest of the
-    /// cost model folds it into the floor. It is the only thing that makes a
-    /// fold worth its own proof now that the counted set is a `slots_mask`, so
-    /// it is a parameter and not a zero baked in.
-    pub recursion_verify: f64,
+    /// MEASURED: the aggregation guest with recursion removed — 34,002 executed
+    /// steps — proves in 7.176 s +/- 0.084 over three warm runs. An *empty*
+    /// guest is 4.843 s, so 2.33 s of this is the AIRs a poseidon2-and-Fp12
+    /// guest instantiates and an empty one does not.
+    pub stage_floor_s: f64,
+    /// Seconds per validator opened out of the accumulator: its leaf, one curve
+    /// addition, and the 2,311 executed steps of walking its witness.
+    ///
+    /// DERIVED from the attester sweep, whose OLS slope over 2,048 .. 154,000
+    /// attesters is 878.2 us +/- 6.5, less one internal node for the contiguous
+    /// range it opened.
+    pub per_validator_s: f64,
+    /// Seconds per internal accumulator node above the opened leaves.
+    ///
+    /// MEASURED: the 29-point poseidon2 sweep gives 69,714,770 cost units/s on
+    /// poseidon2 work, and an accumulator node is 3,033 of them.
+    pub acc_node_s: f64,
+    /// Cost units of Fp2-tower work a second: hash-to-curve, Miller loops, the
+    /// final exponentiation.
+    ///
+    /// FITTED, and the weakest number here — nothing in the campaign runs BLS at
+    /// mainnet scale, so it is a within-family rate read off floor-dominated
+    /// fixtures. The bracket around it is 121M to 663M units/s.
+    pub bls_units_per_second: f64,
+    /// SNARK compression of the final proof.
+    ///
+    /// MEASURED: `GENERATE_VADCOP_FINAL_COMPRESSED_PROOF` is 151-170 ms over
+    /// five warm wraps. The 12.5 s of wall around it is process startup, which
+    /// a long-lived prover does not pay.
+    pub wrap_s: f64,
+    /// Seconds to verify one child proof recursively.
+    ///
+    /// Unmeasured: the fixtures carry stub child proofs, so the two stages that
+    /// would exercise it could only be proved with recursion removed. It is the
+    /// only thing that makes a fold worth its own proof now that the counted set
+    /// is a `slots_mask`, so it is a parameter and not a zero baked in.
+    pub recursion_verify_s: f64,
     pub acc_depth: u32,
 }
 
 impl Default for ProverModel {
     fn default() -> Self {
         Self {
-            proof_base: 293_601_280.0,
-            units_per_second: 67_452_592.0,
-            warm_fixed_s: 0.5,
-            wrap_s: 0.192,
-            recursion_verify: 0.0,
+            stage_floor_s: 7.176,
+            per_validator_s: 834.7e-6,
+            acc_node_s: 43.5e-6,
+            bls_units_per_second: 207_400_000.0,
+            wrap_s: 0.157,
+            recursion_verify_s: 0.0,
             acc_depth: zkasper_common::constants::ACC_TREE_DEPTH,
         }
     }
 }
 
 impl ProverModel {
-    /// Wall-clock a warm prover takes over `cost`.
-    pub fn seconds(&self, cost: f64) -> f64 {
-        self.warm_fixed_s + cost / self.units_per_second
+    /// Seconds of Fp2-tower work worth `units` of trace area.
+    fn bls_s(&self, units: f64) -> f64 {
+        units / self.bls_units_per_second
+    }
+
+    /// Opening `leaves` scattered validators out of a depth-`depth` tree.
+    fn open_scattered_s(&self, leaves: f64, depth: u32) -> f64 {
+        leaves * self.per_validator_s + scattered_nodes(leaves, depth) * self.acc_node_s
+    }
+
+    /// The same, when the leaves are one index range.
+    fn open_contiguous_s(&self, leaves: f64, depth: u32) -> f64 {
+        leaves * self.per_validator_s + contiguous_nodes(leaves, depth) * self.acc_node_s
+    }
+
+    /// Rebuilding the 32-leaf committee tree from its summed buckets.
+    fn committee_tree_s(&self) -> f64 {
+        ((1u64 << cost::COMMITTEE_DEPTH) + (1u64 << cost::COMMITTEE_DEPTH) - 1) as f64
+            * self.acc_node_s
+    }
+
+    /// What a set of slot complements costs short of the final exponentiation.
+    ///
+    /// `named` is what the proof opens against the accumulator: its absentees
+    /// and the signers of any minority head vote. `messages` is distinct signing
+    /// roots, because the Miller accumulator keys on the root — extra aggregates
+    /// over one message cost a G2 add and nothing else.
+    fn complement_s(&self, named: f64, slots: f64, messages: f64) -> f64 {
+        self.open_scattered_s(named, self.acc_depth)
+            + self.open_scattered_s(slots, cost::COMMITTEE_DEPTH)
+            + self.bls_s(
+                cost::MILLER_BATCH
+                    + cost::G2_SUBGROUP
+                    + messages * (cost::HASH_TO_CURVE + cost::MILLER_PAIR),
+            )
     }
 
     /// One group proof: slot complements verified as far as the Miller loop,
     /// which the final exponentiation is deliberately not part of.
-    pub fn group_cost(&self, named: f64, slots: f64, messages: f64) -> f64 {
-        self.proof_base + complement_work(named, slots, messages, self.acc_depth)
+    pub fn group_s(&self, named: f64, slots: f64, messages: f64) -> f64 {
+        self.stage_floor_s + self.complement_s(named, slots, messages)
     }
 
     /// One fold, absorbing `groups` finished group proofs.
     ///
     /// Nothing but the floor and an Fp12 multiply each: cross-slot deduplication
     /// is a `slots_mask` now, so a fold no longer opens a counted-set tree.
-    pub fn fold_cost(&self, groups: f64) -> f64 {
-        self.proof_base
-            + (groups + 1.0) * self.recursion_verify
-            + groups * (cost::FP12_MUL + cost::COMMIT_FP12)
+    pub fn fold_s(&self, groups: f64) -> f64 {
+        self.stage_floor_s
+            + (groups + 1.0) * self.recursion_verify_s
+            + groups * self.bls_s(cost::FP12_MUL + cost::COMMIT_FP12)
     }
 
     /// The final proof: the tail's complements inline, `absorbed` group proofs
     /// taken directly, and the epoch's one final exponentiation.
-    pub fn final_cost(
+    pub fn final_s(
         &self,
         named: f64,
         slots: f64,
@@ -204,17 +255,17 @@ impl ProverModel {
         absorbed: f64,
         folded: bool,
     ) -> f64 {
-        self.proof_base
+        self.stage_floor_s
             + if slots > 0.0 {
-                complement_work(named, slots, messages, self.acc_depth)
+                self.complement_s(named, slots, messages)
             } else {
                 0.0
             }
-            + cost::FINAL_EXP
+            + self.bls_s(cost::FINAL_EXP)
             // With no fold to inherit from, the final proof verifies the epoch
             // diff and the committee proof itself, on the critical path.
-            + (absorbed + if folded { 1.0 } else { 2.0 }) * self.recursion_verify
-            + (absorbed + 1.0) * (cost::FP12_MUL + cost::COMMIT_FP12)
+            + (absorbed + if folded { 1.0 } else { 2.0 }) * self.recursion_verify_s
+            + (absorbed + 1.0) * self.bls_s(cost::FP12_MUL + cost::COMMIT_FP12)
     }
 
     /// One chunk of the per-epoch committee proof, which sums every slot's
@@ -225,20 +276,26 @@ impl ProverModel {
     /// committee root as one proof over the whole registry. A chunk publishes
     /// the 32 partial buckets rather than a root, so only the last proof in the
     /// chain builds the tree.
-    pub fn committee_chunk_cost(&self, validators: f64, chunks: f64) -> f64 {
+    ///
+    /// This is the stage the time model moved most. At 1,050,000 validators one
+    /// chunk is about 929 s — 2.4 epochs of a single card — against the 215 s
+    /// the cost-unit model claimed, because the model counted a leaf hash and a
+    /// curve addition per validator and none of the 2,311 executed steps that go
+    /// with them.
+    pub fn committee_chunk_s(&self, validators: f64, chunks: f64) -> f64 {
         let share = validators / chunks;
-        self.proof_base
-            + open_leaves(share, self.acc_depth)
-            + share * cost::G1_ADD
-            + if chunks == 1.0 { committee_tree() } else { 0.0 }
+        self.stage_floor_s
+            + self.open_contiguous_s(share, self.acc_depth)
+            + if chunks == 1.0 {
+                self.committee_tree_s()
+            } else {
+                0.0
+            }
     }
 
     /// The fold that adds committee chunks together and builds the tree.
-    pub fn committee_fold_cost(&self, chunks: f64) -> f64 {
-        self.proof_base
-            + (chunks + 1.0) * self.recursion_verify
-            + chunks * (1u64 << cost::COMMITTEE_DEPTH) as f64 * cost::G1_ADD
-            + committee_tree()
+    pub fn committee_fold_s(&self, chunks: f64) -> f64 {
+        self.stage_floor_s + (chunks + 1.0) * self.recursion_verify_s + self.committee_tree_s()
     }
 }
 
@@ -382,7 +439,8 @@ pub struct ScheduledProof {
     pub lane: usize,
     pub start_s: f64,
     pub end_s: f64,
-    pub cost: f64,
+    /// Seconds of prover time this proof occupies its lane for.
+    pub duration_s: f64,
 }
 
 /// A plan, placed on lanes and on the clock.
@@ -403,7 +461,9 @@ pub struct Schedule {
     /// bound that decides how many cards the fleet needs.
     pub committee_done_s: f64,
     pub epoch_s: f64,
-    pub total_cost: f64,
+    /// Prover-seconds the whole epoch spends, summed over every lane. What the
+    /// fleet is billed for, as against `latency_s`, which is what it sells.
+    pub total_prover_s: f64,
 }
 
 impl Schedule {
@@ -455,7 +515,7 @@ pub fn schedule(
         .expect("at least one lane")
 }
 
-/// The objective: latency, then GPUs, then cost — behind the one hard
+/// The objective: latency, then GPUs, then prover time — behind the one hard
 /// constraint, which is that an epoch owes the next one a committee proof and a
 /// schedule that does not deliver it is not a schedule at all.
 ///
@@ -469,7 +529,7 @@ fn better(a: &Schedule, b: &Schedule) -> std::cmp::Ordering {
         .cmp(&overrun(b))
         .then(tenths(a).cmp(&tenths(b)))
         .then(a.lanes.cmp(&b.lanes))
-        .then(a.total_cost.total_cmp(&b.total_cost))
+        .then(a.total_prover_s.total_cmp(&b.total_prover_s))
 }
 
 fn with_lanes(
@@ -493,7 +553,7 @@ fn with_lanes(
             postable_s: 0.0,
             committee_done_s: 0.0,
             epoch_s: 0.0,
-            total_cost: 0.0,
+            total_prover_s: 0.0,
         };
     }
 
@@ -554,8 +614,8 @@ fn with_lanes(
 /// Every group partition worth simulating, as lists of unit groups.
 ///
 /// A dynamic program over slots: the state after cutting a prefix is the lanes'
-/// finish times and the cost paid so far, and a state that is no worse on every
-/// lane *and* cheaper dominates. That is exact for the group stage — group
+/// finish times and the prover time paid so far, and a state that is no worse on
+/// every lane *and* cheaper dominates. That is exact for the group stage — group
 /// releases only increase, so a later group never wants an earlier lane gap —
 /// and it collapses the 2^21 partitions of a mainnet epoch to a few dozen.
 fn search(
@@ -592,7 +652,7 @@ fn cuts(
     let mut levels: Vec<Vec<Partial>> = vec![Vec::new(); head.len() + 1];
     levels[0].push(Partial {
         ends: vec![0.0; group_lanes],
-        cost: 0.0,
+        prover_s: 0.0,
         groups: Vec::new(),
     });
 
@@ -601,7 +661,7 @@ fn cuts(
             for end in at + 1..=head.len() {
                 let members = head[at..end].to_vec();
                 let release = arrival(*members.last().expect("a group is never empty"));
-                let cost = policy.prover.group_cost(
+                let duration = policy.prover.group_s(
                     named(units, &members),
                     members.len() as f64,
                     messages(units, &members),
@@ -614,14 +674,14 @@ fn cuts(
                     .min_by(|a, b| a.1.total_cmp(b.1))
                     .map(|(i, _)| i)
                     .expect("a group always has a lane");
-                ends[lane] = release.max(ends[lane]) + policy.prover.seconds(cost);
+                ends[lane] = release.max(ends[lane]) + duration;
                 ends.sort_by(|a, b| a.total_cmp(b));
 
                 let mut groups = state.groups.clone();
                 groups.push(members);
                 levels[end].push(Partial {
                     ends,
-                    cost: state.cost + cost,
+                    prover_s: state.prover_s + duration,
                     groups,
                 });
             }
@@ -657,17 +717,17 @@ fn messages(units: &[SlotComplement], members: &[usize]) -> f64 {
 struct Partial {
     /// Lane finish times, ascending.
     ends: Vec<f64>,
-    cost: f64,
+    prover_s: f64,
     groups: Vec<Vec<usize>>,
 }
 
-/// Drop states another state beats on cost and on every lane.
+/// Drop states another state beats on prover time and on every lane.
 ///
 /// The cap keeps both ends of the trade: the cheapest states, which is what the
 /// bulk of the epoch is chosen on, and the earliest-finishing ones, which is
 /// what the deadline is met on.
 fn prune(mut states: Vec<Partial>, cap: usize) -> Vec<Partial> {
-    states.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+    states.sort_by(|a, b| a.prover_s.total_cmp(&b.prover_s));
     let mut kept: Vec<Partial> = Vec::new();
     for state in states {
         let dominated = kept
@@ -708,7 +768,7 @@ fn simulate(
 
     let mut group_end = Vec::with_capacity(groups.len());
     for (i, members) in groups.iter().enumerate() {
-        let cost = model.group_cost(
+        let duration = model.group_s(
             named(units, members),
             members.len() as f64,
             messages(units, members),
@@ -716,16 +776,16 @@ fn simulate(
         let (lane, start) = lanes.place(
             &policy.eligible(Stage::Group(i)),
             arrival(*members.last().expect("a group is never empty")),
-            model.seconds(cost),
+            duration,
         );
-        let end = start + model.seconds(cost);
+        let end = start + duration;
         group_end.push(end);
         proofs.push(ScheduledProof {
             stage: Stage::Group(i),
             lane,
             start_s: start,
             end_s: end,
-            cost,
+            duration_s: duration,
         });
     }
 
@@ -745,8 +805,7 @@ fn simulate(
         while cursor < order.len() && group_end[order[cursor]] <= ready {
             cursor += 1;
         }
-        let cost = model.fold_cost((cursor - first) as f64);
-        let duration = model.seconds(cost);
+        let duration = model.fold_s((cursor - first) as f64);
         let (lane, start) = lanes.peek(&policy.eligible(Stage::Fold(folds.len())), ready, duration);
         if start + duration > deadline_s {
             cursor = first;
@@ -759,7 +818,7 @@ fn simulate(
             lane,
             start_s: start,
             end_s: chain_free,
-            cost,
+            duration_s: duration,
         });
         folds.push(order[first..cursor].to_vec());
     }
@@ -770,31 +829,32 @@ fn simulate(
         release = release.max(group_end[g]);
     }
 
-    let cost = model.final_cost(
+    let duration = model.final_s(
         named(units, tail),
         tail.len() as f64,
         messages(units, tail),
         unfolded.len() as f64,
         !folds.is_empty(),
     );
-    let duration = model.seconds(cost);
     let (lane, start) = lanes.place(&policy.eligible(Stage::Final), release, duration);
     proofs.push(ScheduledProof {
         stage: Stage::Final,
         lane,
         start_s: start,
         end_s: start + duration,
-        cost,
+        duration_s: duration,
     });
 
-    let wrap = model.warm_fixed_s + model.wrap_s;
+    // The wrap runs on the client that proved the final proof, reusing its
+    // setups and const pols, so it is one more call on a lane already held.
+    let wrap = model.wrap_s;
     lanes.commit(lane, start + duration, wrap);
     proofs.push(ScheduledProof {
         stage: Stage::Wrap,
         lane,
         start_s: start + duration,
         end_s: start + duration + wrap,
-        cost: 0.0,
+        duration_s: wrap,
     });
     let postable_s = start + duration + wrap;
 
@@ -804,9 +864,8 @@ fn simulate(
     let mut committee_done_s = 0.0f64;
     if policy.validators > 0.0 {
         for chunk in 0..policy.committee_chunks {
-            let cost =
-                model.committee_chunk_cost(policy.validators, policy.committee_chunks as f64);
-            let duration = model.seconds(cost);
+            let duration =
+                model.committee_chunk_s(policy.validators, policy.committee_chunks as f64);
             let (lane, start) =
                 lanes.place(&policy.eligible(Stage::Committee(chunk)), 0.0, duration);
             committee_done_s = committee_done_s.max(start + duration);
@@ -815,12 +874,11 @@ fn simulate(
                 lane,
                 start_s: start,
                 end_s: start + duration,
-                cost,
+                duration_s: duration,
             });
         }
         if policy.committee_chunks > 1 {
-            let cost = model.committee_fold_cost(policy.committee_chunks as f64);
-            let duration = model.seconds(cost);
+            let duration = model.committee_fold_s(policy.committee_chunks as f64);
             let (lane, start) = lanes.place(
                 &policy.eligible(Stage::CommitteeFold),
                 committee_done_s,
@@ -832,7 +890,7 @@ fn simulate(
                 lane,
                 start_s: start,
                 end_s: committee_done_s,
-                cost,
+                duration_s: duration,
             });
         }
     }
@@ -849,7 +907,7 @@ fn simulate(
             attesting_balance: 0,
             threshold_reached: false,
         },
-        total_cost: proofs.iter().map(|p| p.cost).sum(),
+        total_prover_s: proofs.iter().map(|p| p.duration_s).sum(),
         lanes: occupied.len(),
         proofs,
         threshold_s,
@@ -1241,25 +1299,24 @@ mod tests {
         (0..32).map(|s| unit(s, 4, 200)).collect()
     }
 
-    fn with_floor(proof_base: f64) -> StreamPolicy {
+    fn with_floor(stage_floor_s: f64) -> StreamPolicy {
         StreamPolicy {
             prover: ProverModel {
-                proof_base,
+                stage_floor_s,
                 ..ProverModel::default()
             },
             ..StreamPolicy::default()
         }
     }
 
-    /// The audited floor: what a proof really costs against the shipped proving
-    /// key, rather than the constant Zisk displays.
-    const AUDITED_FLOOR: f64 = 789_000_000.0;
+    /// The measured floor: what the aggregation guest costs with nothing in it.
+    const MEASURED_FLOOR_S: f64 = 7.176;
 
     /// Slots with slack belong in as few groups as the deadline allows, because
     /// a group of twenty costs barely more than a group of one.
     #[test]
     fn the_bulk_of_the_epoch_is_one_group() {
-        let schedule = schedule(&even_epoch(), 100, &with_floor(AUDITED_FLOOR));
+        let schedule = schedule(&even_epoch(), 100, &with_floor(MEASURED_FLOOR_S));
         let sizes: Vec<usize> = schedule.plan.groups.iter().map(|g| g.len()).collect();
         assert!(sizes.len() <= 3, "the epoch was cut into {sizes:?}");
         assert!(
@@ -1277,7 +1334,7 @@ mod tests {
     #[test]
     fn only_the_final_proof_starts_after_the_last_attestation() {
         let units = even_epoch();
-        let schedule = schedule(&units, 100, &with_floor(AUDITED_FLOOR));
+        let schedule = schedule(&units, 100, &with_floor(MEASURED_FLOOR_S));
         let last = units[*schedule.plan.tail.last().expect("a tail")].slot;
         let arrival = (last - units[0].slot) as f64 * 12.0;
 
@@ -1291,21 +1348,23 @@ mod tests {
     }
 
     /// A slot goes inline when no group could have finished it in the slot's
-    /// worth of slack, so where the tail ends is a function of the floor.
+    /// worth of slack, so where the tail ends is a function of the floor. At the
+    /// measured 7.18 s a one-slot group still fits inside a 12 s slot; the old
+    /// model's 789M cost units were 12.2 s of prover time and did not.
     #[test]
     fn a_bigger_floor_pushes_another_slot_into_the_tail() {
         let units = even_epoch();
-        let displayed = schedule(&units, 100, &with_floor(293_601_280.0));
-        let audited = schedule(&units, 100, &with_floor(AUDITED_FLOOR));
+        let measured = schedule(&units, 100, &with_floor(MEASURED_FLOOR_S));
+        let doubled = schedule(&units, 100, &with_floor(2.0 * MEASURED_FLOOR_S));
 
-        assert_eq!(displayed.plan.tail.len(), 1);
-        assert_eq!(audited.plan.tail.len(), 2);
-        assert!(audited.latency_s() > displayed.latency_s());
+        assert_eq!(measured.plan.tail.len(), 1);
+        assert_eq!(doubled.plan.tail.len(), 2);
+        assert!(doubled.latency_s() > measured.latency_s());
     }
 
     #[test]
     fn no_lane_runs_two_proofs_at_once() {
-        let schedule = schedule(&even_epoch(), 100, &with_floor(AUDITED_FLOOR));
+        let schedule = schedule(&even_epoch(), 100, &with_floor(MEASURED_FLOOR_S));
         for (i, a) in schedule.proofs.iter().enumerate() {
             for b in &schedule.proofs[i + 1..] {
                 assert!(
@@ -1329,10 +1388,10 @@ mod tests {
             validators: 1_000_000.0,
             committee_chunks: 4,
             lanes: 4,
-            ..with_floor(AUDITED_FLOOR)
+            ..with_floor(MEASURED_FLOOR_S)
         };
         let with = schedule(&units, 100, &policy);
-        let without = schedule(&units, 100, &with_floor(AUDITED_FLOOR));
+        let without = schedule(&units, 100, &with_floor(MEASURED_FLOOR_S));
 
         assert_eq!(
             (with.latency_s() * 10.0).round(),
