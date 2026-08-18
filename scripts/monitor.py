@@ -27,20 +27,36 @@ def status_path():
 
     A hardcoded path made this check fail loudly the moment the daemon was
     restarted with a different --output-dir, which is the fastest way to teach
-    an operator to ignore an alert. Ask the process instead, and fall back only
+    an operator to ignore an alert. Ask the process instead, and return None
     when nothing is running.
+
+    Matching on the command line is not enough: the supervisor is a shell whose
+    own argv contains the daemon's path, so a substring match finds it, fails to
+    see --output-dir in a shell's arguments, and silently falls back. That is
+    how this check read an 84-minute-old manifest as current while the daemon
+    was crashlooping. Resolve /proc/PID/exe instead, which only the real binary
+    satisfies.
     """
     try:
         pids = subprocess.run(["pgrep", "-f", "release/zkasperd"],
                               capture_output=True, text=True, timeout=15).stdout.split()
         for pid in pids:
+            try:
+                if not Path(f"/proc/{pid}/exe").resolve().name.startswith("zkasperd"):
+                    continue
+            except OSError:
+                continue
             argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             for i, a in enumerate(argv):
                 if a == b"--output-dir" and i + 1 < len(argv):
                     return str(Path(argv[i + 1].decode()) / "status.json")
     except Exception:
         pass
-    return DEFAULT_STATUS
+    return None
+
+
+def daemon_running():
+    return status_path() is not None
 VAST_KEY_FILE = "/root/.openclaw/workspace/.vast-api"
 API = "https://api.zkasper.com/v1/status"
 SITE = "https://zkasper.com"
@@ -56,10 +72,16 @@ def check(name, ok, detail):
 
 def daemon():
     """The daemon, from the manifest it rewrites after every stage."""
+    path = status_path()
+    # A stale manifest read as if it were current is worse than no reading at
+    # all: on 2026-08-18 this reported a healthy-looking epoch for 84 minutes
+    # while the daemon was crashlooping and four rented GPUs sat idle.
+    if path is None:
+        return [check("daemon", False, "no zkasperd process running")]
     try:
-        s = json.loads(Path(status_path()).read_text())
+        s = json.loads(Path(path).read_text())
     except Exception as e:
-        return [check("daemon", False, f"no manifest at {status_path()}: {e}")]
+        return [check("daemon", False, f"no manifest at {path}: {e}")]
 
     out, age = [], time.time() - s.get("updated_unix", 0)
     out.append(check("daemon", age <= STALE_S,
