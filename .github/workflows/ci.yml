@@ -160,6 +160,33 @@ jobs:
       - name: Measure
         run: python3 scripts/bench.py --build
 
+  zisk-prover:
+    name: Zisk prover feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # zisk-sdk is a git dependency that links MPI and runs bindgen, so it
+      # needs more than the other jobs. Installed one package per invocation:
+      # a single apt call is atomic, so one unresolvable name would silently
+      # take every other dependency with it.
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          for pkg in nasm libgmp-dev libomp-dev libopenmpi-dev openmpi-bin \
+                     libsodium23 pkg-config clang libclang-dev libssl-dev
+          do
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          done
+      # The real prover is feature-gated, so `cargo check --workspace` stays
+      # green while it is broken. That has already happened once: a merge left
+      # zisk_prover.rs uncompilable and Pipeline::stages() panicking on a
+      # missing VK, and every other job passed.
+      - run: cargo clippy --workspace --features zisk-prover --all-targets -- -D warnings
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

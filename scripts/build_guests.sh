@@ -19,6 +19,7 @@ export PATH="$HOME/.zisk/bin:$PATH"
 GUESTS=(
   bootstrap-guest
   epoch-diff-guest
+  committee-proof-guest
   slot-proof-guest
   justification-guest
   finalization-guest
