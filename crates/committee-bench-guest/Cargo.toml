@@ -1,0 +1,14 @@
+[package]
+name = "zkasper-committee-bench-guest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkasper-committee-bench-guest"
+path = "src/main.rs"
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }

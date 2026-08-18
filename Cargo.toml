@@ -12,6 +12,7 @@ members = [
     "crates/aggregation-guest",
     "crates/stream-final-guest",
     "crates/bench-guest",
+    "crates/committee-bench-guest",
 ]
 resolver = "2"
 
