@@ -171,7 +171,7 @@ fn slot_witness(
 // Full E2E test
 // ---------------------------------------------------------------------------
 
-/// Bootstrap, justify epoch E, move the accumulator with an epoch diff that
+/// Start from an init point, justify epoch E, move the accumulator with an epoch diff that
 /// actually changes an effective balance, justify E+1 against the accumulator
 /// that diff produced, and finalize the pair.
 ///

@@ -262,9 +262,11 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
 /// A witness too large to frame is not spooled, because a retry of it would
 /// fail identically for ever and re-send the whole thing each time.
 ///
-/// Found on mainnet 2026-08-18: a bootstrap witness over 2,338,764 validators
-/// serializes to 916 MB against a 512 MB cap, and the client queued it and kept
-/// trying. The cap is a config value here so the test does not need 512 MB.
+/// Found on mainnet 2026-08-18, on the since-deleted bootstrap stage: its
+/// witness over 2,338,764 validators serialized to 916 MB against a 512 MB cap,
+/// and the client queued it and kept trying. No stage is that large now, but the
+/// rule is about the spool rather than about one witness, so it stays. The cap is
+/// a config value here so the test does not need 512 MB.
 #[test]
 fn refuses_to_queue_a_witness_that_cannot_be_sent() {
     let spool = tempfile::tempdir().unwrap();

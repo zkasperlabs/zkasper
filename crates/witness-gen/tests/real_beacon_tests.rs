@@ -128,7 +128,7 @@ async fn test_real_init_point() {
 }
 
 // -----------------------------------------------------------------------
-// Test: bootstrap + epoch diff with real data
+// Test: init point + epoch diff with real data
 // -----------------------------------------------------------------------
 
 #[tokio::test]

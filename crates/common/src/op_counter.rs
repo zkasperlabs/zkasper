@@ -43,7 +43,7 @@ pub mod cost {
     /// precompile. `add_complete_safe_bls12_381` costs 67,854 for the same work
     /// because it re-validates both operands every call.
     pub const PUBKEY_AGGREGATE: u64 = 2_428;
-    /// Decompress one 48-byte public key. Only bootstrap and epoch-diff pay it.
+    /// Decompress one 48-byte public key. Only the epoch diff pays it.
     pub const DECOMPRESS: u64 = 49_311;
     /// Hash one message to G2.
     pub const HASH_TO_CURVE: u64 = 18_594_521;

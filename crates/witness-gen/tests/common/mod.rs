@@ -421,8 +421,8 @@ impl SyntheticChain {
     /// A real state carries 8192 slots of history; a synthetic one only has to
     /// carry the boundary a finalization will open out of it. The daemon runs
     /// the same induction — each epoch diff records what the diff before it
-    /// produced — so the two agree slot for slot, starting from the bootstrap,
-    /// which records nothing because nothing came before it.
+    /// produced — so the two agree slot for slot, starting from the epoch the
+    /// init point names, which records nothing because nothing came before it.
     fn history_at(&self, slot: u64) -> SlotHistory {
         let spe = self.config.slots_per_epoch;
         if slot <= self.first_epoch * spe {

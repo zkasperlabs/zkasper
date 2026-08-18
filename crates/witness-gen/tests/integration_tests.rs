@@ -318,11 +318,11 @@ async fn test_epoch_diff_round_trip() {
 }
 
 // -----------------------------------------------------------------------
-// Full pipeline: bootstrap -> epoch diff
+// Full pipeline: init point -> epoch diff
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_full_pipeline_bootstrap_then_epoch_diff() {
+async fn test_full_pipeline_init_point_then_epoch_diff() {
     let slot_1 = 3200u64;
     let slot_2 = 3232u64;
 

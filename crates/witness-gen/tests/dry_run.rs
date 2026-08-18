@@ -83,7 +83,7 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
         serde_json::from_slice(&std::fs::read(out.join("status.json")).expect("a manifest"))
             .expect("the manifest is JSON");
 
-    // Bootstrapped where the node said it was finalized, and the accumulator
+    // Started where the init point said, and the accumulator
     // walked from there to the head one epoch diff at a time.
     assert_eq!(status["chain"], "mainnet", "{}", transcript(&run));
     assert_eq!(
@@ -101,12 +101,12 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
         chain.total_active_balance_at(LAST_EPOCH).to_string(),
         "the epoch diffs did not carry the balance change through",
     );
-    // Nothing is written for the epoch the run starts on until a stage actually
-    // proves something, because starting is now a check rather than a proof.
-    assert!(!out
-        .join(format!("epoch-{FIRST_EPOCH:09}"))
-        .join("bootstrap.bin")
-        .exists());
+    // The epoch the run starts on was not reached by an epoch diff — it is where
+    // the init point put the accumulator — so it has no diff artifact, while
+    // every epoch after it does.
+    let first = out.join(format!("epoch-{FIRST_EPOCH:09}"));
+    assert!(first.exists());
+    assert!(!first.join("epoch_diff.bin").exists());
 
     // Justified every epoch, and finalized every pair of consecutive ones.
     assert_eq!(status["justified_through"], LAST_EPOCH);

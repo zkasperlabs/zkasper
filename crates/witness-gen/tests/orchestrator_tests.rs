@@ -159,7 +159,7 @@ async fn test_follows_four_epochs_end_to_end() {
     let out = dir.path().join("out");
     assert!(!out
         .join(format!("epoch-{FIRST_EPOCH:09}"))
-        .join("bootstrap.bin")
+        .join("epoch_diff.bin")
         .exists());
     for epoch in FIRST_EPOCH..=LAST_EPOCH {
         let epoch_dir = out.join(format!("epoch-{epoch:09}"));
@@ -476,7 +476,7 @@ async fn test_resumes_after_a_crash_mid_epoch() {
     assert_eq!(justified, vec![12, 13]);
 
     // And the accumulator ends up bit-identical to the uninterrupted run: same
-    // root, and the same audit chain over every epoch since bootstrap.
+    // root, and the same audit chain over every epoch since the init point.
     let resumed = daemon.state();
     assert_eq!(resumed.cursor_epoch, reference.cursor_epoch);
     assert_eq!(resumed.acc_root, reference.acc_root);
