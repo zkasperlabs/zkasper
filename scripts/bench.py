@@ -16,7 +16,8 @@ import sys
 import tempfile
 
 ELF = "target/elf/riscv64ima-zisk-zkvm-elf/release/zkasper-bench-guest"
-ZISKEMU = os.path.expanduser("~/.zisk/bin/ziskemu")
+ZISK_BIN = os.environ.get("ZISK_BIN", os.path.expanduser("~/.zisk/bin"))
+ZISKEMU = os.path.join(ZISK_BIN, "ziskemu")
 
 # mode id, label, (low iterations, high iterations)
 MODES = [
@@ -87,7 +88,7 @@ def main():
     args = ap.parse_args()
 
     if args.build:
-        env = dict(os.environ, PATH=os.path.expanduser("~/.zisk/bin") + ":" + os.environ["PATH"])
+        env = dict(os.environ, PATH=ZISK_BIN + ":" + os.environ["PATH"])
         subprocess.run(
             ["cargo-zisk", "build", "--release", "-p", "zkasper-bench-guest"],
             check=True, env=env,

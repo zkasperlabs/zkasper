@@ -32,7 +32,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ELF = os.path.join(
     ROOT, "target/elf/riscv64ima-zisk-zkvm-elf/release/zkasper-committee-bench-guest"
 )
-ZISKEMU = os.path.expanduser("~/.zisk/bin/ziskemu")
+ZISK_BIN = os.environ.get("ZISK_BIN", os.path.expanduser("~/.zisk/bin"))
+ZISKEMU = os.path.join(ZISK_BIN, "ziskemu")
 FIXTURES = os.path.join(ROOT, "test_data/committee_bench")
 
 # variant id, label, and whether it is a whole verification (a candidate, whose
@@ -220,7 +221,7 @@ def main():
 
     if args.build:
         env = dict(os.environ,
-                   PATH=os.path.expanduser("~/.zisk/bin") + ":" + os.environ["PATH"])
+                   PATH=ZISK_BIN + ":" + os.environ["PATH"])
         subprocess.run(
             ["cargo-zisk", "build", "--release", "-p", "zkasper-committee-bench-guest"],
             cwd=ROOT, check=True, env=env,

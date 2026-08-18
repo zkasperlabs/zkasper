@@ -14,7 +14,7 @@ set -euo pipefail
 # of them together rather than one at a time.
 
 cd "$(dirname "$0")/.."
-export PATH="$HOME/.zisk/bin:$PATH"
+export PATH="${ZISK_BIN:-$HOME/.zisk/bin}:$PATH"
 
 GUESTS=(
   bootstrap-guest
