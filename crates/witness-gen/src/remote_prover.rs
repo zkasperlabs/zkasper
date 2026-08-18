@@ -126,7 +126,16 @@ use crate::prover::{NativeProver, Proof, ProveCost, Prover, Stage};
 /// Version 2 is that change: `Stage::Bootstrap` was removed, which renumbered
 /// everything. **Bump this whenever `Stage` gains or loses a variant**, so the
 /// two ends refuse each other instead of misreading each other.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// **The witness and output types are the wire too**, for the same reason and
+/// with the same failure mode: they cross it as bincode, which is positional and
+/// self-describes nothing, so a field added to one of them makes an old peer
+/// read the bytes after it as something else. Version 3 is that change — the
+/// justification became a fold chain, so `JustificationWitness` gained a
+/// previous link and `JustificationOutput` gained the running state and the
+/// supermajority flag. **Bump this whenever a type that crosses the wire changes
+/// shape**, not only when `Stage` does.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Cap on one frame. The committee witness is about 115 MB; nothing else is
 /// close, and a length that claims more is a bad peer rather than a big proof.

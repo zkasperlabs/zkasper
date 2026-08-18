@@ -481,10 +481,16 @@ fn refuses_a_server_without_the_stages_this_run_needs() {
 /// `Stage` is the trap. Bincode writes an enum as its discriminant index, so
 /// removing a variant renumbers every stage after it and an old server's
 /// "committee" becomes a new client's something-else — a frame that parses
-/// into a plausible lie. Removing `Stage::Bootstrap` is why this is 2.
+/// into a plausible lie. Removing `Stage::Bootstrap` is why this became 2.
+///
+/// The witness and output types are the same trap in a different place: bincode
+/// is positional, so a field added to one of them shifts everything after it and
+/// an old peer reads a plausible lie again. `JustificationWitness` gaining a
+/// previous link, and `JustificationOutput` gaining its running state, is why
+/// this is 3.
 #[test]
 fn the_protocol_version_is_checked() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
 }
 
 /// Against a real prover server, holding a real warm prover.
