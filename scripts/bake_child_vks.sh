@@ -111,6 +111,10 @@ HEADER
     printf '\n/// `%s`\npub const %s: ProgramVk = [%s];\n' "$2" "$1" "$3" >>"$file"
     shift 3
   done
+  # Four u64s on one line is over the width rustfmt wants, so a generated file
+  # that is not formatted here fails `cargo fmt --check` the moment it is
+  # committed -- and the next bake undoes whoever formatted it by hand.
+  rustfmt --edition 2021 "$file" 2>/dev/null || true
   echo "wrote $file"
 }
 
