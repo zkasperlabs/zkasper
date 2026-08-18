@@ -797,25 +797,43 @@ async fn test_ssz_file_finality() {
     );
 
     let commitment = zkasper_common::acc::commitment(&tree.root(), total_active_balance);
-    let justification = zkasper_justification_guest::verify_justification(
-        &zkasper_witness_gen::witness_justification::build(
-            outputs,
-            vec![Vec::new(); slots.len()],
-            commitment,
-            [0; 4],
-            [0; 4],
-            committees.output.clone(),
-            Vec::new(),
-            target_epoch,
-            target_root,
-            total_active_balance,
-            tree.root(),
-        ),
-    );
+    let context = zkasper_witness_gen::witness_justification::Context {
+        accumulator_commitment: commitment,
+        acc_root: tree.root(),
+        target_epoch,
+        target_root,
+        total_active_balance,
+        slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
+        justification_program_vk: [0; 4],
+    };
+
+    // Fold two slot proofs at a time, the way the daemon does while the epoch
+    // is still running, rather than all of them into one circuit.
+    let mut justification = None;
+    let mut links = 0;
+    for chunk in outputs.chunks(2) {
+        let opening = justification.is_none();
+        justification = Some(zkasper_justification_guest::verify_justification(
+            &zkasper_witness_gen::witness_justification::build(
+                &context,
+                opening.then(|| committees.output.clone()),
+                Vec::new(),
+                justification,
+                Vec::new(),
+                chunk.to_vec(),
+                vec![Vec::new(); chunk.len()],
+            ),
+        ));
+        links += 1;
+    }
+    let justification = justification.expect("the epoch has slot proofs to fold");
 
     assert_eq!(justification.target_root, target_root);
     assert_eq!(justification.accumulator_commitment, commitment);
-    eprintln!("justification proof verified successfully!");
+    assert_eq!(justification.attesting_balance, attesting_balance);
+    assert!(justification.justified);
+    eprintln!("justification chain of {links} links verified successfully!");
 }
 
 // ---------------------------------------------------------------------------
@@ -853,9 +871,7 @@ async fn test_ssz_file_gnosis_state_root() {
 #[tokio::test]
 #[ignore = "downloads ~320MB"]
 async fn test_ssz_file_streaming_finality() {
-    use zkasper_common::types::{
-        BoundaryAnchor, EpochDiffOutput, JustificationOutput, PreviousJustification,
-    };
+    use zkasper_common::types::{BoundaryAnchor, EpochDiffOutput, PreviousJustification};
     use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy};
 
     init_tracing();
@@ -998,11 +1014,11 @@ async fn test_ssz_file_streaming_finality() {
         &committees,
         &units,
         &plan,
-        PreviousJustification::Batch(JustificationOutput {
-            accumulator_commitment: previous_commitment,
-            target_epoch: target_epoch - 1,
-            target_root: previous_root,
-        }),
+        PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            previous_commitment,
+            target_epoch - 1,
+            previous_root,
+        )),
         boundary,
     );
 

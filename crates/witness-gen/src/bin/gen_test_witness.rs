@@ -257,8 +257,13 @@ fn gen_justification(output_path: &str) {
         total_active_balance: fixture.total_active_balance,
         slot_program_vk: [0; 4],
         committee_program_vk: [0; 4],
-        committee: fixture.committees.output.clone(),
+        justification_program_vk: [0; 4],
+        committee: Some(fixture.committees.output.clone()),
         committee_proof: Vec::new(),
+        // The link that opens an epoch, which is the only one whose witness can
+        // be written without a real child proof to extend.
+        previous: None,
+        previous_proof: Vec::new(),
         slot_proof_outputs: outputs,
         slot_proofs: vec![vec![], vec![]], // native mode: no real child proofs
     };
@@ -300,16 +305,13 @@ fn gen_finalization(output_path: &str) {
         epoch_2: epoch_e1,
     };
 
-    let just_e = JustificationOutput {
-        accumulator_commitment: data.accumulator_commitment,
-        target_epoch: epoch_e,
-        target_root: target_root_e,
-    };
-    let just_e1 = JustificationOutput {
-        accumulator_commitment: commitment_e1,
-        target_epoch: epoch_e1,
-        target_root: target_root_e1,
-    };
+    let just_e = zkasper_common::test_utils::justified_output(
+        data.accumulator_commitment,
+        epoch_e,
+        target_root_e,
+    );
+    let just_e1 =
+        zkasper_common::test_utils::justified_output(commitment_e1, epoch_e1, target_root_e1);
 
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
@@ -393,11 +395,11 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
         &data.committees,
         &units,
         &plan,
-        PreviousJustification::Batch(JustificationOutput {
-            accumulator_commitment: previous_commitment,
-            target_epoch: epoch - 1,
-            target_root: data.previous_root,
-        }),
+        PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            previous_commitment,
+            epoch - 1,
+            data.previous_root,
+        )),
         data.boundary.clone(),
     );
 

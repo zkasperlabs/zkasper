@@ -25,6 +25,7 @@ use common::stream_fixture;
 
 use zkasper_common::constants::ACC_TREE_DEPTH;
 use zkasper_common::recursion::verify_child;
+use zkasper_common::types::SlotProofWitness;
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
 use zkasper_witness_gen::prover::{Prover, Stage, DEFAULT_ELF_DIR};
@@ -182,4 +183,165 @@ fn warm_stage_times() {
             );
         }
     }
+}
+
+/// What a recursive child verification costs, as a curve in child count.
+///
+/// [`zkasper_witness_gen::streaming::ProverModel::recursion_verify_s`] was a
+/// zero for as long as nothing could measure it: the fixtures carry stub child
+/// proofs, a guest rejects an empty proof, and the two stages that recurse could
+/// therefore only be proved with the recursion removed. This sweep is the
+/// measurement, and it uses the real circuit — one justification link per point,
+/// over `k` real slot proofs and one real committee proof, so `k + 1` children.
+///
+/// **Read the shape, not one point.** A large fixed cost with a cheap per-child
+/// term and a genuinely linear cost want different pipelines, and only a sweep
+/// tells them apart.
+///
+/// ```text
+/// ./scripts/build_guests.sh committee-proof-guest slot-proof-guest justification-guest
+/// ZKASPER_GPU=1 cargo test --release --features zisk-prover \
+///   --test zisk_proof_tests -- --ignored --nocapture recursion_cost_curve
+/// ```
+#[test]
+#[ignore = "needs a Zisk proving key and an hour of proving"]
+fn recursion_cost_curve() {
+    let children: Vec<usize> = std::env::var("ZKASPER_CHILDREN")
+        .unwrap_or_else(|_| "1,2,3,4,6,8,11,16,22".into())
+        .split(',')
+        .map(|v| v.trim().parse().expect("a child count"))
+        .collect();
+    let slots = *children.iter().max().expect("at least one point") as u64;
+
+    let chain = ChainConfig::MAINNET;
+    let prover = ZiskProver::new(ZiskProverConfig {
+        elf_dir: elf_dir(),
+        gpu: std::env::var_os("ZKASPER_GPU").is_some(),
+        ..ZiskProverConfig::new(
+            chain.clone(),
+            &[Stage::Committee, Stage::SlotProof, Stage::Justification],
+        )
+    })
+    .expect("build a prover");
+
+    // One synthetic epoch, `slots` committees of two. The committee proof and
+    // every slot proof below are real proofs of it, because a recursion has
+    // nothing to verify otherwise.
+    let epoch = zkasper_witness_gen::fixture::Epoch::new(chain, 100, slots, 2);
+    let (committee_output, committee_proof) = prover
+        .prove_committee(&epoch.committees.witness)
+        .expect("committee proof");
+    println!(
+        "committee proof over {} members: {:?}",
+        epoch.committees.witness.members.len(),
+        prover.last_cost(),
+    );
+
+    let mut slot_outputs = Vec::new();
+    let mut slot_proofs = Vec::new();
+    for slot in 0..slots {
+        let complement = epoch.complement(slot, &[]);
+        let (output, proof) = prover
+            .prove_slot(&SlotProofWitness {
+                accumulator_commitment: epoch.accumulator_commitment,
+                committee_root: epoch.committees.root(),
+                target_epoch: epoch.epoch,
+                target_root: epoch.target_root,
+                signing_domain: epoch.signing_domain,
+                acc_root: epoch.acc_root,
+                total_active_balance: epoch.total_active_balance,
+                acc_multi_proof: epoch.tree.build_multi_proof(&complement.named_indices),
+                committee_multi_proof: epoch.committees.multi_proof(&[slot]),
+                slots: vec![complement.witness],
+            })
+            .expect("slot proof");
+        println!("SLOT slot={slot} {:?}", prover.last_cost());
+        slot_outputs.push(output);
+        slot_proofs.push(proof);
+    }
+
+    let context = zkasper_witness_gen::witness_justification::Context {
+        accumulator_commitment: epoch.accumulator_commitment,
+        acc_root: epoch.acc_root,
+        target_epoch: epoch.epoch,
+        target_root: epoch.target_root,
+        total_active_balance: epoch.total_active_balance,
+        slot_program_vk: prover.program_vk(Stage::SlotProof),
+        committee_program_vk: prover.program_vk(Stage::Committee),
+        justification_program_vk: prover.program_vk(Stage::Justification),
+    };
+
+    // The link that opens an epoch, at every width in the sweep: `k` slot
+    // proofs and the committee proof.
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for &k in &children {
+        prover
+            .prove_justification(&zkasper_witness_gen::witness_justification::build(
+                &context,
+                Some(committee_output.clone()),
+                committee_proof.clone(),
+                None,
+                Vec::new(),
+                slot_outputs[..k].to_vec(),
+                slot_proofs[..k].to_vec(),
+            ))
+            .expect("opening link");
+        let cost = prover.last_cost().expect("a cost");
+        println!(
+            "OPENING children={} slots={k} prove_millis={} wrap_millis={}",
+            k + 1,
+            cost.prove_millis,
+            cost.wrap_millis,
+        );
+        points.push(((k + 1) as f64, cost.prove_millis as f64 / 1000.0));
+    }
+
+    // The link the daemon runs after the epoch opens: one predecessor and
+    // `width` slot proofs. Same child count, different children, which is what
+    // says the curve is about recursion rather than about slots.
+    let (opening, opening_proof) = prover
+        .prove_justification(&zkasper_witness_gen::witness_justification::build(
+            &context,
+            Some(committee_output),
+            committee_proof,
+            None,
+            Vec::new(),
+            slot_outputs[..1].to_vec(),
+            slot_proofs[..1].to_vec(),
+        ))
+        .expect("the link to extend");
+
+    for width in [1usize, 2, 4] {
+        if 1 + width > slot_outputs.len() {
+            continue;
+        }
+        prover
+            .prove_justification(&zkasper_witness_gen::witness_justification::build(
+                &context,
+                None,
+                Vec::new(),
+                Some(opening.clone()),
+                opening_proof.clone(),
+                slot_outputs[1..1 + width].to_vec(),
+                slot_proofs[1..1 + width].to_vec(),
+            ))
+            .expect("extending link");
+        println!(
+            "EXTENDING children={} prove_millis={}",
+            width + 1,
+            prover.last_cost().expect("a cost").prove_millis,
+        );
+    }
+
+    // Least squares over the sweep, so the report is a line and not a guess.
+    let n = points.len() as f64;
+    let sx: f64 = points.iter().map(|p| p.0).sum();
+    let sy: f64 = points.iter().map(|p| p.1).sum();
+    let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
+    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    println!(
+        "OLS {:.3} s + {slope:.3} s per child",
+        (sy - slope * sx) / n
+    );
 }

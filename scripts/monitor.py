@@ -19,26 +19,33 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
+DEFAULT_STATUS = "/mnt/ssd/zkasper-run/out/status.json"
 
 
 def status_path():
-    """Where the *running* daemon writes, or `None` when none is running.
+    """Where the *running* daemon writes, not where one used to.
 
     A hardcoded path made this check fail loudly the moment the daemon was
     restarted with a different --output-dir, which is the fastest way to teach
-    an operator to ignore an alert. Ask the process instead.
+    an operator to ignore an alert. Ask the process instead, and return None
+    when nothing is running.
 
-    `None` rather than a default path, because the two states are not the same
-    and reporting them the same way is worse than reporting neither. On
-    2026-08-18 the daemon was down for half an hour while this read the manifest
-    of a run that had already ended and called it healthy: the epoch, the head
-    and the gossip counters were all real, and all history. A monitor that
-    cannot tell "stopped" from "fine" is the one thing a monitor must not be.
+    Matching on the command line is not enough: the supervisor is a shell whose
+    own argv contains the daemon's path, so a substring match finds it, fails to
+    see --output-dir in a shell's arguments, and silently falls back. That is
+    how this check read an 84-minute-old manifest as current while the daemon
+    was crashlooping. Resolve /proc/PID/exe instead, which only the real binary
+    satisfies.
     """
     try:
         pids = subprocess.run(["pgrep", "-f", "release/zkasperd"],
                               capture_output=True, text=True, timeout=15).stdout.split()
         for pid in pids:
+            try:
+                if not Path(f"/proc/{pid}/exe").resolve().name.startswith("zkasperd"):
+                    continue
+            except OSError:
+                continue
             argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             for i, a in enumerate(argv):
                 if a == b"--output-dir" and i + 1 < len(argv):
@@ -46,6 +53,10 @@ def status_path():
     except Exception:
         pass
     return None
+
+
+def daemon_running():
+    return status_path() is not None
 VAST_KEY_FILE = "/root/.openclaw/workspace/.vast-api"
 API = "https://api.zkasper.com/v1/status"
 SITE = "https://zkasper.com"
@@ -62,8 +73,11 @@ def check(name, ok, detail):
 def daemon():
     """The daemon, from the manifest it rewrites after every stage."""
     path = status_path()
+    # A stale manifest read as if it were current is worse than no reading at
+    # all: on 2026-08-18 this reported a healthy-looking epoch for 84 minutes
+    # while the daemon was crashlooping and four rented GPUs sat idle.
     if path is None:
-        return [check("daemon", False, "no daemon running")]
+        return [check("daemon", False, "no zkasperd process running")]
     try:
         s = json.loads(Path(path).read_text())
     except Exception as e:

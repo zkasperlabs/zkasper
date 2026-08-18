@@ -346,6 +346,32 @@ fn an_aggregate_from_another_checkpoint_is_rejected() {
     });
 }
 
+/// The first epoch of a run is justified by a chain of batch folds, and the
+/// partial links of that chain are valid proofs of a partial count. The final
+/// proof has to read the flag rather than take the proof's existence for the
+/// claim, or a run would finalize an epoch a third of the stake voted for.
+#[test]
+fn a_partial_batch_justification_is_rejected() {
+    let fixture = fixture();
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+    let run = run(&fixture, &folded(&plan));
+
+    let mut forged = run.final_witness.clone();
+    match &mut forged.previous_justification {
+        PreviousJustification::Batch(output) => output.justified = false,
+        PreviousJustification::Stream(_) => panic!("the fixture justifies with a batch fold"),
+    }
+
+    assert!(rejection("a partial justification was accepted", || {
+        zkasper_stream_final_guest::verify_stream_final_with_depth(&forged, ACC_DEPTH);
+    })
+    .contains("partial fold"));
+}
+
 /// Group proofs are independent of each other, so they can be proven in any
 /// order or in parallel; only the folds are sequential.
 #[test]
