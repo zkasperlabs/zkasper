@@ -17,12 +17,17 @@ synced with a mock execution layer, `zkasperd --mode streaming --prover native`.
 schedule; the 2/3 trigger; reorg handling; the status manifest; restart recovery.
 The three arrival-timing assumptions the design rests on are confirmed (§8).
 
+**The warm prover now works on a GPU.** On 2026-08-18 a rented RTX 5090 built
+`--features zisk-prover` under CUDA 12.9.1, produced real group and slot proofs
+that `verify_child` accepted, and proved again with no re-initialisation. A
+daemon with no CUDA drove the same prover over the network through
+`zkasper-prover-server`, and kept running when the server was killed. The
+per-stage times are in [BENCHMARKS.md](BENCHMARKS.md); nothing in §8 below is a
+proving measurement, because §8 is the `--prover native` run.
+
 **Does not work yet, in order of how much it matters.**
 
-1. **The warm prover has never run on a GPU.** Everything here is
-   `--prover native`, so no measurement in this document is a proving
-   measurement.
-2. **The trigger's rate rule can fire on a quiet 200 ms window** in the middle of
+1. **The trigger's rate rule can fire on a quiet 200 ms window** in the middle of
    the burst. Two of the three steady-state epochs fired at 924 ms and 1,355 ms
    of wait, nowhere near the cap, with 8,159 and 6,822 attesters still in flight.
    Raising the cap does not reach those two (§8).
