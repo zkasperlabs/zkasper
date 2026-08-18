@@ -42,8 +42,11 @@ crates/
   bootstrap-guest/     # Zisk guest: one-time tree construction
   epoch-diff-guest/    # Zisk guest: validator set diff
   slot-proof-guest/    # Zisk guest: one slot's attestations
+  group-proof-guest/   # Zisk guest: several slots, no final exponentiation
+  aggregation-guest/   # Zisk guest: folds group proofs into a running aggregate
   justification-guest/ # Zisk guest: folds slot proofs, checks 2/3
   finalization-guest/  # Zisk guest: pairs two justifications
+  stream-final-guest/  # Zisk guest: the one proof after the last attestation
   bench-guest/         # Zisk guest: precompile cost probe
   witness-gen/         # host-side witness generator (beacon API, tree management)
   onchain-verifier/    # Solidity verifier contract
@@ -63,6 +66,51 @@ path. See [BENCHMARKS.md](BENCHMARKS.md).
 `syscall_poseidon2` runs the same permutation in software on native targets, so
 the host tree and the in-circuit tree agree by construction rather than by a
 second implementation that has to be kept in sync.
+
+### Streaming: minimising `T2 - T`
+
+`T` is the moment the chain has published enough attestations to justify a
+checkpoint; `T2` is the moment a proof of it exists. That gap is the only
+latency a consumer sees, and it is not the cost of proving an epoch — it is the
+cost of whatever still depends on the *last* attestation. The pipeline is built
+to leave one proof there.
+
+```
+    slots 0..12      13..18   19..21  22  23   the aggregate that crosses 2/3
+    +-----------+    +-----+  +---+  +-+ +-+   +-------------------------+
+    | group     |    |group|  |grp|  |g| |g|   |  proven inline, in the  |
+    | proof     |    |     |  |   |  | | | |   |  final proof itself     |
+    +-----+-----+    +--+--+  +-+-+  +++ +++   +------------+------------+
+          |             |       |     |   |                 |
+          v             v       v     v   v                 v
+    +-----------------------------------------+    +-----------------+
+    |     running aggregate (folded as         |-->|   final proof   |--> finalization
+    |     each group finishes)                 |    +-----------------+
+    +-----------------------------------------+       ^ one final exponentiation
+                                                        for the whole epoch
+```
+
+Four things make that work, and `crates/witness-gen/src/streaming.rs` implements
+the schedule:
+
+- **The Miller loop is split from the final exponentiation.** A group proof
+  computes its Miller loops and publishes a commitment to the Fp12 accumulator;
+  it asserts *nothing* about the signatures. The final proof multiplies every
+  group's accumulator and runs one final exponentiation for the epoch.
+- **Groups shrink geometrically** toward the threshold, so the last one is a
+  single aggregate rather than a fixed eight slots.
+- **The epoch stops at the threshold**, measured by accumulated weight. On the
+  real mainnet epoch in the test suite that skips 39% of the aggregates.
+- **The tail is collapsed**: one proof verifies the aggregate, does the marginal
+  aggregate inline, settles every signature, checks 2/3, and emits the
+  finalization — instead of four proofs in series.
+
+Measured on epoch 430529, `T2 - T` is **1.418B cost units**: 22.2s on an RTX 5090
+that keeps its allocation open, against 129.6s for fixed groups of eight with a
+four-stage tail. The warm path is the product — a cold `cargo-zisk` invocation is
+19.52s of startup before it proves anything, which is why
+`crates/witness-gen/src/prover.rs` requires a long-running prover. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Building
 
@@ -187,12 +235,20 @@ exactly one epoch forward.
 - [x] Accumulator leaf commits the decompressed public key (28.4% off a mainnet epoch)
 - [x] Finalization across a real epoch boundary, with the epoch diff linking the
       two accumulators verified inside the proof
+- [x] Streaming proof pipeline: Miller loops split from the final
+      exponentiation, geometric groups, threshold trigger, collapsed tail
+      (`T2 - T` 6.1x shorter, measured on epoch 430529)
+- [x] Counted-set bitmap tree, so cross-epoch deduplication costs what is added
+      rather than what has accumulated
 - [ ] Finalizing an epoch whose first slot was empty. The accumulator is built
       from the state at the epoch boundary, and the finalized header only names
       that state when a block sits on the boundary slot. Covering the empty case
       needs the boundary state root proved out of the finalized state's
       `state_roots` list.
-- [ ] Projective or batched-inversion G1 aggregation (now the largest cost)
+- [ ] Accumulator membership for the marginal aggregate, which is now half of
+      `T2 - T`. Proving a superset before `T` and selecting from it inside the
+      final proof is the next real win.
+- [ ] Projective or batched-inversion G1 aggregation
 - [ ] Solidity verifier integration with the Zisk proof format
 - [ ] Bootstrap chunking across recursive proofs
 
