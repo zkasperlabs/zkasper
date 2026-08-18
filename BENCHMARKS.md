@@ -12,6 +12,14 @@ zkasper:
 python3 scripts/bench.py --build
 ```
 
+> **Recalibration, 2026-08-18.** The per-proof floor and the GPU throughput model
+> in this file were re-measured on an RTX 5090 against Zisk v1.0.0-alpha over a
+> 29-point sweep. `BASE = 293,601,280` is a compile-time constant in zisk that
+> does not describe the shipped proving key, and every latency figure derived
+> from it inherited the error. Numbers marked **superseded** below should not be
+> quoted. See [The per-proof floor](#the-per-proof-floor-is-a-constant-that-does-not-describe-the-prover),
+> raw data in `data/gpu_bench/`, and `python3 scripts/fit_gpu_bench.py`.
+
 ## Primitives
 
 | primitive | cost | precompiles used |
@@ -31,7 +39,7 @@ python3 scripts/bench.py --build
 | `acc::commit_fp12` | 78,002 | `poseidon2` |
 | G2 subgroup check | 8,219,617 | Fp2 tower |
 | pairing check, 2 pairs (`pairing_check_safe`) | 248,054,847 | Fp2 tower |
-| **per-proof floor (BASE)** | **293,601,280** | — |
+| **per-proof floor (BASE)** | **293,601,280** *(superseded — see below)* | — |
 
 ### The pairing numbers were three things in a trench coat
 
@@ -64,6 +72,230 @@ Reconciling: 39,633,399 + 2 x 33,222,822 + 2 x 6,076,715 + 132,665,557 =
 250,898,030, against the 248,054,847 a two-pair check actually costs. The 1.1%
 left over is the batch's own vector handling, which the marginal measurement
 attributes to the pair.
+
+## The per-proof floor is a constant that does not describe the prover
+
+`BASE` is not measured. `ziskemu -X` prints a compile-time constant from zisk's
+`emulator/src/emu_costs.rs`:
+
+```rust
+pub const ROM_COST: usize = 21 << 21;
+pub const TABLES_COST: usize = (55 + 35 + 29) << 21;
+pub const BASE_COST: usize = ROM_COST + TABLES_COST;   // 293,601,280
+```
+
+It models a ROM of 21 columns over 2^21 rows plus three lookup tables of 55, 35
+and 29 columns over 2^21 rows. Nothing in the prover reads it; only the report
+printer does.
+
+### What the prover actually instantiates
+
+An empty guest — `bench-guest` in baseline mode with `n = 0`, 496 executed steps
+— makes the prover log exactly which AIRs it builds:
+
+```
+Zisk | Binary: 1 | BinaryExtension: 1 | Dma64AlignedMem: 1 | InputData: 1 |
+Main: 1 | Mem: 1 | MemAlign: 1 | Rom: 1 | RomData: 1 |
+VirtualTableZisk0: 1 | VirtualTableZisk1: 1 | Total global instances: 11
+```
+
+Eleven AIRs, every one of them a full trace, on a program that does nothing.
+Their geometry is in `data/gpu_bench/proving_key_airs.tsv`, dumped from the
+shipped key:
+
+| AIR | rows | columns | cells |
+|---|---:|---:|---:|
+| `Main` | 2^22 | 68 | 285,212,672 |
+| `Binary` | 2^22 | 60 | 251,658,240 |
+| `BinaryExtension` | 2^22 | 53 | 222,298,112 |
+| `VirtualTableZisk0` | 2^21 | 65 | 136,314,880 |
+| `Mem` | 2^22 | 28 | 117,440,512 |
+| `MemAlign` | 2^21 | 53 | 111,149,056 |
+| `Dma64AlignedMem` | 2^21 | 50 | 104,857,600 |
+| `Rom` | 2^22 | 16 | 67,108,864 |
+| `InputData` | 2^21 | 29 | 60,817,408 |
+| `VirtualTableZisk1` | 2^21 | 29 | 60,817,408 |
+| `RomData` | 2^21 | 14 | 29,360,128 |
+| **total** | | | **1,447,034,880** |
+
+**The real floor is 1,447,034,880 trace cells, 4.93x the 293,601,280 the model
+charges.** Three separate errors compound:
+
+1. `Rom` is at 2^22 with 16 columns, not 2^21 with 21.
+2. There are **two** virtual tables (65 and 29 columns), not three of 55/35/29.
+3. Six AIRs in the minimal set — `Main`, `Binary`, `BinaryExtension`, `Mem`,
+   `MemAlign`, `Dma64AlignedMem` — are not in the floor at all. The model
+   charges them per *executed* unit (`MAIN_COST = 68` is exactly `Main`'s column
+   count) while the prover pads each to a whole instance.
+
+### But the floor costs far less time than its area suggests
+
+Measured directly, three proves of that empty guest take **4.843 s ± 0.028**
+(`Proof generated`, GPU already allocated). The 29-point sweep extrapolates to
+the same place: **4.940 s ± 0.096**.
+
+That is 299 M cells/s on the floor's own cells, against 70 M units/s on
+poseidon2 work — padded and constant rows prove about **4.3x faster per cell**,
+because most of them are zero or precomputed. So:
+
+| | |
+|---|---:|
+| `BASE_COST` as shipped | 293,601,280 |
+| floor as trace cells actually built | 1,447,034,880 (**4.93x**) |
+| floor as time, in the same units as variable work | **337,628,631** (**1.15x**) |
+
+The three are different quantities and the middle one is not a drop-in
+replacement for the first. For predicting latency — which is all this project
+uses the constant for — the right correction is modest: the floor is **1.15x**
+what the model charges, not 4.93x.
+
+### Cost units are not a single currency
+
+The clearest result in the sweep is a negative one. Baseline mode at `n = 0` and
+at `n = 100,000` differ by **83,558,605** cost units and instantiate *the same
+eleven AIRs*:
+
+| | VARIABLE | instances | `Proof generated` |
+|---|---:|---:|---:|
+| `n = 0` | 40,371 | 11 | 4.843 s |
+| `n = 100,000` | 83,598,976 | 11 | 4.902 s |
+
+83.6M cost units bought **0.06 s ± 0.09** — indistinguishable from zero, against
+the 1.24 s the published model predicts. Non-precompile work is free until it
+crosses an AIR-instance boundary, and then it steps. Poseidon2 work looks smooth
+only because it crosses `Poseidon` instances constantly: at `n = 1,000,000` the
+prover builds 107 of them, and `Main` has gone from 1 instance to 3.
+
+A cost model that adds `Main` steps, memory accesses and precompile calls into
+one number, then divides by one throughput figure, cannot be right for both
+kinds of work at once. It is roughly right for the BLS-heavy guests this project
+actually proves, because those are dominated by precompiles.
+
+### The measured GPU model
+
+29 sizes, `n` = 10,000 to 1,000,000, 3 warm proves each, RTX 5090, Zisk
+v1.0.0-alpha. Regressed on `VARIABLE`, never on `TOTAL` — `TOTAL` contains the
+constant under test.
+
+| | floor | slope | residual rms |
+|---|---:|---:|---:|
+| wall clock per `cargo-zisk prove` | 18.470 s ± 0.273 | 69,965,637 ± 1,199,943 units/s | 0.931 s |
+| prover's own `Proof generated` | **4.940 s ± 0.096** | **69,714,770 ± 420,107 units/s** | 0.328 s |
+| ...restricted to one `Main` instance | 5.170 s ± 0.094 | 73,315,993 ± 1,107,828 units/s | 0.220 s |
+
+Against the superseded `time = 19.5 s + units / 67,452,592`: the slope was 3.4%
+low, and the 19.5 s was never a proving floor. It is **13.49 s of process start
+and GPU allocation** plus about 5 s of actual floor, which is why it cannot be
+added to a `proof_base` term without counting the floor twice.
+
+
+## What one GPU actually holds
+
+The prover does not allocate what the witness needs. It reads *free* VRAM at
+startup and fills it. Every prove in the campaign logged the same thing on an
+idle 32.61 GB RTX 5090, for workloads spanning 40x in cost:
+
+```
+Minimum free memory available for GPU usage: 30.609253 GB
+GPU 0: Allocated 30.135334 GB (28.413327 GB unified + 1.722007 GB const pols)
+Pinned host memory per GPU: 2.000000 GB
+```
+
+`cargo-zisk prove -m/--minimal-memory` does **not** change this: same 30.135334
+GB allocated, same 31,684 MiB peak, same proving time (12.455 s against
+12.549 s). Whatever it reduces, it is not the GPU arena.
+
+### The 30 GB is greed, not a requirement
+
+Holding VRAM back with a trivial `cudaMalloc` before starting the prover shows
+the allocation tracking what is left:
+
+| held back | free before | prover allocated | `Proof generated` | result |
+|---:|---:|---:|---:|---|
+| 0 GB | 31.36 GB | 30.14 GB | 12.30 s | ok |
+| 4 GB | 26.86 GB | 25.34 GB | 12.83 s | ok |
+| 8 GB | 22.86 GB | 20.76 GB | 14.50 s | ok |
+| 16 GB | 14.86 GB | 12.90 GB | 19.78 s | ok |
+| 20 GB | 10.86 GB | — | — | `Not enough GPU memory to run the proof` |
+
+**The working minimum is about 14 GB free, allocating 12.9 GB**, and the penalty
+for running there is 61% on proving time (19.78 s against 12.30 s), not failure.
+The card is not a hard constraint at 30 GB; the prover simply takes everything
+it can see.
+
+### Two provers on one card
+
+Started naively and simultaneously, they race: both read free VRAM before either
+allocates, both plan to take ~29 GB, and the loser dies at startup with
+
+```
+GPU 0: Available memory: 1.250488 GB / 31.356567 GB
+[ERROR]: GPU 0: Insufficient memory. Need 28.606488 GB but only 1.250488 GB available
+```
+
+It is a loud, immediate failure, not an OOM or a silent serialisation. The
+survivor is also degraded — it came up with `3 streams for basic proofs and 0
+streams for recursive proofs` and took 24.46 s instead of 12.46 s.
+
+But 2 x 14 GB fits inside 32.61 GB, so the constraint is the greedy sizing, not
+the memory. There is no flag to cap it; capping has to come from outside the
+process — an MPS per-client limit, a co-resident allocation, or a container
+memory limit — and then two provers coexist.
+
+
+## The group stage, measured against attester count
+
+`gen-test-witness group-proof <out> <n-validators>` builds a fixture whose one
+aggregate covers `n/2` attesters. Proved on the RTX 5090, 3 warm proves each,
+`Proof generated` (raw data in `data/gpu_bench/attester_*.tsv`):
+
+| attesters | STEPS | VARIABLE | `Proof generated` | effective units/s | steps/attester |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 1,769,057 | 191,762,010 | 10.54 s ± 4.20 | 18,186,262 | 3,455 |
+| 4,096 | 5,910,479 | 595,312,633 | 8.95 s ± 0.28 | 66,532,724 | 1,443 |
+| 16,384 | 20,110,664 | 1,982,290,621 | 14.23 s ± 0.90 | 139,342,796 | 1,227 |
+| 65,536 | 76,911,936 | 7,539,064,642 | 34.37 s ± 0.81 | 219,341,641 | 1,174 |
+| 125,000 | 145,632,319 | 14,267,663,844 | 60.92 s ± 0.91 | 234,195,592 | 1,165 |
+| 308,000 | 357,111,686 | 35,009,796,558 | 140.46 s | 249,243,910 | 1,159 |
+
+Two things fall out, and they pull in opposite directions.
+
+**The analytical cost model understates a group proof by 3.6x.** At 125,000
+attesters `scripts/streaming_cost.py` accounts for 3.93B cost units; the guest
+really costs 14.27B. The missing term is not cryptography. At 65,536 attesters
+the emulator attributes **66.8% of the cost to `MAIN`** — plain interpreted
+RISC-V — against 4.9% to precompiles:
+
+```
+MAIN         5,230,011,648  66.77%
+OPCODES      1,045,722,377  13.35%
+MEMORY         876,798,512  11.19%
+PRECOMPILES    386,532,105   4.93%
+```
+
+That is **~1,159 executed steps per attester** — deserialising the witness and
+walking the attester list — and the model counts none of it. It counts
+`acc_leaf`, `acc_node` and BLS and nothing else.
+
+**But the model's predicted *times* are close anyway**, because the second error
+cancels the first. Effective throughput climbs from 18M units/s on a
+floor-dominated proof to **249M units/s** at 308,000 attesters, against the
+69.7M units/s measured on poseidon2 work. `MAIN`-heavy work proves about 3.5x
+faster per cost unit than the calibration workload:
+
+| | modelled | measured | error |
+|---|---:|---:|---:|
+| group of ~83,000 attesters | 43.3 s | ~42.2 s | −2.5% |
+| group of 125,000 attesters | 58.7 s | 60.9 s | +3.8% |
+| group of 308,000 attesters | 118.5 s | 140.5 s | **+18.5%** |
+
+So the scheduling analysis built on those times survives — the largest group is
+18% more expensive than assumed, which makes the deadline slightly harder, not
+easier. What does not survive is the idea that a single cost-units-per-second
+number describes this prover. It does not: the same constant is wrong by 3.5x in
+one direction for `MAIN`-heavy guests and right only for the poseidon2 workload
+it was fitted on.
+
 
 ## What the numbers decided
 
