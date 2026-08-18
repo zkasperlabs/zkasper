@@ -219,6 +219,11 @@ pub struct Status {
     /// was not given one to publish to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish: Option<PublishStatus>,
+    /// Finalization proofs that reached another chain, oldest first. Written by
+    /// whatever submitted them, not by the prover. Empty when the daemon was
+    /// not given a postings file to read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub postings: Vec<crate::postings::Posting>,
 }
 
 /// What publishing to the API has cost.

@@ -9,6 +9,7 @@ pub mod epoch_state;
 pub mod fixture;
 pub mod gossip;
 pub mod orchestrator;
+pub mod postings;
 pub mod prover;
 pub mod pubkey;
 pub mod publish;

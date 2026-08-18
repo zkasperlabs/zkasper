@@ -219,6 +219,14 @@ struct Cli {
     /// `<output-dir>/prover-spool`.
     #[arg(long)]
     prover_spool: Option<PathBuf>,
+
+    /// File a submitter appends postings to, one JSON object per line, as
+    /// `zkasper-cli` in the zkasper-solana repository writes it. The daemon
+    /// reads it, publishes each new line as a `posting.landed` event and
+    /// carries the recent ones in `status.json`. Without it the daemon says
+    /// nothing about any chain a proof was posted to.
+    #[arg(long, env = "ZKASPER_POSTINGS")]
+    postings: Option<PathBuf>,
 }
 
 impl Cli {
@@ -353,6 +361,7 @@ async fn main() -> Result<()> {
         // path walks blocks either way.
         gossip_url: (pipeline == Pipeline::Streaming && !cli.no_gossip)
             .then(|| cli.beacon_url.clone()),
+        postings_path: cli.postings.clone(),
         ..OrchestratorConfig::new(cli.chain.config(), cli.chain.name())
     };
 
