@@ -794,29 +794,38 @@ off the critical path.
 | 469374 | 1,177 | 1,095 | 75 | 2 | 0 | catch-up |
 | **469375** | **6,961** | **6,378** | **4,999** | **16** | **0** | **steady state** |
 | 469376 | 5,707 | 5,565 | 80 | 0 | 1 | catch-up |
+| 469379 | 8,027 | 7,835 | 111 | 0 | 1 | catch-up |
+| 469380 | 4,276 | 4,204 | 89 | 0 | 1 | catch-up |
+| **469381** | **1,642** | **1,355** | **6,822** | **21** | **0** | **steady state** |
 
-**Only 469375 is a steady-state epoch** — the only one the daemon followed from
-near its first slot, folding a group per slot as gossip closed it, 16 in total.
-Every other row is an epoch the daemon opened already in progress after a
-bootstrap or a restart, which folds nothing before the trigger and therefore
+**Only 469375 and 469381 are steady-state epochs** — the only two the daemon
+followed from near their first slot, folding a group per slot as gossip closed
+it, 16 and 21 in total. Every other row is an epoch opened already in progress
+after a bootstrap or a restart, which folds nothing before the trigger and so
 reports `folded_groups = 0` and `late_groups = 1`. Those rows say what a
 catch-up costs, not what the pipeline costs. **Do not quote them as a
-steady-state result**, and do not quote a single steady-state epoch as a
-distribution either — one epoch is a data point, not a measurement.
+steady-state result.** Two epochs are not a distribution either; what follows is
+what two epochs can support.
 
-Two things the steady-state epoch does establish:
+- **`late_groups = 0` on both steady-state epochs, and 1 on every catch-up.**
+  The alert is meaningful and the daemon keeps up with the chain once it is on
+  it.
+- **`wait_millis` is 82–92% of `T2 - T`.** Under `--prover native` the prover is
+  not on the critical path; the trigger holding for in-flight attestations is. A
+  GPU run will report a similar `T2 - T` for an entirely different reason, so
+  these are a baseline for the *trigger*, not for proving.
+- **`tail_named` is the number that will hurt on a GPU, and it is two orders of
+  magnitude larger in steady state**: 4,999 and 6,822, against 75–111 on every
+  catch-up. At the README's 1.79 ms per named leaf that is **8.9 s and 12.2 s of
+  proving** on the critical path, against a `T2 - T` of 1.6–7.0 s today. Read
+  with the trigger-cap section above: the two steady-state epochs waited 6,378 ms
+  and 1,355 ms and neither got the burst, which drains at a median of 7,326 ms.
 
-- **`wait_millis` is 92% of `T2 - T`.** The prover is not on the critical path
-  under `--prover native`; the trigger deliberately holding for in-flight
-  attestations is. A GPU run will report a similar `T2 - T` for an entirely
-  different reason, so these numbers are a baseline for the *trigger*, not for
-  proving.
-- **`tail_named` is the number that will hurt on a GPU**, and it is 4,999 on the
-  one epoch that ran in the intended shape against 75–110 on the catch-up
-  epochs. See the trigger-cap section above.
+The catch-up rows are not noise, incidentally — they are what every epoch after
+a restart looks like, and §6 explains why restarts happen.
 
-Getting a real distribution needs a run that stays up. Sections above explain why
-this one did not: an empty epoch boundary ends it, roughly every hundred epochs.
+Getting a real distribution needs a run that stays up for hours. The section
+below explains why this one could not.
 
 ### Two bugs the run found
 
