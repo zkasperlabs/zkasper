@@ -752,6 +752,11 @@ pushed. They are recorded because they say what a readiness run is for.
    day**. Fixed by reading the state root from `/eth/v1/beacon/states/{slot}/root`,
    which is defined for every slot.
 
+   Verified live rather than in a test: the run was re-bootstrapped at epoch
+   469375 so that its first epoch diff was the one over slot 15,020,032, and it
+   logged `accumulator advanced ... millis=23128` where the previous build had
+   logged nothing but `Error: build epoch diff witness` on a five-second loop.
+
 The second one is the reason a day-long run needed rehearsing rather than
 launching: nothing in a fixture-backed test suite produces a skipped epoch
 boundary.
