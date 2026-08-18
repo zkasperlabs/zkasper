@@ -350,7 +350,9 @@ For real proofs the proving stack goes on the GPU box, not here. Build
 confirmed against `nvidia/cuda:12.9.1-devel-ubuntu24.04` on 2026-08-18.
 
 ```sh
-# on the GPU box, after ziskup --gpu --provingkey
+# on the GPU box, after ziskup --gpu --provingkey.
+# Stop any prover server first -- see below.
+pkill -f zkasper-prover-server
 ./scripts/bake_child_vks.sh
 cargo build --release --features zisk-prover --bin zkasper-prover-server
 ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasper-prover-server \
@@ -376,6 +378,15 @@ the handshake rather than several minutes into an epoch, because
 `child_vks::check` compares the server's keys against the constants the daemon
 was built with. Commit the four `crates/*/src/child_vks.rs` files it writes
 alongside the ELFs they describe.
+
+**Stop the prover server before rebaking a box that is already serving.** A warm
+prover holds tens of gigabytes for the life of the process, and `cargo-zisk`
+building eight guests wants the rest; on a 251 GB box the OOM killer took four
+guest builds while the script kept going and wrote the keys it had. The result
+is a half-baked set that looks built. It surfaces at the next daemon start as
+`the guests were built before the epoch_diff program had a key` — which is the
+right message, but it is a rebuild away from the box, so save yourself the
+round trip. Nothing in the bake needs the GPU.
 
 `--stages group,slot_proof` starts a server for part of a pipeline; each guest
 costs a ROM setup and gigabytes of `~/.zisk/cache`, so do not set up nine when
