@@ -5,7 +5,7 @@
 //! An attestation is gossiped in the slot it is made and included in a block one
 //! or more slots later, so a daemon reading
 //! `/eth/v2/beacon/blocks/{id}/attestations` sees everything at least a slot
-//! late. Mainnet epoch 430529 puts a number on it: 99.85% of a slot's attesters
+//! late. Mainnet epoch 430529 puts a number on it: 99.98% of a slot's attesters
 //! are already in the very next block, so essentially the whole slot existed on
 //! gossip while the slot was still running and the block only redelivered it
 //! 12 s later.
