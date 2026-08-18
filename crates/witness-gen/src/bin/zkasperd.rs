@@ -248,11 +248,13 @@ struct Cli {
     /// How long to wait for one proof before giving the connection up.
     ///
     /// It has to clear the slowest proof the run will ask for, and that is not
-    /// the one on the critical path: the batch-path justification recursively
-    /// verifies every slot proof of the epoch, and over ~22 of them it took more
-    /// than ten minutes on an RTX 5090 (measured 2026-08-18). A timeout under
-    /// that does not fail — it retries, and the retry is just as slow, so the
-    /// epoch never lands and the card works on proofs nobody is waiting for.
+    /// the one on the critical path. It used to be the batch-path
+    /// justification, which recursively verified every slot proof of the epoch
+    /// and took 1,222 s over ~22 of them on an RTX 5090 (measured 2026-08-18);
+    /// that proof is a chain of bounded folds now, and the slowest is the
+    /// committee proof at about two minutes. A timeout under the slowest proof
+    /// does not fail — it retries, and the retry is just as slow, so the epoch
+    /// never lands and the card works on proofs nobody is waiting for.
     #[arg(long, default_value_t = 1800)]
     prover_timeout_seconds: u64,
 

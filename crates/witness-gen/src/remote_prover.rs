@@ -405,12 +405,15 @@ pub struct RemoteProverConfig {
     /// answering can hold the pipeline, so it can be neither short enough to
     /// abandon good proofs nor long enough to hide a dead server.
     ///
-    /// The slowest proof a run asks for is not the one on the critical path. A
-    /// batch-path justification recursively verifies every slot proof of its
-    /// epoch, and over ~22 of them that took more than ten minutes on an RTX
-    /// 5090 (measured 2026-08-18). A timeout under the slowest proof does not
-    /// fail — it retries, and the retry is just as slow, so the epoch never
-    /// lands and the card spends its time on proofs nobody is waiting for.
+    /// The slowest proof a run asks for is not the one on the critical path. It
+    /// used to be the batch-path justification, which recursively verified
+    /// every slot proof of its epoch and took 1,222 s over ~22 of them on an
+    /// RTX 5090 (measured 2026-08-18); that proof is a chain of bounded folds
+    /// now, and the slowest is the committee proof at about two minutes. The
+    /// default stays well above it, because a timeout under the slowest proof
+    /// does not fail — it retries, and the retry is just as slow, so the epoch
+    /// never lands and the card spends its time on proofs nobody is waiting
+    /// for.
     pub request_timeout: Duration,
     /// Held after a failed connect, so an outage costs one attempt per interval
     /// rather than one per stage.
