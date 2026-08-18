@@ -562,21 +562,31 @@ from that run:
 |---|---:|---:|
 | critical path | 8.597B | **1.418B** |
 | CPU (333.4s + cost/1,244,523 per proof) | 7,908s | **1,473s** |
-| GPU cold (19.52s per invocation) | 205.7s | **60.3s** |
-| GPU warm (allocation held open) | 129.6s | **22.2s** |
+| GPU cold (19.52s per invocation) | 205.7s | **60.3s** *(superseded)* |
+| GPU warm (allocation held open) | 129.6s | **22.2s** *(superseded)* |
 
 **6.1x** in cost units, **5.8x** in GPU wall-clock.
 
-GPU figures use 67,452,592 cost units per second, measured on an RTX 5090
-against Zisk 1.0.0-alpha, plus one wrap invocation at 0.192s of actual
-compression.
+> **Superseded.** Both GPU rows are computed from `293,601,280` and
+> `67,452,592`, and both constants are wrong — see
+> [The per-proof floor](#the-per-proof-floor-is-a-constant-that-does-not-describe-the-prover).
+> The cost-unit column is also wrong in the other direction: measured against
+> real group proofs, `streaming_cost.py` understates a group by **3.6x** because
+> it counts no `MAIN` execution. The two errors partly cancel, so the *times* are
+> closer than the *costs* — group proofs land within 4% of the model at 83k–125k
+> attesters and 18.5% over it at 308k — but nothing here should be quoted as a
+> measurement until the model is rebuilt on
+> [the group-stage numbers](#the-group-stage-measured-against-attester-count).
 
-**Warm and cold are different products.** The 19.52s "fixed cost" of a proof is
-process startup and 30 GB of GPU allocation, not proving — the wrap measurement
-makes this unmistakable: 18.4s wall-clock around 0.192s of work. Two cold
-invocations are 39s of nothing, which is why the pipeline is only under 30
-seconds on a prover that stays up. `crates/witness-gen/src/prover.rs` documents
-this as a requirement of the trait rather than a deployment note.
+**Warm and cold are different products, and the gap is 13.5s.** Measured over 87
+warm proves, wall clock exceeds the prover's own `Proof generated` by
+**13.49 s** — `INITIALIZING_PROOFMAN` is 7.74 s ± 0.71 of that and process start
+and teardown are the rest. That is what a long-running prover saves per proof,
+and it is the whole argument for `crates/witness-gen/src/prover.rs` taking
+`&self`. The 19.52s previously quoted here was a regression intercept that also
+absorbed the per-proof floor, so it cannot be added to a `proof_base` term
+without counting the floor twice — which `scripts/streaming_cost.py` currently
+does.
 
 ### Where the remaining 1.418B went
 
