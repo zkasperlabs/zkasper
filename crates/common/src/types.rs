@@ -424,21 +424,6 @@ pub struct FinalizationWitness {
     pub epoch_diff_proof: Vec<u64>,
 }
 
-/// Witness for Bootstrap: one-time accumulator tree construction.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BootstrapWitness {
-    pub state_root: [u8; 32],
-    pub epoch: u64,
-    pub validators: Vec<ValidatorData>,
-    /// SSZ proof from state_root to the validators data tree root.
-    pub state_to_validators_siblings: Vec<[u8; 32]>,
-    pub validators_list_length: u64,
-    /// Per-validator: the 8 SSZ field-level hash-tree leaves.
-    pub validator_field_chunks: Vec<[[u8; 32]; 8]>,
-    /// Per-validator: raw pubkey split into 2x32-byte SSZ chunks.
-    pub validator_pubkey_chunks: Vec<[[u8; 32]; 2]>,
-}
-
 // ---------------------------------------------------------------------------
 // Public output encoding
 // ---------------------------------------------------------------------------

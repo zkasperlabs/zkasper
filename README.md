@@ -13,8 +13,9 @@ A finalization proof publishes the finalized checkpoint, the beacon state root
 of that checkpoint, and the accumulator commitments the attestations were opened
 against. The accumulator is a second validator-set tree, hashed with Poseidon2
 over Goldilocks, that costs far less to open than the SSZ registry. Its
-commitments chain back through one epoch diff per epoch to a single bootstrap
-state.
+commitments chain back through one epoch diff per epoch to a single trusted
+init point — one beacon state root the operator chose. See
+[docs/assumptions.md](docs/assumptions.md).
 
 `T` is the moment the chain publishes enough attestations to justify a
 checkpoint. `T2` is the moment a proof of it exists. `T2 - T` is the only
@@ -27,7 +28,6 @@ between `T` and `T2`. See [BENCHMARKS.md](BENCHMARKS.md).
 ```
 crates/
   common/                # shared types, SSZ, accumulator, Merkle, BLS, recursion
-  bootstrap-guest/       # guest: one-time tree construction
   epoch-diff-guest/      # guest: validator set diff, one per epoch
   committee-proof-guest/ # guest: one epoch's committee aggregates
   slot-proof-guest/      # guest: one slot's attestations, by complement
@@ -62,10 +62,25 @@ zkVM. To build the guest ELFs for the real target, run:
 `zkasperd` follows a beacon node, writes one witness per stage, and rewrites
 `status.json` after every stage:
 
+A fresh run needs an **init point**: the accumulator it starts from, as
+configuration rather than as a proof. Take one from the node, then start the
+daemon with it:
+
 ```sh
+cargo run --release --bin zkasper-init-point -- \
+    --beacon-url http://localhost:5052 --out init-point.json
 cargo run --release --bin zkasperd -- \
-    --beacon-url http://localhost:5052 --mode streaming
+    --beacon-url http://localhost:5052 --mode streaming \
+    --init-point init-point.json
 ```
+
+With no `--slot`, `zkasper-init-point` takes the node's finalized checkpoint,
+which is where a run should start. The daemon rejects an init point whose
+commitment does not bind its own root and balance, and then refuses to start
+unless the accumulator it rebuilds from the registry is the one the file claims.
+`--init-point` is ignored once a state file exists, so a restart resumes rather
+than starting a second chain. What this trusts, and what it does not, is
+[docs/assumptions.md](docs/assumptions.md).
 
 `--mode streaming` proves each epoch as the attestations arrive.
 `--mode batch`, the default, proves each slot and folds the epoch after the
@@ -117,7 +132,7 @@ node, and [RUNBOOK.md](RUNBOOK.md) to operate one.
 For one step at a time, use the `zkasper-witness-gen` binary:
 
 ```sh
-cargo run -p zkasper-witness-gen -- --beacon-url http://localhost:5052 bootstrap 3200
+cargo run -p zkasper-witness-gen -- --beacon-url http://localhost:5052 init init-point.json
 cargo run -p zkasper-witness-gen -- --beacon-url http://localhost:5052 epoch-diff 3200 3232
 ```
 
@@ -143,7 +158,9 @@ Open:
 - Recursive verification is unmeasured. It is a model parameter that defaults to
   zero.
 - The Solidity verifier is not integrated with the Zisk proof format.
-- Bootstrap is one proof, and it is not chunked.
+- The init point is trusted, not proven. A consumer has to regenerate it, or
+  hold the accumulator to the rule in [docs/assumptions.md](docs/assumptions.md)
+  that every state root it passed through be named by a later finalization.
 
 ## Read next
 

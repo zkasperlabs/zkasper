@@ -188,7 +188,15 @@ impl BeaconApi for BeaconApiClient {
 
     async fn get_state_root(&self, state_id: &str) -> Result<Option<[u8; 32]>> {
         let url = format!("{}/eth/v1/beacon/states/{}/root", self.base_url, state_id);
-        let resp = checked_json(self.client.get(&url).send().await?).await?;
+        let resp = self.client.get(&url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // A node that will not answer for this slot is the `None` the trait
+            // documents — read the header instead. Returning an error here would
+            // make the `Option` unreachable for the one implementation that has
+            // a network behind it.
+            return Ok(None);
+        }
+        let resp: serde_json::Value = resp.error_for_status()?.json().await?;
         Ok(Some(parse_hex_bytes32(&resp["data"], "root")?))
     }
 }

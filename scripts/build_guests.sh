@@ -17,7 +17,6 @@ cd "$(dirname "$0")/.."
 export PATH="${ZISK_BIN:-$HOME/.zisk/bin}:$PATH"
 
 GUESTS=(
-  bootstrap-guest
   epoch-diff-guest
   committee-proof-guest
   slot-proof-guest

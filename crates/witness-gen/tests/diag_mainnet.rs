@@ -243,10 +243,10 @@ async fn diag_finality_bls() {
     let slot = load_state(&mut api, "state_13776928.ssz", &CONFIG);
     let (target_epoch, target_root) = load_finality(&mut api, "finality_epoch_430529.json.gz");
 
-    let (_w, tree, _es, total_active_balance, _n) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
+        .await
+        .unwrap();
+    let (tree, total_active_balance) = (snapshot.tree, init.total_active_balance);
 
     let raw = &api.states[&slot.to_string()].raw_ssz;
     let signing_domain = zkasper_common::bls::compute_domain(

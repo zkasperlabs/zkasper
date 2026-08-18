@@ -66,7 +66,8 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
 
-    let run = daemon(&node, dir.path())
+    let init_point = init_point(&node, dir.path()).await;
+    let run = daemon(&node, dir.path(), &init_point)
         .output()
         .await
         .expect("zkasperd runs");
@@ -82,7 +83,7 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
         serde_json::from_slice(&std::fs::read(out.join("status.json")).expect("a manifest"))
             .expect("the manifest is JSON");
 
-    // Bootstrapped where the node said it was finalized, and the accumulator
+    // Started where the init point said, and the accumulator
     // walked from there to the head one epoch diff at a time.
     assert_eq!(status["chain"], "mainnet", "{}", transcript(&run));
     assert_eq!(
@@ -93,17 +94,19 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     assert!(status["prover"]
         .as_str()
         .is_some_and(|prover| prover.starts_with("native")));
-    assert_eq!(status["bootstrap_epoch"], FIRST_EPOCH);
+    assert_eq!(status["init_epoch"], FIRST_EPOCH);
     assert_eq!(status["accumulator"]["epoch"], LAST_EPOCH);
     assert_eq!(
         status["accumulator"]["total_active_balance"],
         chain.total_active_balance_at(LAST_EPOCH).to_string(),
         "the epoch diffs did not carry the balance change through",
     );
-    assert!(out
-        .join(format!("epoch-{FIRST_EPOCH:09}"))
-        .join("bootstrap.bin")
-        .exists());
+    // The epoch the run starts on was not reached by an epoch diff — it is where
+    // the init point put the accumulator — so it has no diff artifact, while
+    // every epoch after it does.
+    let first = out.join(format!("epoch-{FIRST_EPOCH:09}"));
+    assert!(first.exists());
+    assert!(!first.join("epoch_diff.bin").exists());
 
     // Justified every epoch, and finalized every pair of consecutive ones.
     assert_eq!(status["justified_through"], LAST_EPOCH);
@@ -114,7 +117,7 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     );
 
     // The threshold fired partway through the epoch rather than at the end of
-    // it. The first epoch after a bootstrap has nothing to finalize and goes
+    // it. The first epoch of a run has nothing to finalize and goes
     // through the batch path, which proves one slot at a time — so its artifacts
     // are the record of where the daemon stopped counting.
     let first = out.join(format!("epoch-{FIRST_EPOCH:09}"));
@@ -158,11 +161,45 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
 
 /// The daemon, pointed at the mock node, exactly as it will be pointed at a real
 /// one. Only `--prover` changes when there is a GPU to prove on.
-fn daemon(node: &MockNode, dir: &std::path::Path) -> tokio::process::Command {
+/// Take the run's init point with the real `zkasper-init-point` binary.
+///
+/// The daemon no longer proves its own starting accumulator, so the generator is
+/// now part of the launch procedure — and a procedure nothing exercises is a
+/// procedure that breaks on the day it is needed. This runs the binary an
+/// operator runs, against the node the daemon will follow, and hands the daemon
+/// the file it wrote.
+async fn init_point(node: &MockNode, dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("init-point.json");
+    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_zkasper-init-point"))
+        .arg("--beacon-url")
+        .arg(node.url())
+        .args(["--chain", "mainnet"])
+        .args(["--slot", &(FIRST_EPOCH * SPE).to_string()])
+        .arg("--out")
+        .arg(&path)
+        .output()
+        .await
+        .expect("zkasper-init-point runs");
+    assert!(
+        run.status.success(),
+        "zkasper-init-point exited with {}\n{}",
+        run.status,
+        transcript(&run),
+    );
+    path
+}
+
+fn daemon(
+    node: &MockNode,
+    dir: &std::path::Path,
+    init_point: &std::path::Path,
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_zkasperd"));
     command
         .arg("--beacon-url")
         .arg(node.url())
+        .arg("--init-point")
+        .arg(init_point)
         .arg("--db-path")
         .arg(dir.join("zkasperd.db"))
         .arg("--output-dir")
@@ -208,7 +245,8 @@ async fn test_the_daemon_publishes_the_whole_run() {
     let api = StubApi::start().await;
     let dir = tempfile::tempdir().unwrap();
 
-    let run = daemon(&node, dir.path())
+    let init_point = init_point(&node, dir.path()).await;
+    let run = daemon(&node, dir.path(), &init_point)
         .args(["--prover-usd-per-hour", "0.51"])
         .args(["--api-url", &api.url()])
         .args(["--api-token", "dry-run"])
@@ -392,7 +430,8 @@ async fn test_the_daemon_publishes_to_a_live_api() {
     .expect("the mock node binds a port");
     let dir = tempfile::tempdir().unwrap();
 
-    let run = daemon(&node, dir.path())
+    let init_point = init_point(&node, dir.path()).await;
+    let run = daemon(&node, dir.path(), &init_point)
         .args(["--api-url", &url])
         .args(["--api-token", &token])
         .args(["--api-batch-millis", "200"])

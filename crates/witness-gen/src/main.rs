@@ -1,6 +1,6 @@
 use zkasper_witness_gen::{
-    beacon_api, db, epoch_state, network, orchestrator, prover, witness_bootstrap,
-    witness_epoch_diff, witness_slot_proof,
+    beacon_api, db, epoch_state, init_point, network, orchestrator, prover, witness_epoch_diff,
+    witness_slot_proof,
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use zkasper_common::ChainConfig;
 use beacon_api::{BeaconApi, BeaconApiClient};
 use db::Db;
 use epoch_state::EpochState;
+use init_point::InitPoint;
 
 #[derive(Clone, ValueEnum)]
 enum Chain {
@@ -44,10 +45,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build initial Poseidon tree from the full validator set
-    Bootstrap {
-        /// Slot to bootstrap from (must be an epoch boundary)
-        slot: u64,
+    /// Build the initial Poseidon tree from a trusted init point.
+    ///
+    /// Take the init point with `zkasper-init-point`. This walks the registry it
+    /// names and refuses to write anything unless the accumulator it builds is
+    /// the one the file claims.
+    Init {
+        /// Init point JSON
+        init_point: String,
     },
     /// Generate epoch diff witness between two epoch-boundary slots
     EpochDiff {
@@ -82,25 +87,21 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Command::Bootstrap { slot } => {
-            eprintln!("bootstrapping from slot {slot}...");
+        Command::Init { init_point } => {
+            let init = InitPoint::read(&init_point)?;
+            eprintln!("starting from epoch {} of {}...", init.epoch, init.chain);
 
-            let (witness, tree, _epoch_state, total_active_balance, num_validators) =
-                witness_bootstrap::build(&api, &config, slot).await?;
+            let snapshot = init_point::open(&api, &config, &init.chain, &init).await?;
 
-            let epoch = witness.epoch;
-
-            // Save tree state to DB
-            db.save(&tree, epoch, total_active_balance, num_validators)?;
-            eprintln!("saved tree state: epoch={epoch}, validators={num_validators}, total_active_balance={total_active_balance}");
-
-            // Serialize witness
-            let output_path = format!("{}/bootstrap_input.bin", cli.output_dir);
-            let bytes = bincode::serialize(&witness).context("serialize bootstrap witness")?;
-            std::fs::write(&output_path, bytes).context("write bootstrap witness")?;
+            db.save(
+                &snapshot.tree,
+                init.epoch,
+                init.total_active_balance,
+                init.num_validators,
+            )?;
             eprintln!(
-                "wrote {output_path} ({} bytes)",
-                std::fs::metadata(&output_path)?.len()
+                "saved tree state: epoch={}, validators={}, total_active_balance={}",
+                init.epoch, init.num_validators, init.total_active_balance,
             );
         }
 
@@ -108,7 +109,7 @@ async fn main() -> Result<()> {
             eprintln!("epoch diff: slot {slot1} -> {slot2}...");
 
             let (mut tree, cursor_epoch, total_active_balance, _num_validators) =
-                db.load()?.context("no saved state — run bootstrap first")?;
+                db.load()?.context("no saved state — run `init` first")?;
 
             eprintln!("loaded tree state: cursor_epoch={cursor_epoch}, total_active_balance={total_active_balance}");
 
@@ -157,7 +158,7 @@ async fn main() -> Result<()> {
 
             let (tree, _cursor_epoch, total_active_balance, _num_validators) = db
                 .load()?
-                .context("no saved state — run bootstrap + epoch-diff first")?;
+                .context("no saved state — run `init` + `epoch-diff` first")?;
 
             let target_root = parse_hex_bytes32(&target_root)?;
             let signing_domain = parse_hex_bytes32(&signing_domain)?;

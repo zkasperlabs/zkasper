@@ -4,7 +4,7 @@ set -euo pipefail
 # Generate and verify a real Zisk proof, and report how long proving took.
 #
 # Usage: ./scripts/test_zisk_proof.sh [proof-type]
-#   proof-type: bootstrap | epoch-diff | slot-proof | justification | finalization
+#   proof-type: epoch-diff | slot-proof | justification | finalization
 #
 # Requires a proving key: ziskup --version 1.0.0-alpha --cpu --provingkey -y
 
@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-PROOF_TYPE=${1:-bootstrap}
+PROOF_TYPE=${1:-epoch-diff}
 GUEST_BIN="zkasper-${PROOF_TYPE}-guest"
 ELF="target/elf/riscv64ima-zisk-zkvm-elf/release/${GUEST_BIN}"
 WORK="target/proofs/${PROOF_TYPE}"

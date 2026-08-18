@@ -53,12 +53,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use anyhow::{anyhow, Result};
 
-use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
-    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    AggregateOutput, AggregateWitness, CommitteeOutput, CommitteeWitness, EpochDiffOutput,
+    EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
     JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
     StreamFinalOutput, StreamFinalWitness,
 };
@@ -78,7 +77,6 @@ pub type Proof = Vec<u64>;
 /// the same thing as attestations arrive and collapses the tail into one proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
-    Bootstrap,
     EpochDiff,
     Committee,
     SlotProof,
@@ -92,7 +90,6 @@ pub enum Stage {
 impl Stage {
     pub fn as_str(self) -> &'static str {
         match self {
-            Stage::Bootstrap => "bootstrap",
             Stage::EpochDiff => "epoch_diff",
             Stage::Committee => "committee",
             Stage::SlotProof => "slot_proof",
@@ -108,7 +105,6 @@ impl Stage {
     /// third party rebuilds to check a proof came from this circuit.
     pub fn guest(self) -> &'static str {
         match self {
-            Stage::Bootstrap => "zkasper-bootstrap-guest",
             Stage::EpochDiff => "zkasper-epoch-diff-guest",
             Stage::Committee => "zkasper-committee-proof-guest",
             Stage::SlotProof => "zkasper-slot-proof-guest",
@@ -120,8 +116,7 @@ impl Stage {
         }
     }
 
-    pub const ALL: [Stage; 9] = [
-        Stage::Bootstrap,
+    pub const ALL: [Stage; 8] = [
         Stage::EpochDiff,
         Stage::Committee,
         Stage::SlotProof,
@@ -189,14 +184,6 @@ pub struct ProveCost {
     pub wrap_millis: u64,
 }
 
-/// Public output of the bootstrap stage.
-#[derive(Clone, Copy, Debug)]
-pub struct AccOutput {
-    pub commitment: Digest,
-    pub acc_root: Digest,
-    pub total_active_balance: u64,
-}
-
 /// Turns a witness into a proof of that witness.
 ///
 /// Implementors must return the same public outputs the circuit commits to —
@@ -233,7 +220,6 @@ pub trait Prover: Send + Sync {
         None
     }
 
-    fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)>;
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)>;
     fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)>;
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)>;
@@ -286,24 +272,6 @@ impl Prover for NativeProver {
         // native `verify_child` short-circuits on an empty proof before it looks
         // at the key.
         [0; 4]
-    }
-
-    fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)> {
-        let (commitment, acc_root, total_active_balance) = run_circuit(Stage::Bootstrap, || {
-            zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-                witness,
-                self.config.validators_tree_depth,
-                self.config.acc_tree_depth,
-            )
-        })?;
-        Ok((
-            AccOutput {
-                commitment,
-                acc_root,
-                total_active_balance,
-            },
-            Proof::new(),
-        ))
     }
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {

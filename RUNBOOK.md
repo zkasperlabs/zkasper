@@ -1,7 +1,7 @@
 # Running zkasperd against mainnet
 
-How to provision, install, bootstrap, run, monitor and recover a continuous
-mainnet finality-proving deployment.
+How to provision, install, start, run, monitor and recover a continuous mainnet
+finality-proving deployment.
 
 Every number here is labelled MEASURED (with where and when) or MODELLED.
 `scripts/gpu_bench.sh` is the companion document for the proving box; this one
@@ -12,7 +12,7 @@ covers the daemon and the chain it follows.
 Written from a live mainnet run on this machine: Lighthouse v8.2.1 checkpoint-
 synced with a mock execution layer, `zkasperd --mode streaming --prover native`.
 
-**Works.** Bootstrap from a real 2.34M-validator state; all-subnets gossip at
+**Works.** Starting from a real 2.34M-validator state; all-subnets gossip at
 28,033 attestations a slot with zero drops; the singles-first collector; the
 schedule; the 2/3 trigger; reorg handling; the status manifest; restart recovery.
 The three arrival-timing assumptions the design rests on are confirmed (§8).
@@ -36,6 +36,10 @@ proving measurement, because §8 is the `--prover native` run.
 the epoch diff; a 404 was reported as a parse error; a pruned bootstrap state
 wedged startup. See §8 and §6.
 
+**Fixed since**: bootstrap is gone. The daemon starts from a trusted init point —
+see [docs/assumptions.md](docs/assumptions.md) — which deletes the two-minute
+startup and the whole "bootstrap epoch pruned" failure mode with it.
+
 **Fixed after it**: an empty epoch boundary slot no longer ends the run — the
 boundary state root is proven out of the justified checkpoint's `state_roots`
 rather than read off a header that does not exist — and the trigger cap is
@@ -46,7 +50,7 @@ rather than read off a header that does not exist — and the trigger cap is
 1. [Topology, and why the beacon node is not on the GPU box](#1-topology)
 2. [The beacon node](#2-the-beacon-node)
 3. [Installing and starting the node](#3-installing-and-starting-the-node)
-4. [Bootstrapping and running the daemon](#4-bootstrapping-and-running-the-daemon)
+4. [Starting and running the daemon](#4-starting-and-running-the-daemon)
 5. [Monitoring: what to alert on](#5-monitoring-what-to-alert-on)
 6. [Recovery](#6-recovery)
 7. [Provisioning and cost](#7-provisioning-and-cost)
@@ -99,22 +103,24 @@ zkasperd needs more from a node than a validator does. All three must hold.
 |---|---|---|
 | 1 | `--subscribe-all-subnets` | The `single_attestation` topic only carries subnets the node joined. A default node joins **2 of 64** (`SUBNETS_PER_NODE: 2`), so its feed is 3.1% of gossip. |
 | 2 | `--http-sse-capacity-multiplier` **20000** | Lighthouse buffers each SSE topic in a broadcast ring of `multiplier × 16`. The default multiplier is 1, so **16 messages** against a slot's 28,130. 2000 gives 32,000 — only **1.1 slots** of headroom, so one stalled slot drops attestations. **20000 gives 320,000, about 11 slots, for roughly 128 MB of ring.** Overshoot deliberately: the ring is cheap and a drop is silent and unrecoverable. |
-| 3 | `/eth/v2/debug/beacon/states/{id}` enabled | Bootstrap reads the whole `BeaconState` from it, and **so does every epoch diff** — it is a continuous dependency, not a one-off. |
+| 3 | `/eth/v2/debug/beacon/states/{id}` enabled | **Every epoch diff** reads the whole `BeaconState` from it, and so does the boundary anchor a finalization opens. It is a continuous dependency, not a one-off. Startup does not need it: the init point carries its own branch to the `validators` field. |
 | 4 | `--epochs-per-migration` **16** | How far back the node still *has* the states requirement 3 serves. At the default of 1 this node served state only **64 to 95 slots back** (MEASURED 2026-08-18), two or three epochs, and a daemon that spends longer than that on one epoch asks for a state that has been migrated to the freezer and gets a 404. |
 
 **Requirement 4 is what a real prover makes binding.** A witness-only daemon
 never falls two epochs behind, so the default window is invisible. With proofs,
-the first epoch after every bootstrap goes through the batch path, and its one
+the first epoch of every run goes through the batch path, and its one
 justification recursively verifies every slot proof of the epoch: **1,224 s over
 22 of them** on an RTX 5090 (MEASURED 2026-08-18, mainnet epoch 469424). A run
-therefore starts about 25 minutes behind the chain and spends the next 20
+therefore starts about 20 minutes behind the chain and spends the next 20
 catching up. That is far longer than the default window, so the daemon fell
 behind its own startup, 404ed, and crashlooped — 74 restarts in an hour.
 Sixteen epochs of hot states is about 1.7 hours of slack, which absorbs it.
 
-The window only widens for states finalized *after* the node restarts. States
-already migrated stay migrated, so a daemon whose chain depends on one of them
-has to bootstrap forward; it does that by itself.
+Deleting bootstrap took about two minutes off the front of that but not the
+batch-path tax itself, so requirement 4 stands. The window only widens for
+states finalized *after* the node restarts; states already migrated stay
+migrated. A daemon whose chain depends on one of them can no longer skip forward
+on its own — it stops, and recovery is a fresh init point (§6).
 
 **Subscribe to `single_attestation`, not `attestation`.** Since Electra,
 Lighthouse emits `EventKind::SingleAttestation` for unaggregated attestations and
@@ -157,9 +163,9 @@ for it; both QuickNode and PublicNode run PeerDAS supernodes with
 `custody_group_count: 128` for blob serving and still sit on 2 attestation
 subnets.
 
-**Conclusion: run your own node.** A hosted provider is usable only as a
-bootstrap source or as an aggregate-only fallback, and costs you the four seconds
-that unaggregated attestations buy.
+**Conclusion: run your own node.** A hosted provider is usable only as a source
+for an init point or as an aggregate-only fallback, and costs you the four
+seconds that unaggregated attestations buy.
 
 ### 2.3 A mock execution layer is sufficient
 
@@ -304,7 +310,7 @@ encoding of the same state is 959 MB against 335 MB SSZ.
 
 ---
 
-## 4. Bootstrapping and running the daemon
+## 4. Starting and running the daemon
 
 ### Step 6 — Build the daemon
 
@@ -340,10 +346,11 @@ ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasperd \
 
 `--stages group,slot_proof` starts a server for part of a pipeline; each guest
 costs a ROM setup and gigabytes of `~/.zisk/cache`, so do not set up nine when
-the run needs two. `--mode streaming` sets up **nine**, not six: the first epoch
-after a bootstrap has nothing before it to finalize, so it goes through the
-batch path — slot proofs and a justification — before the streaming path takes
-over. Build all nine guests.
+the run needs two. `--mode streaming` sets up **eight**, not five: the first
+epoch of a run has nothing before it to finalize, so it goes through the batch
+path — slot proofs and a justification — before the streaming path takes over.
+Build all eight guests. There is no ninth: the bootstrap guest is gone, and with
+it the stage that used to sit in front of every pipeline.
 
 Only for a single-box run does the prover go in the daemon: add
 `--features zisk-prover` here and use `--prover zisk`.
@@ -359,39 +366,49 @@ prover milliseconds per epoch and publishes those separately, because an hourly
 rate is a fact about a rental contract rather than about the pipeline. See
 [docs/api-v1.md](docs/api-v1.md#what-an-epoch-cost).
 
-**The bootstrap witness does not fit in a frame, and that is expected.** On
-mainnet it serializes to **916 MB** against the 512 MB `MAX_FRAME_BYTES` cap
-(2,338,764 validators, measured 2026-08-18), so the bootstrap gets the empty
-proof a witness-only run gets and the daemon carries on. Nothing downstream
-verifies the bootstrap proof — the bootstrap state is the declared root of trust,
-see [docs/assumptions.md](docs/assumptions.md) — so the accumulator chain is
-unaffected and every stage after it is really proven. The client does not spool a
-witness it cannot send, because a retry of it would fail identically for ever.
+### Step 7 — Take the init point
 
-### Step 7 — Check the node still holds the state you will bootstrap from
-
-A checkpoint-synced Lighthouse serves states from its split slot (the finalized
-checkpoint) forward. Its own sync anchor stops being served once finalization
-moves past it. If you bootstrap from a slot on the wrong side of that line, the
-daemon bootstraps successfully and then **wedges on the next epoch** because it
-cannot re-read that state.
+The daemon does not prove its own starting accumulator. It is given one, and
+refuses to start without it on a fresh run:
 
 ```sh
-curl -s http://127.0.0.1:5052/eth/v1/beacon/states/head/finality_checkpoints \
-  | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; \
-      e=int(d['finalized']['epoch']); print('finalized epoch', e, 'slot', e*32)"
+cargo build --release --bin zkasper-init-point
+./target/release/zkasper-init-point \
+  --beacon-url http://127.0.0.1:5052 \
+  --chain mainnet \
+  --out /mnt/ssd/zkasper-run/init-point.json
 ```
 
-Then confirm that slot answers:
+With no `--slot` it takes the node's current finalized checkpoint, which is where
+a run should start. The file is small enough to read:
+
+```json
+{
+  "chain": "mainnet",
+  "epoch": 469300,
+  "state_root": "0x...",
+  "num_validators": 2338764,
+  "total_active_balance": 42233196000000000,
+  "acc_root": "0x...",
+  "accumulator_commitment": "0x...",
+  "state_to_validators_siblings": ["0x...", "0x...", "0x...", "0x...", "0x...", "0x..."]
+}
+```
+
+**Publish it with the run.** It is the declared root of trust, and the only way a
+consumer can check it is to regenerate it: `zkasper-init-point --slot <epoch*32>`
+against any node that still holds that state, then `diff`. See
+[docs/assumptions.md](docs/assumptions.md).
+
+Confirm the node still holds the state the file names — the daemon walks that
+registry on its first breath:
 
 ```sh
 curl -s -o /dev/null -w "%{http_code}\n" \
-  http://127.0.0.1:5052/eth/v1/beacon/states/<slot>/fork
+  http://127.0.0.1:5052/eth/v1/beacon/states/<epoch*32>/fork
 ```
 
-If it is not 200, wait for the next finalization and repeat. Leave
-`--bootstrap-slot` unset so the daemon takes the node's current finalized
-checkpoint.
+If it is not 200, take the init point again at the new finalized checkpoint.
 
 ### Step 7b — Know that the node's state window slides
 
@@ -401,10 +418,10 @@ window is only about two epochs wide and it moves. Nothing older than the curren
 finalized checkpoint is served, and `--archive` is not the answer (it also turns
 on genesis backfill and a week of reconstruction for 418 GiB).
 
-That matters here because **bootstrap takes about two minutes**, and the daemon
-needs its own bootstrap epoch's state again on its first tick. A bootstrap that
-lands shortly before a finalization loses that state underneath itself and fails
-with:
+**This used to be the main startup hazard and no longer is.** Bootstrap took
+about two minutes over a 2.3M-validator state and then needed that same state
+again on its first tick, so one that landed shortly before a finalization lost
+the state underneath itself and failed with:
 
 ```
 Error: fetch validators for the target epoch
@@ -412,12 +429,15 @@ Caused by: .../states/15020064/validators returned 404 Not Found:
            {"code":404,"message":"NOT_FOUND: beacon state at slot 15020064"}
 ```
 
-It is a race, not a misconfiguration — the same daemon bootstrapped at a
-different moment runs for hours. The supervisor below wins it by deleting the
-store and letting the next attempt bootstrap from the new finalized checkpoint.
+Startup is now a registry walk at the init point's epoch, with no proving and no
+335 MB state download, so the window it has to fit inside is seconds rather than
+minutes. Take the init point and start the daemon in the same breath and the race
+is not close.
 
-Once past its first tick the daemon works on epochs near the head, which are
-always inside the window, so this only ever bites at startup.
+The window still matters *after* startup: every epoch diff reads the previous
+epoch's state, so a daemon that falls far enough behind asks for one that is
+gone. It stops and says so rather than starting a second accumulator over the
+top of the first — see §6.
 
 ### Step 8 — Run the daemon under a supervisor
 
@@ -442,36 +462,23 @@ while true; do
     --beacon-url http://127.0.0.1:5052 \
     --db-path "$RUN/zkasperd.db" \
     --output-dir "$RUN/out" \
+    --init-point "$RUN/init-point.json" \
     --chain mainnet \
     --mode streaming \
     >> "$RUN/zkasperd.log" 2>&1
   rc=$?
   echo "=== zkasperd exited rc=$rc at $(date -Is) ===" >> "$RUN/zkasperd.log"
 
-  # One failure is NOT fixed by restarting, and needs the store deleted so the
-  # daemon re-bootstraps. It costs the accumulator chain a break; drop the block
-  # if an unbroken chain matters more than uninterrupted epochs.
-
-  # The node's state window slid past the bootstrap epoch mid-bootstrap.
-  if tail -n 40 "$RUN/zkasperd.log" \
-       | grep -q "NOT_FOUND: beacon state at slot"; then
-    echo "=== bootstrap epoch pruned; re-bootstrapping at $(date -Is) ===" \
-      >> "$RUN/zkasperd.log"
-    rm -f "$RUN/zkasperd.db"
-    fails=0
-  fi
-
-  # Anything else that no number of restarts fixes. Five, not one, because a
-  # re-bootstrap breaks the accumulator chain and — with a real prover — leaves
-  # the epoch that restarts it unproven. Observed 2026-08-18: the daemon
-  # crashlooped nine times on `SSZ state root mismatch at slot_2` before the
-  # node's state window slid past the epoch and the rule above caught it.
+  # The supervisor does not delete the store on its own any more. It used to,
+  # because a pruned bootstrap epoch could only be escaped by bootstrapping
+  # again — and that silently broke the accumulator chain, which is the one
+  # thing a consumer cannot detect for themselves. A run that cannot continue
+  # now stops here, and §6 says what to do about it.
   if [ "$rc" -eq 0 ]; then fails=0; else fails=$((fails + 1)); fi
   if [ "$fails" -ge 5 ]; then
-    echo "=== $fails consecutive failures; re-bootstrapping at $(date -Is) ===" \
-      >> "$RUN/zkasperd.log"
-    rm -f "$RUN/zkasperd.db"
-    fails=0
+    echo "=== $fails consecutive failures; stopping at $(date -Is)." \
+         "Read the log, then RUNBOOK §6 ===" >> "$RUN/zkasperd.log"
+    exit 1
   fi
 
   sleep 5
@@ -484,20 +491,24 @@ setsid nohup ./run_zkasperd.sh > supervisor.log 2>&1 < /dev/null &
 
 Under systemd this is `Restart=always` with `RestartSec=5`.
 
-### Step 9 — Confirm the bootstrap
+### Step 9 — Confirm the start
 
-Bootstrap takes about **2 minutes** on mainnet (MEASURED 128,164 ms for
-2,338,364 validator records). Watch for:
+Starting is a registry walk: no proving, and no state download. Watch for:
 
 ```
-bootstrap complete num_validators=2338364 total_active_balance=42233196000000000
-bootstrapped ... millis=128164
+started from a trusted init point epoch=469300 num_validators=2338764
+  total_active_balance=42233196000000000 acc_root=0x... state_root=0x...
 following attestation gossip
 ```
 
-**The first epoch after bootstrap runs the batch pipeline, not the streaming
-one, and this is expected.** The streaming path needs an epoch diff on record and
-a justification for the previous epoch, and after a bootstrap neither exists. You
+If the daemon exits instead, read the message: it names the field that
+disagreed — the validator count, the total active balance, the accumulator root
+it rebuilt, or the state root the branch opened to. Any of those means the init
+point does not describe the registry at that epoch, and the run must not start.
+
+**The first epoch of a run uses the batch pipeline, not the streaming one, and
+this is expected.** The streaming path needs an epoch diff on record and a
+justification for the previous epoch, and at the init point neither exists. You
 will see `slot_proof` and `justification` stages for that epoch and no
 `recent_latencies` entry. From the next epoch on you get `group`, `aggregate` and
 `stream_final`, and a measured `T2 - T`.
@@ -584,7 +595,7 @@ output directory on local disk, not on network storage.
 
 | Signal | Condition | Meaning |
 |---|---|---|
-| `recent_latencies[].late_groups` | `> 0` | The daemon fell behind: attestations arrived that had not been folded when the trigger fired. It is a throughput symptom, not a correctness one. Currently 0 or 1 by construction. **Expected on the first streaming epoch after a bootstrap or a restart**, which opens mid-epoch and so folds nothing before the trigger — read it together with `folded_groups`, and only treat it as real when `folded_groups` is also non-zero. |
+| `recent_latencies[].late_groups` | `> 0` | The daemon fell behind: attestations arrived that had not been folded when the trigger fired. It is a throughput symptom, not a correctness one. Currently 0 or 1 by construction. **Expected on the first streaming epoch of a run, or after a restart**, which opens mid-epoch and so folds nothing before the trigger — read it together with `folded_groups`, and only treat it as real when `folded_groups` is also non-zero. |
 | `gossip.reconnects` | rising | The node or the network is unstable. Epochs around each reconnect were sourced from blocks, so their `T2 - T` is not representative — exclude them from any latency claim. |
 | `gossip` | **absent** | The daemon is reading blocks instead of gossip and is a slot behind by construction. Either `--no-gossip` is set or the pipeline is `batch`. |
 | `recent_latencies[].t2_minus_t_millis` | drifting up | Compare against the baseline in §8. |
@@ -660,26 +671,33 @@ voluntary.
 | Symptom | Cause | Action |
 |---|---|---|
 | `Error: fetch chain head` | Node unreachable | Restart node, then daemon. Nothing is damaged. |
-| `... returned 404 Not Found: NOT_FOUND: beacon state at slot N` | The node no longer holds that state | If it is the bootstrap epoch, delete the store and re-bootstrap (§ below). Otherwise wait one epoch. |
+| `... returned 404 Not Found: NOT_FOUND: beacon state at slot N` | The node no longer holds that state | Wait one epoch: the daemon may simply be ahead of the node. If it repeats, the run has fallen out of the node's window and cannot be resumed — restart from a new init point (§ below). |
 | `missing current_version` / `missing data array` | Old binary. Fixed: the client now reports the status and body. | Rebuild. |
-| `store at ... is damaged; delete it to re-bootstrap` | Truncation or checksum failure | Not recoverable in place. Delete and re-bootstrap; note that `acc_chain_digest` restarts and will not match a peer that never lost theirs. |
+| `store at ... is damaged; delete it and start again from an init point` | Truncation or checksum failure | Not recoverable in place. Restart from a new init point (§ below); note that `acc_chain_digest` restarts and will not match a peer that never lost theirs. |
 | `store ... holds a X accumulator, but this run is configured for Y` | Wrong `--db-path` or `--chain` | Point at the right file. |
-| `store format version N, expected M` | Format bump, no migration exists | Delete and re-bootstrap. |
+| `store format version N, expected M` | Format bump, no migration exists | Restart from a new init point (§ below). |
 | `the ... circuit rejected the witness` | An unprovable witness | Real bug. Keep the epoch directory under `out/epoch-*` — it is the reproduction. |
 | `the ... proof does not verify against its own program key and outputs` | Prover, ELF or proving-key mismatch | Not a chain problem. Check the ELF against the proving key. |
-| `fetch header at slot N` / `NOT_FOUND: beacon block at slot N`, repeating forever | **The epoch boundary slot was skipped.** Fixed — the epoch diff now reads the state root from `/eth/v1/beacon/states/{slot}/root`, which is defined for a skipped slot, instead of from a block header, which is not. On a build before that fix the daemon crash-loops permanently, because the slot will never gain a block. | Rebuild. To get moving without one, re-bootstrap with `--bootstrap-slot` set past the skipped boundary. |
-| Wedged, repeating the same epoch | The node cannot serve that epoch's state | Re-bootstrap. |
+| `fetch header at slot N` / `NOT_FOUND: beacon block at slot N`, repeating forever | **The epoch boundary slot was skipped.** Fixed — the epoch diff now reads the state root from `/eth/v1/beacon/states/{slot}/root`, which is defined for a skipped slot, instead of from a block header, which is not. On a build before that fix the daemon crash-loops permanently, because the slot will never gain a block. | Rebuild. To get moving without one, take a fresh init point past the skipped boundary. |
+| Wedged, repeating the same epoch | The node cannot serve that epoch's state | Restart from a new init point (§ below). |
+| `accumulator_commitment ... does not bind acc_root ... and total_active_balance ...` | The init point's three accumulator fields disagree | The file is wrong or was edited. Take it again with `zkasper-init-point`; do not patch it by hand. |
+| `init point claims ... but the state at slot N ...` | The init point does not describe the registry at its own epoch | Wrong slot, wrong chain, or a file from another deployment. Take it again against this node. |
+| `no accumulator state file and no init point` | A fresh run with no `--init-point` | Step 7. |
 
-### Re-bootstrapping
+### Restarting from a new init point
 
-Destroys the accumulator chain since the last bootstrap. Do it only when the
-table above says to.
+**This breaks the accumulator chain**, and the break is visible: `init_epoch`
+moves, and `acc_chain_digest` restarts and will not match a peer that never lost
+theirs. Do it only when the table above says to, and publish the new init point
+alongside the old one — a consumer applying the rule in
+[docs/assumptions.md](docs/assumptions.md) needs to know where one chain ended
+and the next began.
 
 ```sh
 pkill -f run_zkasperd.sh; pkill -f 'target/release/zkasperd'
 cd /mnt/ssd/zkasper-run
 rm -f zkasperd.db && rm -rf out
-# repeat step 7 to confirm the node holds the finalized state, then step 8
+# then step 7 to take a fresh init point, and step 8 to start again
 ```
 
 ### Testing that recovery works
@@ -706,7 +724,6 @@ the epoch redone with no `recent_latencies` entry for it.
 | Node datadir | **947 MB** after 15 minutes | Checkpoint-synced, backfill running. Budget 450+ GB for a month with default `--hierarchy-exponents`. |
 | `zkasperd.db` | **343 MB** | Rewritten whole twice an epoch. |
 | `out/` | **110–120 MB per epoch** | Witness files, of which `committee.bin` is 113 MB. At 225 epochs a day that is **~26 GB/day, ~780 GB/month** — larger than the beacon database. Prune or ship them; nothing re-reads a closed epoch's directory. |
-| bootstrap epoch dir | **986 MB** | One-off, holds the bootstrap witness. |
 | SSE ingest | 28,033 events/slot | ~1.47 MB/s sustained, 3.8 TB/month if it crosses a network. |
 
 Machine: 8 cores, 32 GB RAM and 1 TB is the floor for daemon + node with a mock
@@ -1006,7 +1023,6 @@ For contrast, QuickNode's public endpoint delivers 877/slot: **3.1%**.
 
 | Stage | Measured |
 |---|---|
-| bootstrap | 128,164 ms, 2,338,364 validator records, 42,233,196 ETH active |
 | epoch_diff | 33,378 ms and 25,046 ms |
 | committee | 27,649 ms |
 | group | 4,812 ms |
@@ -1035,7 +1051,7 @@ off the critical path.
 **Only 469375, 469381 and 469382 are steady-state epochs** — the only three the
 daemon followed from near their first slot, folding a group per slot as gossip
 closed it, 16/21/20 in total. Every other row is an epoch opened already in
-progress after a bootstrap or a restart, which folds nothing before the trigger
+progress at the start of a run or after a restart, which folds nothing before the trigger
 and so reports `folded_groups = 0` and `late_groups = 1`. Those rows say what a
 catch-up costs, not what the pipeline costs. **Do not quote them as a
 steady-state result.** Three epochs are not a distribution either; what follows
@@ -1123,7 +1139,7 @@ pushed. They are recorded because they say what a readiness run is for.
    day**. Fixed by reading the state root from `/eth/v1/beacon/states/{slot}/root`,
    which is defined for every slot.
 
-   Verified live rather than in a test: the run was re-bootstrapped at epoch
+   Verified live rather than in a test: the run was restarted at epoch
    469375 so that its first epoch diff was the one over slot 15,020,032, and it
    logged `accumulator advanced ... millis=23128` where the previous build had
    logged nothing but `Error: build epoch diff witness` on a five-second loop.

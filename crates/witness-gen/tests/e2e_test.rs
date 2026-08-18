@@ -1,4 +1,4 @@
-//! End-to-end test: bootstrap → slot proofs → justification → finalization → epoch diff.
+//! End-to-end test: init point → slot proofs → justification → finalization → epoch diff.
 //!
 //! Uses 4 validators with real BLS signatures from deterministic secret keys.
 //! Small tree depths (2) for fast execution.
@@ -171,7 +171,7 @@ fn slot_witness(
 // Full E2E test
 // ---------------------------------------------------------------------------
 
-/// Bootstrap, justify epoch E, move the accumulator with an epoch diff that
+/// Start from an init point, justify epoch E, move the accumulator with an epoch diff that
 /// actually changes an effective balance, justify E+1 against the accumulator
 /// that diff produced, and finalize the pair.
 ///
@@ -218,9 +218,9 @@ fn test_e2e_full_pipeline() {
     let source_root = [0x01u8; 32];
 
     // =========================================================
-    // Step A: Bootstrap at slot E*4
+    // Step A: start from an init point at slot E*4
     // =========================================================
-    let bootstrap_slot = epoch_e * TEST_CONFIG.slots_per_epoch;
+    let init_slot = epoch_e * TEST_CONFIG.slots_per_epoch;
 
     let responses: Vec<_> = validators
         .iter()
@@ -229,47 +229,33 @@ fn test_e2e_full_pipeline() {
         .collect();
 
     let mut mock = MockBeaconApi::new();
-    let header_e = make_header(
-        bootstrap_slot,
-        &responses,
-        TEST_DEPTH,
-        &SlotHistory::default(),
-    );
+    let header_e = make_header(init_slot, &responses, TEST_DEPTH, &SlotHistory::default());
     // Epoch E's checkpoint is the block at its first slot, so its root is that
     // header's own root. The finalization circuit opens the header and checks
     // it against the root the attesters signed.
     let target_root_e = common::header_root(&header_e);
     mock.validators
-        .insert(bootstrap_slot.to_string(), responses.clone());
-    mock.headers
-        .insert(bootstrap_slot.to_string(), header_e.clone());
+        .insert(init_slot.to_string(), responses.clone());
+    mock.headers.insert(init_slot.to_string(), header_e.clone());
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (bootstrap_witness, tree, _epoch_state, boot_balance, boot_count) = rt
-        .block_on(zkasper_witness_gen::witness_bootstrap::build(
+    let (init, snapshot) = rt
+        .block_on(zkasper_witness_gen::init_point::take(
             &mock,
             &TEST_CONFIG,
-            bootstrap_slot,
+            "test",
+            init_slot,
         ))
         .unwrap();
+    let tree = snapshot.tree;
 
-    assert_eq!(boot_count, 4);
-    assert_eq!(boot_balance, total_active_balance);
+    assert_eq!(init.num_validators, 4);
+    assert_eq!(init.total_active_balance, total_active_balance);
+    assert_eq!(init.acc_root, tree.root());
+    assert_eq!(init.acc_root, acc_root);
+    assert_eq!(init.accumulator_commitment, commitment);
 
-    // Verify bootstrap
-    let (boot_commitment, boot_poseidon_root, boot_total_balance) =
-        zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-            &bootstrap_witness,
-            TEST_DEPTH,
-            TEST_DEPTH,
-        );
-
-    assert_eq!(boot_poseidon_root, tree.root());
-    assert_eq!(boot_poseidon_root, acc_root);
-    assert_eq!(boot_total_balance, total_active_balance);
-    assert_eq!(boot_commitment, commitment);
-
-    eprintln!("✓ Bootstrap verified");
+    eprintln!("✓ Init point checked");
 
     // =========================================================
     // Step B: Slot proofs for epoch E (2 committees, both fully attesting)
@@ -362,7 +348,7 @@ fn test_e2e_full_pipeline() {
     // Epoch E+1's state records what epoch E's boundary produced, which is what
     // the finalization opens the anchor out of.
     let history_e = SlotHistory {
-        slot: bootstrap_slot,
+        slot: init_slot,
         block_root: target_root_e,
         state_root: header_e.state_root,
     };
@@ -373,7 +359,7 @@ fn test_e2e_full_pipeline() {
     mock.headers
         .insert(slot_e1_0.to_string(), header_e1.clone());
 
-    let old_state = zkasper_witness_gen::EpochState::empty(bootstrap_slot, 4);
+    let old_state = zkasper_witness_gen::EpochState::empty(init_slot, 4);
     let mut tree_e1 = tree.clone();
 
     let (epoch_diff_witness, _new_epoch_state, new_balance, new_count) = rt
@@ -535,16 +521,16 @@ fn test_e2e_full_pipeline() {
     // =========================================================
     // Accumulator commitment chain
     // =========================================================
-    assert_eq!(boot_commitment, commitment);
+    assert_eq!(init.accumulator_commitment, commitment);
     assert_eq!(
         epoch_diff_witness.acc_root_1, acc_root,
-        "epoch diff should start from bootstrap's poseidon root"
+        "epoch diff should start from the init point's poseidon root"
     );
     assert_eq!(
         epoch_diff_witness.total_active_balance_1, total_active_balance,
-        "epoch diff should start from bootstrap's total balance"
+        "epoch diff should start from the init point's total balance"
     );
 
     eprintln!("✓ Full E2E pipeline passed!");
-    eprintln!("  Bootstrap → Slot proofs (epoch E) → Justification E → Epoch diff → Slot proofs (epoch E+1) → Justification E+1 → Finalization");
+    eprintln!("  Init point → Slot proofs (epoch E) → Justification E → Epoch diff → Slot proofs (epoch E+1) → Justification E+1 → Finalization");
 }

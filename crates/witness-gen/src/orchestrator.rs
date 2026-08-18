@@ -49,8 +49,8 @@
 //! manifest publishes the measured value.
 //!
 //! An epoch can only be streamed if the epoch before it left a justification and
-//! an epoch diff behind, so the first epoch after a bootstrap always goes through
-//! the batch path and the streaming run picks up from the next one.
+//! an epoch diff behind, so the first epoch of a run always goes through the
+//! batch path and the streaming run picks up from the next one.
 //!
 //! What is not here yet is parallelism: groups are proved one at a time, in
 //! order, on the calling task. The aggregators do not depend on that — they take
@@ -86,6 +86,7 @@ use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
 use crate::committee::EpochCommittees;
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
+use crate::init_point::{self, InitPoint};
 use crate::postings::PostingLog;
 use crate::prover::{Proof, Prover, Stage};
 use crate::publish::{self, ClosedEpoch, EpochProgress, Publisher};
@@ -93,7 +94,7 @@ use crate::store::{
     EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState, StreamFinalRecord,
 };
 use crate::streaming::{self, Filling, StreamContext, StreamPolicy};
-use crate::{witness_bootstrap, witness_epoch_diff, witness_justification};
+use crate::{witness_epoch_diff, witness_justification};
 
 /// How many stage timings the manifest keeps.
 const RECENT_STAGES: usize = 64;
@@ -122,12 +123,11 @@ pub enum Pipeline {
 impl Pipeline {
     /// Stages a prover has to be able to produce for this pipeline.
     ///
-    /// Streaming still needs the batch stages: the first epoch after a bootstrap
-    /// has nothing to finalize and goes through them.
+    /// Streaming still needs the batch stages: the first epoch of a run has
+    /// nothing to finalize and goes through them.
     pub fn stages(self) -> &'static [Stage] {
         match self {
             Pipeline::Batch => &[
-                Stage::Bootstrap,
                 Stage::EpochDiff,
                 Stage::Committee,
                 Stage::SlotProof,
@@ -135,7 +135,6 @@ impl Pipeline {
                 Stage::Finalization,
             ],
             Pipeline::Streaming => &[
-                Stage::Bootstrap,
                 Stage::EpochDiff,
                 Stage::Committee,
                 Stage::SlotProof,
@@ -156,8 +155,10 @@ pub struct OrchestratorConfig {
     pub chain_name: String,
     pub db_path: PathBuf,
     pub output_dir: PathBuf,
-    /// Slot to bootstrap from. Defaults to the node's finalized checkpoint.
-    pub bootstrap_slot: Option<u64>,
+    /// Where the accumulator chain starts, when there is no state file to
+    /// resume from. See [`crate::init_point`]: the daemon checks it against a
+    /// fresh walk of the registry and refuses to start on a mismatch.
+    pub init_point: Option<InitPoint>,
     /// Overrides the domain otherwise derived from the node's fork and genesis.
     pub signing_domain: Option<[u8; 32]>,
     /// How long to wait after a tick that could make no further progress.
@@ -196,7 +197,7 @@ impl OrchestratorConfig {
             chain_name: chain_name.into(),
             db_path: PathBuf::from("zkasper.db"),
             output_dir: PathBuf::from("zkasper-out"),
-            bootstrap_slot: None,
+            init_point: None,
             signing_domain: None,
             poll_interval: Duration::from_secs(4),
             trigger_interval: Duration::from_millis(200),
@@ -217,8 +218,12 @@ impl OrchestratorConfig {
 /// the split moves every epoch — measured on 2026-08-18, the window was about
 /// the last 60 to 100 slots. An accumulator that falls behind therefore asks for
 /// a state that no longer exists, and no number of restarts brings it back: the
-/// window only moves further away. The daemon bootstraps forward instead of
-/// exiting.
+/// window only moves further away.
+///
+/// The daemon used to bootstrap forward on its own here, which silently broke
+/// the accumulator chain at the epoch it restarted on. It now stops and says
+/// what to do, because a break a consumer cannot see is worse than an outage an
+/// operator can.
 ///
 /// Matched on the message because that is what a beacon node gives. The daemon
 /// leans on the same string being distinctive that an operator does.
@@ -501,7 +506,7 @@ pub struct Orchestrator<A> {
 }
 
 impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
-    /// Resume from the persisted accumulator, or bootstrap if there is none.
+    /// Resume from the persisted accumulator, or start from the init point.
     pub async fn open(api: A, config: OrchestratorConfig, prover: Box<dyn Prover>) -> Result<Self> {
         Self::open_with_publisher(api, config, prover, None).await
     }
@@ -534,10 +539,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 Self::assemble(api, config, store, sink, prover, snapshot, publish)
             }
             None => {
-                let (snapshot, timing) =
-                    Self::bootstrap(&api, &config, &sink, &*prover, publish.as_ref()).await?;
-                let mut this = Self::assemble(api, config, store, sink, prover, snapshot, publish);
-                this.record(timing);
+                let init = config.init_point.clone().context(
+                    "no accumulator state file and no init point; \
+                     generate one with `zkasper-init-point` and pass --init-point",
+                )?;
+                let snapshot = init_point::open(&api, &config.chain, &config.chain_name, &init)
+                    .await
+                    .context("start from the configured init point")?;
+                let this = Self::assemble(api, config, store, sink, prover, snapshot, publish);
                 this.store.save(&this.snapshot)?;
                 this
             }
@@ -637,49 +646,23 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// One unit of work: justify the epoch the accumulator sits on, or move the
     /// accumulator to the next one.
     ///
-    /// A tick that failed because the node has thrown the state away is not an
-    /// error the caller can do anything with, so it is handled here: see
+    /// A tick that failed because the node has thrown the state away cannot be
+    /// retried into success, so it is named rather than repeated: see
     /// [`is_pruned_state`].
     pub async fn tick(&mut self) -> Result<Tick> {
-        match self.tick_once().await {
-            Err(e) if is_pruned_state(&e) => {
-                warn!(
-                    epoch = self.snapshot.state.cursor_epoch,
-                    error = %format!("{e:#}"),
-                    "the node no longer serves the state this epoch needs; \
-                     bootstrapping forward to one it does",
-                );
-                self.rebootstrap().await?;
-                Ok(Tick {
-                    head_slot: self.head_slot,
-                    advanced_to: Some(self.snapshot.state.cursor_epoch),
-                    ..Tick::default()
-                })
+        self.tick_once().await.map_err(|e| {
+            if is_pruned_state(&e) {
+                return e.context(format!(
+                    "the node no longer serves the state epoch {} needs. Restarting will not \
+                     bring it back — the window only moves further away. Take a fresh init \
+                     point near the node's finalized checkpoint, delete the state file and \
+                     start again; the accumulator chain breaks at that epoch, so publish the \
+                     new init point alongside it.",
+                    self.snapshot.state.cursor_epoch,
+                ));
             }
-            other => other,
-        }
-    }
-
-    /// Start again from a state the node still has.
-    ///
-    /// This breaks the accumulator chain: the epoch it restarts on is anchored
-    /// on a bootstrap rather than on the epoch before it. That is the price of
-    /// staying alive, and it is the same price the supervisor's `rm -f` paid
-    /// more slowly and after several failed restarts.
-    async fn rebootstrap(&mut self) -> Result<()> {
-        let (snapshot, timing) = Self::bootstrap(
-            &self.api,
-            &self.config,
-            &self.sink,
-            &*self.prover,
-            self.publish.as_ref(),
-        )
-        .await?;
-        self.snapshot = snapshot;
-        self.pending = None;
-        self.streaming = None;
-        self.record(timing);
-        self.store.save(&self.snapshot)
+            e
+        })
     }
 
     async fn tick_once(&mut self) -> Result<Tick> {
@@ -748,90 +731,6 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             Err(e) => warn!(error = %e, "could not read the node's finality checkpoints"),
         }
         Ok(())
-    }
-
-    // -----------------------------------------------------------------
-    // Stage: bootstrap
-    // -----------------------------------------------------------------
-
-    #[instrument(
-        name = "stage",
-        skip_all,
-        fields(stage = "bootstrap", epoch = tracing::field::Empty, slot = tracing::field::Empty),
-    )]
-    async fn bootstrap(
-        api: &A,
-        config: &OrchestratorConfig,
-        sink: &ArtifactSink,
-        prover: &dyn Prover,
-        publish: Option<&Arc<Publisher>>,
-    ) -> Result<(Snapshot, StageTiming)> {
-        let slot = match config.bootstrap_slot {
-            Some(slot) => slot,
-            None => {
-                let checkpoints = api
-                    .get_finality_checkpoints("head")
-                    .await
-                    .context("fetch finality checkpoints to pick a bootstrap slot")?;
-                checkpoints.finalized.epoch * config.chain.slots_per_epoch
-            }
-        };
-        let epoch = slot / config.chain.slots_per_epoch;
-        let span = tracing::Span::current();
-        span.record("epoch", epoch);
-        span.record("slot", slot);
-        let started = Instant::now();
-        if let Some(publish) = publish {
-            publish.stage_started(Stage::Bootstrap, epoch, Some(slot), None);
-        }
-
-        let (witness, tree, epoch_state, total_active_balance, num_validators) =
-            witness_bootstrap::build(api, &config.chain, slot)
-                .await
-                .context("build bootstrap witness")?;
-
-        let (output, proof) = prover.prove_bootstrap(&witness)?;
-        if output.acc_root != tree.root() {
-            bail!("bootstrap circuit disagrees with the host accumulator tree");
-        }
-        if output.total_active_balance != total_active_balance {
-            bail!("bootstrap circuit disagrees on the total active balance");
-        }
-
-        let artifact = sink.write_witness(epoch, "bootstrap", &witness)?;
-        write_proof(sink, epoch, "bootstrap", &proof)?;
-
-        let state = StoreState::bootstrapped(
-            config.chain_name.clone(),
-            epoch,
-            output.acc_root,
-            total_active_balance,
-            num_validators,
-        );
-
-        info!(
-            num_validators,
-            total_active_balance,
-            acc_root = %hex_digest(&output.acc_root),
-            millis = started.elapsed().as_millis() as u64,
-            "bootstrapped",
-        );
-
-        Ok((
-            Snapshot {
-                state,
-                tree,
-                epoch_state,
-            },
-            StageTiming::new(
-                Stage::Bootstrap,
-                epoch,
-                started,
-                prover.last_cost(),
-                artifact,
-            )
-            .with_proof(&proof),
-        ))
     }
 
     // -----------------------------------------------------------------
@@ -1481,8 +1380,8 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     ///
     /// A final proof turns the previous epoch's justification into a
     /// finalization and inherits the accumulator link from the diff that opened
-    /// the epoch, so an epoch with neither — the first after a bootstrap — has
-    /// to go through the batch path, and the one after it streams.
+    /// the epoch, so an epoch with neither — the first of a run — has to go
+    /// through the batch path, and the one after it streams.
     fn can_stream(&self) -> bool {
         self.snapshot.state.last_epoch_diff.is_some()
             && self
@@ -2346,7 +2245,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             prover: self.prover.name().to_string(),
             updated_unix: now_unix(),
             head_slot: self.head_slot,
-            bootstrap_epoch: state.bootstrap_epoch,
+            init_epoch: state.init_epoch,
             accumulator: self.acc_status(),
             justified_through: state.justified_through,
             last_justified: state

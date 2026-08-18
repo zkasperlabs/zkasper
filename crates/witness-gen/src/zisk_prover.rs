@@ -58,14 +58,14 @@ use zisk_sdk::{EmbeddedClient, GuestProgram, ProofKind, ProverClient, ZiskStdin}
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::{verify_child, ProgramVk};
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
-    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    AggregateOutput, AggregateWitness, CommitteeOutput, CommitteeWitness, EpochDiffOutput,
+    EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
     JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
     StreamFinalOutput, StreamFinalWitness,
 };
 use zkasper_common::ChainConfig;
 
-use crate::prover::{run_circuit, AccOutput, Proof, ProveCost, Prover, Stage, DEFAULT_ELF_DIR};
+use crate::prover::{run_circuit, Proof, ProveCost, Prover, Stage, DEFAULT_ELF_DIR};
 
 /// How to build a [`ZiskProver`].
 #[derive(Clone, Debug)]
@@ -300,31 +300,6 @@ impl Prover for ZiskProver {
 
     fn last_cost(&self) -> Option<ProveCost> {
         *self.last_cost.lock().unwrap()
-    }
-
-    fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)> {
-        let (commitment, acc_root, total_active_balance) = run_circuit(Stage::Bootstrap, || {
-            zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-                witness,
-                self.chain.validators_tree_depth,
-                self.chain.acc_tree_depth,
-            )
-        })?;
-        let publics = zkasper_bootstrap_guest::public_bytes(
-            witness,
-            &commitment,
-            &acc_root,
-            total_active_balance,
-        );
-        let proof = self.prove(Stage::Bootstrap, witness, &publics)?;
-        Ok((
-            AccOutput {
-                commitment,
-                acc_root,
-                total_active_balance,
-            },
-            proof,
-        ))
     }
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {

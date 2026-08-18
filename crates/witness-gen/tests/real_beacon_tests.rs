@@ -13,7 +13,7 @@ mod common;
 use anyhow::Result;
 
 use zkasper_common::acc;
-use zkasper_common::constants::{ACC_TREE_DEPTH, VALIDATORS_TREE_DEPTH};
+use zkasper_common::constants::VALIDATORS_TREE_DEPTH;
 use zkasper_common::ssz::list_hash_tree_root;
 use zkasper_common::ChainConfig;
 
@@ -83,52 +83,52 @@ async fn test_ssz_state_parsing() {
 }
 
 // -----------------------------------------------------------------------
-// Test: full bootstrap with real data + guest verification
+// Test: take an init point from real data and open it again
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires BEACON_API_URL"]
-async fn test_real_bootstrap() {
+async fn test_real_init_point() {
     let api = get_api();
     let slot = get_finalized_slot(&api).await.unwrap();
     let epoch = slot / CONFIG.slots_per_epoch;
 
-    eprintln!("testing real bootstrap at slot {slot} (epoch {epoch})");
+    eprintln!("taking a real init point at slot {slot} (epoch {epoch})");
 
-    let (witness, tree, _epoch_state, total_active_balance, num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
+        .await
+        .unwrap();
 
-    eprintln!("  validators: {num_validators}");
-    eprintln!("  total_active_balance: {total_active_balance}");
+    eprintln!("  validators: {}", init.num_validators);
+    eprintln!("  total_active_balance: {}", init.total_active_balance);
     eprintln!(
         "  acc_root: 0x{}",
-        hex::encode(zkasper_common::acc::to_bytes(&tree.root()))
+        hex::encode(zkasper_common::acc::to_bytes(&snapshot.tree.root()))
     );
 
-    assert!(num_validators > 0, "should have validators");
-    assert!(total_active_balance > 0, "should have non-zero balance");
-    assert_eq!(witness.epoch, epoch);
-    assert_eq!(witness.validators.len(), num_validators as usize);
-
-    // Verify with bootstrap guest
-    let (commitment, acc_root, balance) = zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-        &witness,
-        VALIDATORS_TREE_DEPTH,
-        ACC_TREE_DEPTH,
+    assert!(init.num_validators > 0, "should have validators");
+    assert!(
+        init.total_active_balance > 0,
+        "should have non-zero balance"
+    );
+    assert_eq!(init.epoch, epoch);
+    assert_eq!(init.acc_root, snapshot.tree.root());
+    assert_eq!(
+        init.accumulator_commitment,
+        acc::commitment(&init.acc_root, init.total_active_balance),
     );
 
-    assert_eq!(acc_root, tree.root());
-    assert_eq!(balance, total_active_balance);
-
-    let expected_commitment = acc::commitment(&acc_root, total_active_balance);
-    assert_eq!(commitment, expected_commitment);
-    eprintln!("  guest verification passed");
+    // What a third party does with the file a deployment publishes: walk the
+    // same registry and refuse it if anything disagrees.
+    let reopened = zkasper_witness_gen::init_point::open(&api, &CONFIG, "mainnet", &init)
+        .await
+        .expect("the published init point describes the registry at its own state root");
+    assert_eq!(reopened.tree.root(), init.acc_root);
+    eprintln!("  init point re-derived from the registry");
 }
 
 // -----------------------------------------------------------------------
-// Test: bootstrap + epoch diff with real data
+// Test: init point + epoch diff with real data
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -144,23 +144,19 @@ async fn test_real_epoch_diff() {
 
     eprintln!("testing real epoch diff: slot {slot_1} -> {slot_2}");
 
-    // Bootstrap at slot_1
-    let (bootstrap_witness, mut tree, epoch_state, total_active_balance, num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot_1)
-            .await
-            .unwrap();
+    // Start at slot_1
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot_1)
+        .await
+        .unwrap();
+    let (mut tree, epoch_state, total_active_balance, num_validators) = (
+        snapshot.tree,
+        snapshot.epoch_state,
+        init.total_active_balance,
+        init.num_validators,
+    );
 
-    eprintln!("  bootstrap: {num_validators} validators, balance={total_active_balance}");
-
-    // Verify bootstrap
-    let (_commitment, bootstrap_root, bootstrap_balance) =
-        zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-            &bootstrap_witness,
-            VALIDATORS_TREE_DEPTH,
-            ACC_TREE_DEPTH,
-        );
-    assert_eq!(bootstrap_root, tree.root());
-    assert_eq!(bootstrap_balance, total_active_balance);
+    eprintln!("  init point: {num_validators} validators, balance={total_active_balance}");
+    assert_eq!(init.acc_root, tree.root());
 
     // Epoch diff
     let (diff_witness, _new_epoch_state, new_balance, new_num_validators) =
@@ -208,17 +204,14 @@ async fn test_real_full_pipeline() {
 
     eprintln!("testing real full pipeline: slot {slot_1} -> {slot_2}");
 
-    // Bootstrap
-    let (bootstrap_witness, tree, _epoch_state, total_active_balance, num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot_1)
-            .await
-            .unwrap();
-
-    // Verify bootstrap
-    let (_bootstrap_commitment, _, _) = zkasper_bootstrap_guest::verify_bootstrap_with_depth(
-        &bootstrap_witness,
-        VALIDATORS_TREE_DEPTH,
-        ACC_TREE_DEPTH,
+    // Start from an init point
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot_1)
+        .await
+        .unwrap();
+    let (tree, total_active_balance, num_validators) = (
+        snapshot.tree,
+        init.total_active_balance,
+        init.num_validators,
     );
 
     // Save to DB
