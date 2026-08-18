@@ -223,6 +223,15 @@ struct Cli {
     /// `<output-dir>/prover-spool`.
     #[arg(long)]
     prover_spool: Option<PathBuf>,
+
+    /// What an hour of this deployment's proving hardware costs, in US dollars.
+    ///
+    /// The daemon measures prover milliseconds per epoch and publishes both,
+    /// separately. It never multiplies them: a rate is a fact about a rental
+    /// contract rather than about the pipeline, and a reader pricing an epoch
+    /// against their own hardware needs the two numbers apart.
+    #[arg(long)]
+    prover_usd_per_hour: Option<f64>,
 }
 
 impl Cli {
@@ -365,6 +374,7 @@ async fn main() -> Result<()> {
         gossip_url: (pipeline == Pipeline::Streaming && !cli.no_gossip)
             .then(|| cli.beacon_url.clone()),
         genesis_validators_root: Some(genesis_validators_root),
+        prover_usd_per_hour: cli.prover_usd_per_hour,
         ..OrchestratorConfig::new(cli.chain.config(), chain_name)
     };
 

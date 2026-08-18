@@ -108,6 +108,8 @@ export class IndexDO extends DurableObject {
         summary TEXT,
         stage_count INTEGER,
         prove_millis_total INTEGER,
+        wrap_millis_total INTEGER,
+        prover_millis_total INTEGER,
         wall_millis_total INTEGER,
         updated_millis INTEGER
       );
@@ -146,6 +148,23 @@ export class IndexDO extends DurableObject {
       );
       CREATE INDEX IF NOT EXISTS events_epoch ON events (epoch);
     `);
+    this.addColumns("epochs", {
+      wrap_millis_total: "INTEGER",
+      prover_millis_total: "INTEGER",
+    });
+  }
+
+  /** Columns added after a deployment already created the table.
+   *
+   * `CREATE TABLE IF NOT EXISTS` never revisits a table it did not create, and
+   * `ADD COLUMN` throws on one that is already there, so ask the table what it
+   * holds. A daemon that publishes a field this store has no column for would
+   * otherwise lose it silently. */
+  private addColumns(table: string, columns: Record<string, string>): void {
+    const have = new Set(this.all(`PRAGMA table_info(${table})`).map((r) => String(r.name)));
+    for (const [name, type] of Object.entries(columns)) {
+      if (!have.has(name)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+    }
   }
 
   private loadSeq(): number {
@@ -479,6 +498,8 @@ export class IndexDO extends DurableObject {
           accumulator: this.jmerge(epoch, "accumulator", s.accumulator),
           stage_count: num(s.stage_count) ?? undefined,
           prove_millis_total: num(s.prove_millis_total) ?? undefined,
+          wrap_millis_total: num(s.wrap_millis_total) ?? undefined,
+          prover_millis_total: num(s.prover_millis_total) ?? undefined,
           wall_millis_total: num(s.wall_millis_total) ?? undefined,
         });
         return;
@@ -553,6 +574,18 @@ export class IndexDO extends DurableObject {
     return num(this.one("SELECT SUM(prove_millis) AS s FROM stages WHERE epoch = ?", epoch)?.s);
   }
 
+  /** Prover time an epoch cost: the proofs and the wraps together. What a rate
+   *  per hour multiplies. */
+  private proverTotal(epoch: number): number | null {
+    return num(
+      this.one(
+        "SELECT SUM(COALESCE(prove_millis, 0) + COALESCE(wrap_millis, 0)) AS s" +
+          " FROM stages WHERE epoch = ?",
+        epoch,
+      )?.s,
+    );
+  }
+
   private proofObject(r: Row): any {
     const p = jparse(r.proof);
     if (!p) return null;
@@ -576,6 +609,8 @@ export class IndexDO extends DurableObject {
       latency: jparse(r.latency),
       stage_count: num(r.stage_count) ?? this.stageCount(r.epoch),
       prove_millis_total: num(r.prove_millis_total) ?? this.proveTotal(r.epoch),
+      wrap_millis_total: num(r.wrap_millis_total) ?? null,
+      prover_millis_total: num(r.prover_millis_total) ?? this.proverTotal(r.epoch),
       proof: this.proofObject(r),
     };
   }

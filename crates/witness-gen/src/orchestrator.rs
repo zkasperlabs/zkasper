@@ -57,7 +57,7 @@
 //! outputs and proofs and do not care which order they were produced in — so
 //! handing the prover to a pool of GPUs is a change to this file only.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,7 +78,8 @@ use zkasper_common::ChainConfig;
 use crate::acc_tree::AccTree;
 use crate::artifacts::{
     hex0x, hex_digest, now_unix, now_unix_millis, AccStatus, ArtifactRef, ArtifactSink,
-    CheckpointStatus, CurrentEpoch, EpochLatency, GossipStatus, PublishStatus, StageTiming, Status,
+    CheckpointStatus, CurrentEpoch, EpochCost, EpochLatency, GossipStatus, PublishStatus,
+    StageTiming, Status,
 };
 use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
@@ -172,6 +173,10 @@ pub struct OrchestratorConfig {
     /// reader can check the label rather than take it. `None` leaves the
     /// orchestrator to fetch it when a signing domain first needs it.
     pub genesis_validators_root: Option<[u8; 32]>,
+    /// What an hour of this deployment's proving hardware costs. A deployment
+    /// fact the daemon cannot observe, published so a reader can price the
+    /// prover milliseconds it does measure. Nothing here multiplies by it.
+    pub prover_usd_per_hour: Option<f64>,
 }
 
 impl OrchestratorConfig {
@@ -190,6 +195,7 @@ impl OrchestratorConfig {
             stream_policy: StreamPolicy::default(),
             gossip_url: None,
             genesis_validators_root: None,
+            prover_usd_per_hour: None,
         }
     }
 }
@@ -457,6 +463,10 @@ pub struct Orchestrator<A> {
     viewed: Option<Instant>,
     node_finalized: Option<Checkpoint>,
     genesis_validators_root: Option<[u8; 32]>,
+    /// Prover time per epoch, accumulated as stages land. Keyed by epoch rather
+    /// than reset at a boundary, because the committee proof of E+1 runs inside
+    /// E and its cost belongs to E+1.
+    costs: HashMap<u64, EpochCost>,
 }
 
 impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
@@ -536,6 +546,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             head_slot: 0,
             viewed: None,
             node_finalized: None,
+            costs: HashMap::new(),
         }
     }
 
@@ -1136,6 +1147,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         // justification is the only proof it will ever have. Publishing it as
         // the epoch's proof is what keeps that epoch from sitting open forever.
         if finalized.is_none() {
+            let cost = self.take_cost(target_epoch);
             if let Some(publish) = &self.publish {
                 let vk = self.prover.program_vk(Stage::Justification);
                 let publics = record.output.public_bytes();
@@ -1158,6 +1170,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 publish.proof_landed(target_epoch, reference.clone(), inputs.clone(), None);
                 publish.epoch_closed(&ClosedEpoch {
                     epoch: target_epoch,
+                    cost,
                     target_root: crate::artifacts::hex0x(&record.output.target_root),
                     finalizes_epoch: target_epoch,
                     justified: serde_json::to_value(justified_checkpoint(&record.output))?,
@@ -1272,6 +1285,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .with_proof(&proof),
         );
 
+        let cost = self.take_cost(current.output.target_epoch);
         if let Some(publish) = &self.publish {
             let epoch = current.output.target_epoch;
             let vk = self.prover.program_vk(Stage::Finalization);
@@ -1294,6 +1308,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             publish.proof_landed(epoch, reference.clone(), inputs.clone(), None);
             publish.epoch_closed(&ClosedEpoch {
                 epoch,
+                cost,
                 target_root: crate::artifacts::hex0x(&current.output.target_root),
                 finalizes_epoch: output.finalized_epoch,
                 justified: serde_json::to_value(justified_checkpoint(&current.output))?,
@@ -1839,6 +1854,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             epoch: output.finalized_epoch,
             root: output.finalized_root,
         };
+        let cost = self.take_cost(target_epoch);
         if let Some(publish) = &self.publish {
             let vk = self.prover.program_vk(Stage::StreamFinal);
             let publics = output.public_bytes();
@@ -1866,6 +1882,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             );
             publish.epoch_closed(&ClosedEpoch {
                 epoch: target_epoch,
+                cost,
                 target_root: crate::artifacts::hex0x(&aggregator.context.target_root),
                 finalizes_epoch: output.finalized_epoch,
                 justified: serde_json::json!({
@@ -1971,10 +1988,21 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         if let Some(publish) = &self.publish {
             publish.stage_finished(&timing);
         }
+        self.costs.entry(timing.epoch).or_default().absorb(&timing);
         if self.recent.len() == RECENT_STAGES {
             self.recent.pop_front();
         }
         self.recent.push_back(timing);
+    }
+
+    /// What `epoch` has cost the prover so far, and forget everything older.
+    ///
+    /// Called once, as the epoch closes: an epoch that is finished can still be
+    /// followed by a stage of a later one, but never by another of its own.
+    fn take_cost(&mut self, epoch: u64) -> EpochCost {
+        let cost = self.costs.remove(&epoch).unwrap_or_default();
+        self.costs.retain(|&e, _| e > epoch);
+        cost
     }
 
     /// Announce a stage before it runs, so a consumer can show it in flight
@@ -2037,6 +2065,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 .genesis_validators_root
                 .as_ref()
                 .map(|root| hex0x(root)),
+            prover_usd_per_hour: self.config.prover_usd_per_hour,
             prover: self.prover.name().to_string(),
             updated_unix: now_unix(),
             head_slot: self.head_slot,

@@ -198,6 +198,8 @@ everything here also arrives on `/v1/live` as a `status` event.
   "last_justified": { "...": "checkpoint" },
   "last_finalized": { "...": "checkpoint" },
   "node_finalized": { "...": "checkpoint" },
+  "genesis_validators_root": "0x4b36...fe95",
+  "prover_usd_per_hour": 0.51,
   "gossip": { "attestations": 4210233, "reconnects": 0, "dropped": 0 },
   "recent_stages": [ { "...": "stage" } ],
   "recent_latencies": [ { "...": "latency" } ],
@@ -263,6 +265,8 @@ number, for paging), `status` (`proven`, `proving`, `abandoned`).
       "latency": { "...": "latency" },
       "stage_count": 14,
       "prove_millis_total": 41234,
+      "wrap_millis_total": 402,
+      "prover_millis_total": 41636,
       "proof": { "...": "proof" }
     }
   ]
@@ -304,6 +308,8 @@ One epoch, with every stage that ran.
   "stages": [ { "...": "stage" } ],
   "stage_count": 14,
   "prove_millis_total": 41234,
+  "wrap_millis_total": 402,
+  "prover_millis_total": 41636,
   "wall_millis_total": 384000,
   "proof": { "...": "proof" },
   "public_inputs": { "...": "public_inputs" },
@@ -314,6 +320,25 @@ One epoch, with every stage that ran.
 `stages` is ordered by `started_unix_millis`. 404 for an epoch this daemon never
 opened. Cache: `public, max-age=5` while `proving`, `public, max-age=86400`
 once `proven` or `abandoned`.
+
+### What an epoch cost
+
+`prover_millis_total` is the prover time an epoch bought: `prove_millis_total`
+for the proofs and `wrap_millis_total` for the compressions after them. Every
+stage carries its own two numbers, so `stages` says where the time went — on
+mainnet almost all of it is the committee proof, which is why that stage is
+given a whole epoch of lead time and is the one worth optimising.
+
+Multiply by `prover_usd_per_hour` from `/v1/status` for what the epoch cost the
+deployment that produced it, or by your own rate for what it would cost you.
+The two are published apart deliberately: an hourly rate is a fact about a
+rental contract rather than about the pipeline, it changes without the pipeline
+changing, and a price baked in here could not be recomputed against anything
+else. Nothing in the daemon or the API multiplies them.
+
+`prover_usd_per_hour` is absent when the operator did not say what the hardware
+costs, and the milliseconds are zero on a `--prover native` run, which proves
+nothing.
 
 ## `GET /v1/proofs/{epoch}`
 
@@ -546,7 +571,8 @@ differs from it. Nothing here renames or removes a field.
    `public_inputs`, `verify`, `latency` and `accumulator` rather than replacing
    them, so a richer value an earlier `proof.landed` carried survives.
 7. **Derived server-side only when the daemon did not send them**, never
-   overriding: `stage_count`, `prove_millis_total`, `wall_millis_total`,
+   overriding: `stage_count`, `prove_millis_total`, `prover_millis_total`,
+   `wall_millis_total`,
    `next_before`, `service.*`, `current_epoch.attesting_pct` (computed on the
    u64 strings, so it carries more decimals than the example) and `proof.url`.
 8. **`abandoned_reason` is omitted rather than null** when the epoch was not

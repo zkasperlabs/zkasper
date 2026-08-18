@@ -206,6 +206,7 @@ async fn test_the_daemon_publishes_the_whole_run() {
     let dir = tempfile::tempdir().unwrap();
 
     let run = daemon(&node, dir.path())
+        .args(["--prover-usd-per-hour", "0.51"])
         .args(["--api-url", &api.url()])
         .args(["--api-token", "dry-run"])
         .args(["--api-batch-millis", "100"])
@@ -272,6 +273,32 @@ async fn test_the_daemon_publishes_the_whole_run() {
         );
     }
 
+    // What the epoch cost the prover, which is the only input a price can be
+    // built from. A native run proves nothing, so the milliseconds are zero and
+    // the stage count is not: the point is that the fields are there and are
+    // counted per epoch rather than derived downstream.
+    let closed_epochs: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "epoch.closed")
+        .collect();
+    for closed in &closed_epochs {
+        let summary = &closed["summary"];
+        assert!(
+            summary["stage_count"].as_u64().is_some_and(|n| n > 0),
+            "an epoch closed without any stages: {summary}",
+        );
+        assert_eq!(
+            summary["prover_millis_total"].as_u64(),
+            Some(
+                summary["prove_millis_total"]
+                    .as_u64()
+                    .expect("prove millis")
+                    + summary["wrap_millis_total"].as_u64().expect("wrap millis")
+            ),
+            "prover time is proving and wrapping together: {summary}",
+        );
+    }
+
     // `T` and `T2`, in that order, with the latency the manifest measured.
     let closed = events
         .iter()
@@ -311,6 +338,10 @@ async fn test_the_daemon_publishes_the_whole_run() {
     assert_eq!(
         status["chain"], "unrecognised",
         "a synthetic node running mainnet parameters is not mainnet",
+    );
+    assert_eq!(
+        status["prover_usd_per_hour"], 0.51,
+        "the rate is a deployment fact, published as given",
     );
     assert_eq!(
         status["genesis_validators_root"],
