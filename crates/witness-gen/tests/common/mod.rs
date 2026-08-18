@@ -333,6 +333,15 @@ impl SyntheticChain {
         }
     }
 
+    /// Put this chain on the network `root` identifies, so a daemon reading the
+    /// node's genesis resolves that network's name. The signing domain moves
+    /// with it, because the domain is derived from this root.
+    pub fn on_network(mut self, root: [u8; 32]) -> Self {
+        self.genesis_validators_root = root;
+        self.domain = compute_domain(&DOMAIN_BEACON_ATTESTER, &self.fork_version, &root);
+        self
+    }
+
     pub fn epochs(&self) -> std::ops::RangeInclusive<u64> {
         self.first_epoch..=self.last_epoch
     }
