@@ -441,6 +441,47 @@ fn test_justification_round_trip() {
     assert_eq!(output.target_root, target_root);
 }
 
+/// The two-thirds gate divides by `total_active_balance`. If that number were
+/// free, a prover would set it low enough that any attesting balance cleared the
+/// bar. It is only safe because the accumulator commits to it.
+#[test]
+#[should_panic(expected = "accumulator commitment mismatch")]
+fn test_justification_rejects_an_understated_active_balance() {
+    let acc_root = [42u64; 4];
+    let total_active_balance: u64 = 4 * 32_000_000_000;
+    let commitment = acc::commitment(&acc_root, total_active_balance);
+    let target_epoch = 100u64;
+    let target_root = [7u8; 32];
+
+    // One slot attests, a quarter of the stake — nowhere near two thirds.
+    let slot_proof_outputs = vec![SlotProofOutput {
+        accumulator_commitment: commitment,
+        committee_root: COMMITTEE_ROOT,
+        target_epoch,
+        target_root,
+        attesting_balance: 32_000_000_000,
+        slots_mask: 0b1,
+    }];
+
+    let witness = JustificationWitness {
+        slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
+        accumulator_commitment: commitment,
+        acc_root,
+        target_epoch,
+        target_root,
+        // The lie: claim the network is a quarter of its real size, so one slot
+        // looks like the whole of it.
+        total_active_balance: 32_000_000_000,
+        committee: committee_output(commitment, target_epoch),
+        committee_proof: vec![],
+        slot_proof_outputs,
+        slot_proofs: vec![vec![]],
+    };
+
+    zkasper_justification_guest::verify_justification(&witness);
+}
+
 #[test]
 #[should_panic(expected = "counts a slot that was already counted")]
 fn test_justification_rejects_a_slot_counted_twice() {
