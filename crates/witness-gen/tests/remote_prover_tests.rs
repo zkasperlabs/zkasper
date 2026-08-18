@@ -22,6 +22,7 @@ use zkasper_witness_gen::prover::{NativeProver, Prover, Stage};
 use zkasper_witness_gen::remote_prover::{
     serve_client, RemoteProver, RemoteProverConfig, ServerConfig, PROTOCOL_VERSION,
 };
+use zkasper_witness_gen::split_prover::SplitProver;
 use zkasper_witness_gen::streaming;
 
 const ACC_DEPTH: u32 = 4;
@@ -257,6 +258,65 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
     assert_eq!(counters.pending, 4);
     assert_eq!(counters.dropped, 0);
     assert_eq!(spooled_files(spool.path()), 4);
+}
+
+/// Two provers, one stage each, and every proof lands on the right one.
+///
+/// One card cannot keep up with mainnet — an epoch cost 399 s of an RTX 5090
+/// against the 384 s an epoch lasts — so a deployment splits the stages across
+/// cards. What must not happen is a proof going to a prover that was never set
+/// up for its stage: the key it binds would be another program's.
+#[test]
+fn routes_each_stage_to_its_own_prover() {
+    let groups = Server::bind_with(&[Stage::Group]);
+    let slots = Server::bind_with(&[Stage::SlotProof]);
+
+    let split = SplitProver::new(
+        Box::new(
+            RemoteProver::connect(RemoteProverConfig {
+                stages: vec![Stage::Group],
+                ..client(&groups.addr, None)
+            })
+            .expect("connect to the group prover"),
+        ),
+        vec![(
+            Stage::SlotProof,
+            Box::new(
+                RemoteProver::connect(RemoteProverConfig {
+                    stages: vec![Stage::SlotProof],
+                    ..client(&slots.addr, None)
+                })
+                .expect("connect to the slot prover"),
+            ) as Box<dyn Prover>,
+        )],
+    )
+    .expect("split");
+
+    assert_eq!(split.routed(), vec!["slot_proof"]);
+
+    // Each prover is set up for one stage only, so a misroute is not a subtle
+    // wrong answer: asking a prover for a stage it never learned panics in
+    // `program`, because the verification key it would bind does not exist.
+    // Both calls returning at all is the routing working.
+    let witness = witness();
+    let (group, _, _) = split.prove_group(&witness).expect("group proof");
+    let (slot, _) = split.prove_slot(&witness).expect("slot proof");
+
+    let native = NativeProver::new(chain());
+    assert_eq!(
+        group.public_bytes(),
+        native.prove_group(&witness).unwrap().0.public_bytes(),
+    );
+    assert_eq!(
+        slot.attesting_balance,
+        native.prove_slot(&witness).unwrap().0.attesting_balance,
+    );
+
+    // Both cards' counters, added up, because an operator wants to know the
+    // service lost a proof rather than which card lost it.
+    let health = split.health().expect("a network prover reports health");
+    assert_eq!(health.proved, 2);
+    assert_eq!(health.unproven, 0);
 }
 
 /// A witness too large to frame is not spooled, because a retry of it would
