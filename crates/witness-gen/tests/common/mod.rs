@@ -3,19 +3,25 @@
 
 //! MockBeaconApi and test helpers for witness-gen integration tests.
 
+pub mod mock_node;
+pub mod stub_api;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::Result;
 
 use zkasper_common::acc;
+use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
+use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::types::{
     BlockHeaderFields, Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification,
     ValidatorData,
 };
 use zkasper_common::ChainConfig;
 
+use zkasper_witness_gen::artifacts::hex0x;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
 use zkasper_witness_gen::beacon_api::{
     AttestationResponse, BeaconApi, ChainStatusApi, CommitteeResponse, FinalityCheckpoints,
@@ -74,39 +80,6 @@ impl MockBeaconApi {
     /// Block ids `get_block_attestations` was called with.
     pub fn requested_blocks(&self) -> Vec<String> {
         self.attestation_requests.lock().unwrap().clone()
-    }
-
-    /// Serve committees for `epoch` that partition `validators` across the
-    /// epoch's slots, one validator each.
-    ///
-    /// A committee proof only needs the slot buckets to be disjoint and to cover
-    /// everyone it opens — who sits where is the node's shuffle, and getting it
-    /// wrong costs liveness rather than soundness — so validator `i` attests at
-    /// the epoch's slot `i`.
-    pub fn set_committees(
-        &mut self,
-        epoch: u64,
-        validators: &[ValidatorResponse],
-        slots_per_epoch: u64,
-    ) {
-        assert!(
-            validators.len() as u64 <= slots_per_epoch,
-            "{} validators do not fit one per slot in {slots_per_epoch} slots",
-            validators.len(),
-        );
-        let boundary = epoch * slots_per_epoch;
-        self.committees.insert(
-            (boundary.to_string(), epoch),
-            validators
-                .iter()
-                .enumerate()
-                .map(|(i, v)| CommitteeResponse {
-                    slot: boundary + i as u64,
-                    index: 0,
-                    validators: vec![v.index],
-                })
-                .collect(),
-        );
     }
 
     /// Move the head, the way a node does between polls.
@@ -254,6 +227,243 @@ pub fn header_root(header: &HeaderResponse) -> [u8; 32] {
         &header.state_root,
         &header.body_root,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic chain
+// ---------------------------------------------------------------------------
+
+pub type Key = (blst::min_pk::SecretKey, [u8; 48]);
+
+pub const BALANCE_GWEI: u64 = 32_000_000_000;
+
+fn generate_keys(n: usize) -> Vec<Key> {
+    (0..n)
+        .map(|i| {
+            let mut ikm = [0u8; 32];
+            ikm[0] = i as u8;
+            ikm[1] = 0xAB;
+            let sk = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
+            let pk = sk.sk_to_pk().to_bytes();
+            (sk, pk)
+        })
+        .collect()
+}
+
+/// A run of consecutive epochs with real keys, real signatures over real
+/// attestation data, and headers whose roots are the roots the daemon resolves.
+///
+/// Served either in process as a [`MockBeaconApi`] or over HTTP by
+/// [`mock_node::MockNode`], from the same construction — a dry run against the
+/// real binary is only worth anything if it is the chain the in-process tests
+/// already pin.
+///
+/// Validator 0 loses 1 ETH of effective balance every epoch. That is a field the
+/// accumulator leaf commits to, so every epoch has a real mutation to diff *and*
+/// lands on a different accumulator — the case finalization has to work across.
+pub struct SyntheticChain {
+    pub config: ChainConfig,
+    pub keys: Vec<Key>,
+    pub first_epoch: u64,
+    pub last_epoch: u64,
+    pub genesis_validators_root: [u8; 32],
+    pub fork_version: [u8; 4],
+    pub domain: [u8; 32],
+}
+
+impl SyntheticChain {
+    pub fn new(config: ChainConfig, validators: usize, first_epoch: u64, last_epoch: u64) -> Self {
+        assert!(
+            validators as u64 <= config.slots_per_epoch,
+            "{validators} validators do not fit one per slot in {} slots",
+            config.slots_per_epoch,
+        );
+        let genesis_validators_root = [0xAA; 32];
+        let fork_version = [0x04, 0x00, 0x00, 0x00];
+        Self {
+            domain: compute_domain(
+                &DOMAIN_BEACON_ATTESTER,
+                &fork_version,
+                &genesis_validators_root,
+            ),
+            keys: generate_keys(validators),
+            config,
+            first_epoch,
+            last_epoch,
+            genesis_validators_root,
+            fork_version,
+        }
+    }
+
+    pub fn epochs(&self) -> std::ops::RangeInclusive<u64> {
+        self.first_epoch..=self.last_epoch
+    }
+
+    /// Validator set as of `epoch`.
+    pub fn validators_at(&self, epoch: u64) -> Vec<ValidatorResponse> {
+        self.keys
+            .iter()
+            .enumerate()
+            .map(|(i, (_, pubkey))| ValidatorResponse {
+                index: i as u64,
+                pubkey: *pubkey,
+                effective_balance: if i == 0 {
+                    BALANCE_GWEI - epoch.saturating_sub(self.first_epoch) * 1_000_000_000
+                } else {
+                    BALANCE_GWEI
+                },
+                activation_epoch: 0,
+                exit_epoch: FAR_FUTURE_EPOCH,
+                withdrawal_credentials: {
+                    let mut wc = [0u8; 32];
+                    wc[0] = 0x01;
+                    wc
+                },
+                slashed: false,
+                activation_eligibility_epoch: 0,
+                withdrawable_epoch: FAR_FUTURE_EPOCH,
+            })
+            .collect()
+    }
+
+    pub fn total_active_balance_at(&self, epoch: u64) -> u64 {
+        self.validators_at(epoch)
+            .iter()
+            .map(|v| v.effective_balance)
+            .sum()
+    }
+
+    /// Header of the block at `slot`, whose state root commits to the validator
+    /// set of the epoch that slot falls in.
+    pub fn header_at(&self, slot: u64) -> HeaderResponse {
+        make_header(
+            slot,
+            &self.validators_at(slot / self.config.slots_per_epoch),
+            self.config.validators_tree_depth,
+        )
+    }
+
+    /// The checkpoint root for `epoch`: the root of the block at its first slot.
+    ///
+    /// It has to be the real root of the header the chain serves, because the
+    /// finalization circuit opens that header and checks it against the root the
+    /// attesters signed over.
+    pub fn checkpoint_root(&self, epoch: u64) -> [u8; 32] {
+        header_root(&self.header_at(epoch * self.config.slots_per_epoch))
+    }
+
+    /// Committees for `epoch`, partitioning the validators across its slots one
+    /// each.
+    ///
+    /// A committee proof only needs the slot buckets to be disjoint and to cover
+    /// everyone it opens — who sits where is the node's shuffle, and getting it
+    /// wrong costs liveness rather than soundness — so validator `i` attests at
+    /// the epoch's slot `i`.
+    pub fn committees_at(&self, epoch: u64) -> Vec<CommitteeResponse> {
+        (0..self.keys.len() as u64)
+            .map(|i| CommitteeResponse {
+                slot: epoch * self.config.slots_per_epoch + i,
+                index: 0,
+                validators: vec![i],
+            })
+            .collect()
+    }
+
+    /// Validator `index`'s attestation to the epoch's slot `index`, signed for
+    /// real. The block at the slot after it carries it — the earliest one that
+    /// can, and the block the aggregator waits for before it closes the slot.
+    pub fn attestation(&self, epoch: u64, index: usize) -> AttestationResponse {
+        let slot = epoch * self.config.slots_per_epoch + index as u64;
+        let target_root = self.checkpoint_root(epoch);
+        let source_root = self.checkpoint_root(epoch - 1);
+        let beacon_block_root = [0u8; 32];
+        let signing_root = compute_signing_root(
+            &attestation_data_root(
+                slot,
+                0,
+                &beacon_block_root,
+                epoch - 1,
+                &source_root,
+                epoch,
+                &target_root,
+            ),
+            &self.domain,
+        );
+
+        AttestationResponse {
+            // One validator per committee, so the aggregation bitfield is that
+            // one bit plus the SSZ bitlist's length sentinel above it, and
+            // `committee_bits` names the single committee — the shape a node has
+            // served since Electra moved the index out of `AttestationData`.
+            aggregation_bits: vec![0x03],
+            committee_bits: vec![0x01],
+            data_slot: slot,
+            data_index: 0,
+            data_beacon_block_root: beacon_block_root,
+            data_source_epoch: epoch - 1,
+            data_source_root: source_root,
+            data_target_epoch: epoch,
+            data_target_root: target_root,
+            signature: self.keys[index]
+                .0
+                .sign(
+                    &signing_root,
+                    b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+                    &[],
+                )
+                .to_bytes(),
+            single_attester: None,
+        }
+    }
+
+    /// Attestation slots it takes to carry `epoch` over 2/3 of its own active
+    /// balance.
+    pub fn slots_to_threshold(&self, epoch: u64) -> u64 {
+        let quorum = self.total_active_balance_at(epoch) as u128 * 2;
+        let mut attesting = 0u128;
+        for (i, validator) in self.validators_at(epoch).iter().enumerate() {
+            attesting += validator.effective_balance as u128;
+            if attesting * 3 >= quorum {
+                return i as u64 + 1;
+            }
+        }
+        panic!("the whole validator set does not reach 2/3 of itself");
+    }
+
+    /// This chain, in process, with the head at `head_slot`.
+    pub fn mock(&self, head_slot: u64) -> MockBeaconApi {
+        let mut mock = MockBeaconApi::new();
+        mock.genesis_validators_root = self.genesis_validators_root;
+        mock.fork_version = self.fork_version;
+
+        for epoch in self.epochs() {
+            let boundary = epoch * self.config.slots_per_epoch;
+            let header = self.header_at(boundary);
+            let target_root = header_root(&header);
+
+            mock.validators
+                .insert(boundary.to_string(), self.validators_at(epoch));
+            mock.headers.insert(boundary.to_string(), header.clone());
+            // Finalization looks the checkpoint's header up by its root, the way
+            // it has to when the epoch's first slot holds no block.
+            mock.headers.insert(hex0x(&target_root), header);
+            mock.block_roots.insert(boundary.to_string(), target_root);
+            mock.committees
+                .insert((boundary.to_string(), epoch), self.committees_at(epoch));
+
+            for index in 0..self.keys.len() {
+                mock.attestations.insert(
+                    (boundary + index as u64 + 1).to_string(),
+                    vec![self.attestation(epoch, index)],
+                );
+            }
+        }
+
+        mock.headers
+            .insert("head".to_string(), self.header_at(head_slot));
+        mock.set_finality(self.first_epoch, self.checkpoint_root(self.first_epoch));
+        mock
+    }
 }
 
 // ---------------------------------------------------------------------------

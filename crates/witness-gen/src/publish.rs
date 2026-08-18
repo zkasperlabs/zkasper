@@ -29,7 +29,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use zkasper_common::types::{FinalizationOutput, StreamFinalOutput};
+use zkasper_common::types::{FinalizationOutput, JustificationOutput, StreamFinalOutput};
 
 use crate::artifacts::{hex0x, hex_digest, now_unix_millis, write_atomic, StageTiming, Status};
 use crate::prover::Stage;
@@ -131,6 +131,10 @@ enum Message {
     Event(Value),
     Status(Box<Value>),
     Proof(Box<ProofUpload>),
+    /// Post everything held, then answer. What a daemon on its way out waits
+    /// for, so the last epoch of a run is published rather than lost with the
+    /// runtime that was about to be dropped.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Hands events to the background task that posts them.
@@ -250,30 +254,23 @@ impl Publisher {
         );
     }
 
-    pub fn epoch_progress(
-        &self,
-        epoch: u64,
-        attesting_balance: u64,
-        total_active_balance: u64,
-        threshold_pct: f64,
-        folded_groups: usize,
-        slots_held: usize,
-        head_slot: u64,
-    ) {
+    /// The weight climbing towards the threshold, at most once per progress
+    /// interval — the events are cheap but the API's row budget is not.
+    pub fn epoch_progress(&self, progress: &EpochProgress) {
         if !self.due(&self.last_progress, self.progress_interval_millis) {
             return;
         }
         self.event(
             "epoch.progress",
-            epoch,
+            progress.epoch,
             json!({
-                "attesting_balance": attesting_balance.to_string(),
-                "total_active_balance": total_active_balance.to_string(),
-                "attesting_pct": percent(attesting_balance, total_active_balance),
-                "threshold_pct": threshold_pct,
-                "folded_groups": folded_groups,
-                "slots_held": slots_held,
-                "head_slot": head_slot,
+                "attesting_balance": progress.attesting_balance.to_string(),
+                "total_active_balance": progress.total_active_balance.to_string(),
+                "attesting_pct": percent(progress.attesting_balance, progress.total_active_balance),
+                "threshold_pct": progress.threshold_pct,
+                "folded_groups": progress.folded_groups,
+                "slots_held": progress.slots_held,
+                "head_slot": progress.head_slot,
             }),
         );
     }
@@ -435,6 +432,18 @@ impl Publisher {
         })));
     }
 
+    /// Wait for everything queued to be posted or spooled.
+    ///
+    /// Only worth calling on the way out: publishing is fire-and-forget by
+    /// design, and a caller that awaits it per event has put the API back on
+    /// the critical path.
+    pub async fn flush(&self) {
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        if self.tx.send(Message::Flush(ack)).await.is_ok() {
+            let _ = wait.await;
+        }
+    }
+
     pub fn counters(&self) -> PublishCounters {
         PublishCounters {
             posted: self.counters.posted.load(Ordering::Relaxed),
@@ -443,6 +452,17 @@ impl Publisher {
             pending: self.counters.pending.load(Ordering::Relaxed),
         }
     }
+}
+
+/// How far an epoch in flight has got.
+pub struct EpochProgress {
+    pub epoch: u64,
+    pub attesting_balance: u64,
+    pub total_active_balance: u64,
+    pub threshold_pct: f64,
+    pub folded_groups: usize,
+    pub slots_held: usize,
+    pub head_slot: u64,
 }
 
 /// An epoch that finished, as the API stores it.
@@ -496,6 +516,16 @@ pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
         "finalized_state_root": hex0x(&output.finalized_state_root),
         "justified_epoch": output.justified_epoch,
         "justified_root": hex0x(&output.justified_root),
+    })
+}
+
+/// The claim a batch justification makes on its own, for the one epoch of a run
+/// that has nothing before it to finalize.
+pub fn justification_public_inputs(output: &JustificationOutput) -> Value {
+    json!({
+        "accumulator_commitment": hex_digest(&output.accumulator_commitment),
+        "justified_epoch": output.target_epoch,
+        "justified_root": hex0x(&output.target_root),
     })
 }
 
@@ -647,6 +677,13 @@ async fn post_loop(
                     } else {
                         spool.counters.posted.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                Some(Message::Flush(ack)) => {
+                    flush(&client, &mut spool, &mut events, &mut status).await;
+                    if !spool.is_empty() {
+                        drain(&client, &mut spool).await;
+                    }
+                    let _ = ack.send(());
                 }
                 None => break,
             },

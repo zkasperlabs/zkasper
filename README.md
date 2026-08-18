@@ -248,6 +248,27 @@ around slot 22 of a mainnet epoch rather than at the epoch boundary. Nothing pas
 that point is proven. A finalization follows whenever two consecutive epochs
 justify.
 
+### Publishing to the public API
+
+Given `--api-url`, the daemon mirrors every stage to
+[the v1 API](docs/api-v1.md) as it happens — a stage starting, a stage finishing
+with its measured duration, the 2/3 threshold crossing, the final proof landing —
+and uploads the epoch's proof bytes. That is what drives the live view on
+zkasper.com; it is a mirror, and the daemon remains the source of truth.
+
+```sh
+ZKASPER_API_TOKEN=... ZKASPER_COMMIT=$(git rev-parse --short HEAD) \
+cargo run --release --bin zkasperd -- --beacon-url http://localhost:5052 \
+    --mode streaming --api-url https://api.zkasper.com
+```
+
+`ZKASPER_COMMIT` is compiled in and published with every proof, so a verifier
+knows which tree to rebuild the guest from. Publishing cannot hold proving up:
+events go through a bounded queue, and anything the API will not take is spooled
+to `<output-dir>/spool` and sent when it answers again — across a restart too.
+`status.json` reports what that has cost under `publish`, and an outage long
+enough to overflow the spool shows up there as `dropped` rather than as silence.
+
 ### Beacon node requirements
 
 `--mode streaming` follows attestations on the node's event stream,
