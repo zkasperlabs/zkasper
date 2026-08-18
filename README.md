@@ -54,8 +54,15 @@ software implementation. The same code therefore runs in the tests and in the
 zkVM. To build the guest ELFs for the real target, run:
 
 ```sh
-./scripts/build_guests.sh
+./scripts/bake_child_vks.sh
 ```
+
+That builds every guest and writes each one's verification key into the guests
+that verify it, which is what makes a recursive verification bind a *program*
+rather than a key the prover supplied. The keys form a dependency graph, so the
+script builds in the order the graph requires and one pass is enough;
+`build_guests.sh` builds ELFs alone and leaves the constants describing the
+previous ones. See [docs/assumptions.md](docs/assumptions.md) section 3.
 
 ## Run
 

@@ -1,5 +1,7 @@
 extern crate alloc;
 
+pub mod child_vks;
+
 use zkasper_common::types::{FinalizationOutput, FinalizationWitness};
 
 /// Verify a finalization: two consecutive justification proofs, plus the epoch
@@ -13,7 +15,7 @@ pub fn verify_finalization_with_slots(
     witness: &FinalizationWitness,
     slots_per_epoch: u64,
 ) -> FinalizationOutput {
-    use zkasper_common::recursion::verify_child;
+    use zkasper_common::recursion::verify_baked_child;
 
     assert_eq!(
         witness.justification_outputs.len(),
@@ -25,6 +27,13 @@ pub fn verify_finalization_with_slots(
     let just_e1 = &witness.justification_outputs[1];
 
     // Verify both justification proofs, bound to program and outputs.
+    //
+    // The key is the constant this guest was compiled with, so it names
+    // `justification-guest`. Requiring the chain's published key to be the same
+    // constant is what extends that from the link this proof holds to every
+    // link below it: a fold chain verifies its predecessors under a key it
+    // carries, and this is the comparison that says the carried key is the real
+    // program's.
     for (i, (proof, output)) in witness
         .justification_proofs
         .iter()
@@ -32,12 +41,18 @@ pub fn verify_finalization_with_slots(
         .enumerate()
     {
         assert!(
-            verify_child(
+            verify_baked_child(
                 proof,
-                &witness.justification_program_vk,
+                &child_vks::JUSTIFICATION_PROGRAM_VK,
                 &output.public_bytes()
             ),
             "justification proof {} failed recursive verification",
+            i,
+        );
+        assert_eq!(
+            output.program_vk,
+            child_vks::JUSTIFICATION_PROGRAM_VK,
+            "justification proof {} folds a chain pinned to a different program",
             i,
         );
     }
@@ -80,9 +95,9 @@ pub fn verify_finalization_with_slots(
     // proven registry transition.
     let diff = &witness.epoch_diff_output;
     assert!(
-        verify_child(
+        verify_baked_child(
             &witness.epoch_diff_proof,
-            &witness.epoch_diff_program_vk,
+            &child_vks::EPOCH_DIFF_PROGRAM_VK,
             &diff.public_bytes(),
         ),
         "epoch diff proof failed recursive verification",

@@ -494,13 +494,25 @@ Nothing here has to be taken on trust. To check that epoch `E` was finalized:
 1. `GET /v1/epochs/E` and read `verify`.
 2. `GET /v1/proofs/E` — the proof words.
 3. Build the guest yourself: `git checkout <verify.zkasper_commit>`, then
-   `./scripts/build_guests.sh <verify.program>` with Zisk
-   `verify.zisk_version`. Its verification key must equal `verify.program_vk`.
-   That is what binds the proof to this circuit rather than to any circuit.
+   `./scripts/bake_child_vks.sh` with Zisk `verify.zisk_version`. Its
+   verification key must equal `verify.program_vk`. That is what binds the proof
+   to this circuit rather than to any circuit. The bake script rather than
+   `build_guests.sh`, because a guest verifies its children against keys it was
+   compiled with and the script is what derives them — a plain build leaves
+   constants describing the previous ELFs and a different key at the end.
 4. Check the proof: `zkasper_common::recursion::verify_child(&words,
    &program_vk, &public_bytes)`. It checks the key the proof commits to, the
    public bytes it commits to, that nothing was smuggled into the unused public
    words, and then the STARK itself.
+
+   The proof's *children* need nothing from you: every child key is a constant of
+   the guest you just rebuilt, so verifying the top proof pins the tree under it.
+   The exceptions are the three fold chains, which cannot hold their own key and
+   publish it instead. For a `stream_final` proof, compare
+   `public_inputs.program_vk` against `verify.program_vk` — they must be equal,
+   and if they are not, the epoch below this proof came from a program nobody
+   named. For a `justification` proof read on its own, compare its `program_vk`
+   against the justification guest's. See [assumptions.md](assumptions.md) §3.
 5. Check the claim against the chain: `public_inputs.finalized_root` is the block
    root of epoch `public_inputs.finalized_epoch`'s checkpoint, and
    `finalized_state_root` is the state root at that epoch's first slot — not the

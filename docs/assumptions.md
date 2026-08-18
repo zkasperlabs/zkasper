@@ -207,30 +207,76 @@ over the same message adds their public keys and their signatures in step.
 
 ## 3. Accepted risks
 
-### Nothing pins which program a child proof came from
+### Which program a child proof came from: pinned, except at three edges
 
-Every recursive verification in this repository reads the key it checks the
-child against **out of the witness**: `slot_program_vk`, `committee_program_vk`,
-`justification_program_vk`, `group_program_vk`, `aggregate_program_vk`,
-`epoch_diff_program_vk` and `previous_program_vk` are all fields a prover fills
-in. `verify_child` then requires the child proof to carry that key and to
-verify under it — which it does — but nothing requires the key to be *this
-pipeline's* guest.
+**This used to be open, and it is worth knowing that it was.** Every recursive
+verification read the key it checked the child against **out of the witness**:
+`slot_program_vk`, `committee_program_vk`, `justification_program_vk`,
+`group_program_vk`, `aggregate_program_vk`, `epoch_diff_program_vk` and
+`previous_program_vk` were all fields a prover filled in. `verify_child` required
+the child proof to carry that key and to verify under it — which it did — but
+nothing required the key to be *this pipeline's* guest. A prover could write a
+guest of their own that emitted whatever `SlotProofOutput` they liked, prove it
+honestly, hand the parent its key, and get a real proof out of the honest parent
+circuit. The parent's own key was unchanged, so a verifier that pinned only the
+top-level program accepted it.
 
-A prover can therefore write a guest of their own that emits whatever
-`SlotProofOutput` they like, prove it honestly, hand the parent its key, and get
-a real proof out of the honest parent circuit. The parent's own key is
-unchanged, so a verifier that pins only the top-level program accepts it. The
-Solidity verifier pins exactly that and no more.
+**The keys are now constants of the guests.** They live in
+`crates/*/src/child_vks.rs`, one module per guest that verifies something, and
+`scripts/bake_child_vks.sh` writes them from the ELFs. A constant is part of the
+circuit: change it and the guest's ELF changes, which changes the key every
+parent of that guest holds. So the keys form a dependency graph, and the script
+walks it in topological order — leaves, then aggregation, then justification,
+then stream-final and finalization. One pass reaches a fixed point, because
+nothing written at a later step can change an ELF built at an earlier one. That
+is why the constants sit in the guest crates rather than in one shared module: a
+shared module would put aggregation's key in a file aggregation itself compiles,
+and the graph would have a cycle with no fixed point at all.
 
-**What closes it is baking the child keys into the guests** as build-time
-constants, so the whole tree is pinned by the one key the verifier holds. Until
-then a consumer has to compare every `program_vk` and `program_digest` the API
-publishes against keys they derived themselves from the guest ELFs.
+**Rebuilding is one command, and a mismatch fails at startup.** `cargo-zisk
+build` on its own leaves guests whose constants describe the previous ELFs;
+`./scripts/bake_child_vks.sh` builds and bakes together, and the four generated
+files are committed with the ELFs they describe.
+`zkasper_witness_gen::child_vks::check` compares every key a prover derives from
+an ELF against the constant the guests hold — in `ZiskProver` where the ELF is
+read, and again at the prover-server handshake — and refuses to start on a
+disagreement. A guest that was never baked holds all zeros, which is no
+program's key, so it refuses every child proof rather than accepting one from
+anywhere. The failure direction is always "no proof", never "a proof of
+something else".
 
-This is not new to the justification chain; it is how every stage has always
-worked. It is written down here because a fold chain adds one more of them, and
-because it is the kind of gap that is invisible until someone looks for it.
+**Three edges cannot be baked, because they are a program's own key.** A fold
+chain verifies its predecessor under the key of the program doing the verifying,
+and a program that contained its own key would change the ELF that derives it.
+There is no fixed point to find. Those three edges — the justification fold, the
+aggregation fold, and one epoch's stream final proof consuming the last — still
+read their key from the witness, and each publishes it:
+`JustificationOutput.program_vk`, `AggregateOutput.program_vk` and
+`StreamFinalOutput.program_vk`. Every link requires its predecessor to have
+published the same key, so a chain agrees on one program throughout; what ties
+that agreed key to the real program is the consumer.
+
+For two of the three the consumer is a circuit, and the binding is closed with
+nothing left over:
+
+- `finalization-guest` and `stream-final-guest` both bake the justification
+  program's key and require `JustificationOutput.program_vk` to equal it.
+- `stream-final-guest` bakes the aggregation program's key and requires
+  `AggregateOutput.program_vk` to equal it.
+
+**The third is the one obligation this scheme leaves outside the circuits.**
+Nothing in this repository consumes a stream final proof except the next epoch's
+stream final proof, so no guest is in a position to bake that key. **An on-chain
+verifier must require `StreamFinalOutput.program_vk` to equal the program key it
+already pins.** Without that comparison the proof it holds is genuine and the
+epoch below it is whatever the prover chose. In the public outputs the key is
+the last four words: at offset 44 of 52, in the `uint32` layout
+`ZkasperVerifier.sol` reads. The contract has no stream-final entry point yet,
+and adding one means adding that check with it.
+
+The same obligation applies to any consumer that reads a justification proof on
+its own rather than through a finalization — the API publishes them — since the
+circuit that would have made the comparison is not in the picture.
 
 ### The slashed-validator gap
 

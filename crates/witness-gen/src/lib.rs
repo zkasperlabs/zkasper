@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod attestation_collector;
 pub mod beacon_api;
 pub mod boundary;
+pub mod child_vks;
 pub mod committee;
 pub mod db;
 pub mod epoch_state;

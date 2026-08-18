@@ -405,3 +405,201 @@ fn group_proofs_do_not_depend_on_each_other() {
         "a group proof depended on when it was run",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Which program a child came from
+// ---------------------------------------------------------------------------
+//
+// A recursive verification checks a proof against a key. For as long as that key
+// came out of the witness, the check said "this proof verifies under a key the
+// prover chose" — which a prover satisfies by writing their own guest, emitting
+// whatever output they like, proving it honestly and handing over its key. The
+// keys are constants of the guests now, except the two a program cannot hold
+// because they are its own; those are published instead, and these tests are
+// what says the published value is checked.
+
+/// A running aggregate is the head of a fold chain that verified its own links
+/// under a key it carries. The final proof bakes that key, so a chain pinned to
+/// any other program stops here — which is what stops the whole chain below it
+/// being somebody else's circuit.
+#[test]
+fn an_aggregate_pinned_to_another_program_is_refused() {
+    let fixture = fixture();
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+    let run = run(&fixture, &folded(&plan));
+
+    let mut forged = run.final_witness.clone();
+    forged
+        .aggregate
+        .as_mut()
+        .expect("a folded aggregate")
+        .program_vk = [0xAA; 4];
+
+    let message = rejection("an aggregate from another program was accepted", || {
+        zkasper_stream_final_guest::verify_stream_final_with_depth(&forged, ACC_DEPTH);
+    });
+    assert!(
+        message.contains("pinned to a different program"),
+        "unexpected failure: {message}",
+    );
+
+    zkasper_stream_final_guest::verify_stream_final_with_depth(&run.final_witness, ACC_DEPTH);
+}
+
+/// The same one fold down. A chain that changed program halfway would let every
+/// link before the change be a circuit of the prover's own.
+#[test]
+fn an_aggregate_chain_cannot_change_program_between_folds() {
+    let fixture = fixture();
+
+    let fold_of = |slot: usize, previous: Option<AggregateOutput>, miller| {
+        let units: Vec<&SlotComplement> = vec![&fixture.units[slot]];
+        let witness = streaming::group_witness(
+            &fixture.context,
+            &fixture.epoch.tree,
+            &fixture.epoch.committees,
+            &units,
+        );
+        let attested = zkasper_slot_proof_guest::attest(&witness, ACC_DEPTH);
+        let output = zkasper_slot_proof_guest::verify_group_proof_with_depth(&witness, ACC_DEPTH);
+        (
+            streaming::aggregate_witness(
+                &fixture.context,
+                previous,
+                Vec::new(),
+                miller,
+                vec![output],
+                vec![Vec::new()],
+                vec![attested.miller],
+            ),
+            attested.miller,
+        )
+    };
+
+    let (opening, first_miller) = fold_of(0, None, zkasper_common::bls::FP12_ONE);
+    let opened = zkasper_aggregation_guest::verify_aggregate(&opening);
+    let (extending, _) = fold_of(1, Some(opened.clone()), first_miller);
+
+    let mut forged = extending.clone();
+    forged.previous.as_mut().expect("a predecessor").program_vk = [0xAA; 4];
+
+    let message = rejection("an aggregate chain changed program mid-fold", || {
+        zkasper_aggregation_guest::verify_aggregate(&forged);
+    });
+    assert!(
+        message.contains("produced by a different program"),
+        "unexpected failure: {message}",
+    );
+
+    zkasper_aggregation_guest::verify_aggregate(&extending);
+}
+
+/// The previous epoch, when a batch justification finalized it. Its key is a
+/// constant of this guest, so the chain it heads is pinned without the verifier
+/// having to do anything.
+#[test]
+fn a_batch_justification_from_another_program_is_refused() {
+    let fixture = fixture();
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+    let run = run(&fixture, &plan);
+
+    let mut forged = run.final_witness.clone();
+    let PreviousJustification::Batch(batch) = &mut forged.previous_justification else {
+        panic!("the fixture finalizes a batch justification");
+    };
+    batch.program_vk = [0xAA; 4];
+
+    let message = rejection("a justification from another program was accepted", || {
+        zkasper_stream_final_guest::verify_stream_final_with_depth(&forged, ACC_DEPTH);
+    });
+    assert!(
+        message.contains("pinned to a different program"),
+        "unexpected failure: {message}",
+    );
+}
+
+/// The previous epoch when *this* pipeline proved it — the one recursive edge in
+/// the repository whose key is neither a constant nor checkable by a circuit,
+/// because a stream final proof is consumed by a verifier and not by another
+/// guest. The chain agrees on one key and publishes it; a link that verified its
+/// predecessor under a different one is refused here, and an on-chain verifier
+/// closes the last step by requiring the published key to be the one it pins.
+#[test]
+fn a_previous_epoch_that_names_another_program_is_refused() {
+    let fixture = fixture();
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+    let run = run(&fixture, &plan);
+
+    let PreviousJustification::Batch(batch) = &run.final_witness.previous_justification else {
+        panic!("the fixture finalizes a batch justification");
+    };
+    let previous = StreamFinalOutput {
+        // Nothing above reads what the previous epoch itself finalized.
+        accumulator_commitment: [0; 4],
+        next_accumulator_commitment: batch.accumulator_commitment,
+        finalized_epoch: batch.target_epoch - 1,
+        finalized_root: [0; 32],
+        finalized_state_root: [0; 32],
+        justified_epoch: batch.target_epoch,
+        justified_root: batch.target_root,
+        program_vk: run.final_witness.stream_program_vk,
+    };
+
+    let mut witness = run.final_witness.clone();
+    witness.previous_justification = PreviousJustification::Stream(Box::new(previous.clone()));
+    zkasper_stream_final_guest::verify_stream_final_with_depth(&witness, ACC_DEPTH);
+
+    let mut forged = witness.clone();
+    forged.previous_justification = PreviousJustification::Stream(Box::new(StreamFinalOutput {
+        program_vk: [0xAA; 4],
+        ..previous
+    }));
+
+    let message = rejection("a previous epoch from another program was accepted", || {
+        zkasper_stream_final_guest::verify_stream_final_with_depth(&forged, ACC_DEPTH);
+    });
+    assert!(
+        message.contains("names a different program"),
+        "unexpected failure: {message}",
+    );
+}
+
+/// What the proof itself carries, so a verifier can make the comparison the
+/// circuit cannot.
+#[test]
+fn the_final_proof_publishes_the_key_it_verified_the_previous_epoch_under() {
+    let fixture = fixture();
+    let plan = streaming::plan(
+        &fixture.units,
+        fixture.context.total_active_balance,
+        &StreamPolicy::default(),
+    );
+    let run = run(&fixture, &plan);
+
+    assert_eq!(
+        run.final_output.program_vk,
+        run.final_witness.stream_program_vk,
+    );
+    let publics = run.final_output.public_bytes();
+    assert_eq!(
+        &publics[publics.len() - 32..],
+        run.final_output
+            .program_vk
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>(),
+        "the key has to be in the public outputs or a verifier cannot see it",
+    );
+}

@@ -14,8 +14,9 @@ pub struct Context {
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub total_active_balance: u64,
-    pub slot_program_vk: ProgramVk,
-    pub committee_program_vk: ProgramVk,
+    /// The key the chain's links verify each other under. The slot-proof and
+    /// committee keys used to sit beside it; they are constants of the guest
+    /// now, so nothing here can name the program a fold verifies.
     pub justification_program_vk: ProgramVk,
 }
 
@@ -43,8 +44,6 @@ pub fn build(
         target_root: context.target_root,
         total_active_balance: context.total_active_balance,
         acc_root: context.acc_root,
-        slot_program_vk: context.slot_program_vk,
-        committee_program_vk: context.committee_program_vk,
         justification_program_vk: context.justification_program_vk,
         committee,
         committee_proof,

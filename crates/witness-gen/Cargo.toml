@@ -31,6 +31,12 @@ path = "src/bin/prover_server.rs"
 name = "zkasper-init-point"
 path = "src/bin/gen_init_point.rs"
 
+# Derives a guest's verification key from its ELF. `scripts/bake_child_vks.sh`
+# is the only caller; it needs `--features zisk-prover`.
+[[bin]]
+name = "zkasper-program-vk"
+path = "src/bin/program_vk.rs"
+
 [dependencies]
 ziskos = { workspace = true }
 zkasper-common = { path = "../common", features = ["test-utils"] }

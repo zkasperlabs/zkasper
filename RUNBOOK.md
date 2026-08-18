@@ -351,7 +351,7 @@ confirmed against `nvidia/cuda:12.9.1-devel-ubuntu24.04` on 2026-08-18.
 
 ```sh
 # on the GPU box, after ziskup --gpu --provingkey
-./scripts/build_guests.sh
+./scripts/bake_child_vks.sh
 cargo build --release --features zisk-prover --bin zkasper-prover-server
 ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasper-prover-server \
   --gpu --listen 0.0.0.0:9099 --mode streaming
@@ -366,6 +366,16 @@ cargo build --release --bin zkasperd     # no CUDA needed here
 ZKASPER_PROVER_TOKEN=<secret> ./target/release/zkasperd \
   --prover remote --prover-addr 127.0.0.1:9099 ...
 ```
+
+`bake_child_vks.sh` rather than `build_guests.sh`: a guest verifies its children
+against keys it was compiled with, and that script is what derives them from the
+ELFs and writes them back. It takes a ROM setup per guest, which is the same cost
+the server pays at startup anyway. Skip it and the guests hold all-zero child
+keys, which no program has, so every recursion fails — and the client says so at
+the handshake rather than several minutes into an epoch, because
+`child_vks::check` compares the server's keys against the constants the daemon
+was built with. Commit the four `crates/*/src/child_vks.rs` files it writes
+alongside the ELFs they describe.
 
 `--stages group,slot_proof` starts a server for part of a pipeline; each guest
 costs a ROM setup and gigabytes of `~/.zisk/cache`, so do not set up nine when

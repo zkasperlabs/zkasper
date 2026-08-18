@@ -20,6 +20,17 @@ interface IZiskVerifier {
 ///                state_root_2(8), epoch_2(2)]
 ///   Finality:   [commitment_e(8), commitment_e1(8), finalized_epoch(2),
 ///                finalized_root(8), finalized_state_root(8)]
+///   StreamFinal:the same 34 words, then [justified_epoch(2),
+///                justified_root(8), program_vk(8)]
+///
+/// There is no stream-final entry point yet. Whoever adds one must also require
+/// `program_vk` — words 44..51 — to equal the program key its verifier pins.
+/// That is the key the proof verified the *previous* epoch's proof under, and a
+/// stream final proof is the one recursion in the pipeline whose child program
+/// no circuit is in a position to pin: a program cannot contain its own
+/// verification key, and nothing but the next epoch's proof consumes this one.
+/// Skip the check and the proof on chain is genuine while the epoch below it is
+/// whatever the prover chose. See `docs/assumptions.md` section 3.
 ///
 /// The accumulator_commitment is poseidon(poseidon_root, total_active_balance),
 /// binding the Poseidon validator tree to the total active balance in one value.

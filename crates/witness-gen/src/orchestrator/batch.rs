@@ -94,8 +94,6 @@ impl EpochAggregator {
             target_epoch: self.target_epoch,
             target_root: self.target_root,
             total_active_balance: self.total_active_balance,
-            slot_program_vk: prover.program_vk(Stage::SlotProof),
-            committee_program_vk: prover.program_vk(Stage::Committee),
             justification_program_vk: prover.program_vk(Stage::Justification),
         }
     }
@@ -599,8 +597,6 @@ impl BatchPipeline {
             .report
             .begin(Stage::Finalization, current.output.target_epoch, None, None);
         let witness = FinalizationWitness {
-            justification_program_vk: engine.prover.program_vk(Stage::Justification),
-            epoch_diff_program_vk: engine.prover.program_vk(Stage::EpochDiff),
             boundary,
             justification_outputs: vec![previous.output.clone(), current.output.clone()],
             justification_proofs: vec![previous.proof.clone(), current.proof.clone()],

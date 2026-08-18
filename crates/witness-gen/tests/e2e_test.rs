@@ -6,6 +6,7 @@
 mod common;
 
 use common::{make_header, validator_data_to_response, MockBeaconApi};
+use zkasper_witness_gen::child_vks;
 use zkasper_witness_gen::state_diff::SlotHistory;
 
 use zkasper_common::acc;
@@ -312,9 +313,7 @@ fn test_e2e_full_pipeline() {
     // epoch has: the first carries the committee proof, the second extends it.
     let mut outputs_e = outputs_e.into_iter();
     let just_e_open = JustificationWitness {
-        slot_program_vk: [0; 4],
-        committee_program_vk: [0; 4],
-        justification_program_vk: [0; 4],
+        justification_program_vk: child_vks::JUSTIFICATION,
         committee: Some(committees_e.output.clone()),
         committee_proof: vec![], // stub proof
         previous: None,
@@ -481,9 +480,7 @@ fn test_e2e_full_pipeline() {
     // Step F: Justification for epoch E+1
     // =========================================================
     let just_e1_witness = JustificationWitness {
-        slot_program_vk: [0; 4],
-        committee_program_vk: [0; 4],
-        justification_program_vk: [0; 4],
+        justification_program_vk: child_vks::JUSTIFICATION,
         committee: Some(committees_e1.output.clone()),
         committee_proof: vec![],
         previous: None,
@@ -508,8 +505,6 @@ fn test_e2e_full_pipeline() {
     // Step G: Finalization across the epoch boundary
     // =========================================================
     let finalization_witness = FinalizationWitness {
-        justification_program_vk: [0; 4],
-        epoch_diff_program_vk: [0; 4],
         boundary: common::make_boundary(&header_e1, &responses_e1, TEST_DEPTH, &history_e),
         justification_outputs: vec![just_e_output, just_e1_output],
         justification_proofs: vec![vec![], vec![]],

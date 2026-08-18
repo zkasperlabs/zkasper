@@ -330,6 +330,21 @@ pub struct JustificationOutput {
     /// a [`JustificationOutput`] therefore requires this flag: both finalization
     /// circuits do, and so does the daemon before it publishes one.
     pub justified: bool,
+    /// Key of the program that produced this proof, and that every link of the
+    /// chain verifies its predecessor under.
+    ///
+    /// A fold chain is the one recursive edge that cannot be a build-time
+    /// constant: a program that contained its own key would change the ELF that
+    /// derives it. Publishing it here is what closes the gap instead. Every
+    /// link requires its predecessor to have published the same key, so a chain
+    /// agrees on one program throughout; and the consumer that *does* bake this
+    /// key requires the published value to equal the constant it was built
+    /// against, which collapses the whole chain onto the real program.
+    ///
+    /// Both consumers bake it: `finalization-guest` and `stream-final-guest`.
+    /// A consumer that reads a justification on its own — the API publishes
+    /// them — has to make the same comparison itself.
+    pub program_vk: crate::recursion::ProgramVk,
 }
 
 /// Witness for a justification proof: extend a running justification with
@@ -349,14 +364,15 @@ pub struct JustificationWitness {
     /// divides by whatever the prover chose.
     pub acc_root: Digest,
 
-    /// Verification key of the slot-proof program. Bound into the justification
-    /// output so the on-chain verifier can pin which program the slot proofs
-    /// came from.
-    pub slot_program_vk: crate::recursion::ProgramVk,
-    /// Verification key of the committee program.
-    pub committee_program_vk: crate::recursion::ProgramVk,
-    /// Verification key of this program, so a justification can extend a
-    /// justification.
+    /// Key this chain's links verify each other under, published as
+    /// [`JustificationOutput::program_vk`].
+    ///
+    /// The only child key still read from the witness, and only because a
+    /// program cannot contain its own key. The slot-proof and committee keys
+    /// used to sit beside it and are now build-time constants of the guest
+    /// (`zkasper_justification_guest::child_vks` and
+    /// `zkasper_aggregation_guest::child_vks`), so a prover can no longer name
+    /// the program whose children it wants verified.
     pub justification_program_vk: crate::recursion::ProgramVk,
 
     /// The committee proof every slot proof counted against. Required when
@@ -448,10 +464,6 @@ pub struct FinalizationOutput {
 /// Witness for a finalization proof (pairs two consecutive justifications).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalizationWitness {
-    /// Verification key of the justification program.
-    pub justification_program_vk: crate::recursion::ProgramVk,
-    /// Verification key of the epoch-diff program.
-    pub epoch_diff_program_vk: crate::recursion::ProgramVk,
     /// The finalized epoch's boundary, opened out of the justified checkpoint.
     pub boundary: BoundaryAnchor,
     /// Justification outputs for epochs E and E+1.
@@ -520,6 +532,7 @@ impl JustificationOutput {
             .u64(self.attesting_balance)
             .u64(self.slots_mask)
             .u64(self.justified as u64)
+            .program_vk(&self.program_vk)
             .finish()
     }
 }
@@ -601,6 +614,11 @@ pub struct AggregateOutput {
     pub slots_mask: u64,
     /// Commitment to the product of every folded group's Miller accumulator.
     pub miller_commitment: Digest,
+    /// Key of the program that produced this proof, on the terms
+    /// [`JustificationOutput::program_vk`] sets out.
+    ///
+    /// `stream-final-guest` is the consumer that bakes it.
+    pub program_vk: crate::recursion::ProgramVk,
 }
 
 /// Witness for an aggregation proof: extend a running aggregate with finished
@@ -612,14 +630,12 @@ pub struct AggregateWitness {
     pub target_epoch: u64,
     pub target_root: [u8; 32],
 
-    /// Verification key of the group-proof program.
-    pub group_program_vk: crate::recursion::ProgramVk,
-    /// Verification key of this program, so an aggregate can extend an aggregate.
+    /// Key this chain's links verify each other under, published as
+    /// [`AggregateOutput::program_vk`]. The only child key still read from the
+    /// witness, and only because a program cannot contain its own key; the
+    /// group, epoch-diff and committee keys are build-time constants of
+    /// `zkasper_aggregation_guest::child_vks`.
     pub aggregate_program_vk: crate::recursion::ProgramVk,
-    /// Verification key of the epoch-diff program.
-    pub epoch_diff_program_vk: crate::recursion::ProgramVk,
-    /// Verification key of the committee program.
-    pub committee_program_vk: crate::recursion::ProgramVk,
 
     /// The diff that carried the accumulator from the previous epoch to this
     /// one. Required when `previous` is absent — the fold that opens an epoch is
@@ -720,6 +736,16 @@ pub struct StreamFinalOutput {
     /// proof can consume this one as its previous justification.
     pub justified_epoch: u64,
     pub justified_root: [u8; 32],
+    /// Key of the program that produced this proof, on the terms
+    /// [`JustificationOutput::program_vk`] sets out.
+    ///
+    /// Nothing in this repository consumes a stream final proof except the next
+    /// epoch's, so this is the one key whose comparison falls to the verifier
+    /// rather than to a circuit: **an on-chain verifier must require this to
+    /// equal the program key it already pins.** Without that comparison the
+    /// proof it holds is genuine and the epoch below it is whatever the prover
+    /// chose. See `docs/assumptions.md` §3.
+    pub program_vk: crate::recursion::ProgramVk,
 }
 
 /// Witness for the final proof of an epoch.
@@ -738,11 +764,13 @@ pub struct StreamFinalWitness {
     pub acc_root: Digest,
     pub total_active_balance: u64,
 
-    pub group_program_vk: crate::recursion::ProgramVk,
-    pub aggregate_program_vk: crate::recursion::ProgramVk,
-    pub previous_program_vk: crate::recursion::ProgramVk,
-    pub epoch_diff_program_vk: crate::recursion::ProgramVk,
-    pub committee_program_vk: crate::recursion::ProgramVk,
+    /// Key the previous epoch's *stream* final proof is verified under, and
+    /// published as [`StreamFinalOutput::program_vk`]. The only child key still
+    /// read from the witness: every other one, the batch justification's
+    /// included, is a build-time constant of
+    /// `zkasper_stream_final_guest::child_vks` or of the aggregation guest this
+    /// one borrows its links from.
+    pub stream_program_vk: crate::recursion::ProgramVk,
 
     /// The epoch diff linking the previous epoch's accumulator to this one's.
     /// Only needed when there is no aggregate to inherit it from.
@@ -806,6 +834,7 @@ impl AggregateOutput {
             .u64(self.attesting_balance)
             .u64(self.slots_mask)
             .digest(&self.miller_commitment)
+            .program_vk(&self.program_vk)
             .finish()
     }
 }
@@ -820,6 +849,7 @@ impl StreamFinalOutput {
             .bytes32(&self.finalized_state_root)
             .u64(self.justified_epoch)
             .bytes32(&self.justified_root)
+            .program_vk(&self.program_vk)
             .finish()
     }
 }
