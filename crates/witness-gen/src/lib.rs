@@ -8,6 +8,7 @@ pub mod db;
 pub mod epoch_state;
 pub mod fixture;
 pub mod gossip;
+pub mod network;
 pub mod orchestrator;
 pub mod prover;
 pub mod pubkey;

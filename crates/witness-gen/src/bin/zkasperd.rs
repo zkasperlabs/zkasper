@@ -27,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::BeaconApiClient;
+use zkasper_witness_gen::network;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
 use zkasper_witness_gen::prover::{NativeProver, Prover};
 use zkasper_witness_gen::publish::{DaemonInfo, PublishConfig, Publisher};
@@ -90,7 +91,10 @@ struct Cli {
     #[arg(long, default_value = "zkasper-out")]
     output_dir: PathBuf,
 
-    /// Target chain
+    /// Chain parameters to run with. What the run publishes as its chain
+    /// comes from the node's genesis validators root, not from this: see
+    /// `crate::network`. A node whose root names a different network is an
+    /// error, and one no network claims publishes as `unrecognised`.
     #[arg(long, default_value = "mainnet")]
     chain: Chain,
 
@@ -330,6 +334,13 @@ async fn main() -> Result<()> {
         Mode::Batch => Pipeline::Batch,
         Mode::Streaming => Pipeline::Streaming,
     };
+
+    // The label this run publishes comes from the node, never from `--chain`.
+    // See `crate::network`: the flag picks parameters, and a node running
+    // mainnet parameters is not therefore mainnet.
+    let api = BeaconApiClient::new(&cli.beacon_url);
+    let (chain_name, genesis_validators_root) = network::resolve(&api, cli.chain.name()).await?;
+
     let config = OrchestratorConfig {
         db_path: cli.db_path.clone(),
         output_dir: cli.output_dir.clone(),
@@ -353,7 +364,8 @@ async fn main() -> Result<()> {
         // path walks blocks either way.
         gossip_url: (pipeline == Pipeline::Streaming && !cli.no_gossip)
             .then(|| cli.beacon_url.clone()),
-        ..OrchestratorConfig::new(cli.chain.config(), cli.chain.name())
+        genesis_validators_root: Some(genesis_validators_root),
+        ..OrchestratorConfig::new(cli.chain.config(), chain_name)
     };
 
     // Built before the first beacon call, so a missing ELF or proving key fails
@@ -362,6 +374,7 @@ async fn main() -> Result<()> {
 
     info!(
         chain = %config.chain_name,
+        genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
         db = %config.db_path.display(),
         out = %config.output_dir.display(),
         prover = prover.name(),
@@ -370,13 +383,8 @@ async fn main() -> Result<()> {
 
     let publisher = cli.build_publisher(&config)?;
 
-    let mut orchestrator = Orchestrator::open_with_publisher(
-        BeaconApiClient::new(&cli.beacon_url),
-        config,
-        prover,
-        publisher.clone(),
-    )
-    .await?;
+    let mut orchestrator =
+        Orchestrator::open_with_publisher(api, config, prover, publisher.clone()).await?;
 
     let result = if cli.once {
         orchestrator.catch_up().await.map(|ticks| {
