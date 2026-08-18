@@ -167,7 +167,7 @@ impl<A> Orchestrator<A> {
                 .map(CheckpointStatus::from),
             recent_stages: report.recent.iter().cloned().collect(),
             recent_latencies: report.latencies.iter().cloned().collect(),
-            current_epoch: self.current_epoch(),
+            current_epoch: self.stream.current_epoch(&self.engine.config),
             gossip: self.engine.gossip.as_ref().map(|source| {
                 let counters = source.counters();
                 GossipStatus {

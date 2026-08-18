@@ -1,7 +1,19 @@
-//! Which pipeline proves an epoch.
+//! Which pipeline proves an epoch, and what a pipeline is.
 //!
-//! The choice is made once, from configuration, and re-made every tick against
-//! what the accumulator has behind it: see [`super::Orchestrator::tick`].
+//! [`Pipeline`] picks what happens to the slots. [`Pipeline::Batch`] proves one
+//! slot proof each and folds them into a justification once the epoch is over,
+//! which is three proofs deep and simple. [`Pipeline::Streaming`] proves a group
+//! per tick, folds each into a running aggregate as it finishes, and collapses
+//! justification, finalization and the epoch's one final exponentiation into a
+//! single proof over the attestation that crossed the threshold — see
+//! [`crate::streaming`]. Only the latter puts one proof on `T2 - T`, and the
+//! manifest publishes the measured value.
+//!
+//! An epoch can only be streamed if the epoch before it left a justification and
+//! an epoch diff behind, so the first epoch after a bootstrap always goes through
+//! the batch path and the streaming run picks up from the next one. The choice
+//! is therefore configured once but re-made every tick, against what the
+//! accumulator has behind it: see [`super::stream::StreamPipeline::can_stream`].
 
 use anyhow::Result;
 
