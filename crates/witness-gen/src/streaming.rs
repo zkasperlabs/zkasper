@@ -41,6 +41,34 @@
 //! above about 11 s makes it two, and the schedule finds the boundary rather
 //! than assuming it.
 //!
+//! # And exactly two recursions do, which is now the whole of `T2 − T`
+//!
+//! A child costs [`ProverModel::recursion_verify_s`] — 53.087 s, MEASURED —
+//! against a 3.640 s floor, so the sentences above are true and no longer the
+//! point. `T2 − T` on a mainnet epoch is **117.7 s**, of which 106 is two
+//! recursive verifications the final proof cannot skip: the running aggregate,
+//! and the previous epoch's justification. Everything the schedule chooses —
+//! how to cut the groups, how many cards, where the tail begins — is the
+//! remaining twelve.
+//!
+//! Two things follow, and they are the opposite of what a free recursion
+//! implied.
+//!
+//! **A fold is worth its floor now.** It used to buy nothing: absorbing a group
+//! into the final proof was free, so a fold was a wasted floor and the schedule
+//! only emitted one when it had time to spare. A group absorbed after `T` is
+//! 53 s on the critical path and the same group folded before it is 53 s off
+//! it, so folding is worth a floor and a half of its own several times over —
+//! but only for groups that would otherwise land after `T`. Folding anything
+//! else adds a recursion for the fold's own predecessor and buys nothing.
+//!
+//! **The second irreducible recursion is not irreducible.** The previous
+//! epoch's justification exists a full epoch before this epoch's last
+//! attestation, exactly like the epoch diff and the committee proof — both of
+//! which are already verified by the fold that opens the epoch for precisely
+//! this reason. Verifying it there too would take 53 s off `T2 − T`, which is
+//! more than every other term in this model put together.
+//!
 //! # What the schedule is up against is arrival time, not throughput
 //!
 //! A slot's marginal work is well under a second, against twelve seconds of
