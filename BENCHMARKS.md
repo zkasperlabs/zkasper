@@ -237,10 +237,30 @@ It is a loud, immediate failure, not an OOM or a silent serialisation. The
 survivor is also degraded — it came up with `3 streams for basic proofs and 0
 streams for recursive proofs` and took 24.46 s instead of 12.46 s.
 
-But 2 x 14 GB fits inside 32.61 GB, so the constraint is the greedy sizing, not
-the memory. There is no flag to cap it; capping has to come from outside the
-process — an MPS per-client limit, a co-resident allocation, or a container
-memory limit — and then two provers coexist.
+But that is a race, not a requirement. Holding 17 GB back while prover A starts
+makes A size itself at 12.90 GB and take one basic stream; releasing the hog
+leaves 18.1 GB, and prover B then starts alongside it with one basic and two
+recursive streams. **Both proofs complete.**
+
+| | GPU allocated | streams | `Proof generated` |
+|---|---:|---|---:|
+| solo | 30.14 GB | 3 basic + 1 recursive | 15.43 s |
+| A, capped | 12.90 GB | 1 basic + 0 recursive | 26.45 s |
+| B, alongside A | ~15 GB | 1 basic + 2 recursive | 21.01 s |
+
+(The CPU was busy building guests during this run, so all three are inflated;
+the ratios are what matter.)
+
+So **one prover does not need a whole card** — two fit, at roughly 1.4–1.7x the
+per-proof latency each, for about 1.2x aggregate throughput. There is no flag to
+cap the allocation, so the cap has to come from outside the process: an MPS
+per-client memory limit, a co-resident allocation, or a container limit.
+
+For a latency-bound pipeline that is a poor trade — two cards at 1x beat one
+card running two provers at 1.6x — so concurrency still argues for more GPUs.
+But the reason is throughput economics, not a 30 GB hardware wall, and any
+capacity plan built on "one prove saturates one 5090" is built on a
+configuration default rather than a requirement.
 
 
 ## The group stage, measured against attester count
