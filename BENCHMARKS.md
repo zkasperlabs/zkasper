@@ -16,9 +16,15 @@ python3 scripts/bench.py --build
 > in this file were re-measured on an RTX 5090 against Zisk v1.0.0-alpha over a
 > 29-point sweep. `BASE = 293,601,280` is a compile-time constant in zisk that
 > does not describe the shipped proving key, and every latency figure derived
-> from it inherited the error. Numbers marked **superseded** below should not be
-> quoted. See [The per-proof floor](#the-per-proof-floor-is-a-constant-that-does-not-describe-the-prover),
-> raw data in `data/gpu_bench/`, and `python3 scripts/fit_gpu_bench.py`.
+> from it inherited the error. Worse, **there is no single cost-units-per-second
+> constant to correct it to**: measured effective throughput spans 18M to 246M
+> units/s across the campaign's own guests. Everything that used to predict
+> latency now predicts *seconds* directly, from
+> [the time model](#the-time-model-seconds-rather-than-cost-units) —
+> `scripts/time_model.py`, and `ProverModel` in
+> `crates/witness-gen/src/streaming.rs`. Numbers marked **superseded** below
+> should not be quoted. Raw data in `data/gpu_bench/`; the fits are reproduced
+> by `python3 scripts/fit_gpu_bench.py` and `python3 scripts/time_model.py`.
 
 ## Primitives
 
@@ -39,7 +45,7 @@ python3 scripts/bench.py --build
 | `acc::commit_fp12` | 78,002 | `poseidon2` |
 | G2 subgroup check | 8,219,617 | Fp2 tower |
 | pairing check, 2 pairs (`pairing_check_safe`) | 248,054,847 | Fp2 tower |
-| **per-proof floor (BASE)** | **293,601,280** *(superseded — see below)* | — |
+| **per-proof floor (BASE)** | **293,601,280** *(superseded: it is not a cost, it is 7.18 s — see below)* | — |
 
 ### The pairing numbers were three things in a trench coat
 
@@ -188,6 +194,92 @@ low, and the 19.5 s was never a proving floor. It is **13.49 s of process start
 and GPU allocation** plus about 5 s of actual floor, which is why it cannot be
 added to a `proof_base` term without counting the floor twice.
 
+That fit is still only good for *this* guest. What replaces the whole approach
+is below.
+
+## The time model: seconds rather than cost units
+
+`scripts/time_model.py`, mirrored by `ProverModel` in
+`crates/witness-gen/src/streaming.rs`. It predicts seconds from the quantities
+that drive them, with a rate per work class rather than one rate for everything.
+
+| term | value | what set it |
+|---|---:|---|
+| stage floor | **7.176 s ± 0.084** | MEASURED — the aggregation guest with recursion removed: 34,002 executed steps, 3 warm proves |
+| empty-guest floor | 4.843 s ± 0.027 | MEASURED — 496 steps, eleven AIRs, 3 warm proves |
+| per opened validator | **834.7 µs** | DERIVED — the attester sweep's 878.2 µs slope, less one internal node |
+| per accumulator node | 43.5 µs | MEASURED — 3,033 cost units at the poseidon2 sweep's 69,714,770 units/s |
+| Fp2-tower rate | 207,400,000 units/s | FITTED — least squares on the group and slot fixtures |
+| ...one distinct message | 0.250 s | hash-to-curve plus a marginal Miller loop, at that rate |
+| ...per-proof Miller batch | 0.231 s | the 63 shared squarings plus the G2 subgroup check |
+| ...final exponentiation | 0.640 s | once per epoch |
+| wrap compression | 0.157 s | MEASURED — five warm wraps, 151–170 ms |
+| cold penalty | 13.49 s | MEASURED — 87 proves, wall minus `Proof generated` |
+| recursive verification | **unmeasured** | the fixtures carry stub children; it is a parameter, not a zero |
+
+The stage floor is the load-bearing one, and it is worth being clear about what
+it is. An empty guest instantiates eleven AIRs for 4.843 s. The aggregation
+guest executes 34,002 steps — 82x an empty guest's cost units, still nothing —
+and takes 7.176 s. The 2.33 s between them is the AIRs a poseidon2-and-Fp12
+guest instantiates and an empty one does not, and every zkasper stage pays it.
+
+There is deliberately no per-invocation constant. These are the prover's own
+`Proof generated` times and a warm prover pays exactly them; the 19.52 s that
+used to be added on top already contained the floor.
+
+### How well it does
+
+Against the four fixture stages it was fitted on, worst error **4.3%**:
+
+| stage | model | measured | error |
+|---|---:|---:|---:|
+| aggregation, recursion removed | 7.18 s | 7.18 s ± 0.08 | −0.0% |
+| group proof | 7.66 s | 8.00 s ± 0.03 | −4.3% |
+| slot proof, own final exponentiation | 8.36 s | 8.22 s ± 0.13 | +1.7% |
+| stream-final, recursion removed | 8.30 s | 8.21 s ± 0.21 | +1.1% |
+
+Against the group-size sweep, which it was *not* shaped for — the sweep is the
+enumerating guest, whose floor is about 1 s below a complement group proof's —
+worst error **6.0%**, always conservative:
+
+| attesters | model | measured | error |
+|---:|---:|---:|---:|
+| 256 | 7.9 s | 10.5 s ± 4.20 | −25.2% |
+| 2,048 | 9.5 s | 8.9 s ± 0.28 | +5.7% |
+| 8,192 | 14.9 s | 14.2 s ± 0.90 | +4.4% |
+| 32,768 | 36.4 s | 34.4 s ± 0.81 | +6.0% |
+| 62,500 | 62.5 s | 60.9 s ± 0.92 | +2.7% |
+| 154,000 | 142.9 s | 142.2 s ± 1.72 | +0.5% |
+
+The 256-attester row is the one point whose three repeats disagree by 7 s; its
+own noise is larger than the error.
+
+### What it cannot do, and what would fix that
+
+**One model does not span every workload, and this one does not try.** It covers
+zkasper's guests. The poseidon2 bench guest needs its own rate (69.7M units/s),
+and plain integer work is free until it crosses an AIR-instance boundary and
+then steps. Anything outside the pipeline should be measured, not extrapolated.
+
+**The Fp2-tower rate is the weakest constant.** Nothing in the campaign runs BLS
+at mainnet scale, so it is read off floor-dominated fixtures and the bracket
+around it is wide:
+
+| | rate | why it is wrong |
+|---|---:|---|
+| slot minus group | 663,293,070 units/s | an in-instance marginal — the second proof's work fitted in the AIR instance the first already built |
+| group minus aggregation stub | 121,351,898 units/s | attributes the whole gap to BLS when part of it is a different AIR set |
+| least squares on both | **207,400,000 units/s** | what the model uses |
+
+A group carrying 64 messages is 26 s at the rate used and 18 s at the slow end.
+One sweep over message count would close this, and it is the single most
+valuable measurement left.
+
+**Recursive verification is not measured at all.** Both stages that would show
+it could only be proved with it removed. It is a parameter with a default of
+zero, and the schedule's sensitivity to it is printed by the streaming schedule
+test.
+
 
 ## What one GPU actually holds
 
@@ -265,26 +357,41 @@ configuration default rather than a requirement.
 
 ## The group stage, measured against attester count
 
-`gen-test-witness group-proof <out> <n-validators>` builds a fixture whose one
-aggregate covers `n/2` attesters. Proved on the RTX 5090, 3 warm proves each,
-`Proof generated` (raw data in `data/gpu_bench/attester_*.tsv`):
+`gen-test-witness group-proof <out> <n-validators>` builds a fixture over `n`
+validators split across two slots, so the one group proved covers **`n/2`
+attesters**. The ELF used was the pre-complement guest, which enumerates
+attesters rather than naming absentees — which is why the sweep scales at all,
+and which makes it the right calibration for the two places that still walk a
+validator list: the committee proof, and a slot proof's named set. Proved on the
+RTX 5090, 3 warm proves each, `Proof generated`, raw data in
+`data/gpu_bench/attester_*.tsv`:
 
-| attesters | STEPS | VARIABLE | `Proof generated` | effective units/s | steps/attester |
-|---:|---:|---:|---:|---:|---:|
-| 512 | 1,769,057 | 191,762,010 | 10.54 s ± 4.20 | 18,186,262 | 3,455 |
-| 4,096 | 5,910,479 | 595,312,633 | 8.95 s ± 0.28 | 66,532,724 | 1,443 |
-| 16,384 | 20,110,664 | 1,982,290,621 | 14.23 s ± 0.90 | 139,342,796 | 1,227 |
-| 65,536 | 76,911,936 | 7,539,064,642 | 34.37 s ± 0.81 | 219,341,641 | 1,174 |
-| 125,000 | 145,632,319 | 14,267,663,844 | 60.92 s ± 0.91 | 234,195,592 | 1,165 |
-| 308,000 | 357,111,686 | 35,009,796,558 | 140.46 s | 249,243,910 | 1,159 |
+| fixture `n` | attesters | STEPS | VARIABLE | `Proof generated` | effective units/s | steps/attester |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 256 | 1,769,057 | 191,762,010 | 10.54 s ± 4.20 | 18,186,262 | 6,910 |
+| 4,096 | 2,048 | 5,910,479 | 595,312,633 | 8.95 s ± 0.28 | 66,532,724 | 2,886 |
+| 16,384 | 8,192 | 20,110,664 | 1,982,290,621 | 14.23 s ± 0.90 | 139,342,796 | 2,455 |
+| 65,536 | 32,768 | 76,911,936 | 7,539,064,642 | 34.37 s ± 0.81 | 219,341,641 | 2,347 |
+| 125,000 | 62,500 | 145,632,319 | 14,267,663,844 | 60.92 s ± 0.92 | 234,195,592 | 2,330 |
+| 308,000 | 154,000 | 357,111,686 | 35,009,796,558 | 142.17 s ± 1.72 | 246,253,630 | 2,319 |
 
-Two things fall out, and they pull in opposite directions.
+(An earlier version of this table labelled the fixture argument "attesters" and
+so halved the per-attester figures. The times are unchanged; only the
+denominator was wrong.)
 
-**The analytical cost model understates a group proof by 3.6x.** At 125,000
-attesters `scripts/streaming_cost.py` accounts for 3.93B cost units; the guest
-really costs 14.27B. The missing term is not cryptography. At 65,536 attesters
-the emulator attributes **66.8% of the cost to `MAIN`** — plain interpreted
-RISC-V — against 4.9% to precompiles:
+Two things fall out.
+
+**Time is linear in attesters and the fit is tight.** OLS over the five sizes
+from 2,048 attesters up: intercept **6.55 s ± 0.49**, slope **878.2 µs ± 6.5**
+per attester, residuals within ±0.95 s of times spanning 8.9 s to 142 s. The
+fixture hands validators out in index order, so the opening is contiguous and
+carries about one internal node per leaf — which is why there is no curvature to
+fit. That slope is the `per_validator_s` of the time model.
+
+**The analytical cost model understates a group proof badly, and the missing
+term is not cryptography.** At 65,536 attesters the emulator attributes **66.8%
+of the cost to `MAIN`** — plain interpreted RISC-V — against 4.9% to
+precompiles:
 
 ```
 MAIN         5,230,011,648  66.77%
@@ -293,28 +400,20 @@ MEMORY         876,798,512  11.19%
 PRECOMPILES    386,532,105   4.93%
 ```
 
-That is **~1,159 executed steps per attester** — deserialising the witness and
-walking the attester list — and the model counts none of it. It counts
-`acc_leaf`, `acc_node` and BLS and nothing else.
+That is **2,347 executed steps per attester**, deserialising the witness and
+walking the attester list, and `scripts/streaming_cost.py` counted none of it:
+it counted `acc_leaf`, `acc_node` and BLS and nothing else, 6,407 cost units
+against 226,483 really spent.
 
-**But the model's predicted *times* are close anyway**, because the second error
-cancels the first. Effective throughput climbs from 18M units/s on a
-floor-dominated proof to **249M units/s** at 308,000 attesters, against the
-69.7M units/s measured on poseidon2 work. `MAIN`-heavy work proves about 3.5x
-faster per cost unit than the calibration workload:
-
-| | modelled | measured | error |
-|---|---:|---:|---:|
-| group of ~83,000 attesters | 43.3 s | ~42.2 s | −2.5% |
-| group of 125,000 attesters | 58.7 s | 60.9 s | +3.8% |
-| group of 308,000 attesters | 118.5 s | 140.5 s | **+18.5%** |
-
-So the scheduling analysis built on those times survives — the largest group is
-18% more expensive than assumed, which makes the deadline slightly harder, not
-easier. What does not survive is the idea that a single cost-units-per-second
-number describes this prover. It does not: the same constant is wrong by 3.5x in
-one direction for `MAIN`-heavy guests and right only for the poseidon2 workload
-it was fitted on.
+**The two errors partly cancelled, which is why nothing caught either.**
+Effective throughput climbs from 18M units/s on a floor-dominated proof to
+**246M units/s** at 154,000 attesters, against the 69.7M units/s measured on
+poseidon2 work — a **13.5x range within one guest**. `MAIN`-heavy work proves
+about 3.5x faster per cost unit than the calibration workload, so understating
+the work and understating the rate landed the old model within a few per cent of
+the right *time* at 62,500 attesters and 18% under it at 154,000. It was right
+by accident, in one place, and there is no constant that fixes it — which is the
+argument for the time model rather than a new rate.
 
 
 ## The pipeline stages, proved
@@ -331,7 +430,11 @@ is listed separately because it is the only one that is ever cold.
 
 The two differ by 137M cost units and by **0.18 s**. Both are floor-dominated,
 which is the same quantisation result as the bench guest seen from a different
-angle: below an AIR-instance boundary, cost units buy very little time.
+angle: below an AIR-instance boundary, cost units buy very little time. That
+0.18 s is an *in-instance* marginal — the slot proof's final exponentiation fits
+in the `ArithEq384` instance the group proof already built — so it must not be
+extrapolated to a proof large enough to need a second one. It is the fast end of
+the bracket on the Fp2-tower rate.
 
 `aggregation` and `stream-final` **could not be proved as shipped**. Their
 witnesses carry stub child proofs, `verify_child` rejects an empty proof inside
@@ -343,16 +446,22 @@ Rebuilding them with that one rejection removed (`verify_child` returning true
 for an empty proof) makes them run, and gives a **lower bound** that excludes
 all recursive verification:
 
-| stage, recursion removed | STEPS | VARIABLE | TOTAL | wall, warm |
+| stage, recursion removed | STEPS | VARIABLE | `Proof generated`, warm | wall |
 |---|---:|---:|---:|---:|
-| aggregation | 34,002 | 3,309,296 | 296,910,576 | 20.0-20.9 s |
-| stream-final | 2,376,988 | 275,264,815 | 568,866,095 | 21.7-22.1 s |
+| aggregation | 34,002 | 3,309,296 | **7.18 s +/- 0.08** | 20.0-20.9 s |
+| stream-final | 2,376,988 | 275,264,815 | 8.21 s +/- 0.21 | 21.7-22.1 s |
 
 Aggregation without recursion is **3.3M cost units** - it is nothing but the
-floor. Whatever an aggregation proof really costs is almost entirely the
-recursive verification of its children, which is exactly the term this fixture
-cannot exercise. Do not read these as stage costs; read them as evidence that
-the interesting cost is the part that is missing.
+floor, and 7.18 s of it. That is the single most useful number in this file: a
+guest doing 34,002 steps of nothing takes 2.33 s longer than an empty guest
+doing 496, and the only thing between them is the AIRs a poseidon2-and-Fp12
+guest instantiates. It is the `stage_floor_s` of the time model.
+
+What these do *not* give is the cost of recursion. Whatever an aggregation proof
+really costs is almost entirely the recursive verification of its children,
+which is exactly the term this fixture cannot exercise. Do not read these as
+stage costs; read the floor off them, and read the rest as evidence that the
+interesting cost is the part that is missing.
 
 ### Wrapping is startup, not compression
 
@@ -513,8 +622,11 @@ scattered thirty-second of the tree each:
 | **total** | **28.60B** (−47.9%) |
 
 And the committee for epoch `N` is fixed by a RANDAO mix that stops moving two
-epochs earlier, so the 14.49B has a whole epoch — 384 seconds — of slack. It is
-off the critical path by construction, not by scheduling luck.
+epochs earlier, so it has a whole epoch — 384 seconds — of slack. It is off the
+critical path by construction, not by scheduling luck. What it is *not* is free:
+measured, that proof is 878 µs per validator, so at mainnet scale it is 929 s
+and does not fit in the epoch that owes it without being cut into at least six
+chunks. See [Where the next win is](#where-the-next-win-is).
 
 ### What it does to `T2 − T`
 
@@ -523,34 +635,73 @@ the smallest thing a committee aggregate can be the complement of. Measured
 against the 26,813-attester aggregate that crossed the threshold on epoch
 430529:
 
-| | cost | GPU warm |
-|---|---:|---:|
-| marginal aggregate, enumerated | 1.42B | 22.2s |
-| marginal slot, complemented | **0.57B** | **9.6s** |
+| | GPU warm, time model |
+|---|---:|
+| marginal aggregate, enumerated (26,813 attesters) | 40.0s |
+| marginal slot, complemented (98 absentees, 3 messages) | **9.1s** |
 
-**2.5x**, and what is left is almost entirely irreducible: 0.294B of per-proof
-floor and 0.133B of final exponentiation are 75% of it, the accumulator work is
-0.005B, and the counted-set opening is gone — deduplication is now a 32-bit slot
-mask, because a committee proof puts every validator in exactly one slot.
+**4.4x**, and what is left is almost entirely irreducible: the 7.18s stage floor
+and the 0.64s final exponentiation are 86% of it, naming the absentees is 0.15s,
+and the counted-set opening is gone — deduplication is now a 32-bit slot mask,
+because a committee proof puts every validator in exactly one slot.
+
+(The cost-unit version of this table read 1.42B against 0.57B, 22.2s against
+9.6s. The ratio was understated because enumerating 26,813 attesters costs 878 µs
+apiece and the model charged 6,407 cost units; the times were understated for the
+opposite reason. Neither column should be quoted.)
 
 ## Where the next win is
 
-| | | share |
+Measured in prover-seconds rather than trace area, on epoch 430529 as the
+schedule cuts it (2,212,730 validators, five proofs plus the committee proof):
+
+| | seconds | share |
 |---|---:|---:|
-| committee proof | 14.5B | 51% |
-| per-proof floor | 9.7B | 34% |
-| pairings | 3.9B | 14% |
-| slot accumulator work | 0.2B | 1% |
+| committee proof | 1,950 | **97%** |
+| stage floors, the epoch's own five proofs | 28.7 | 1.4% |
+| distinct messages (64 of them) | 16.1 | 0.8% |
+| final exponentiation | 0.64 | 0.03% |
+| naming absentees | ~5 | 0.2% |
+| | **2,005** | |
 
-Two things worth measuring next:
+That is a different picture from the cost-unit one, and the difference is the
+whole point of re-basing. Three things follow:
 
-1. **The committee proof is half the epoch and is trivially parallel.** Bucket
-   sums add and a validator lands in one index range, so splitting it across
-   *n* proofs needs only a fold that adds aggregates. Nothing else in the
-   pipeline has that shape.
+1. **The committee proof is not half the epoch, it is all of it — and it does
+   not fit.** 1,950 s is five epochs of one card. It is fixed two epochs ahead
+   so it has slack, but slack is not the constraint: a chunk longer than 384 s
+   can never land inside the epoch that owes it. It is trivially parallel —
+   bucket sums add and a validator lands in one index range — so this is a
+   card-count problem, not a design one. But it *is* the card-count problem, and
+   the cost-unit model hid it by charging 6,407 units per validator when the
+   real cost is 2,347 executed steps and 878 µs. Scheduled:
 
-2. **The floor is 34% and it is pure overhead.** 34 proofs at 293,601,280 each.
-   Fewer, larger proofs trade that against parallelism.
+   | chunks | cards | `T2 − T` | committee lands at |
+   |---:|---:|---:|---:|
+   | 1 | 2 | 25.6 s | 1,950 s — five epochs late |
+   | 2 | 3 | 25.6 s | 986 s |
+   | 3 | 4 | 25.6 s | 662 s |
+   | 4 | 5 | 25.6 s | 500 s |
+   | **6** | **7** | **25.6 s** | **338 s — inside the epoch** |
+   | 8 | 8 | 34.3 s | 257 s |
+
+   **Six chunks on seven cards** is the first configuration that delivers the
+   next epoch's committee inside this one, and it costs nothing in `T2 − T`.
+   Eight chunks on eight cards is worse on both counts: the extra chunks crowd
+   the lane the deadline work wanted. (These are over the whole 2,212,792-entry
+   registry, which is the conservative reading — the proof opens active
+   validators, of which there are fewer.)
+
+2. **`T2 − T` and the fleet size are now separate questions.** The epoch's own
+   proofs are 55 s of prover time against 384 s of epoch, on one card, and the
+   only thing that shortens them is the floor. Buying cards does not shorten
+   `T2 − T`; it makes the committee proof fit.
+
+3. **The floor is half of what the deadline work costs, and it is pure
+   overhead.** 28.7 s of stage floor against 55 s of deadline work, in five
+   proofs. Fewer, larger proofs trade that against parallelism — and the
+   schedule already does that trade, which is why it cuts a 32-slot epoch into
+   two groups rather than seven.
 
 ## Composite: real slot proof
 
@@ -628,58 +779,98 @@ after the last attestation covers one aggregate of 26,813 attesters.
 
 ### The number
 
-`scripts/streaming_cost.py`, measured constants, the marginal aggregate sized
-from that run:
+`cargo test --release --test ssz_file_tests test_ssz_file_streaming_schedule --
+--ignored --nocapture`, the same epoch, complement proving, the time model:
 
-| | fixed groups of 8 | streaming |
+```
+=== measured floor, 4-card budget: T = 252s, T2 = 278s, T2-T = 25.6s on 2 card(s) ===
+  card 1     0.0s -> 1950.5s  1950.45s  Committee(0)
+  card 0   216.0s ->  239.1s    23.06s  Group(0) slots [0..18]
+  card 0   239.1s ->  246.2s     7.18s  Fold(0)  groups [0]
+  card 0   252.0s ->  262.7s    10.73s  Group(1) slots [19, 20, 21]
+  card 0   264.0s ->  277.5s    13.45s  Final    absorbs [1], inline slot [22]
+  card 0   277.5s ->  277.6s     0.16s  Wrap
+```
+
+**`T2 − T` is 25.6 s.** The epoch's own proofs need **one** card; the second is
+the committee proof for the next epoch, which is throughput work and never
+touches `T2`. Five proofs, two of them groups, one slot inline.
+
+| | seconds | why |
+|---|---:|---|
+| the crossing slot's group, waiting on its block | 12.0 | arrival, not proving |
+| the final proof | 13.45 | one stage floor, one final exponentiation, one slot inline |
+| the wrap | 0.16 | measured compression |
+| | **25.6** | |
+
+Two thirds of it is arrival time and a stage floor, and neither is bought with
+cost units.
+
+#### What this supersedes
+
+| published | was | now | why it moved |
+|---|---:|---:|---|
+| `T2 − T`, streaming, GPU warm | 22.2 s | see below | computed from `293,601,280` and `67,452,592`, neither of which is a time |
+| `T2 − T`, streaming, GPU cold | 60.3 s | 25.6 s + 13.5 s per invocation | the cold constant double-counted the floor |
+| `T2 − T`, scheduled, "789M floor" | 36.1 s | **25.6 s** | 789M was a trace-*area* figure used as a time; the measured stage floor is 7.18 s, not 12.20 s |
+| `T2 − T` at a 294M floor | 26.4 s | 23.3 s | same, for the smaller floor |
+| critical path, cost units | 1.418B | — | retired: `streaming_cost.py` counted no `MAIN` execution, so it understated a group proof several-fold, and the units do not convert to seconds anyway |
+
+The 22.2 s and the 25.6 s are not the same measurement of the same thing: the
+first modelled one proof in isolation, the second is a scheduler placing five
+proofs on cards against real arrival times. The isolated final proof is 9.1 s
+under the time model (`scripts/streaming_cost.py`); the other 16.5 s is waiting
+for the crossing slot's block and for the group ahead of it.
+
+#### What it is sensitive to
+
+| | `T2 − T` | cards |
 |---|---:|---:|
-| critical path | 8.597B | **1.418B** |
-| CPU (333.4s + cost/1,244,523 per proof) | 7,908s | **1,473s** |
-| GPU cold (19.52s per invocation) | 205.7s | **60.3s** *(superseded)* |
-| GPU warm (allocation held open) | 129.6s | **22.2s** *(superseded)* |
+| stage floor 2.00 s (a hypothetical) | 20.4 s | 2 |
+| stage floor 4.84 s (an empty guest) | 23.3 s | 2 |
+| **stage floor 7.18 s (measured)** | **25.6 s** | **2** |
+| stage floor 12.20 s (the old 789M, as time) | 31.5 s | 2 |
+| stage floor 30.00 s | 50.5 s | 2 |
+| Fp2-tower rate 121M units/s (the slow bracket) | 27.1 s | 2 |
+| Fp2-tower rate 663M units/s (the fast bracket) | 24.1 s | 2 |
+| recursive verification 1 s per child | 27.5 s | 2 |
+| recursive verification 5 s per child | 32.7 s | 2 |
 
-**6.1x** in cost units, **5.8x** in GPU wall-clock.
-
-> **Superseded.** Both GPU rows are computed from `293,601,280` and
-> `67,452,592`, and both constants are wrong — see
-> [The per-proof floor](#the-per-proof-floor-is-a-constant-that-does-not-describe-the-prover).
-> The cost-unit column is also wrong in the other direction: measured against
-> real group proofs, `streaming_cost.py` understates a group by **3.6x** because
-> it counts no `MAIN` execution. The two errors partly cancel, so the *times* are
-> closer than the *costs* — group proofs land within 4% of the model at 83k–125k
-> attesters and 18.5% over it at 308k — but nothing here should be quoted as a
-> measurement until the model is rebuilt on
-> [the group-stage numbers](#the-group-stage-measured-against-attester-count).
+The whole Fp2-tower bracket moves `T2 − T` by 3 s, so the model's largest
+uncertainty is not the answer's largest uncertainty. Recursion, which nothing
+measured, is worth more.
 
 **Warm and cold are different products, and the gap is 13.5s.** Measured over 87
 warm proves, wall clock exceeds the prover's own `Proof generated` by
 **13.49 s** — `INITIALIZING_PROOFMAN` is 7.74 s ± 0.71 of that and process start
 and teardown are the rest. That is what a long-running prover saves per proof,
 and it is the whole argument for `crates/witness-gen/src/prover.rs` taking
-`&self`. The 19.52s previously quoted here was a regression intercept that also
-absorbed the per-proof floor, so it cannot be added to a `proof_base` term
-without counting the floor twice — which `scripts/streaming_cost.py` currently
-does.
+`&self`. Five cold invocations would put 67 s into a 25.6 s answer.
 
-### Where the remaining 1.418B went
+### The trigger margin is worth 16.5 s, and it is the user's call
 
-That measurement predates complement proving, and the thing it identified as the
-next win is what complement proving is:
+[`StreamPolicy::threshold_numerator`] defaults to 70% while the circuit enforces
+exactly 2/3. `T` is measured at 2/3 either way, so a margin that pushes the
+crossing into the next slot shows up in full:
 
-| | | share |
-|---|---:|---:|
-| accumulator membership, marginal aggregate | 0.709B | 50.0% |
-| per-proof floor | 0.294B | 20.7% |
-| hash-to-curve, Miller loops, subgroup check | 0.133B | 9.4% |
-| final exponentiation | 0.133B | 9.4% |
-| counted-set opening | 0.084B | 5.9% |
-| public key aggregation | 0.065B | 4.6% |
-| Fp12 multiply and commitment | 0.001B | 0.1% |
+| margin | `T2 − T` | slots proven | balance | over 2/3 |
+|---:|---:|---:|---:|---:|
+| 67% | **9.1 s** | 22 | 68.52% | 1.85% |
+| 68% | 9.1 s | 22 | 68.52% | 1.85% |
+| 69% | 25.6 s | 23 | 71.63% | 4.97% |
+| **70% (default)** | **25.6 s** | 23 | 71.63% | 4.97% |
+| 72% | 34.7 s | 24 | 74.68% | 8.01% |
+| 75% | 45.1 s | 25 | 77.78% | 11.12% |
 
-Half the critical path was opening 26,813 accumulator leaves for one aggregate.
-Naming that slot's ~98 absentees instead drops it to 0.005B, and the counted-set
-opening disappears with the counted set. 1.418B becomes 0.57B; see
-**Complement proving** above.
+**16.5 s**, and the case for spending it is that the margin's original purpose
+is gone: with `slots_mask` a validator belongs to exactly one slot, so nothing
+is double-counted, and `marginal_balance` is exact rather than estimated. What
+is left is reorg risk on the crossing block, and a margin that turns out too
+thin costs a retry rather than soundness — the circuit does not know what margin
+the schedule used.
+
+That is a consensus-facing default and it has not been changed here. It is
+surfaced, with the number attached, for whoever owns that call.
 
 ## Composite: the streaming guests
 
