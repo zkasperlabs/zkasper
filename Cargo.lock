@@ -7198,6 +7198,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkasper-committee-bench-guest"
+version = "0.1.0"
+dependencies = [
+ "ziskos",
+ "zkasper-common",
+]
+
+[[package]]
 name = "zkasper-committee-proof-guest"
 version = "0.1.0"
 dependencies = [

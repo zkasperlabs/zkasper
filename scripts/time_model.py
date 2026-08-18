@@ -18,7 +18,7 @@ calibrated per work class rather than by one rate:
                        2,311 executed steps of walking one validator's bincode
                        witness
     committee members  the same leaf and curve addition out of a flat witness
-                       the guest reads in place: 328 steps, not 2,311
+                       the guest reads in place: 254 steps, not 2,311
     accumulator nodes  poseidon2 permutations above the opened leaves
     Fp2-tower work     hash-to-curve, Miller loops, the final exponentiation
     recursion          verifying a child proof, which nothing measured
@@ -59,16 +59,19 @@ STAGE_FLOOR_S = 7.176
 PER_ATTESTER_S = 878.2e-6
 
 # MEASURED under `ziskemu -X` on the committee guest itself at 16,000, 32,000
-# and 64,000 members: 328.0 executed steps and 36,473 cost units a member,
+# and 64,000 members: 254.0 executed steps and 30,127 cost units a member,
 # linear to five figures. Converted at the rate PER_ATTESTER_S sets for this
 # work class — 223,450 units bought 834.7 us, both figures less one internal
 # node — which is a within-class ratio and not a proving time of its own; the
-# step ratio 328 / 2,311 puts it at 124.6 us, so the two agree to 0.2%.
+# step ratio 254 / 2,311 puts it at 96.5 us, so the two agree to 4.6%.
 #
 # It was 404.5 us while the witness travelled as bincode. A CommitteeMember is
 # fifteen u64s in the layout the guest already wants, and decoding it as fifteen
-# self-describing records cost 829 of the 1,157 steps a member took.
-PER_MEMBER_S = 124.9e-6
+# self-describing records cost 829 of the 1,157 steps a member took. The 328
+# that left took another 74 when bls::PointSum stopped copying the running sum
+# into a syscall struct and back. `scripts/committee_bench.py` is what measures
+# a change like that in a minute rather than an hour.
+PER_MEMBER_S = 101.2e-6
 
 # MEASURED. `data/gpu_bench/bench_*.tsv`, 29 sizes, 3 warm proves each, OLS on
 # the poseidon2 guest: 37.381 us per permutation, se 0.225 us, at 2,606 cost

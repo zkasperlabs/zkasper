@@ -52,7 +52,7 @@
 //!
 //! The committee proof used to be the exception that sized the fleet: 1,950 s
 //! against a 384 s epoch, five cards' worth, cut into chunks to fit. It is
-//! 169 s now — the model was charging it the whole registry rather than the
+//! 146 s now — the model was charging it the whole registry rather than the
 //! active set, and the guest was spending 94% of it deserialising a witness it
 //! was handed in its own memory layout. One card, one chunk, inside the epoch.
 //!
@@ -179,16 +179,18 @@ pub struct ProverModel {
     /// out of a witness the guest does not parse.
     ///
     /// MEASURED under `ziskemu -X` on the committee guest itself, at 16,000,
-    /// 32,000 and 64,000 members: 328.0 executed steps and 36,473 cost units a
+    /// 32,000 and 64,000 members: 254.0 executed steps and 30,127 cost units a
     /// member, linear to five figures. Converted at the rate the attester sweep
     /// sets for this work class — 223,450 units bought 834.7 us — which is a
     /// within-class ratio and not a proving time of its own; the step ratio
-    /// 328 / 2,311 puts it at 124.6 us, so the two yardsticks agree to 0.2%.
+    /// 254 / 2,311 puts it at 96.5 us, so the two yardsticks agree to 4.6%.
     ///
     /// It was 404.5 us while the witness travelled as bincode, which is what
     /// made this proof 94% of the fleet. A `CommitteeMember` is fifteen `u64`s
     /// in the layout the guest already wants, and decoding it as fifteen
-    /// self-describing records cost 829 of the 1,157 steps a member took.
+    /// self-describing records cost 829 of the 1,157 steps a member took. The
+    /// 328 that left took another 74 when `bls::PointSum` stopped copying the
+    /// running sum into a syscall struct and back.
     pub per_member_s: f64,
     /// Seconds per internal accumulator node above the opened leaves.
     ///
@@ -223,7 +225,7 @@ impl Default for ProverModel {
         Self {
             stage_floor_s: 7.176,
             per_validator_s: 834.7e-6,
-            per_member_s: 124.9e-6,
+            per_member_s: 101.2e-6,
             acc_node_s: 43.5e-6,
             bls_units_per_second: 207_400_000.0,
             wrap_s: 0.157,

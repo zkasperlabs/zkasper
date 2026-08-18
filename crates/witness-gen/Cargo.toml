@@ -16,6 +16,10 @@ name = "gen-test-witness"
 path = "src/bin/gen_test_witness.rs"
 
 [[bin]]
+name = "gen-committee-witness"
+path = "src/bin/gen_committee_witness.rs"
+
+[[bin]]
 name = "zkasperd"
 path = "src/bin/zkasperd.rs"
 
