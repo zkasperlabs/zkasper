@@ -7,6 +7,27 @@ use zkasper_common::ssz::{
 };
 use zkasper_common::types::BootstrapWitness;
 
+/// The bytes this stage commits to.
+///
+/// Bootstrap is the one stage whose outputs are not a struct of their own, so
+/// this stands in for the `public_bytes` every other output has — and, like
+/// them, is the single place the encoding is written, so the guest that commits
+/// it and a prover that checks a proof against it cannot disagree.
+pub fn public_bytes(
+    witness: &BootstrapWitness,
+    commitment: &Digest,
+    acc_root: &Digest,
+    total_active_balance: u64,
+) -> Vec<u8> {
+    zkasper_common::recursion::PublicWriter::new()
+        .digest(commitment)
+        .digest(acc_root)
+        .u64(total_active_balance)
+        .bytes32(&witness.state_root)
+        .u64(witness.epoch)
+        .finish()
+}
+
 /// Core bootstrap verification logic. Returns (accumulator_commitment, acc_root, total_active_balance).
 pub fn verify_bootstrap(witness: &BootstrapWitness) -> (Digest, Digest, u64) {
     verify_bootstrap_with_depth(

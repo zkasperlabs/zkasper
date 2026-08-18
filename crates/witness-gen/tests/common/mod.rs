@@ -8,13 +8,23 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 
-use zkasper_common::constants::FAR_FUTURE_EPOCH;
-use zkasper_common::types::{Checkpoint, ValidatorData};
+use std::collections::BTreeSet;
 
+use zkasper_common::acc;
+use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
+use zkasper_common::constants::FAR_FUTURE_EPOCH;
+use zkasper_common::ssz::attestation_data_root;
+use zkasper_common::types::{
+    AttestationWitness, AttestingValidator, BlockHeaderFields, BlsPubkey, BlsSignature, Checkpoint,
+    EpochDiffOutput, JustificationOutput, PreviousJustification, ValidatorData,
+};
+
+use zkasper_witness_gen::acc_tree::AccTree;
 use zkasper_witness_gen::beacon_api::{
     AttestationResponse, BeaconApi, ChainStatusApi, CommitteeResponse, FinalityCheckpoints,
     HeaderResponse, ValidatorResponse,
 };
+use zkasper_witness_gen::streaming::{StreamContext, StreamUnit};
 
 /// A mock beacon API that returns synthetic data for testing.
 pub struct MockBeaconApi {
@@ -37,6 +47,9 @@ pub struct MockBeaconApi {
     /// Continuous mode is supposed to stop fetching blocks the moment the 2/3
     /// threshold is crossed, which is only observable by what it asked for.
     pub attestation_requests: Mutex<Vec<String>>,
+    /// Head header, when a test moves it between ticks. Takes precedence over
+    /// `headers["head"]`.
+    pub head: Mutex<Option<HeaderResponse>>,
 }
 
 impl MockBeaconApi {
@@ -51,12 +64,22 @@ impl MockBeaconApi {
             genesis_validators_root: [0xAA; 32],
             fork_version: [0x04, 0x00, 0x00, 0x00],
             attestation_requests: Mutex::new(Vec::new()),
+            head: Mutex::new(None),
         }
     }
 
     /// Block ids `get_block_attestations` was called with.
     pub fn requested_blocks(&self) -> Vec<String> {
         self.attestation_requests.lock().unwrap().clone()
+    }
+
+    /// Move the head, the way a node does between polls.
+    ///
+    /// Streaming only exists across ticks, and what changes between them is how
+    /// much of the epoch the node has published, so a test that never moves the
+    /// head is testing catch-up rather than streaming.
+    pub fn set_head(&self, header: HeaderResponse) {
+        *self.head.lock().unwrap() = Some(header);
     }
 
     /// Report the same finality checkpoints for every state id.
@@ -126,6 +149,11 @@ impl BeaconApi for MockBeaconApi {
     }
 
     async fn get_header(&self, block_id: &str) -> Result<HeaderResponse> {
+        if block_id == "head" {
+            if let Some(header) = self.head.lock().unwrap().clone() {
+                return Ok(header);
+            }
+        }
         self.headers
             .get(block_id)
             .cloned()
@@ -182,6 +210,187 @@ pub fn header_root(header: &HeaderResponse) -> [u8; 32] {
         &header.state_root,
         &header.body_root,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Streaming fixture
+// ---------------------------------------------------------------------------
+
+pub const STREAM_VALIDATORS: usize = 16;
+pub const STREAM_BALANCE_GWEI: u64 = 32_000_000_000;
+pub const STREAM_EPOCH: u64 = 10;
+
+/// One epoch of a synthetic chain, shaped for the streaming pipeline.
+///
+/// Sixteen validators, one aggregate per slot, real BLS signatures. The
+/// accumulator depth is a parameter because the circuit tests want a tree small
+/// enough to run in a second, while anything proven by a real guest ELF has to
+/// use the depth that ELF was compiled with.
+pub struct StreamFixture {
+    pub keys: Vec<blst::min_pk::SecretKey>,
+    pub tree: AccTree,
+    pub context: StreamContext,
+    pub units: Vec<StreamUnit>,
+    pub finalized_header: BlockHeaderFields,
+    pub previous: PreviousJustification,
+}
+
+pub fn stream_sign(sks: &[&blst::min_pk::SecretKey], msg: &[u8; 32]) -> [u8; 96] {
+    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+    let sigs: Vec<blst::min_pk::Signature> = sks.iter().map(|sk| sk.sign(msg, dst, &[])).collect();
+    let refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
+    blst::min_pk::AggregateSignature::aggregate(&refs, true)
+        .unwrap()
+        .to_signature()
+        .to_bytes()
+}
+
+/// One aggregate per slot, two validators each, eight slots.
+pub fn stream_fixture(acc_depth: u32) -> StreamFixture {
+    let keys: Vec<blst::min_pk::SecretKey> = (0..STREAM_VALIDATORS)
+        .map(|i| {
+            let mut ikm = [0u8; 32];
+            ikm[0] = i as u8;
+            ikm[1] = 0xAB;
+            blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap()
+        })
+        .collect();
+
+    let validators: Vec<ValidatorData> = keys
+        .iter()
+        .map(|sk| ValidatorData {
+            pubkey: BlsPubkey(sk.sk_to_pk().to_bytes()),
+            effective_balance: STREAM_BALANCE_GWEI,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+        })
+        .collect();
+
+    let total_active_balance = STREAM_VALIDATORS as u64 * STREAM_BALANCE_GWEI;
+    let tree = AccTree::build(&validators, STREAM_EPOCH, acc_depth);
+    let signing_domain = compute_domain(&DOMAIN_BEACON_ATTESTER, &[0x04, 0, 0, 0], &[0xAA; 32]);
+
+    // The finalized block is epoch E-1's checkpoint; the circuit opens its
+    // header, so the root has to be the header's own root.
+    let finalized_header = BlockHeaderFields {
+        slot: (STREAM_EPOCH - 1) * 32,
+        proposer_index: 7,
+        parent_root: [0x06; 32],
+        state_root: [0xAB; 32],
+        body_root: [0x09; 32],
+    };
+    let previous_root = zkasper_common::ssz::block_header_root(
+        finalized_header.slot,
+        finalized_header.proposer_index,
+        &finalized_header.parent_root,
+        &finalized_header.state_root,
+        &finalized_header.body_root,
+    );
+
+    // The diff that carried the accumulator from epoch E-1 to E. Its endpoints
+    // are what tie the finalized epoch's justification to this one's.
+    let previous_accumulator_commitment = acc::commitment(&[9, 9, 9, 9], total_active_balance);
+    let epoch_diff = EpochDiffOutput {
+        prev_accumulator_commitment: previous_accumulator_commitment,
+        state_root_1: finalized_header.state_root,
+        epoch_1: STREAM_EPOCH - 1,
+        accumulator_commitment: acc::commitment(&tree.root(), total_active_balance),
+        acc_root: tree.root(),
+        total_active_balance,
+        state_root_2: [0xCD; 32],
+        epoch_2: STREAM_EPOCH,
+    };
+
+    let context = StreamContext {
+        accumulator_commitment: acc::commitment(&tree.root(), total_active_balance),
+        acc_root: tree.root(),
+        total_active_balance,
+        target_epoch: STREAM_EPOCH,
+        target_root: [0x07; 32],
+        signing_domain,
+        group_program_vk: [1; 4],
+        aggregate_program_vk: [2; 4],
+        previous_program_vk: [3; 4],
+        epoch_diff_program_vk: [4; 4],
+        epoch_diff,
+        epoch_diff_proof: Vec::new(),
+        acc_depth,
+    };
+
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let units = (0..8u64)
+        .map(|slot| {
+            let members: Vec<usize> = vec![slot as usize * 2, slot as usize * 2 + 1];
+            stream_unit(&keys, &validators, &context, slot, &members, &mut seen)
+        })
+        .collect();
+
+    StreamFixture {
+        keys,
+        tree,
+        context,
+        units,
+        finalized_header,
+        previous: PreviousJustification::Batch(JustificationOutput {
+            accumulator_commitment: previous_accumulator_commitment,
+            target_epoch: STREAM_EPOCH - 1,
+            target_root: previous_root,
+        }),
+    }
+}
+
+pub fn stream_unit(
+    keys: &[blst::min_pk::SecretKey],
+    validators: &[ValidatorData],
+    context: &StreamContext,
+    slot: u64,
+    members: &[usize],
+    seen: &mut BTreeSet<u64>,
+) -> StreamUnit {
+    let data_root = attestation_data_root(
+        slot,
+        0,
+        &[0; 32],
+        STREAM_EPOCH - 1,
+        &[0x01; 32],
+        STREAM_EPOCH,
+        &context.target_root,
+    );
+    let signing_root = compute_signing_root(&data_root, &context.signing_domain);
+    let sks: Vec<&blst::min_pk::SecretKey> = members.iter().map(|&i| &keys[i]).collect();
+
+    let mut marginal_balance = 0;
+    let attesting_validators = members
+        .iter()
+        .map(|&i| {
+            let count_balance = seen.insert(i as u64);
+            if count_balance {
+                marginal_balance += validators[i].active_effective_balance(STREAM_EPOCH);
+            }
+            AttestingValidator {
+                validator_index: i as u64,
+                pubkey: zkasper_witness_gen::pubkey::decompress(&validators[i].pubkey.0).unwrap(),
+                active_effective_balance: validators[i].active_effective_balance(STREAM_EPOCH),
+                count_balance,
+            }
+        })
+        .collect();
+
+    StreamUnit {
+        slot,
+        marginal_balance,
+        attestation: AttestationWitness {
+            data_slot: slot,
+            data_index: 0,
+            data_beacon_block_root: [0; 32],
+            data_source_epoch: STREAM_EPOCH - 1,
+            data_source_root: [0x01; 32],
+            data_target_epoch: STREAM_EPOCH,
+            data_target_root: context.target_root,
+            signature: BlsSignature(stream_sign(&sks, &signing_root)),
+            attesting_validators,
+        },
+    }
 }
 
 /// Compute the synthetic state root from a set of validator responses.
