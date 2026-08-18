@@ -5,7 +5,10 @@
 use std::process::Command;
 
 fn main() {
+    // HEAD itself does not change when you commit on a branch -- only the ref it
+    // names does -- so watch the reflog, which every commit appends to.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     println!("cargo:rerun-if-env-changed=ZKASPER_COMMIT");
     if std::env::var("ZKASPER_COMMIT").is_ok() {
         return;
