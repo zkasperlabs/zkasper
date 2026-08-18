@@ -138,11 +138,13 @@ impl AttestationSource for EventStreamSource {
 
 /// Hold the stream open for as long as the daemon runs.
 async fn follow(url: String, shared: Arc<Shared>) {
-    // No request timeout: the stream is meant to stay open for the life of the
-    // process, and a read timeout on it would look exactly like a node that has
-    // gone quiet between slots.
+    // No *request* timeout — the stream is meant to stay open for the life of
+    // the process — but an idle one, because a connection that has silently died
+    // is indistinguishable from a quiet node until something says so. A slot's
+    // attestations arrive every slot, so half a minute of nothing is a dead
+    // stream and worth reconnecting for.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(0))
+        .read_timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("a default reqwest client");
 
@@ -224,6 +226,8 @@ fn ingest(frame: &str, shared: &Shared) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::beacon_api::SingleAttester;
 
@@ -271,6 +275,49 @@ data:{"committee_index":"2","attester_index":"64","data":{"slot":"6206","index":
             }
         }
         assert_eq!(shared.inbox.lock().unwrap().len(), 1);
+    }
+
+    /// The whole path over a socket: connect, read a body that never ends, and
+    /// hand an attestation on. What this pins that the frame tests do not is
+    /// that [`EventStreamSource`] speaks HTTP to something.
+    #[tokio::test]
+    async fn the_source_reads_attestations_off_a_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("the source connects");
+            let _ = socket.read(&mut [0u8; 4096]).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/event-stream\r\n\
+                         Connection: close\r\n\r\n\
+                         {AGGREGATE}\n\n{SINGLE}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("the body is written");
+            // Held open, because a beacon node's event stream does not end.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let source = EventStreamSource::connect(&format!("http://127.0.0.1:{port}"));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let attestations = loop {
+            let attestations = source.drain();
+            if !attestations.is_empty() || Instant::now() > deadline {
+                break attestations;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(attestations.len(), 2, "{:?}", source.counters());
+        assert_eq!(attestations[0].data_slot, 6235);
+        assert_eq!(attestations[1].data_slot, 6206);
     }
 
     /// Against a real node, which is the only thing that settles what the
