@@ -68,7 +68,7 @@ pub type Proof = Vec<u64>;
 /// prove every slot, fold them once the epoch is over, pair two justifications.
 /// `Group`, `Aggregate` and `StreamFinal` are the streaming path, which proves
 /// the same thing as attestations arrive and collapses the tail into one proof.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
     Bootstrap,
     EpochDiff,
@@ -118,7 +118,7 @@ impl Stage {
 /// The orchestrator times the whole stage, witness generation included; this is
 /// the part of it that was cryptography. The two are published apart because a
 /// `T2 - T` that folds them together cannot be checked against anything.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProveCost {
     /// Producing the VADCOP final proof.
     pub prove_millis: u64,

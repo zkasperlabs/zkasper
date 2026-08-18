@@ -23,6 +23,10 @@ path = "src/bin/gen_committee_witness.rs"
 name = "zkasperd"
 path = "src/bin/zkasperd.rs"
 
+[[bin]]
+name = "zkasper-prover-server"
+path = "src/bin/prover_server.rs"
+
 [dependencies]
 ziskos = { workspace = true }
 zkasper-common = { path = "../common", features = ["test-utils"] }

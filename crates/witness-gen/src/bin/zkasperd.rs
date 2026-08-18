@@ -9,6 +9,11 @@
 //! with it, and `--prover zisk`, it produces real ones from a prover that is
 //! initialised once and kept warm for the life of the process. See
 //! `crate::prover` and `crate::zisk_prover`.
+//!
+//! `--prover remote` puts that warm prover on another machine, which is the
+//! shape the deployment actually has: the GPU box runs a prover and nothing
+//! else. It needs no CUDA here, so a witness-only build can drive a real GPU.
+//! See `crate::remote_prover`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +30,7 @@ use zkasper_witness_gen::beacon_api::BeaconApiClient;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
 use zkasper_witness_gen::prover::{NativeProver, Prover};
 use zkasper_witness_gen::publish::{DaemonInfo, PublishConfig, Publisher};
+use zkasper_witness_gen::remote_prover::{RemoteProver, RemoteProverConfig};
 use zkasper_witness_gen::streaming::StreamPolicy;
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -48,6 +54,8 @@ enum Backend {
     Native,
     /// Real Zisk proofs, from one prover held open for the whole run.
     Zisk,
+    /// Real Zisk proofs, from a prover server on another machine.
+    Remote,
 }
 
 impl Chain {
@@ -198,6 +206,19 @@ struct Cli {
     #[arg(long)]
     #[cfg(feature = "zisk-prover")]
     proving_key: Option<PathBuf>,
+
+    /// `host:port` of the prover server, for `--prover remote`
+    #[arg(long, default_value = "127.0.0.1:9099")]
+    prover_addr: String,
+
+    /// Token the prover server expects, for `--prover remote`
+    #[arg(long, env = "ZKASPER_PROVER_TOKEN")]
+    prover_token: Option<String>,
+
+    /// Where witnesses wait out a prover outage. Defaults to
+    /// `<output-dir>/prover-spool`.
+    #[arg(long)]
+    prover_spool: Option<PathBuf>,
 }
 
 impl Cli {
@@ -205,7 +226,6 @@ impl Cli {
     ///
     /// One prover, for the life of the process: see `crate::prover` on why that
     /// is the only shape worth measuring.
-    #[cfg_attr(not(feature = "zisk-prover"), allow(unused_variables))]
     fn build_prover(&self, chain: ChainConfig, pipeline: Pipeline) -> Result<Box<dyn Prover>> {
         match self.prover {
             Backend::Native => Ok(Box::new(NativeProver::new(chain))),
@@ -224,6 +244,21 @@ impl Cli {
                 "this binary was built without the `zisk-prover` feature; \
                  rebuild with `cargo build --release --features zisk-prover`",
             ),
+            Backend::Remote => Ok(Box::new(RemoteProver::connect(RemoteProverConfig {
+                spool_dir: Some(
+                    self.prover_spool
+                        .clone()
+                        .unwrap_or_else(|| self.output_dir.join("prover-spool")),
+                ),
+                ..RemoteProverConfig::new(
+                    chain,
+                    &self.prover_addr,
+                    self.prover_token.clone().context(
+                        "--prover remote needs --prover-token (or ZKASPER_PROVER_TOKEN)",
+                    )?,
+                    pipeline.stages(),
+                )
+            })?)),
         }
     }
 }
@@ -274,6 +309,7 @@ impl Cli {
         match self.prover {
             Backend::Native => "native",
             Backend::Zisk => "zisk",
+            Backend::Remote => "remote",
         }
     }
 }
