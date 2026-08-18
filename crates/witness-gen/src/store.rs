@@ -30,14 +30,14 @@ use sha2::{Digest as _, Sha256};
 use tracing::info;
 
 use zkasper_common::acc::{self, Digest};
-use zkasper_common::types::{Checkpoint, JustificationOutput};
+use zkasper_common::types::{Checkpoint, EpochDiffOutput, JustificationOutput};
 
 use crate::acc_tree::AccTree;
 use crate::epoch_state::EpochState;
 use crate::prover::Proof;
 
 const MAGIC: &[u8; 8] = b"ZKASPRD\x01";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Everything the daemon needs to pick up exactly where it stopped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +66,13 @@ pub struct StoreState {
     /// The most recent justification, kept so that the next one can be paired
     /// with it into a finalization across a restart.
     pub last_justification: Option<JustificationRecord>,
+    /// The epoch diff that produced the accumulator the cursor sits on.
+    ///
+    /// Finalization pairs two justifications proved against two different
+    /// accumulators, and the circuit will only accept the pair if it is handed
+    /// the diff that links them. That diff is produced one stage before the
+    /// second justification, so it has to be kept — across a restart too.
+    pub last_epoch_diff: Option<EpochDiffRecord>,
     /// Last checkpoint this daemon proved finalized.
     pub finalized: Option<Checkpoint>,
 }
@@ -74,6 +81,13 @@ pub struct StoreState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JustificationRecord {
     pub output: JustificationOutput,
+    pub proof: Proof,
+}
+
+/// An epoch-diff output and the proof that backs it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EpochDiffRecord {
+    pub output: EpochDiffOutput,
     pub proof: Proof,
 }
 
@@ -98,6 +112,7 @@ impl StoreState {
             justified_through: None,
             attempted_epoch: None,
             last_justification: None,
+            last_epoch_diff: None,
             finalized: None,
         }
     }
@@ -114,6 +129,7 @@ impl StoreState {
         commitment: Digest,
         total_active_balance: u64,
         num_validators: u64,
+        epoch_diff: Option<EpochDiffRecord>,
     ) -> Result<()> {
         if to_epoch != self.cursor_epoch + 1 {
             bail!(
@@ -133,6 +149,7 @@ impl StoreState {
         self.acc_chain_digest = chain_step(&self.acc_chain_digest, to_epoch, &acc_root);
         self.total_active_balance = total_active_balance;
         self.num_validators = num_validators;
+        self.last_epoch_diff = epoch_diff;
         Ok(())
     }
 

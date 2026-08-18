@@ -1,2 +1,5 @@
 /target
 /test_data/
+/crates/onchain-verifier/lib/
+/crates/onchain-verifier/out/
+/crates/onchain-verifier/cache/

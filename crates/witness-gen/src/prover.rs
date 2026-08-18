@@ -23,7 +23,7 @@ use anyhow::{anyhow, Result};
 use zkasper_common::acc::Digest;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    BootstrapWitness, EpochDiffWitness, FinalizationOutput, FinalizationWitness,
+    BootstrapWitness, EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness,
     JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
 };
 use zkasper_common::ChainConfig;
@@ -53,7 +53,7 @@ impl Stage {
     }
 }
 
-/// Public output of the two accumulator stages (bootstrap and epoch diff).
+/// Public output of the bootstrap stage.
 #[derive(Clone, Copy, Debug)]
 pub struct AccOutput {
     pub commitment: Digest,
@@ -77,7 +77,7 @@ pub trait Prover: Send + Sync {
     fn program_vk(&self, stage: Stage) -> ProgramVk;
 
     fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)>;
-    fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(AccOutput, Proof)>;
+    fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)>;
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)>;
     fn prove_justification(
         &self,
@@ -134,22 +134,15 @@ impl Prover for NativeProver {
         ))
     }
 
-    fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(AccOutput, Proof)> {
-        let (commitment, acc_root, total_active_balance) = run_circuit(Stage::EpochDiff, || {
+    fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {
+        let output = run_circuit(Stage::EpochDiff, || {
             zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(
                 witness,
                 self.config.validators_tree_depth,
                 self.config.acc_tree_depth,
             )
         })?;
-        Ok((
-            AccOutput {
-                commitment,
-                acc_root,
-                total_active_balance,
-            },
-            Proof::new(),
-        ))
+        Ok((output, Proof::new()))
     }
 
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)> {

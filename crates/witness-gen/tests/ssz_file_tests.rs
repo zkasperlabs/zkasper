@@ -342,17 +342,20 @@ async fn test_ssz_file_epoch_diff() {
     assert_eq!(diff_witness.state_to_validators_siblings_2.len(), 6);
 
     // Verify the witness through the guest circuit logic
-    let (commitment, acc_root, total_active_balance_out) =
-        zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
+    let diff = zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
 
-    assert_eq!(acc_root, tree.root(), "poseidon root mismatch after verify");
     assert_eq!(
-        total_active_balance_out, new_balance,
+        diff.acc_root,
+        tree.root(),
+        "poseidon root mismatch after verify"
+    );
+    assert_eq!(
+        diff.total_active_balance, new_balance,
         "total active balance mismatch"
     );
     assert_eq!(
-        commitment,
-        zkasper_common::acc::commitment(&acc_root, total_active_balance_out),
+        diff.accumulator_commitment,
+        zkasper_common::acc::commitment(&diff.acc_root, diff.total_active_balance),
     );
 }
 

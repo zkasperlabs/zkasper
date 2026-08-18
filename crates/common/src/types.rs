@@ -93,15 +93,18 @@ pub struct ValidatorMutation {
 /// part of the statement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochDiffOutput {
+    // -- where this proof started --
     /// Commitment the diff started from: `H(acc_root_1, total_active_balance_1)`.
     pub prev_accumulator_commitment: Digest,
+    pub state_root_1: [u8; 32],
+    pub epoch_1: u64,
+
+    // -- where it ends --
     /// Commitment the diff produced.
     pub accumulator_commitment: Digest,
     pub acc_root: Digest,
     pub total_active_balance: u64,
-    pub state_root_1: [u8; 32],
     pub state_root_2: [u8; 32],
-    pub epoch_1: u64,
     pub epoch_2: u64,
 }
 
@@ -258,6 +261,11 @@ pub struct FinalizationOutput {
     /// later named by a finalization proof — which an attacker cannot forge
     /// without 2/3 of the real validator set attesting to their fabricated
     /// state. A branched accumulator can therefore never be confirmed.
+    ///
+    /// The circuit checks this against the epoch diff's `state_root_1`, so it is
+    /// the same beacon state the diff advancing *into* the finalized epoch
+    /// published as its `state_root_2`: the post-state of the block at the
+    /// epoch's first slot. A consumer can compare the two values directly.
     pub finalized_state_root: [u8; 32],
 }
 
@@ -320,12 +328,12 @@ impl EpochDiffOutput {
     pub fn public_bytes(&self) -> Vec<u8> {
         PublicWriter::new()
             .digest(&self.prev_accumulator_commitment)
+            .bytes32(&self.state_root_1)
+            .u64(self.epoch_1)
             .digest(&self.accumulator_commitment)
             .digest(&self.acc_root)
             .u64(self.total_active_balance)
-            .bytes32(&self.state_root_1)
             .bytes32(&self.state_root_2)
-            .u64(self.epoch_1)
             .u64(self.epoch_2)
             .finish()
     }

@@ -51,8 +51,10 @@ fn make_header(slot: u64, validators: &[ValidatorResponse]) -> HeaderResponse {
     let (state_root, _) = make_state_proof(&ssz_data_root, validators.len() as u64);
     HeaderResponse {
         slot,
+        proposer_index: 0,
         state_root,
         parent_root: [0u8; 32],
+        body_root: [0u8; 32],
     }
 }
 
@@ -461,23 +463,40 @@ fn gen_finalization(output_path: &str) {
     );
     let target_root_e1 = [0x08u8; 32];
 
+    // Epoch E+1 is justified against a *different* accumulator: one validator's
+    // effective balance moved over the epoch transition, which is the normal
+    // case on a live chain. The epoch diff below is what ties the two together.
+    let commitment_e1 = acc::commitment(&data.acc_root, data.total_active_balance - 1_000_000_000);
+    let epoch_diff_output = EpochDiffOutput {
+        prev_accumulator_commitment: data.commitment,
+        state_root_1: finalized_header.state_root,
+        epoch_1: epoch_e,
+        accumulator_commitment: commitment_e1,
+        acc_root: data.acc_root,
+        total_active_balance: data.total_active_balance - 1_000_000_000,
+        state_root_2: [0xCDu8; 32],
+        epoch_2: epoch_e1,
+    };
+
     let just_e = JustificationOutput {
         accumulator_commitment: data.commitment,
         target_epoch: epoch_e,
         target_root: target_root_e,
     };
     let just_e1 = JustificationOutput {
-        accumulator_commitment: data.commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
     };
 
     let witness = FinalizationWitness {
         justification_program_vk: [0; 4],
+        epoch_diff_program_vk: [0; 4],
         finalized_header,
-        accumulator_commitment: data.commitment,
         justification_outputs: vec![just_e, just_e1],
         justification_proofs: vec![vec![], vec![]], // stub proofs
+        epoch_diff_output,
+        epoch_diff_proof: vec![],
     };
 
     let bytes = bincode::serialize(&witness).unwrap();

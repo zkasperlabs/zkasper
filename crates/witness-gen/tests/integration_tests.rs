@@ -15,7 +15,10 @@ const TEST_CONFIG: ChainConfig = ChainConfig {
 const TEST_DEPTH: u32 = 2;
 use zkasper_common::acc;
 use zkasper_common::test_utils::make_validator;
-use zkasper_common::types::ValidatorData;
+use zkasper_common::types::{
+    EpochDiffOutput, FinalizationWitness, JustificationOutput, JustificationWitness,
+    SlotProofOutput, ValidatorData,
+};
 
 use zkasper_witness_gen::beacon_api::ValidatorResponse;
 use zkasper_witness_gen::state_diff::find_mutations;
@@ -255,14 +258,26 @@ async fn test_epoch_diff_round_trip() {
     assert_ne!(tree.root(), old_root);
 
     // Verify with epoch-diff guest verification function
-    let (commitment, acc_root, balance) =
+    let output =
         zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(&witness, TEST_DEPTH, TEST_DEPTH);
 
-    assert_eq!(acc_root, tree.root());
-    assert_eq!(balance, new_total_active_balance);
+    assert_eq!(output.acc_root, tree.root());
+    assert_eq!(output.total_active_balance, new_total_active_balance);
 
-    let expected_commitment = acc::commitment(&acc_root, balance);
-    assert_eq!(commitment, expected_commitment);
+    assert_eq!(
+        output.accumulator_commitment,
+        acc::commitment(&output.acc_root, output.total_active_balance),
+    );
+    // Both endpoints are published, so the diff can be chained onto the one it
+    // started from.
+    assert_eq!(
+        output.prev_accumulator_commitment,
+        acc::commitment(&witness.acc_root_1, witness.total_active_balance_1),
+    );
+    assert_eq!(output.epoch_1, witness.epoch_1);
+    assert_eq!(output.epoch_2, witness.epoch_2);
+    assert_eq!(output.state_root_1, witness.state_root_1);
+    assert_eq!(output.state_root_2, witness.state_root_2);
 }
 
 // -----------------------------------------------------------------------
@@ -343,15 +358,14 @@ async fn test_full_pipeline_bootstrap_then_epoch_diff() {
         .unwrap();
 
     // Verify epoch diff
-    let (_diff_commitment, diff_poseidon_root, diff_balance) =
-        zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(
-            &epoch_diff_witness,
-            TEST_DEPTH,
-            TEST_DEPTH,
-        );
+    let diff = zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(
+        &epoch_diff_witness,
+        TEST_DEPTH,
+        TEST_DEPTH,
+    );
 
-    assert_eq!(diff_poseidon_root, loaded_tree.root());
-    assert_eq!(diff_balance, new_balance);
+    assert_eq!(diff.acc_root, loaded_tree.root());
+    assert_eq!(diff.total_active_balance, new_balance);
 
     // epoch 101: v0 exits (0 ETH active), v1=32, v2=32, v3=24
     let expected = 32_000_000_000 + 32_000_000_000 + 24_000_000_000;
@@ -560,108 +574,174 @@ fn test_justification_rejects_insufficient_balance() {
 // Finalization round-trip test
 // -----------------------------------------------------------------------
 
+/// Two accumulators, one epoch apart, and the diff that links them.
+///
+/// Epoch E+1 is justified against a different accumulator than epoch E — the
+/// beacon chain rewrites effective balances at every transition — so a
+/// finalization witness needs the epoch diff that carries one to the other.
+fn linked_accumulators() -> (acc::Digest, acc::Digest, EpochDiffOutput) {
+    let acc_root = [42u64; 4];
+    let balance_e: u64 = 4 * 32_000_000_000;
+    let balance_e1: u64 = balance_e - 1_000_000_000;
+    let commitment_e = acc::commitment(&acc_root, balance_e);
+    let commitment_e1 = acc::commitment(&acc_root, balance_e1);
+
+    let diff = EpochDiffOutput {
+        prev_accumulator_commitment: commitment_e,
+        // Matches the finalized block's state root: the accumulator for epoch E
+        // is built from the state that block produced.
+        state_root_1: fin_header().state_root,
+        epoch_1: 100,
+        accumulator_commitment: commitment_e1,
+        acc_root,
+        total_active_balance: balance_e1,
+        state_root_2: [0xCDu8; 32],
+        epoch_2: 101,
+    };
+    (commitment_e, commitment_e1, diff)
+}
+
+fn finalization_witness(
+    just_e: JustificationOutput,
+    just_e1: JustificationOutput,
+    epoch_diff_output: EpochDiffOutput,
+) -> FinalizationWitness {
+    FinalizationWitness {
+        justification_program_vk: [0; 4],
+        epoch_diff_program_vk: [0; 4],
+        finalized_header: fin_header(),
+        justification_outputs: vec![just_e, just_e1],
+        justification_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
+        epoch_diff_output,
+        epoch_diff_proof: vec![],
+    }
+}
+
 #[test]
 fn test_finalization_round_trip() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{FinalizationWitness, JustificationOutput};
-
-    let acc_root = [42u64; 4];
-    let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = acc::commitment(&acc_root, total_active_balance);
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
 
     let just_e = JustificationOutput {
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e,
         target_epoch: 100,
         target_root: fin_root(),
     };
-
     let just_e1 = JustificationOutput {
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: 101,
         target_root: [8u8; 32],
     };
 
-    let witness = FinalizationWitness {
-        justification_program_vk: [0; 4],
-        finalized_header: fin_header(),
-        accumulator_commitment: commitment,
-        justification_outputs: vec![just_e.clone(), just_e1],
-        justification_proofs: vec![vec![], vec![]], // empty proofs (stub verifier)
-    };
+    let output = zkasper_finalization_guest::verify_finalization(&finalization_witness(
+        just_e, just_e1, diff,
+    ));
 
-    let output = zkasper_finalization_guest::verify_finalization(&witness);
-
-    assert_eq!(output.accumulator_commitment, commitment);
+    assert_eq!(output.accumulator_commitment, commitment_e);
+    assert_eq!(output.next_accumulator_commitment, commitment_e1);
     assert_eq!(output.finalized_epoch, 100);
     assert_eq!(output.finalized_root, fin_root());
+    assert_eq!(output.finalized_state_root, fin_header().state_root);
 }
 
 #[test]
 #[should_panic(expected = "justification epochs not consecutive")]
 fn test_finalization_rejects_non_consecutive_epochs() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{FinalizationWitness, JustificationOutput};
-
-    let acc_root = [42u64; 4];
-    let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = acc::commitment(&acc_root, total_active_balance);
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
 
     let just_e = JustificationOutput {
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e,
         target_epoch: 100,
-        target_root: [7u8; 32],
+        target_root: fin_root(),
     };
-
     // Epoch 102 instead of 101 — not consecutive!
     let just_e2 = JustificationOutput {
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: 102,
         target_root: [8u8; 32],
     };
 
-    let witness = FinalizationWitness {
-        justification_program_vk: [0; 4],
-        finalized_header: fin_header(),
-        accumulator_commitment: commitment,
-        justification_outputs: vec![just_e, just_e2],
-        justification_proofs: vec![vec![], vec![]],
-    };
-
-    zkasper_finalization_guest::verify_finalization(&witness);
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e2, diff));
 }
 
 #[test]
-#[should_panic(expected = "justification 1 accumulator mismatch")]
-fn test_finalization_rejects_accumulator_mismatch() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{FinalizationWitness, JustificationOutput};
+#[should_panic(expected = "epoch diff does not start from the accumulator")]
+fn test_finalization_rejects_a_diff_from_another_accumulator() {
+    let (_, commitment_e1, diff) = linked_accumulators();
 
-    let acc_root = [42u64; 4];
-    let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = acc::commitment(&acc_root, total_active_balance);
-
+    // Epoch E was justified against an accumulator this diff never touched —
+    // exactly the pairing of two unrelated branches the diff is there to stop.
     let just_e = JustificationOutput {
-        accumulator_commitment: commitment,
+        accumulator_commitment: [99u64; 4],
         target_epoch: 100,
-        target_root: [7u8; 32],
+        target_root: fin_root(),
     };
-
-    // Different accumulator commitment
     let just_e1 = JustificationOutput {
-        accumulator_commitment: [99u64; 4], // mismatch!
+        accumulator_commitment: commitment_e1,
         target_epoch: 101,
         target_root: [8u8; 32],
     };
 
-    let witness = FinalizationWitness {
-        justification_program_vk: [0; 4],
-        finalized_header: fin_header(),
-        accumulator_commitment: commitment,
-        justification_outputs: vec![just_e, just_e1],
-        justification_proofs: vec![vec![], vec![]],
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
+}
+
+#[test]
+#[should_panic(expected = "epoch diff does not end at the accumulator")]
+fn test_finalization_rejects_a_diff_to_another_accumulator() {
+    let (commitment_e, _, diff) = linked_accumulators();
+
+    let just_e = JustificationOutput {
+        accumulator_commitment: commitment_e,
+        target_epoch: 100,
+        target_root: fin_root(),
+    };
+    let just_e1 = JustificationOutput {
+        accumulator_commitment: [99u64; 4],
+        target_epoch: 101,
+        target_root: [8u8; 32],
     };
 
-    zkasper_finalization_guest::verify_finalization(&witness);
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
+}
+
+#[test]
+#[should_panic(expected = "epoch diff starts at epoch")]
+fn test_finalization_rejects_a_diff_labelled_with_other_epochs() {
+    let (commitment_e, commitment_e1, mut diff) = linked_accumulators();
+    diff.epoch_1 = 7;
+    diff.epoch_2 = 8;
+
+    let just_e = JustificationOutput {
+        accumulator_commitment: commitment_e,
+        target_epoch: 100,
+        target_root: fin_root(),
+    };
+    let just_e1 = JustificationOutput {
+        accumulator_commitment: commitment_e1,
+        target_epoch: 101,
+        target_root: [8u8; 32],
+    };
+
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
+}
+
+#[test]
+#[should_panic(expected = "built from a different state than the finalized block produced")]
+fn test_finalization_rejects_an_accumulator_built_off_another_state() {
+    let (commitment_e, commitment_e1, mut diff) = linked_accumulators();
+    diff.state_root_1 = [0x77u8; 32];
+
+    let just_e = JustificationOutput {
+        accumulator_commitment: commitment_e,
+        target_epoch: 100,
+        target_root: fin_root(),
+    };
+    let just_e1 = JustificationOutput {
+        accumulator_commitment: commitment_e1,
+        target_epoch: 101,
+        target_root: [8u8; 32],
+    };
+
+    zkasper_finalization_guest::verify_finalization(&finalization_witness(just_e, just_e1, diff));
 }
 
 // -----------------------------------------------------------------------
@@ -670,12 +750,7 @@ fn test_finalization_rejects_accumulator_mismatch() {
 
 #[test]
 fn test_full_justification_to_finalization_pipeline() {
-    use zkasper_common::acc;
-    use zkasper_common::types::{FinalizationWitness, JustificationWitness, SlotProofOutput};
-
-    let acc_root = [42u64; 4];
-    let total_active_balance: u64 = 4 * 32_000_000_000;
-    let commitment = acc::commitment(&acc_root, total_active_balance);
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
 
     // Build justification for epoch 100
     let epoch_100_root = fin_root();
@@ -684,15 +759,15 @@ fn test_full_justification_to_finalization_pipeline() {
 
     let just_witness_100 = JustificationWitness {
         slot_program_vk: [0; 4],
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e,
         target_epoch: 100,
         target_root: epoch_100_root,
-        total_active_balance,
+        total_active_balance: diff.total_active_balance + 1_000_000_000,
         slot_proof_outputs: vec![SlotProofOutput {
-            accumulator_commitment: commitment,
+            accumulator_commitment: commitment_e,
             target_epoch: 100,
             target_root: epoch_100_root,
-            attesting_balance: total_active_balance,
+            attesting_balance: diff.total_active_balance + 1_000_000_000,
             counted_validators_commitment: commitment_100,
             num_counted_validators: 4,
         }],
@@ -703,22 +778,23 @@ fn test_full_justification_to_finalization_pipeline() {
     let output_100 = zkasper_justification_guest::verify_justification(&just_witness_100);
     assert_eq!(output_100.target_epoch, 100);
 
-    // Build justification for epoch 101
+    // Build justification for epoch 101, against the accumulator the diff
+    // produced rather than the one epoch 100 used.
     let epoch_101_root = [8u8; 32];
     let indices_101 = vec![0u64, 1, 2, 3];
     let commitment_101 = acc::commit_indices(&indices_101);
 
     let just_witness_101 = JustificationWitness {
         slot_program_vk: [0; 4],
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: 101,
         target_root: epoch_101_root,
-        total_active_balance,
+        total_active_balance: diff.total_active_balance,
         slot_proof_outputs: vec![SlotProofOutput {
-            accumulator_commitment: commitment,
+            accumulator_commitment: commitment_e1,
             target_epoch: 101,
             target_root: epoch_101_root,
-            attesting_balance: total_active_balance,
+            attesting_balance: diff.total_active_balance,
             counted_validators_commitment: commitment_101,
             num_counted_validators: 4,
         }],
@@ -730,18 +806,15 @@ fn test_full_justification_to_finalization_pipeline() {
     assert_eq!(output_101.target_epoch, 101);
 
     // Finalization: pair two consecutive justifications
-    let finalization_witness = FinalizationWitness {
-        justification_program_vk: [0; 4],
-        finalized_header: fin_header(),
-        accumulator_commitment: commitment,
-        justification_outputs: vec![output_100, output_101],
-        justification_proofs: vec![vec![], vec![]],
-    };
+    let finalization_output = zkasper_finalization_guest::verify_finalization(
+        &finalization_witness(output_100, output_101, diff),
+    );
 
-    let finalization_output =
-        zkasper_finalization_guest::verify_finalization(&finalization_witness);
-
-    assert_eq!(finalization_output.accumulator_commitment, commitment);
+    assert_eq!(finalization_output.accumulator_commitment, commitment_e);
+    assert_eq!(
+        finalization_output.next_accumulator_commitment,
+        commitment_e1
+    );
     assert_eq!(finalization_output.finalized_epoch, 100);
     assert_eq!(finalization_output.finalized_root, epoch_100_root);
 }

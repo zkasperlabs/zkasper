@@ -5,25 +5,29 @@
 //! the daemon in the middle of an epoch and checks that a fresh one picks up
 //! exactly where it stopped.
 //!
-//! The synthetic chain changes one SSZ-only validator field per epoch
-//! (`withdrawable_epoch`), which is enough to make every epoch diff non-empty
-//! while leaving the accumulator leaves alone. That keeps the accumulator
-//! commitment stable across epochs, which is the only case the finalization
-//! circuit can currently pair — see the note in the report.
+//! The synthetic chain drops one validator's effective balance by 1 ETH every
+//! epoch, so the accumulator commitment and the total active balance are
+//! different at every epoch — as they are on a live chain, where the epoch
+//! transition rewrites effective balances. Finalization therefore has to pair
+//! justifications proved against two different accumulators, which is only
+//! possible because the circuit is handed the epoch diff that links them.
 
 mod common;
 
 use std::path::Path;
 use std::time::Duration;
 
-use common::{make_header, MockBeaconApi};
+use common::{header_root, make_header, MockBeaconApi};
 
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
 use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::ChainConfig;
 
-use zkasper_witness_gen::beacon_api::{AttestationResponse, CommitteeResponse, ValidatorResponse};
+use zkasper_witness_gen::artifacts::hex0x;
+use zkasper_witness_gen::beacon_api::{
+    AttestationResponse, CommitteeResponse, HeaderResponse, ValidatorResponse,
+};
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Tick};
 use zkasper_witness_gen::prover::NativeProver;
 use zkasper_witness_gen::store::{Store, StoreState};
@@ -66,25 +70,23 @@ fn generate_keys(n: usize) -> Vec<Key> {
         .collect()
 }
 
-fn checkpoint_root(epoch: u64) -> [u8; 32] {
-    let mut root = [0u8; 32];
-    root[0] = 0xC0;
-    root[1..9].copy_from_slice(&epoch.to_le_bytes());
-    root
-}
-
 /// Validator set as of `epoch`.
 ///
-/// Validator 0's `withdrawable_epoch` tracks the epoch. It is an SSZ field the
-/// accumulator leaf does not commit to, so every epoch has a mutation to diff
-/// while the accumulator root stays put.
+/// Validator 0 loses 1 ETH of effective balance every epoch. That is a field
+/// the accumulator leaf commits to, so every epoch has a real mutation to diff
+/// *and* lands on a different accumulator — the case finalization has to work
+/// across.
 fn validators_at(epoch: u64, keys: &[Key]) -> Vec<ValidatorResponse> {
     keys.iter()
         .enumerate()
         .map(|(i, (_, pubkey))| ValidatorResponse {
             index: i as u64,
             pubkey: *pubkey,
-            effective_balance: BALANCE_GWEI,
+            effective_balance: if i == 0 {
+                BALANCE_GWEI - epoch.saturating_sub(FIRST_EPOCH) * 1_000_000_000
+            } else {
+                BALANCE_GWEI
+            },
             activation_epoch: 0,
             exit_epoch: FAR_FUTURE_EPOCH,
             withdrawal_credentials: {
@@ -94,17 +96,39 @@ fn validators_at(epoch: u64, keys: &[Key]) -> Vec<ValidatorResponse> {
             },
             slashed: false,
             activation_eligibility_epoch: 0,
-            withdrawable_epoch: if i == 0 { epoch } else { FAR_FUTURE_EPOCH },
+            withdrawable_epoch: FAR_FUTURE_EPOCH,
         })
         .collect()
+}
+
+fn total_active_balance_at(epoch: u64, keys: &[Key]) -> u64 {
+    validators_at(epoch, keys)
+        .iter()
+        .map(|v| v.effective_balance)
+        .sum()
+}
+
+/// Header of the block at `epoch`'s first slot.
+fn header_at(epoch: u64, keys: &[Key]) -> HeaderResponse {
+    make_header(epoch * SPE, &validators_at(epoch, keys), TEST_DEPTH)
+}
+
+/// The checkpoint root for `epoch`: the root of the block at its first slot.
+///
+/// It has to be the real root of the header the mock serves, because the
+/// finalization circuit opens that header and checks it against the root the
+/// attesters signed over.
+fn checkpoint_root(epoch: u64, keys: &[Key]) -> [u8; 32] {
+    header_root(&header_at(epoch, keys))
 }
 
 /// One attestation from one validator, signed for real.
 fn attestation_from(
     key: &Key,
-    validator_slot_offset: usize,
     slot: u64,
     epoch: u64,
+    target_root: [u8; 32],
+    source_root: [u8; 32],
     domain: [u8; 32],
 ) -> AttestationResponse {
     let beacon_block_root = [0u8; 32];
@@ -113,9 +137,9 @@ fn attestation_from(
         0,
         &beacon_block_root,
         epoch - 1,
-        &checkpoint_root(epoch - 1),
+        &source_root,
         epoch,
-        &checkpoint_root(epoch),
+        &target_root,
     );
     let signing_root = compute_signing_root(&data_root, &domain);
     let signature = key
@@ -128,7 +152,6 @@ fn attestation_from(
         .to_bytes();
 
     // One validator per committee, so the aggregation bitfield is a single bit.
-    let _ = validator_slot_offset;
     AttestationResponse {
         aggregation_bits: vec![0x01],
         committee_bits: vec![],
@@ -136,9 +159,9 @@ fn attestation_from(
         data_index: 0,
         data_beacon_block_root: beacon_block_root,
         data_source_epoch: epoch - 1,
-        data_source_root: checkpoint_root(epoch - 1),
+        data_source_root: source_root,
         data_target_epoch: epoch,
-        data_target_root: checkpoint_root(epoch),
+        data_target_root: target_root,
         signature,
     }
 }
@@ -156,15 +179,16 @@ fn build_chain(keys: &[Key], head_slot: u64) -> (MockBeaconApi, [u8; 32]) {
     for epoch in FIRST_EPOCH..=LAST_EPOCH {
         let boundary = epoch * SPE;
         let responses = validators_at(epoch, keys);
+        let header = header_at(epoch, keys);
+        let target_root = header_root(&header);
 
         mock.validators
             .insert(boundary.to_string(), responses.clone());
-        mock.headers.insert(
-            boundary.to_string(),
-            make_header(boundary, &responses, TEST_DEPTH),
-        );
-        mock.block_roots
-            .insert(boundary.to_string(), checkpoint_root(epoch));
+        mock.headers.insert(boundary.to_string(), header.clone());
+        // Finalization looks the checkpoint's header up by its root, the way it
+        // has to when the epoch's first slot holds no block.
+        mock.headers.insert(hex0x(&target_root), header);
+        mock.block_roots.insert(boundary.to_string(), target_root);
 
         // One committee per slot, holding one validator.
         mock.committees.insert(
@@ -179,11 +203,19 @@ fn build_chain(keys: &[Key], head_slot: u64) -> (MockBeaconApi, [u8; 32]) {
         );
 
         // Validator i attests in the block at slot boundary + i.
+        let source_root = checkpoint_root(epoch - 1, keys);
         for (i, key) in keys.iter().enumerate() {
             let slot = boundary + i as u64;
             mock.attestations.insert(
                 slot.to_string(),
-                vec![attestation_from(key, i, slot, epoch, domain)],
+                vec![attestation_from(
+                    key,
+                    slot,
+                    epoch,
+                    target_root,
+                    source_root,
+                    domain,
+                )],
             );
         }
     }
@@ -193,7 +225,7 @@ fn build_chain(keys: &[Key], head_slot: u64) -> (MockBeaconApi, [u8; 32]) {
         "head".to_string(),
         make_header(head_slot, &head_validators, TEST_DEPTH),
     );
-    mock.set_finality(FIRST_EPOCH, checkpoint_root(FIRST_EPOCH));
+    mock.set_finality(FIRST_EPOCH, checkpoint_root(FIRST_EPOCH, keys));
 
     (mock, domain)
 }
@@ -250,7 +282,7 @@ async fn test_follows_four_epochs_end_to_end() {
         .clone()
         .expect("finalized something");
     assert_eq!(last.epoch, LAST_EPOCH - 1);
-    assert_eq!(last.root, checkpoint_root(LAST_EPOCH - 1));
+    assert_eq!(last.root, checkpoint_root(LAST_EPOCH - 1, &keys));
 
     // Streaming: each epoch stopped at the slot that crossed 2/3, and the
     // fourth slot's block was never even fetched.
@@ -312,7 +344,7 @@ async fn test_follows_four_epochs_end_to_end() {
     assert_eq!(status["last_finalized"]["epoch"], LAST_EPOCH - 1);
     assert_eq!(
         status["accumulator"]["total_active_balance"],
-        VALIDATORS as u64 * BALANCE_GWEI,
+        total_active_balance_at(LAST_EPOCH, &keys),
     );
     assert!(status["recent_stages"]
         .as_array()
@@ -459,21 +491,23 @@ fn test_accumulator_cannot_skip_or_repeat_an_epoch() {
 
     assert!(state
         .clone()
-        .advance(102, root, commitment, balance, 4)
+        .advance(102, root, commitment, balance, 4, None)
         .is_err());
     assert!(state
         .clone()
-        .advance(100, root, commitment, balance, 4)
+        .advance(100, root, commitment, balance, 4, None)
         .is_err());
 
     // A commitment that does not bind the root it is offered with is refused
     // even when the epoch is right.
     assert!(state
         .clone()
-        .advance(101, root, [0u64; 4], balance, 4)
+        .advance(101, root, [0u64; 4], balance, 4, None)
         .is_err());
 
-    state.advance(101, root, commitment, balance, 4).unwrap();
+    state
+        .advance(101, root, commitment, balance, 4, None)
+        .unwrap();
     assert_eq!(state.cursor_epoch, 101);
 }
 

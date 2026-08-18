@@ -181,14 +181,15 @@ async fn test_real_epoch_diff() {
     );
 
     // Verify epoch diff
-    let (commitment, acc_root, balance) =
-        zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
+    let diff = zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
 
-    assert_eq!(acc_root, tree.root());
-    assert_eq!(balance, new_balance);
+    assert_eq!(diff.acc_root, tree.root());
+    assert_eq!(diff.total_active_balance, new_balance);
 
-    let expected_commitment = acc::commitment(&acc_root, new_balance);
-    assert_eq!(commitment, expected_commitment);
+    assert_eq!(
+        diff.accumulator_commitment,
+        acc::commitment(&diff.acc_root, new_balance),
+    );
     eprintln!("  guest verification passed");
 }
 
@@ -251,15 +252,16 @@ async fn test_real_full_pipeline() {
         .unwrap();
 
     // Verify epoch diff
-    let (diff_commitment, diff_root, diff_balance) =
-        zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
+    let diff = zkasper_epoch_diff_guest::verify_epoch_diff(&diff_witness);
 
-    assert_eq!(diff_root, loaded_tree.root());
-    assert_eq!(diff_balance, new_balance);
+    assert_eq!(diff.acc_root, loaded_tree.root());
+    assert_eq!(diff.total_active_balance, new_balance);
 
     // Verify accumulator commitment chain
-    let expected_diff_commitment = acc::commitment(&diff_root, new_balance);
-    assert_eq!(diff_commitment, expected_diff_commitment);
+    assert_eq!(
+        diff.accumulator_commitment,
+        acc::commitment(&diff.acc_root, new_balance),
+    );
 
     eprintln!("  pipeline: {} -> {} validators", num_validators, new_count);
     eprintln!(

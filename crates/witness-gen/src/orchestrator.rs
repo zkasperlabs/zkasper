@@ -52,7 +52,7 @@ use crate::attestation_collector::SlotStream;
 use crate::beacon_api::{BeaconApi, ChainStatusApi, ValidatorResponse};
 use crate::epoch_state::EpochState;
 use crate::prover::{Proof, Prover, Stage};
-use crate::store::{JustificationRecord, Snapshot, Store, StoreState};
+use crate::store::{EpochDiffRecord, JustificationRecord, Snapshot, Store, StoreState};
 use crate::{witness_bootstrap, witness_epoch_diff, witness_justification};
 
 /// How many stage timings the manifest keeps.
@@ -412,14 +412,23 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         if output.total_active_balance != total_active_balance {
             bail!("epoch diff circuit disagrees on the total active balance at epoch {to_epoch}");
         }
+        if output.prev_accumulator_commitment != self.snapshot.state.acc_commitment {
+            bail!("epoch diff does not start from the accumulator the cursor sits on");
+        }
 
         let mut state = self.snapshot.state.clone();
+        let acc_root = output.acc_root;
+        let commitment = output.accumulator_commitment;
         state.advance(
             to_epoch,
-            output.acc_root,
-            output.commitment,
+            acc_root,
+            commitment,
             output.total_active_balance,
             num_validators,
+            Some(EpochDiffRecord {
+                output,
+                proof: proof.clone(),
+            }),
         )?;
 
         let artifact = self.sink.write_witness(to_epoch, "epoch_diff", &witness)?;
@@ -440,7 +449,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             mutations = witness.mutations.len(),
             num_validators,
             total_active_balance,
-            acc_root = %hex_digest(&output.acc_root),
+            acc_root = %hex_digest(&acc_root),
             millis,
             "accumulator advanced",
         );
@@ -672,41 +681,71 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     }
 
     /// Pair the new justification with the previous epoch's, if they can be.
+    ///
+    /// The two are proved against two different accumulators — effective
+    /// balances move at every epoch transition — so the circuit also needs the
+    /// epoch diff that carries one to the other. That is the diff this daemon
+    /// ran between the two justifications, kept in the store for exactly this.
     async fn try_finalize(&mut self, current: &JustificationRecord) -> Result<Option<Checkpoint>> {
         let Some(previous) = self.snapshot.state.last_justification.clone() else {
             return Ok(None);
         };
-        if previous.output.target_epoch + 1 != current.output.target_epoch {
+        let epoch = previous.output.target_epoch;
+        if epoch + 1 != current.output.target_epoch {
             return Ok(None);
         }
-        // The finalization circuit requires both justifications to carry the
-        // same accumulator commitment. It has no way to check an epoch diff, so
-        // it cannot relate two different accumulators — see the note in
-        // README.md. Any epoch where the validator set actually moved is
-        // therefore unfinalizable here, and saying so is better than feeding the
-        // circuit a witness it will reject.
-        if previous.output.accumulator_commitment != current.output.accumulator_commitment {
+        let Some(epoch_diff) = self.snapshot.state.last_epoch_diff.clone() else {
             warn!(
-                epoch = previous.output.target_epoch,
-                next_epoch = current.output.target_epoch,
-                "cannot finalize across an accumulator change: the finalization circuit \
-                 requires both justifications to share an accumulator commitment",
+                epoch,
+                "no epoch diff on record to link the two accumulators"
+            );
+            return Ok(None);
+        };
+        if epoch_diff.output.epoch_1 != epoch
+            || epoch_diff.output.epoch_2 != current.output.target_epoch
+            || epoch_diff.output.prev_accumulator_commitment
+                != previous.output.accumulator_commitment
+            || epoch_diff.output.accumulator_commitment != current.output.accumulator_commitment
+        {
+            warn!(
+                epoch,
+                diff_epoch_1 = epoch_diff.output.epoch_1,
+                diff_epoch_2 = epoch_diff.output.epoch_2,
+                "the epoch diff on record does not link the two justified accumulators",
             );
             return Ok(None);
         }
 
+        // The finalized block's header, addressed by its own root. Fetching by
+        // root rather than by slot is what makes this work for a checkpoint
+        // whose first slot was skipped.
+        let header = self
+            .api
+            .get_header(&crate::artifacts::hex0x(&previous.output.target_root))
+            .await
+            .with_context(|| format!("fetch the header of epoch {epoch}'s checkpoint block"))?;
+
         let started = Instant::now();
         let witness = FinalizationWitness {
-            accumulator_commitment: current.output.accumulator_commitment,
             justification_program_vk: self.prover.program_vk(Stage::Justification),
+            epoch_diff_program_vk: self.prover.program_vk(Stage::EpochDiff),
+            finalized_header: header.fields(),
             justification_outputs: vec![previous.output.clone(), current.output.clone()],
             justification_proofs: vec![previous.proof.clone(), current.proof.clone()],
+            epoch_diff_output: epoch_diff.output,
+            epoch_diff_proof: epoch_diff.proof,
         };
 
         let (output, proof) = self.prover.prove_finalization(&witness)?;
-        let epoch = current.output.target_epoch;
-        let artifact = self.sink.write_witness(epoch, "finalization", &witness)?;
-        write_proof(&self.sink, epoch, "finalization", &proof)?;
+        let artifact =
+            self.sink
+                .write_witness(current.output.target_epoch, "finalization", &witness)?;
+        write_proof(
+            &self.sink,
+            current.output.target_epoch,
+            "finalization",
+            &proof,
+        )?;
 
         let millis = started.elapsed().as_millis() as u64;
         info!(
@@ -717,7 +756,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         );
         self.record(StageTiming {
             stage: Stage::Finalization.as_str().to_string(),
-            epoch,
+            epoch: current.output.target_epoch,
             slot: None,
             millis,
             artifact: Some(artifact),

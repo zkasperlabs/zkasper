@@ -14,7 +14,7 @@
 //! - `/eth/v1/beacon/states/{state_id}/finality_checkpoints` — where the node is
 
 use anyhow::{Context, Result};
-use zkasper_common::types::Checkpoint;
+use zkasper_common::types::{BlockHeaderFields, Checkpoint};
 
 /// Trait abstracting beacon API access. Implement this for mock-based testing.
 #[async_trait::async_trait]
@@ -133,8 +133,10 @@ impl BeaconApi for BeaconApiClient {
 
         Ok(HeaderResponse {
             slot: parse_u64_str(header, "slot")?,
+            proposer_index: parse_u64_str(header, "proposer_index")?,
             state_root: parse_hex_bytes32(header, "state_root")?,
             parent_root: parse_hex_bytes32(header, "parent_root")?,
+            body_root: parse_hex_bytes32(header, "body_root")?,
         })
     }
 
@@ -236,12 +238,28 @@ pub struct CommitteeResponse {
     pub validators: Vec<u64>,
 }
 
+/// All five `BeaconBlockHeader` fields, so a caller can recompute the block
+/// root the finalization circuit checks the header against.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct HeaderResponse {
     pub slot: u64,
+    pub proposer_index: u64,
     pub state_root: [u8; 32],
     pub parent_root: [u8; 32],
+    pub body_root: [u8; 32],
+}
+
+impl HeaderResponse {
+    pub fn fields(&self) -> BlockHeaderFields {
+        BlockHeaderFields {
+            slot: self.slot,
+            proposer_index: self.proposer_index,
+            parent_root: self.parent_root,
+            state_root: self.state_root,
+            body_root: self.body_root,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

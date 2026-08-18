@@ -332,15 +332,20 @@ pub fn extract_header(
     // Field 4: latest_block_header (BeaconBlockHeader: slot(8) + proposer_index(8) + parent_root(32) + state_root(32) + body_root(32))
     // But state_root in the header is zeroed! The actual state_root is computed.
     // We need to use the *computed* state root, not the one in the header.
-    // parent_root is at offset +16 in the header field.
     let (hdr_start, _) = ranges[4];
+    let proposer_index =
+        u64::from_le_bytes(raw_ssz[hdr_start + 8..hdr_start + 16].try_into().unwrap());
     let mut parent_root = [0u8; 32];
     parent_root.copy_from_slice(&raw_ssz[hdr_start + 16..hdr_start + 48]);
+    let mut body_root = [0u8; 32];
+    body_root.copy_from_slice(&raw_ssz[hdr_start + 80..hdr_start + 112]);
 
     Ok(crate::beacon_api::HeaderResponse {
         slot,
+        proposer_index,
         state_root: [0u8; 32], // caller must set this from compute_fulu_state_root or external source
         parent_root,
+        body_root,
     })
 }
 

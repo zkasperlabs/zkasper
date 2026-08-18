@@ -124,6 +124,15 @@ fn make_test_attestation(
 // Full E2E test
 // ---------------------------------------------------------------------------
 
+/// Bootstrap, justify epoch E, move the accumulator with an epoch diff that
+/// actually changes an effective balance, justify E+1 against the accumulator
+/// that diff produced, and finalize the pair.
+///
+/// The balance change is the point. Effective balances are rewritten at every
+/// epoch transition, so on a live chain the two justifications of a finalizing
+/// pair are never proved against the same accumulator. A test where nothing
+/// moves would pass against a finalization circuit that simply required the two
+/// commitments to be equal, which is the bug this shape exists to catch.
 #[test]
 fn test_e2e_full_pipeline() {
     // 1. Generate 4 BLS key pairs
@@ -154,13 +163,11 @@ fn test_e2e_full_pipeline() {
 
     // 4. Build the accumulator tree
     let epoch_e = 10u64;
+    let epoch_e1 = epoch_e + 1;
     let acc_tree = AccTree::build(&validators, epoch_e, TEST_DEPTH);
     let acc_root = acc_tree.root();
     let commitment = acc::commitment(&acc_root, total_active_balance);
 
-    // 5. Target roots (synthetic block roots for epoch E and E+1)
-    let target_root_e = fin_root();
-    let target_root_e1 = [0x08u8; 32];
     let source_root = [0x01u8; 32];
 
     // =========================================================
@@ -175,10 +182,15 @@ fn test_e2e_full_pipeline() {
         .collect();
 
     let mut mock = MockBeaconApi::new();
-    let header = make_header(bootstrap_slot, &responses, TEST_DEPTH);
+    let header_e = make_header(bootstrap_slot, &responses, TEST_DEPTH);
+    // Epoch E's checkpoint is the block at its first slot, so its root is that
+    // header's own root. The finalization circuit opens the header and checks
+    // it against the root the attesters signed.
+    let target_root_e = common::header_root(&header_e);
     mock.validators
         .insert(bootstrap_slot.to_string(), responses.clone());
-    mock.headers.insert(bootstrap_slot.to_string(), header);
+    mock.headers
+        .insert(bootstrap_slot.to_string(), header_e.clone());
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (bootstrap_witness, tree, _epoch_state, boot_balance, boot_count) = rt
@@ -216,7 +228,6 @@ fn test_e2e_full_pipeline() {
     let slot_e0 = epoch_e * TEST_CONFIG.slots_per_epoch;
     let slot_e1 = slot_e0 + 1;
 
-    // Build attestations for slot 0
     let mut seen_e = std::collections::BTreeSet::new();
     let att_e_slot0 = make_test_attestation(
         &keys,
@@ -233,7 +244,6 @@ fn test_e2e_full_pipeline() {
         &mut seen_e,
     );
 
-    // Build attestations for slot 1
     let att_e_slot1 = make_test_attestation(
         &keys,
         &validators,
@@ -249,15 +259,8 @@ fn test_e2e_full_pipeline() {
         &mut seen_e,
     );
 
-    // Build SlotProofWitness for slot E*4 (validators 0,1)
-    let slot0_indices: Vec<u64> = vec![0, 1];
-    let slot0_leaf_indices: Vec<u64> = att_e_slot0
-        .attesting_validators
-        .iter()
-        .map(|v| v.validator_index)
-        .collect();
     let (_, slot0_poseidon_proof) =
-        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &slot0_leaf_indices);
+        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[0, 1]);
 
     let slot0_witness = SlotProofWitness {
         accumulator_commitment: commitment,
@@ -279,17 +282,8 @@ fn test_e2e_full_pipeline() {
     assert_eq!(slot0_output.attesting_balance, 2 * balance_gwei);
     assert_eq!(slot0_output.num_counted_validators, 2);
 
-    eprintln!("✓ Slot proof 0 (epoch E) verified");
-
-    // Build SlotProofWitness for slot E*4+1 (validators 2,3)
-    let slot1_indices: Vec<u64> = vec![2, 3];
-    let slot1_leaf_indices: Vec<u64> = att_e_slot1
-        .attesting_validators
-        .iter()
-        .map(|v| v.validator_index)
-        .collect();
     let (_, slot1_poseidon_proof) =
-        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &slot1_leaf_indices);
+        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[2, 3]);
 
     let slot1_witness = SlotProofWitness {
         accumulator_commitment: commitment,
@@ -308,7 +302,7 @@ fn test_e2e_full_pipeline() {
     assert_eq!(slot1_output.attesting_balance, 2 * balance_gwei);
     assert_eq!(slot1_output.num_counted_validators, 2);
 
-    eprintln!("✓ Slot proof 1 (epoch E) verified");
+    eprintln!("✓ Slot proofs (epoch E) verified");
 
     // =========================================================
     // Step C: Justification for epoch E
@@ -319,9 +313,9 @@ fn test_e2e_full_pipeline() {
         target_epoch: epoch_e,
         target_root: target_root_e,
         total_active_balance,
-        slot_proof_outputs: vec![slot0_output.clone(), slot1_output.clone()],
+        slot_proof_outputs: vec![slot0_output, slot1_output],
         slot_proofs: vec![vec![], vec![]], // stub proofs
-        counted_indices_per_slot: vec![slot0_indices.clone(), slot1_indices.clone()],
+        counted_indices_per_slot: vec![vec![0, 1], vec![2, 3]],
     };
 
     let just_e_output = zkasper_justification_guest::verify_justification(&just_e_witness);
@@ -333,17 +327,82 @@ fn test_e2e_full_pipeline() {
     eprintln!("✓ Justification (epoch E) verified");
 
     // =========================================================
-    // Step D: Slot proofs for epoch E+1
+    // Step D: Epoch diff E → E+1 (validator 0's balance: 32 → 16 ETH)
     // =========================================================
-    let epoch_e1 = epoch_e + 1;
     let slot_e1_0 = epoch_e1 * TEST_CONFIG.slots_per_epoch;
+
+    let mut validators_e1 = validators.clone();
+    validators_e1[0].effective_balance = 16_000_000_000;
+    let total_active_balance_e1 = 16_000_000_000 + 3 * balance_gwei;
+
+    let responses_e1: Vec<_> = validators_e1
+        .iter()
+        .enumerate()
+        .map(|(i, v)| validator_data_to_response(v, i as u64))
+        .collect();
+
+    let header_e1 = make_header(slot_e1_0, &responses_e1, TEST_DEPTH);
+    let target_root_e1 = common::header_root(&header_e1);
+    mock.validators
+        .insert(slot_e1_0.to_string(), responses_e1.clone());
+    mock.headers.insert(slot_e1_0.to_string(), header_e1);
+
+    let old_state = zkasper_witness_gen::EpochState::empty(bootstrap_slot, 4);
+    let mut tree_e1 = tree;
+
+    let (epoch_diff_witness, _new_epoch_state, new_balance, new_count) = rt
+        .block_on(zkasper_witness_gen::witness_epoch_diff::build(
+            &mock,
+            &TEST_CONFIG,
+            &mut tree_e1,
+            &old_state,
+            slot_e1_0,
+            total_active_balance,
+        ))
+        .unwrap();
+
+    assert_eq!(new_count, 4);
+    assert_eq!(new_balance, total_active_balance_e1);
+
+    let diff = zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(
+        &epoch_diff_witness,
+        TEST_DEPTH,
+        TEST_DEPTH,
+    );
+
+    let acc_root_e1 = tree_e1.root();
+    let commitment_e1 = diff.accumulator_commitment;
+
+    assert_eq!(diff.acc_root, acc_root_e1);
+    assert_eq!(diff.total_active_balance, new_balance);
+    assert_eq!(diff.epoch_1, epoch_e);
+    assert_eq!(diff.epoch_2, epoch_e1);
+    // The diff starts from the accumulator epoch E was justified against, and
+    // arrives at a different one — the whole reason finalization needs it.
+    assert_eq!(diff.prev_accumulator_commitment, commitment);
+    assert_ne!(commitment_e1, commitment);
+    assert_eq!(
+        commitment_e1,
+        acc::commitment(&acc_root_e1, new_balance),
+        "commitment must bind the new root and balance",
+    );
+    // And it is built from the state the finalized block produced.
+    assert_eq!(diff.state_root_1, header_e.state_root);
+
+    eprintln!(
+        "✓ Epoch diff verified: balance {} → {}",
+        total_active_balance, new_balance
+    );
+
+    // =========================================================
+    // Step E: Slot proofs for epoch E+1, against the new accumulator
+    // =========================================================
     let slot_e1_1 = slot_e1_0 + 1;
 
     let mut seen_e1 = std::collections::BTreeSet::new();
-
     let att_e1_slot0 = make_test_attestation(
         &keys,
-        &validators,
+        &validators_e1,
         &[0, 1],
         slot_e1_0,
         0,
@@ -358,7 +417,7 @@ fn test_e2e_full_pipeline() {
 
     let att_e1_slot1 = make_test_attestation(
         &keys,
-        &validators,
+        &validators_e1,
         &[2, 3],
         slot_e1_1,
         0,
@@ -371,19 +430,22 @@ fn test_e2e_full_pipeline() {
         &mut seen_e1,
     );
 
-    // Poseidon tree is the same (no epoch diff yet)
-    let (_, slot_e1_0_proof) =
-        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[0, 1]);
+    let (rebuilt_root, slot_e1_0_proof) =
+        build_acc_tree_multi_proof(&validators_e1, epoch_e1, TEST_DEPTH, &[0, 1]);
+    assert_eq!(
+        rebuilt_root, acc_root_e1,
+        "the diff's incremental update must match a tree rebuilt from scratch",
+    );
     let (_, slot_e1_1_proof) =
-        build_acc_tree_multi_proof(&validators, epoch_e, TEST_DEPTH, &[2, 3]);
+        build_acc_tree_multi_proof(&validators_e1, epoch_e1, TEST_DEPTH, &[2, 3]);
 
     let slot_e1_0_witness = SlotProofWitness {
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         signing_domain,
-        acc_root,
-        total_active_balance,
+        acc_root: acc_root_e1,
+        total_active_balance: new_balance,
         attestations: vec![att_e1_slot0],
         acc_multi_proof: slot_e1_0_proof,
     };
@@ -391,13 +453,19 @@ fn test_e2e_full_pipeline() {
     let slot_e1_0_output =
         zkasper_slot_proof_guest::verify_slot_proof_with_depth(&slot_e1_0_witness, TEST_DEPTH);
 
+    // Validator 0 now carries 16 ETH, so the slot's attesting balance moved too.
+    assert_eq!(
+        slot_e1_0_output.attesting_balance,
+        16_000_000_000 + balance_gwei
+    );
+
     let slot_e1_1_witness = SlotProofWitness {
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
         signing_domain,
-        acc_root,
-        total_active_balance,
+        acc_root: acc_root_e1,
+        total_active_balance: new_balance,
         attestations: vec![att_e1_slot1],
         acc_multi_proof: slot_e1_1_proof,
     };
@@ -408,14 +476,14 @@ fn test_e2e_full_pipeline() {
     eprintln!("✓ Slot proofs (epoch E+1) verified");
 
     // =========================================================
-    // Step E: Justification for epoch E+1
+    // Step F: Justification for epoch E+1
     // =========================================================
     let just_e1_witness = JustificationWitness {
         slot_program_vk: [0; 4],
-        accumulator_commitment: commitment,
+        accumulator_commitment: commitment_e1,
         target_epoch: epoch_e1,
         target_root: target_root_e1,
-        total_active_balance,
+        total_active_balance: new_balance,
         slot_proof_outputs: vec![slot_e1_0_output, slot_e1_1_output],
         slot_proofs: vec![vec![], vec![]],
         counted_indices_per_slot: vec![vec![0, 1], vec![2, 3]],
@@ -423,100 +491,48 @@ fn test_e2e_full_pipeline() {
 
     let just_e1_output = zkasper_justification_guest::verify_justification(&just_e1_witness);
 
-    assert_eq!(just_e1_output.accumulator_commitment, commitment);
+    assert_eq!(just_e1_output.accumulator_commitment, commitment_e1);
     assert_eq!(just_e1_output.target_epoch, epoch_e1);
-    assert_eq!(just_e1_output.target_root, target_root_e1);
 
     eprintln!("✓ Justification (epoch E+1) verified");
 
     // =========================================================
-    // Step F: Finalization (two consecutive justifications)
+    // Step G: Finalization across the epoch boundary
     // =========================================================
     let finalization_witness = FinalizationWitness {
         justification_program_vk: [0; 4],
-        finalized_header: fin_header(),
-        accumulator_commitment: commitment,
+        epoch_diff_program_vk: [0; 4],
+        finalized_header: header_e.fields(),
         justification_outputs: vec![just_e_output, just_e1_output],
         justification_proofs: vec![vec![], vec![]],
+        epoch_diff_output: diff,
+        epoch_diff_proof: vec![],
     };
 
     let finalization_output =
         zkasper_finalization_guest::verify_finalization(&finalization_witness);
 
     assert_eq!(finalization_output.accumulator_commitment, commitment);
+    assert_eq!(
+        finalization_output.next_accumulator_commitment,
+        commitment_e1
+    );
     assert_eq!(finalization_output.finalized_epoch, epoch_e);
     assert_eq!(finalization_output.finalized_root, target_root_e);
+    assert_eq!(
+        finalization_output.finalized_state_root,
+        header_e.state_root
+    );
 
     eprintln!(
-        "✓ Finalization verified: epoch={}, root=0x{}",
+        "✓ Finalization verified across an epoch boundary: epoch={}, root=0x{}",
         epoch_e,
         hex::encode(target_root_e)
     );
 
     // =========================================================
-    // Step G: Epoch diff (mutate validator 0's balance: 32 → 16 ETH)
+    // Accumulator commitment chain
     // =========================================================
-    let epoch_e2 = epoch_e1 + 1;
-    let slot_e2 = epoch_e2 * TEST_CONFIG.slots_per_epoch;
-
-    let mut validators_e2 = validators.clone();
-    validators_e2[0].effective_balance = 16_000_000_000;
-
-    let responses_e2: Vec<_> = validators_e2
-        .iter()
-        .enumerate()
-        .map(|(i, v)| validator_data_to_response(v, i as u64))
-        .collect();
-
-    // Add slot_e2 data to mock
-    let header_e2 = make_header(slot_e2, &responses_e2, TEST_DEPTH);
-    mock.validators.insert(slot_e2.to_string(), responses_e2);
-    mock.headers.insert(slot_e2.to_string(), header_e2);
-
-    // We need the bootstrap slot validators too (for the old state)
-    let old_state = zkasper_witness_gen::EpochState::empty(bootstrap_slot, 4);
-    let mut tree_for_diff = tree;
-
-    let (epoch_diff_witness, _new_epoch_state, new_balance, new_count) = rt
-        .block_on(zkasper_witness_gen::witness_epoch_diff::build(
-            &mock,
-            &TEST_CONFIG,
-            &mut tree_for_diff,
-            &old_state,
-            slot_e2,
-            total_active_balance,
-        ))
-        .unwrap();
-
-    assert_eq!(new_count, 4);
-    // New balance: 16 + 32 + 32 + 32 = 112 ETH
-    let expected_new_balance = 16_000_000_000 + 3 * 32_000_000_000u64;
-    assert_eq!(new_balance, expected_new_balance);
-
-    // Verify epoch diff
-    let (diff_commitment, diff_poseidon_root, diff_balance) =
-        zkasper_epoch_diff_guest::verify_epoch_diff_with_depth(
-            &epoch_diff_witness,
-            TEST_DEPTH,
-            TEST_DEPTH,
-        );
-
-    assert_eq!(diff_poseidon_root, tree_for_diff.root());
-    assert_eq!(diff_balance, new_balance);
-    assert_ne!(diff_commitment, commitment); // balance changed
-
-    let expected_diff_commitment = acc::commitment(&diff_poseidon_root, new_balance);
-    assert_eq!(diff_commitment, expected_diff_commitment);
-
-    eprintln!(
-        "✓ Epoch diff verified: balance {} → {}",
-        total_active_balance, new_balance
-    );
-
-    // =========================================================
-    // Verify accumulator commitment chain
-    // =========================================================
-    // Bootstrap → epoch diff: commitment chains correctly
     assert_eq!(boot_commitment, commitment);
     assert_eq!(
         epoch_diff_witness.acc_root_1, acc_root,
@@ -528,7 +544,7 @@ fn test_e2e_full_pipeline() {
     );
 
     eprintln!("✓ Full E2E pipeline passed!");
-    eprintln!("  Bootstrap → Slot proofs (2 slots × 2 epochs) → Justification × 2 → Finalization → Epoch diff");
+    eprintln!("  Bootstrap → Slot proofs (epoch E) → Justification E → Epoch diff → Slot proofs (epoch E+1) → Justification E+1 → Finalization");
 }
 
 // ---------------------------------------------------------------------------
@@ -544,28 +560,4 @@ fn build_acc_tree_multi_proof(
 ) -> (acc::Digest, AccMultiProof) {
     let tree = AccTree::build(validators, epoch, depth);
     (tree.root(), tree.build_multi_proof(leaf_indices))
-}
-
-/// Fixed header used by finalization tests, plus the root it hashes to.
-/// The circuit opens the header and checks it against the finalized root, so
-/// tests must derive the root rather than invent one.
-fn fin_header() -> zkasper_common::types::BlockHeaderFields {
-    zkasper_common::types::BlockHeaderFields {
-        slot: 3200,
-        proposer_index: 7,
-        parent_root: [0x06u8; 32],
-        state_root: [0xABu8; 32],
-        body_root: [0x09u8; 32],
-    }
-}
-
-fn fin_root() -> [u8; 32] {
-    let h = fin_header();
-    zkasper_common::ssz::block_header_root(
-        h.slot,
-        h.proposer_index,
-        &h.parent_root,
-        &h.state_root,
-        &h.body_root,
-    )
 }

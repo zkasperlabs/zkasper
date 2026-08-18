@@ -13,9 +13,13 @@ interface IZiskVerifier {
 ///
 /// Public output layouts (uint32 arrays, little-endian packed):
 ///
-///   Bootstrap:  [accumulator_commitment(8), state_root(8)]
-///   EpochDiff:  [accumulator_commitment(8), state_root_1(8), state_root_2(8)]
-///   Finality:   [accumulator_commitment(8), finalized_block_root(8)]
+///   Bootstrap:  [commitment(8), acc_root(8), total_active_balance(2),
+///                state_root(8), epoch(2)]
+///   EpochDiff:  [commitment_1(8), state_root_1(8), epoch_1(2),
+///                commitment_2(8), acc_root_2(8), total_active_balance_2(2),
+///                state_root_2(8), epoch_2(2)]
+///   Finality:   [commitment_e(8), commitment_e1(8), finalized_epoch(2),
+///                finalized_root(8), finalized_state_root(8)]
 ///
 /// The accumulator_commitment is poseidon(poseidon_root, total_active_balance),
 /// binding the Poseidon validator tree to the total active balance in one value.
@@ -47,10 +51,17 @@ contract ZkasperVerifier {
     uint256 private constant DIFF_COMMITMENT_2 = 18;
     uint256 private constant DIFF_STATE_ROOT_2 = 36;
 
-    // finalization: commitment, finalized_epoch, finalized_root, finalized_state_root
+    // finalization: commitment_e, commitment_e1, finalized_epoch,
+    //               finalized_root, finalized_state_root
     uint256 private constant FIN_COMMITMENT = 0;
-    uint256 private constant FIN_ROOT = 10;
-    uint256 private constant FIN_STATE_ROOT = 18;
+    uint256 private constant FIN_NEXT_COMMITMENT = 8;
+    uint256 private constant FIN_ROOT = 18;
+    uint256 private constant FIN_STATE_ROOT = 26;
+
+    // Total words each layout occupies, so a short array cannot be read past.
+    uint256 private constant BOOT_WORDS = 28;
+    uint256 private constant DIFF_WORDS = 46;
+    uint256 private constant FIN_WORDS = 34;
 
     bytes32 public accumulatorCommitment;
     bytes32 public latestStateRoot;
@@ -73,13 +84,14 @@ contract ZkasperVerifier {
     }
 
     /// @notice One-time initialization from a trusted state root.
-    /// Public outputs: [accumulator_commitment(8), state_root(8)]
+    /// Public outputs: [commitment(8), acc_root(8), total_active_balance(2),
+    ///                  state_root(8), epoch(2)]
     function bootstrap(
         bytes calldata proof,
         uint32[] calldata publicOutputs
     ) external {
         require(!initialized, "already initialized");
-        require(publicOutputs.length >= 16, "invalid outputs length");
+        require(publicOutputs.length >= BOOT_WORDS, "invalid outputs length");
         require(bootstrapVerifier.verify(proof, publicOutputs), "invalid proof");
 
         accumulatorCommitment = _extractBytes32(publicOutputs, BOOT_COMMITMENT);
@@ -90,13 +102,15 @@ contract ZkasperVerifier {
     }
 
     /// @notice Submit an epoch diff proof to advance the accumulator.
-    /// Public outputs: [accumulator_commitment(8), state_root_1(8), state_root_2(8)]
+    /// Public outputs: [commitment_1(8), state_root_1(8), epoch_1(2),
+    ///                  commitment_2(8), acc_root_2(8), total_active_balance_2(2),
+    ///                  state_root_2(8), epoch_2(2)]
     function submitEpochDiff(
         bytes calldata proof,
         uint32[] calldata publicOutputs
     ) external {
         require(initialized, "not initialized");
-        require(publicOutputs.length >= 24, "invalid outputs length");
+        require(publicOutputs.length >= DIFF_WORDS, "invalid outputs length");
         require(epochDiffVerifier.verify(proof, publicOutputs), "invalid proof");
 
         // Bind BOTH endpoints. The proof now names the accumulator it started
@@ -118,17 +132,25 @@ contract ZkasperVerifier {
     }
 
     /// @notice Submit a finality proof.
-    /// Public outputs: [accumulator_commitment(8), finalized_block_root(8)]
+    /// Public outputs: [commitment_e(8), commitment_e1(8), finalized_epoch(2),
+    ///                  finalized_block_root(8), finalized_state_root(8)]
     function submitFinality(
         bytes calldata proof,
         uint32[] calldata publicOutputs
     ) external {
         require(initialized, "not initialized");
-        require(publicOutputs.length >= 16, "invalid outputs length");
+        require(publicOutputs.length >= FIN_WORDS, "invalid outputs length");
         require(finalityVerifier.verify(proof, publicOutputs), "invalid proof");
 
-        bytes32 provenCommitment = _extractBytes32(publicOutputs, FIN_COMMITMENT);
-        require(provenCommitment == accumulatorCommitment, "accumulator mismatch");
+        // A finality proof spans two epochs, so it names two accumulators: the
+        // one epoch E was justified against and the one E+1 was. Either may be
+        // the accumulator this contract currently holds, depending on whether
+        // the epoch diff between them has been submitted yet.
+        require(
+            _extractBytes32(publicOutputs, FIN_COMMITMENT) == accumulatorCommitment ||
+                _extractBytes32(publicOutputs, FIN_NEXT_COMMITMENT) == accumulatorCommitment,
+            "accumulator mismatch"
+        );
 
         latestFinalizedBlockRoot = _extractBytes32(publicOutputs, FIN_ROOT);
         // Anchors the accumulator: the state root a real supermajority attested

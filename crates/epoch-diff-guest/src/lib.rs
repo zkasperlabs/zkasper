@@ -3,11 +3,10 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use zkasper_common::acc::Digest;
-use zkasper_common::types::EpochDiffWitness;
+use zkasper_common::types::{EpochDiffOutput, EpochDiffWitness};
 
-/// Core epoch-diff verification logic. Returns (new_accumulator_commitment, new_poseidon_root, new_total_active_balance).
-pub fn verify_epoch_diff(witness: &EpochDiffWitness) -> (Digest, Digest, u64) {
+/// Core epoch-diff verification logic.
+pub fn verify_epoch_diff(witness: &EpochDiffWitness) -> EpochDiffOutput {
     verify_epoch_diff_with_depth(
         witness,
         zkasper_common::constants::VALIDATORS_TREE_DEPTH,
@@ -23,7 +22,7 @@ pub fn verify_epoch_diff_with_depth(
     witness: &EpochDiffWitness,
     ssz_depth: u32,
     acc_depth: u32,
-) -> (Digest, Digest, u64) {
+) -> EpochDiffOutput {
     use zkasper_common::acc;
     use zkasper_common::ssz::{
         compute_ssz_merkle_root, list_hash_tree_root, validator_hash_tree_root,
@@ -179,7 +178,26 @@ pub fn verify_epoch_diff_with_depth(
         "state_root_2 mismatch"
     );
 
-    let commitment = zkasper_common::acc::commitment(&acc_root, total_active_balance);
-
-    (commitment, acc_root, total_active_balance)
+    // Publish both endpoints, not just the new one.
+    //
+    // Committing only the new side leaves the proof unmoored: it attests "there
+    // is a valid transition to X" without saying what it started from, so a
+    // client holding accumulator A cannot check that this proof advanced from A.
+    // Chaining is the entire security model of the accumulator, and it cannot be
+    // enforced against values the proof never names. The circuit already
+    // verifies `acc_root_1` and `state_root_1` internally; publishing them is
+    // what lets a verifier close the loop.
+    EpochDiffOutput {
+        prev_accumulator_commitment: acc::commitment(
+            &witness.acc_root_1,
+            witness.total_active_balance_1,
+        ),
+        state_root_1: witness.state_root_1,
+        epoch_1: witness.epoch_1,
+        accumulator_commitment: acc::commitment(&acc_root, total_active_balance),
+        acc_root,
+        total_active_balance,
+        state_root_2: witness.state_root_2,
+        epoch_2: witness.epoch_2,
+    }
 }

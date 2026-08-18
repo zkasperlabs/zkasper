@@ -162,9 +162,26 @@ pub fn make_header(slot: u64, validators: &[ValidatorResponse], depth: u32) -> H
     let state_root = compute_state_root_from_validators(validators, depth);
     HeaderResponse {
         slot,
+        proposer_index: slot % 8,
         state_root,
         parent_root: [0u8; 32],
+        body_root: [0u8; 32],
     }
+}
+
+/// The block root a header hashes to.
+///
+/// Checkpoint roots in these tests have to be the real roots of the headers the
+/// mock serves: the finalization circuit opens the header and checks it against
+/// the root the attesters signed, so an invented root would never verify.
+pub fn header_root(header: &HeaderResponse) -> [u8; 32] {
+    zkasper_common::ssz::block_header_root(
+        header.slot,
+        header.proposer_index,
+        &header.parent_root,
+        &header.state_root,
+        &header.body_root,
+    )
 }
 
 /// Compute the synthetic state root from a set of validator responses.

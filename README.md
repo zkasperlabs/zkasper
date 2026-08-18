@@ -21,7 +21,15 @@ zkasper proves that an Ethereum Casper FFG checkpoint has been finalized, withou
 4. **Justification** — folds a slot's proofs recursively, dedupes attesters
    across slots, and checks the 2/3 threshold.
 
-5. **Finalization** — pairs two consecutive justifications.
+5. **Finalization** — pairs two consecutive justifications, together with the
+   epoch diff that carries the accumulator from the first epoch to the second.
+   Effective balances are rewritten at every epoch transition, so the two
+   justifications are never proved against the same accumulator; verifying the
+   diff between them is what makes the pair sound. The proof publishes both
+   accumulator commitments, the finalized checkpoint, and the beacon state root
+   that checkpoint's block produced — which the circuit pins to the state the
+   accumulator entered the finalized epoch with, so a consumer can compare the
+   two directly.
 
 Stages 3 to 5 compose through `verify_zisk_proof`, so slot proofs can be produced
 independently and in parallel.
@@ -177,6 +185,13 @@ exactly one epoch forward.
 - [x] Measured cost model ([BENCHMARKS.md](BENCHMARKS.md), `scripts/bench.py`)
 - [x] All guests build for `riscv64ima-zisk-zkvm-elf` and run under `ziskemu`
 - [x] Accumulator leaf commits the decompressed public key (28.4% off a mainnet epoch)
+- [x] Finalization across a real epoch boundary, with the epoch diff linking the
+      two accumulators verified inside the proof
+- [ ] Finalizing an epoch whose first slot was empty. The accumulator is built
+      from the state at the epoch boundary, and the finalized header only names
+      that state when a block sits on the boundary slot. Covering the empty case
+      needs the boundary state root proved out of the finalized state's
+      `state_roots` list.
 - [ ] Projective or batched-inversion G1 aggregation (now the largest cost)
 - [ ] Solidity verifier integration with the Zisk proof format
 - [ ] Bootstrap chunking across recursive proofs
