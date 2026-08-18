@@ -492,6 +492,7 @@ voluntary.
 | `store format version N, expected M` | Format bump, no migration exists | Delete and re-bootstrap. |
 | `the ... circuit rejected the witness` | An unprovable witness | Real bug. Keep the epoch directory under `out/epoch-*` — it is the reproduction. |
 | `the ... proof does not verify against its own program key and outputs` | Prover, ELF or proving-key mismatch | Not a chain problem. Check the ELF against the proving key. |
+| `fetch header at slot N` / `NOT_FOUND: beacon block at slot N`, repeating forever | **The epoch boundary slot was skipped.** Fixed — the epoch diff now reads the state root from `/eth/v1/beacon/states/{slot}/root`, which is defined for a skipped slot, instead of from a block header, which is not. On a build before that fix the daemon crash-loops permanently, because the slot will never gain a block. | Rebuild. To get moving without one, re-bootstrap with `--bootstrap-slot` set past the skipped boundary. |
 | Wedged, repeating the same epoch | The node cannot serve that epoch's state | Re-bootstrap. |
 
 ### Re-bootstrapping
@@ -726,6 +727,34 @@ folded before the trigger fired. These are the first two streaming epochs after 
 bootstrap, so the daemon opened them already in progress; this is the shape a
 catch-up produces, not steady state. Do not quote them as a steady-state result
 until a run has produced epochs it followed from their first slot.
+
+### Two bugs the run found
+
+Both were only visible against real mainnet traffic, and both are fixed and
+pushed. They are recorded because they say what a readiness run is for.
+
+1. **A slot could be proved twice.** `SlotStream::forget` dropped a slot's
+   collected attestations but did not stop later ones re-creating it, despite its
+   doc comment saying it did. Attestations for a slot keep arriving for several
+   slots after it closes, so the slot came back, was taken a second time, and the
+   aggregation circuit correctly rejected the epoch with `group proof 0 counts a
+   slot that was already counted`. The daemon died. Observed once in the first
+   four epochs. Fixed by remembering forgotten slots and dropping later arrivals
+   for them — which also fixes the gossip-gap repair path, where a rescan would
+   have re-ingested already-proved slots.
+
+2. **An empty epoch boundary slot wedged the daemon permanently.** The epoch diff
+   verified its parsed state against the block header at the boundary slot. Slot
+   15,020,032 had no block, `/eth/v1/beacon/headers/15020032` returned 404, and
+   the daemon crash-looped — the slot will never gain a block, so the supervisor
+   restarting it forever made no difference. About 1% of slots are missed on
+   mainnet, so this is roughly one epoch in a hundred, or **two to three times a
+   day**. Fixed by reading the state root from `/eth/v1/beacon/states/{slot}/root`,
+   which is defined for every slot.
+
+The second one is the reason a day-long run needed rehearsing rather than
+launching: nothing in a fixture-backed test suite produces a skipped epoch
+boundary.
 
 ### Health at the end of the window
 
