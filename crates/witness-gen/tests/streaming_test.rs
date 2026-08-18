@@ -16,7 +16,7 @@ use common::{
 
 use zkasper_common::types::*;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
-use zkasper_witness_gen::streaming::{self, StreamPolicy};
+use zkasper_witness_gen::streaming::{self, Stage, StreamPolicy};
 
 /// Small enough to run in a second. A guest ELF is compiled against the
 /// production depth instead; see `zisk_proof_tests`.
@@ -40,6 +40,20 @@ fn rejection(what: &str, f: impl FnOnce() + std::panic::UnwindSafe) -> String {
             .downcast::<&'static str>()
             .map(|m| m.to_string())
             .unwrap_or_default(),
+    }
+}
+
+/// The same plan with every group folded rather than handed to the final proof.
+///
+/// A fold is a whole per-proof floor and buys nothing the final proof cannot do
+/// itself, so the scheduler only ever emits one when it has time to spare — and
+/// an eight-slot fixture does not. The tests that are about what a fold *binds*
+/// need one anyway.
+fn folded(plan: &streaming::StreamPlan) -> streaming::StreamPlan {
+    streaming::StreamPlan {
+        folds: (0..plan.groups.len()).map(|g| vec![g]).collect(),
+        absorbed: Vec::new(),
+        ..plan.clone()
     }
 }
 
@@ -74,7 +88,7 @@ fn streaming_pipeline_justifies_and_finalizes() {
     assert_eq!(plan.tail, vec![5]);
     assert!(plan.groups.concat().iter().all(|&i| i < 5));
 
-    let run = run(&fixture, &plan);
+    let run = run(&fixture, &folded(&plan));
 
     assert_eq!(run.final_output.justified_epoch, EPOCH);
     assert_eq!(run.final_output.justified_root, fixture.context.target_root);
@@ -154,7 +168,7 @@ fn a_groups_balance_cannot_be_counted_without_its_pairings() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &plan);
+    let run = run(&fixture, &folded(&plan));
 
     // Swap in the identity for the aggregate's Miller accumulator — the value a
     // prover would want if it hoped to count balances whose signatures it does
@@ -229,23 +243,29 @@ fn a_slot_cannot_be_counted_by_two_groups() {
 ///
 /// This is the claim the whole design rests on, so it is asserted rather than
 /// left to the benchmark script: whatever the epoch's size, what runs after the
-/// last attestation is a single proof over a single committee's complement.
+/// last attestation is a single proof over a single committee's complement, and
+/// the schedule puts nothing else there.
 #[test]
 fn only_one_proof_and_one_slot_sit_after_the_last_attestation() {
     let fixture = fixture();
-    let plan = streaming::plan(
+    let schedule = streaming::schedule(
         &fixture.units,
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &plan);
+    let run = run(&fixture, &schedule.plan);
 
     assert_eq!(run.final_witness.tail.len(), 1);
-    // Nothing but the running aggregate is left to verify: every group was
-    // already folded, so the final proof does one recursion for the epoch, one
-    // for the previous epoch's justification, and no more.
-    assert!(run.final_witness.groups.is_empty());
-    assert!(run.final_witness.aggregate.is_some());
+
+    let last = fixture.units[*schedule.plan.tail.last().unwrap()].slot;
+    let arrival = (last - fixture.units[0].slot) as f64 * 12.0;
+    let after: Vec<Stage> = schedule
+        .proofs
+        .iter()
+        .filter(|p| p.start_s >= arrival)
+        .map(|p| p.stage)
+        .collect();
+    assert_eq!(after, vec![Stage::Final, Stage::Wrap]);
 }
 
 /// The proof chain has to hold together: an aggregate built against one
@@ -258,7 +278,7 @@ fn an_aggregate_from_another_checkpoint_is_rejected() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &plan);
+    let run = run(&fixture, &folded(&plan));
 
     let mut forged = run.final_witness.clone();
     forged.aggregate.as_mut().unwrap().target_root = [0xEE; 32];

@@ -924,3 +924,282 @@ async fn test_ssz_file_streaming_finality() {
         run.aggregate_outputs.len(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Report: what the latency-aware schedule makes of a real epoch
+// ---------------------------------------------------------------------------
+
+/// Print the schedule real mainnet arrivals produce, against the per-proof
+/// floor, the lane pool, the trigger margin and the committee chunking.
+///
+/// This is a report and not an assertion. The floor is a display constant in
+/// Zisk that does not match the shipped AIR layout and is being re-measured, so
+/// every second here moves with it; what is stable is the shape, and the
+/// assertions at the end pin only that.
+#[tokio::test]
+#[ignore = "downloads ~320MB"]
+async fn test_ssz_file_streaming_schedule() {
+    use zkasper_witness_gen::streaming::{self, LanePool, ProverModel, Stage, StreamPolicy};
+
+    init_tracing();
+    const CONFIG: ChainConfig = ChainConfig::MAINNET;
+
+    let path2 = ensure_state(&STATE_2);
+    let mut api = SszFileApi::load(&[(&path2, STATE_2.expected_root)], &CONFIG);
+    let slot = 13_776_928u64;
+    let epoch = slot / CONFIG.slots_per_epoch;
+
+    let finality_path = ensure_file(FINALITY_DATA);
+    let (target_epoch, target_root) = api.load_finality_data(&finality_path);
+    assert_eq!(target_epoch, epoch);
+
+    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, num_validators) =
+        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
+            .await
+            .unwrap();
+
+    let committees = Arc::new(
+        zkasper_witness_gen::committee::build(
+            &api.get_committees(&slot.to_string(), target_epoch)
+                .await
+                .unwrap(),
+            &api.get_validators(&slot.to_string()).await.unwrap(),
+            &tree,
+            &CONFIG,
+            target_epoch,
+            target_epoch,
+            total_active_balance,
+        )
+        .unwrap(),
+    );
+
+    let units = zkasper_witness_gen::attestation_collector::collect_per_slot_for_checkpoint(
+        &api,
+        &CONFIG,
+        committees.clone(),
+        target_epoch,
+        &target_root,
+    )
+    .await
+    .unwrap();
+
+    eprintln!("\nepoch {epoch}: {} slot complements", units.len());
+    eprintln!(
+        "{:>4} {:>6} {:>8} {:>7} {:>6}",
+        "slot", "named", "absent", "messages", "cum%",
+    );
+    let mut cumulative = 0u128;
+    for unit in &units {
+        cumulative += unit.marginal_balance as u128;
+        eprintln!(
+            "{:>4} {:>6} {:>8} {:>8} {:>5.1}%",
+            unit.slot - units[0].slot,
+            unit.named_indices.len(),
+            unit.witness.absentees.len(),
+            1 + unit.witness.secondary.len(),
+            cumulative as f64 / total_active_balance as f64 * 100.0,
+        );
+    }
+
+    let policy = |proof_base: f64, lanes: usize, lane_pool: LanePool| StreamPolicy {
+        lanes,
+        lane_pool,
+        validators: num_validators as f64,
+        prover: ProverModel {
+            proof_base,
+            ..ProverModel::default()
+        },
+        ..StreamPolicy::default()
+    };
+    let sizes = |schedule: &streaming::Schedule| -> Vec<usize> {
+        schedule.plan.groups.iter().map(|g| g.len()).collect()
+    };
+
+    // The floor Zisk displays, and the floor a source-level audit of the shipped
+    // proving key says it really is.
+    const FLOORS: [(&str, f64); 2] = [("293.6M", 293_601_280.0), ("789M", 789_000_000.0)];
+
+    for (label, proof_base) in FLOORS {
+        eprintln!(
+            "\n=== per-proof floor {label} ({:.1}s warm) ===",
+            proof_base / 67_452_592.0 + 0.5,
+        );
+        eprintln!(
+            "{:>5} {:>12} {:>8} {:>6} {:>9} {:>7} {:>10}  groups + inline",
+            "budget", "pool", "T2-T", "cards", "cost", "proofs", "committee",
+        );
+        for lanes in 1..=6 {
+            for lane_pool in [LanePool::Fungible, LanePool::Specialised] {
+                let schedule = streaming::schedule(
+                    &units,
+                    total_active_balance,
+                    &policy(proof_base, lanes, lane_pool),
+                );
+                eprintln!(
+                    "{lanes:>6} {:>12} {:>7.1}s {:>6} {:>8.1}B {:>7} {:>9.0}s  {:?} + {}",
+                    format!("{lane_pool:?}"),
+                    schedule.latency_s(),
+                    schedule.lanes,
+                    schedule.total_cost / 1e9,
+                    schedule.proofs.len(),
+                    schedule.committee_done_s,
+                    sizes(&schedule),
+                    schedule.plan.tail.len(),
+                );
+            }
+        }
+    }
+
+    // The timeline an orchestrator has to execute.
+    let chosen = streaming::schedule(
+        &units,
+        total_active_balance,
+        &policy(789_000_000.0, 4, LanePool::Fungible),
+    );
+    eprintln!(
+        "\n=== 789M floor, 4-card budget: T = {:.0}s, T2 = {:.0}s, T2-T = {:.1}s on {} card(s) ===",
+        chosen.threshold_s,
+        chosen.postable_s,
+        chosen.latency_s(),
+        chosen.lanes,
+    );
+    for proof in &chosen.proofs {
+        let covers = match proof.stage {
+            Stage::Group(g) => format!(
+                "slots {:?}",
+                chosen.plan.groups[g]
+                    .iter()
+                    .map(|&i| units[i].slot - units[0].slot)
+                    .collect::<Vec<_>>(),
+            ),
+            Stage::Fold(f) => format!("groups {:?}", chosen.plan.folds[f]),
+            Stage::Final => format!(
+                "absorbs {:?}, inline slots {:?}",
+                chosen.plan.absorbed,
+                chosen
+                    .plan
+                    .tail
+                    .iter()
+                    .map(|&i| units[i].slot - units[0].slot)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => String::new(),
+        };
+        eprintln!(
+            "  card {}  {:>6.1}s -> {:>6.1}s  {:>7.3}B  {:?} {covers}",
+            proof.lane,
+            proof.start_s,
+            proof.end_s,
+            proof.cost / 1e9,
+            proof.stage,
+        );
+    }
+
+    // How much of the answer is the floor rather than the schedule.
+    eprintln!("\n=== sensitivity to the floor, 4-card budget ===");
+    eprintln!(
+        "{:>8} {:>8} {:>7} {:>6} {:>9} {:>7}  groups",
+        "floor", "T2-T", "inline", "cards", "cost", "proofs",
+    );
+    for proof_base in [
+        100e6, 200e6, 293.6e6, 400e6, 500e6, 620e6, 789e6, 1000e6, 1500e6,
+    ] {
+        let schedule = streaming::schedule(
+            &units,
+            total_active_balance,
+            &policy(proof_base, 4, LanePool::Fungible),
+        );
+        eprintln!(
+            "{:>7.0}M {:>7.1}s {:>7} {:>6} {:>8.1}B {:>7}  {:?}",
+            proof_base / 1e6,
+            schedule.latency_s(),
+            schedule.plan.tail.len(),
+            schedule.lanes,
+            schedule.total_cost / 1e9,
+            schedule.proofs.len(),
+            sizes(&schedule),
+        );
+    }
+
+    // The trigger margin. `T` is 2/3 either way, so a margin that pushes the
+    // crossing into the next slot shows up here as a whole slot of latency.
+    eprintln!("\n=== sensitivity to the trigger margin, 789M floor, 4-card budget ===");
+    eprintln!(
+        "{:>7} {:>8} {:>7} {:>10} {:>9}",
+        "margin", "T2-T", "slots", "balance", "over 2/3",
+    );
+    for numerator in [67u64, 68, 69, 70, 72, 75] {
+        let schedule = streaming::schedule(
+            &units,
+            total_active_balance,
+            &StreamPolicy {
+                threshold_numerator: numerator,
+                ..policy(789_000_000.0, 4, LanePool::Fungible)
+            },
+        );
+        let share = schedule.plan.attesting_balance as f64 / total_active_balance as f64;
+        eprintln!(
+            "{numerator:>6}% {:>7.1}s {:>7} {:>9.2}% {:>8.2}%",
+            schedule.latency_s(),
+            schedule.plan.groups.concat().len() + schedule.plan.tail.len(),
+            share * 100.0,
+            (share - 2.0 / 3.0) * 100.0,
+        );
+    }
+
+    // The committee proof: half the epoch's cost, a whole epoch of lead time,
+    // and trivially chunkable. What it decides is the card count, not `T2 − T`.
+    eprintln!("\n=== committee proof chunking, 789M floor ===");
+    eprintln!(
+        "{:>7} {:>7} {:>8} {:>7} {:>9} {:>9}",
+        "chunks", "cards", "T2-T", "done", "committee", "total",
+    );
+    for chunks in [1usize, 2, 4, 8, 16] {
+        for lanes in 1..=6 {
+            let schedule = streaming::schedule(
+                &units,
+                total_active_balance,
+                &StreamPolicy {
+                    committee_chunks: chunks,
+                    ..policy(789_000_000.0, lanes, LanePool::Fungible)
+                },
+            );
+            if schedule.committee_overrun_s() == 0.0 || lanes == 6 {
+                let committee: f64 = schedule
+                    .proofs
+                    .iter()
+                    .filter(|p| matches!(p.stage, Stage::Committee(_) | Stage::CommitteeFold))
+                    .map(|p| p.cost)
+                    .sum();
+                eprintln!(
+                    "{chunks:>7} {:>7} {:>7.1}s {:>6.0}s {:>8.1}B {:>8.1}B",
+                    schedule.lanes,
+                    schedule.latency_s(),
+                    schedule.committee_done_s,
+                    committee / 1e9,
+                    schedule.total_cost / 1e9,
+                );
+                break;
+            }
+        }
+    }
+
+    // The shape, which does not move with the floor: weight arrives one
+    // committee at a time, so the epoch ends with a tail the final proof
+    // swallows whole and exactly one proof between the last attestation and the
+    // wrap.
+    assert!(chosen.plan.threshold_reached);
+    assert!(
+        !chosen.plan.tail.is_empty(),
+        "the crossing slot took a group"
+    );
+    let last = units[*chosen.plan.tail.last().unwrap()].slot;
+    let arrival = (last - units[0].slot) as f64 * 12.0;
+    let after: Vec<Stage> = chosen
+        .proofs
+        .iter()
+        .filter(|p| p.start_s >= arrival && !matches!(p.stage, Stage::Committee(_)))
+        .map(|p| p.stage)
+        .collect();
+    assert_eq!(after, vec![Stage::Final, Stage::Wrap]);
+}
