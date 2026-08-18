@@ -56,7 +56,7 @@ The validator-set accumulator the proofs are bound to.
 ```
 
 `chain_digest` is the running hash over every `(epoch, acc_root)` since
-bootstrap. Two daemons that followed the same chain agree on it; one that missed
+the init point. Two daemons that followed the same chain agree on it; one that missed
 an epoch does not.
 
 ### `stage`
@@ -81,7 +81,7 @@ and are absent on a witness-only run.
 }
 ```
 
-`stage` is one of `bootstrap`, `epoch_diff`, `committee`, `slot_proof`,
+`stage` is one of `epoch_diff`, `committee`, `slot_proof`,
 `justification`, `finalization`, `group`, `aggregate`, `stream_final` — the
 daemon's own names, unchanged. `index` orders repeats of the same stage inside an
 epoch (group 0, group 1, …) and is `null` for stages that run once.
@@ -156,7 +156,7 @@ The decoded form of `public_bytes` for a `stream_final` proof. This is the claim
 ```
 
 For a `finalization` proof (the batch pipeline, which runs for the first epoch
-after a bootstrap) the fields are `accumulator_commitment`, `finalized_epoch`,
+of a run) the fields are `accumulator_commitment`, `finalized_epoch`,
 `finalized_root`, `finalized_state_root`.
 
 ### `verify`
@@ -230,7 +230,7 @@ everything here also arrives on `/v1/live` as a `status` event.
   "pipeline": "streaming",
   "updated_unix": 1755525140,
   "head_slot": 15019776,
-  "bootstrap_epoch": 469300,
+  "init_epoch": 469300,
   "accumulator": { "...": "accumulator" },
   "justified_through": 469368,
   "last_justified": { "...": "checkpoint" },
@@ -324,9 +324,9 @@ number, for paging), `status` (`proven`, `proving`, `abandoned`).
   under the daemon. `abandoned_reason` says which.
 
 The first epoch of a run is `proven` with `finalized: null` and a `proof` whose
-stage is `justification`. It has nothing before it to finalize — a bootstrap has
-no previous justification to pair with — so a justification is the only proof it
-will ever have. Every epoch after it is closed by `stream_final`.
+stage is `justification`. It has nothing before it to finalize — the epoch a run
+starts on has no previous justification to pair with — so a justification is the
+only proof it will ever have. Every epoch after it is closed by `stream_final`.
 
 `next_before` is null when there is no older page. Cache: `public, max-age=5`.
 
@@ -503,12 +503,17 @@ Nothing here has to be taken on trust. To check that epoch `E` was finalized:
    words, and then the STARK itself.
 5. Check the claim against the chain: `public_inputs.finalized_root` is the block
    root of epoch `public_inputs.finalized_epoch`'s checkpoint, and
-   `finalized_state_root` is that block's state root. Ask any beacon node.
+   `finalized_state_root` is the state root at that epoch's first slot — not the
+   finalized block's own state root, which differs whenever that slot is empty.
+   Ask any beacon node.
 6. Check the accumulator: `public_inputs.accumulator_commitment` is the
    validator set the attestations were opened against. It chains back to
-   bootstrap through the epoch diffs, and `/v1/status`'s
+   the deployment's init point through the epoch diffs, and `/v1/status`'s
    `accumulator.chain_digest` is the running hash of that chain — recompute it
-   from the epoch list and compare.
+   from the epoch list and compare. `init_epoch` is where that chain starts; it
+   moving means the chain broke and was restarted. The init point itself is
+   trusted, not proven, and regenerating it is step 7 — see
+   [assumptions.md](assumptions.md).
 
 Steps 1-5 need nothing from zkasper but the bytes this API serves. Step 6 is what
 makes a *series* of proofs a chain rather than a pile.

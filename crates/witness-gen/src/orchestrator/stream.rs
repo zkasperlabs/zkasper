@@ -878,8 +878,8 @@ impl StreamPipeline {
     ///
     /// A final proof turns the previous epoch's justification into a
     /// finalization and inherits the accumulator link from the diff that opened
-    /// the epoch, so an epoch with neither — the first after a bootstrap — has
-    /// to go through the batch path, and the one after it streams.
+    /// the epoch, so an epoch with neither — the first of a run — has to go
+    /// through the batch path, and the one after it streams.
     pub(super) fn can_stream(state: &StoreState) -> bool {
         state.last_epoch_diff.is_some()
             && state.previous_justification(state.cursor_epoch).is_some()

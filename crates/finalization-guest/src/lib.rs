@@ -42,6 +42,19 @@ pub fn verify_finalization_with_slots(
         );
     }
 
+    // A justification proof is a link in a fold chain, and the partial links
+    // are valid proofs of a partial count. Only a link that says two thirds is
+    // behind it justifies anything, so a finalization has to read the flag
+    // rather than take the proof's existence for the claim.
+    for (i, output) in witness.justification_outputs.iter().enumerate() {
+        assert!(
+            output.justified,
+            "justification proof {} counts {} of the active balance, which is not a \
+             supermajority",
+            i, output.attesting_balance,
+        );
+    }
+
     // Epochs must be consecutive: E and E+1
     assert_eq!(
         just_e1.target_epoch,

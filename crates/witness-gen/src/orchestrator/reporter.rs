@@ -152,7 +152,7 @@ impl<A> Orchestrator<A> {
             prover: self.engine.prover.name().to_string(),
             updated_unix: now_unix(),
             head_slot: self.engine.chain.head_slot(),
-            bootstrap_epoch: state.bootstrap_epoch,
+            init_epoch: state.init_epoch,
             accumulator: acc_status(state),
             justified_through: state.justified_through,
             last_justified: state

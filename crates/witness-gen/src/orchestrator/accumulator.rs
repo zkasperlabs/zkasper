@@ -1,27 +1,24 @@
-//! How the accumulator gets to where it is.
+//! How the accumulator moves.
 //!
-//! Two ways in, and they are not equivalent. A bootstrap reads a beacon state
-//! whole and starts a fresh chain of accumulators from it; an epoch diff proves
-//! the step from the epoch the cursor sits on to the next one, so every epoch
-//! after the first is anchored on the one before it. The daemon only bootstraps
-//! twice over: once because it has no store, and once because the node threw
-//! away the state the chain needed — see [`is_pruned_state`].
+//! A run starts from a checked init point — see [`crate::init_point`] — and
+//! every epoch after that is reached by an epoch diff, which proves the step
+//! from the epoch the cursor sits on to the next one. That is what anchors each
+//! epoch on the one before it, and it is also why a node that has thrown away
+//! the state the next diff needs ends the run rather than restarting it: see
+//! [`is_pruned_state`].
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use tracing::{info, instrument};
 
-use crate::artifacts::{hex_digest, ArtifactSink, StageTiming};
+use crate::artifacts::{hex_digest, StageTiming};
 use crate::beacon_api::{BeaconApi, ChainStatusApi};
-use crate::prover::{Prover, Stage};
-use crate::publish::Publisher;
-use crate::store::{EpochDiffRecord, Snapshot, StoreState};
-use crate::{witness_bootstrap, witness_epoch_diff};
+use crate::prover::Stage;
+use crate::store::{EpochDiffRecord, Snapshot};
+use crate::witness_epoch_diff;
 
 use super::engine::{write_proof, Engine};
-use super::OrchestratorConfig;
 
 /// Whether `error` means the node has thrown away a state this run still needs.
 ///
@@ -29,93 +26,17 @@ use super::OrchestratorConfig;
 /// the split moves every epoch — measured on 2026-08-18, the window was about
 /// the last 60 to 100 slots. An accumulator that falls behind therefore asks for
 /// a state that no longer exists, and no number of restarts brings it back: the
-/// window only moves further away. The daemon bootstraps forward instead of
-/// exiting.
+/// window only moves further away.
+///
+/// The daemon used to bootstrap forward on its own here, which silently broke
+/// the accumulator chain at the epoch it restarted on. It now stops and says
+/// what to do, because a break a consumer cannot see is worse than an outage an
+/// operator can.
 ///
 /// Matched on the message because that is what a beacon node gives. The daemon
 /// leans on the same string being distinctive that an operator does.
 pub(super) fn is_pruned_state(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains("NOT_FOUND: beacon state at slot")
-}
-
-#[instrument(
-    name = "stage",
-    skip_all,
-    fields(stage = "bootstrap", epoch = tracing::field::Empty, slot = tracing::field::Empty),
-)]
-pub(super) async fn bootstrap<A: BeaconApi + ChainStatusApi>(
-    api: &A,
-    config: &OrchestratorConfig,
-    sink: &ArtifactSink,
-    prover: &dyn Prover,
-    publish: Option<&Arc<Publisher>>,
-) -> Result<(Snapshot, StageTiming)> {
-    let slot = match config.bootstrap_slot {
-        Some(slot) => slot,
-        None => {
-            let checkpoints = api
-                .get_finality_checkpoints("head")
-                .await
-                .context("fetch finality checkpoints to pick a bootstrap slot")?;
-            checkpoints.finalized.epoch * config.chain.slots_per_epoch
-        }
-    };
-    let epoch = slot / config.chain.slots_per_epoch;
-    let span = tracing::Span::current();
-    span.record("epoch", epoch);
-    span.record("slot", slot);
-    let started = Instant::now();
-    if let Some(publish) = publish {
-        publish.stage_started(Stage::Bootstrap, epoch, Some(slot), None);
-    }
-
-    let (witness, tree, epoch_state, total_active_balance, num_validators) =
-        witness_bootstrap::build(api, &config.chain, slot)
-            .await
-            .context("build bootstrap witness")?;
-
-    let (output, proof) = prover.prove_bootstrap(&witness)?;
-    if output.acc_root != tree.root() {
-        bail!("bootstrap circuit disagrees with the host accumulator tree");
-    }
-    if output.total_active_balance != total_active_balance {
-        bail!("bootstrap circuit disagrees on the total active balance");
-    }
-
-    let artifact = sink.write_witness(epoch, "bootstrap", &witness)?;
-    write_proof(sink, epoch, "bootstrap", &proof)?;
-
-    let state = StoreState::bootstrapped(
-        config.chain_name.clone(),
-        epoch,
-        output.acc_root,
-        total_active_balance,
-        num_validators,
-    );
-
-    info!(
-        num_validators,
-        total_active_balance,
-        acc_root = %hex_digest(&output.acc_root),
-        millis = started.elapsed().as_millis() as u64,
-        "bootstrapped",
-    );
-
-    Ok((
-        Snapshot {
-            state,
-            tree,
-            epoch_state,
-        },
-        StageTiming::new(
-            Stage::Bootstrap,
-            epoch,
-            started,
-            prover.last_cost(),
-            artifact,
-        )
-        .with_proof(&proof),
-    ))
 }
 
 impl<A: BeaconApi + ChainStatusApi> Engine<A> {
@@ -212,25 +133,5 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
             .with_proof(&proof),
         );
         Ok(())
-    }
-
-    /// Start again from a state the node still has.
-    ///
-    /// This breaks the accumulator chain: the epoch it restarts on is anchored
-    /// on a bootstrap rather than on the epoch before it. That is the price of
-    /// staying alive, and it is the same price the supervisor's `rm -f` paid
-    /// more slowly and after several failed restarts.
-    pub(super) async fn rebootstrap(&mut self) -> Result<()> {
-        let (snapshot, timing) = bootstrap(
-            &self.api,
-            &self.config,
-            &self.sink,
-            &*self.prover,
-            self.report.publisher(),
-        )
-        .await?;
-        self.snapshot = snapshot;
-        self.report.record(timing);
-        self.store.save(&self.snapshot)
     }
 }

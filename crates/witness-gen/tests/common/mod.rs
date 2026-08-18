@@ -15,9 +15,7 @@ use zkasper_common::acc;
 use zkasper_common::bls::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
 use zkasper_common::constants::FAR_FUTURE_EPOCH;
 use zkasper_common::ssz::attestation_data_root;
-use zkasper_common::types::{
-    Checkpoint, EpochDiffOutput, JustificationOutput, PreviousJustification, ValidatorData,
-};
+use zkasper_common::types::{Checkpoint, EpochDiffOutput, PreviousJustification, ValidatorData};
 use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::artifacts::hex0x;
@@ -421,8 +419,8 @@ impl SyntheticChain {
     /// A real state carries 8192 slots of history; a synthetic one only has to
     /// carry the boundary a finalization will open out of it. The daemon runs
     /// the same induction — each epoch diff records what the diff before it
-    /// produced — so the two agree slot for slot, starting from the bootstrap,
-    /// which records nothing because nothing came before it.
+    /// produced — so the two agree slot for slot, starting from the epoch the
+    /// init point names, which records nothing because nothing came before it.
     fn history_at(&self, slot: u64) -> SlotHistory {
         let spe = self.config.slots_per_epoch;
         if slot <= self.first_epoch * spe {
@@ -651,11 +649,11 @@ fn stream_fixture_from(epoch: Epoch) -> StreamFixture {
             .map(|slot| epoch.complement(slot, &[]))
             .collect(),
         context,
-        previous: PreviousJustification::Batch(JustificationOutput {
-            accumulator_commitment: previous_accumulator_commitment,
-            target_epoch: STREAM_EPOCH - 1,
-            target_root: epoch.previous_root,
-        }),
+        previous: PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            previous_accumulator_commitment,
+            STREAM_EPOCH - 1,
+            epoch.previous_root,
+        )),
         epoch,
     }
 }

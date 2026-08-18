@@ -164,8 +164,8 @@ impl PointSum {
 
 /// Decompress a 48-byte public key into the form the accumulator leaf commits to.
 ///
-/// Only the bootstrap and epoch-diff proofs call this — once per validator that
-/// enters or changes, rather than once per attester per slot.
+/// Only the epoch-diff proof calls this — once per validator that enters or
+/// changes, rather than once per attester per slot.
 pub fn decompress_pubkey(compressed: &[u8; 48]) -> Option<G1Point> {
     #[cfg(feature = "count-ops")]
     crate::op_counter::inc_decompress(1);

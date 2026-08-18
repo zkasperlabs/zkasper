@@ -30,8 +30,8 @@
 //!
 //! - `engine` — the node, the prover, the accumulator and where results go:
 //!   what every stage needs, whichever pipeline is driving.
-//! - `accumulator` — the two ways the accumulator moves, bootstrap and epoch
-//!   diff.
+//! - `accumulator` — the epoch diff that moves the accumulator, and the one
+//!   failure that ends a run rather than being retried.
 //! - `batch` and `stream` — the two pipelines. They are alternatives, never
 //!   stages of one another, and neither can reach the other's half-built epoch.
 //!   `pipeline` holds the choice between them and the contract they share.
@@ -53,8 +53,8 @@ pub use pipeline::Pipeline;
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
-use tracing::{info, warn};
+use anyhow::{bail, Context, Result};
+use tracing::info;
 
 use zkasper_common::types::Checkpoint;
 
@@ -63,11 +63,12 @@ use crate::artifacts::{hex_digest, ArtifactSink};
 use crate::beacon_api::{BeaconApi, ChainStatusApi};
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
+use crate::init_point;
 use crate::prover::Prover;
 use crate::publish::Publisher;
 use crate::store::{Snapshot, Store, StoreState};
 
-use accumulator::{bootstrap, is_pruned_state};
+use accumulator::is_pruned_state;
 use batch::BatchPipeline;
 use chain_view::ChainView;
 use engine::Engine;
@@ -118,7 +119,7 @@ pub struct Orchestrator<A> {
 }
 
 impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
-    /// Resume from the persisted accumulator, or bootstrap if there is none.
+    /// Resume from the persisted accumulator, or start from the init point.
     pub async fn open(api: A, config: OrchestratorConfig, prover: Box<dyn Prover>) -> Result<Self> {
         Self::open_with_publisher(api, config, prover, None).await
     }
@@ -151,10 +152,14 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 Self::assemble(api, config, store, sink, prover, snapshot, publish)
             }
             None => {
-                let (snapshot, timing) =
-                    bootstrap(&api, &config, &sink, &*prover, publish.as_ref()).await?;
-                let mut this = Self::assemble(api, config, store, sink, prover, snapshot, publish);
-                this.engine.report.record(timing);
+                let init = config.init_point.clone().context(
+                    "no accumulator state file and no init point; \
+                     generate one with `zkasper-init-point` and pass --init-point",
+                )?;
+                let snapshot = init_point::open(&api, &config.chain, &config.chain_name, &init)
+                    .await
+                    .context("start from the configured init point")?;
+                let this = Self::assemble(api, config, store, sink, prover, snapshot, publish);
                 this.engine.store.save(&this.engine.snapshot)?;
                 this
             }
@@ -250,35 +255,29 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     /// One unit of work: justify the epoch the accumulator sits on, or move the
     /// accumulator to the next one.
     ///
-    /// A tick that failed because the node has thrown the state away is not an
-    /// error the caller can do anything with, so it is handled here: see
+    /// A tick that failed because the node has thrown the state away cannot be
+    /// retried into success, so it is named rather than repeated: see
     /// [`is_pruned_state`].
     pub async fn tick(&mut self) -> Result<Tick> {
-        match self.tick_once().await {
-            Err(e) if is_pruned_state(&e) => {
-                warn!(
-                    epoch = self.engine.snapshot.state.cursor_epoch,
-                    error = %format!("{e:#}"),
-                    "the node no longer serves the state this epoch needs; \
-                     bootstrapping forward to one it does",
-                );
-                self.engine.rebootstrap().await?;
-                self.forget_epoch();
-                Ok(Tick {
-                    head_slot: self.engine.chain.head_slot(),
-                    advanced_to: Some(self.engine.snapshot.state.cursor_epoch),
-                    ..Tick::default()
-                })
+        self.tick_once().await.map_err(|e| {
+            if is_pruned_state(&e) {
+                return e.context(format!(
+                    "the node no longer serves the state epoch {} needs. Restarting will not \
+                     bring it back — the window only moves further away. Take a fresh init \
+                     point near the node's finalized checkpoint, delete the state file and \
+                     start again; the accumulator chain breaks at that epoch, so publish the \
+                     new init point alongside it.",
+                    self.engine.snapshot.state.cursor_epoch,
+                ));
             }
-            other => other,
-        }
+            e
+        })
     }
 
     /// Drop whatever epoch is part-built.
     ///
     /// Every proof inside one is bound to the accumulator commitment the epoch
-    /// opened against, so an accumulator that moves — forward by a diff, or
-    /// sideways by a bootstrap — invalidates all of it.
+    /// opened against, so moving the accumulator invalidates all of it.
     fn forget_epoch(&mut self) {
         self.batch.forget();
         self.stream.forget();

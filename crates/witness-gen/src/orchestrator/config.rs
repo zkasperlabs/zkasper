@@ -5,9 +5,20 @@ use std::time::Duration;
 
 use zkasper_common::ChainConfig;
 
+use crate::init_point::InitPoint;
 use crate::streaming::StreamPolicy;
 
 use super::Pipeline;
+
+/// Slot proofs one link of the justification chain absorbs, by default.
+///
+/// Two, because a link's cost is a floor plus a recursion per child and the
+/// recursion is the expensive half: a link of two verifies three children —
+/// its predecessor and two slot proofs — which is the same shape the streaming
+/// fold has. Widening it trades fewer proofs for a bigger trace in each, and
+/// past a handful of children the trace stops being the linear thing the trade
+/// assumes. `BENCHMARKS.md` has the curve that set this.
+const DEFAULT_JUSTIFICATION_FOLD_WIDTH: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct OrchestratorConfig {
@@ -16,8 +27,10 @@ pub struct OrchestratorConfig {
     pub chain_name: String,
     pub db_path: PathBuf,
     pub output_dir: PathBuf,
-    /// Slot to bootstrap from. Defaults to the node's finalized checkpoint.
-    pub bootstrap_slot: Option<u64>,
+    /// Where the accumulator chain starts, when there is no state file to
+    /// resume from. See [`crate::init_point`]: the daemon checks it against a
+    /// fresh walk of the registry and refuses to start on a mismatch.
+    pub init_point: Option<InitPoint>,
     /// Overrides the domain otherwise derived from the node's fork and genesis.
     pub signing_domain: Option<[u8; 32]>,
     /// How long to wait after a tick that could make no further progress.
@@ -28,6 +41,14 @@ pub struct OrchestratorConfig {
     pub trigger_interval: Duration,
     /// How many epochs past the target to keep looking for its attestations.
     pub attestation_lookahead_epochs: u64,
+    /// How many slot proofs one link of the justification chain absorbs.
+    ///
+    /// The batch path used to fold the whole epoch at once, which is where its
+    /// 1,221 s justification came from. Recursion costs
+    /// [`crate::streaming::ProverModel::recursion_verify_s`] a child and grows
+    /// faster than linearly past a handful of them, so a link stays small and
+    /// the chain stays long. See [`crate::streaming`] for the trade.
+    pub justification_fold_width: usize,
     pub pipeline: Pipeline,
     /// When the streaming pipeline stops collecting, and how long the trigger
     /// may hold past it. See [`crate::streaming`].
@@ -56,11 +77,12 @@ impl OrchestratorConfig {
             chain_name: chain_name.into(),
             db_path: PathBuf::from("zkasper.db"),
             output_dir: PathBuf::from("zkasper-out"),
-            bootstrap_slot: None,
+            init_point: None,
             signing_domain: None,
             poll_interval: Duration::from_secs(4),
             trigger_interval: Duration::from_millis(200),
             attestation_lookahead_epochs: 2,
+            justification_fold_width: DEFAULT_JUSTIFICATION_FOLD_WIDTH,
             pipeline: Pipeline::default(),
             stream_policy: StreamPolicy::default(),
             gossip_url: None,

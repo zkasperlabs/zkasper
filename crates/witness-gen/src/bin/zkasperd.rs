@@ -1,6 +1,6 @@
 //! zkasperd — the continuous witness generator.
 //!
-//! Bootstraps an accumulator from a recent finalized state, then follows the
+//! Starts an accumulator from a trusted init point, then follows the
 //! chain: one epoch diff per epoch, slot proofs as attestations arrive, a
 //! justification the moment 2/3 is crossed, and a finalization when two
 //! consecutive epochs justify.
@@ -30,11 +30,13 @@ use tracing_subscriber::EnvFilter;
 
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::beacon_api::BeaconApiClient;
+use zkasper_witness_gen::init_point::InitPoint;
 use zkasper_witness_gen::network;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
-use zkasper_witness_gen::prover::{NativeProver, Prover};
+use zkasper_witness_gen::prover::{NativeProver, Prover, Stage};
 use zkasper_witness_gen::publish::{DaemonInfo, PublishConfig, Publisher};
 use zkasper_witness_gen::remote_prover::{RemoteProver, RemoteProverConfig};
+use zkasper_witness_gen::split_prover::SplitProver;
 use zkasper_witness_gen::streaming::StreamPolicy;
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -101,10 +103,15 @@ struct Cli {
     #[arg(long, default_value = "mainnet")]
     chain: Chain,
 
-    /// Slot to bootstrap from. Defaults to the node's finalized checkpoint.
-    /// Ignored when the state file already exists.
+    /// Init point JSON: where the accumulator chain starts. Take one with
+    /// `zkasper-init-point`. Required for a fresh run, ignored when the state
+    /// file already exists.
+    ///
+    /// The daemon walks the registry it names and refuses to start unless the
+    /// accumulator it builds is the one the file claims. See
+    /// `zkasper_witness_gen::init_point` for what this does and does not trust.
     #[arg(long)]
-    bootstrap_slot: Option<u64>,
+    init_point: Option<PathBuf>,
 
     /// Attestation signing domain (hex). Derived from the node's fork and
     /// genesis when not given.
@@ -227,6 +234,17 @@ struct Cli {
     #[arg(long)]
     prover_spool: Option<PathBuf>,
 
+    /// Send one stage to a different prover, as `stage=host:port`. Repeatable.
+    ///
+    /// One card cannot keep up with mainnet: an epoch of the streaming pipeline
+    /// cost 399 s of one RTX 5090 against the 384 s an epoch lasts (measured
+    /// 2026-08-18), of which the committee proof was 179 s. That proof has a
+    /// full epoch of lead time and never touches `T2`, so
+    /// `--prover-route committee=<second card>` is the one that buys the most:
+    /// it leaves about 220 s on the card that does have to meet a deadline.
+    #[arg(long, value_parser = parse_route)]
+    prover_route: Vec<(Stage, String)>,
+
     /// How long to wait for one proof before giving the connection up.
     ///
     /// It has to clear the slowest proof the run will ask for, and that is not
@@ -291,22 +309,51 @@ impl Cli {
                 "this binary was built without the `zisk-prover` feature; \
                  rebuild with `cargo build --release --features zisk-prover`",
             ),
-            Backend::Remote => Ok(Box::new(RemoteProver::connect(RemoteProverConfig {
-                spool_dir: Some(
-                    self.prover_spool
-                        .clone()
-                        .unwrap_or_else(|| self.output_dir.join("prover-spool")),
-                ),
-                request_timeout: Duration::from_secs(self.prover_timeout_seconds),
-                ..RemoteProverConfig::new(
-                    chain,
-                    &self.prover_addr,
-                    self.prover_token.clone().context(
-                        "--prover remote needs --prover-token (or ZKASPER_PROVER_TOKEN)",
-                    )?,
-                    pipeline.stages(),
-                )
-            })?)),
+            Backend::Remote => {
+                let token = self
+                    .prover_token
+                    .clone()
+                    .context("--prover remote needs --prover-token (or ZKASPER_PROVER_TOKEN)")?;
+                let spool = self
+                    .prover_spool
+                    .clone()
+                    .unwrap_or_else(|| self.output_dir.join("prover-spool"));
+                let connect = |addr: &str, stages: &[Stage], spool: PathBuf| {
+                    RemoteProver::connect(RemoteProverConfig {
+                        spool_dir: Some(spool),
+                        request_timeout: Duration::from_secs(self.prover_timeout_seconds),
+                        ..RemoteProverConfig::new(chain.clone(), addr, token.clone(), stages)
+                    })
+                };
+                if self.prover_route.is_empty() {
+                    return Ok(Box::new(connect(
+                        &self.prover_addr,
+                        pipeline.stages(),
+                        spool,
+                    )?));
+                }
+                // Each prover is set up for exactly the stages it will be asked
+                // for, because every guest costs a ROM setup and gigabytes of
+                // `~/.zisk/cache` on the box that holds it.
+                let routed: Vec<Stage> = self.prover_route.iter().map(|(s, _)| *s).collect();
+                let default: Vec<Stage> = pipeline
+                    .stages()
+                    .iter()
+                    .copied()
+                    .filter(|stage| !routed.contains(stage))
+                    .collect();
+                let mut routes: Vec<(Stage, Box<dyn Prover>)> = Vec::new();
+                for (stage, addr) in &self.prover_route {
+                    let prover = connect(addr, &[*stage], spool.join(stage.as_str()))?;
+                    routes.push((*stage, Box::new(prover)));
+                }
+                let split = SplitProver::new(
+                    Box::new(connect(&self.prover_addr, &default, spool)?),
+                    routes,
+                )?;
+                info!(routed = ?split.routed(), "some stages prove on another card");
+                Ok(Box::new(split))
+            }
         }
     }
 }
@@ -383,6 +430,10 @@ async fn main() -> Result<()> {
         Mode::Batch => Pipeline::Batch,
         Mode::Streaming => Pipeline::Streaming,
     };
+    // Read and checked before anything else happens, because an init point whose
+    // commitment does not bind its own root and balance names an accumulator
+    // nobody holds, and finding that out after a registry walk helps no one.
+    let init_point = cli.init_point.as_deref().map(InitPoint::read).transpose()?;
     // Before the first beacon call, so that a daemon which cannot reach its node
     // is still a scrape target saying so rather than a silent absence.
     if !cli.no_metrics {
@@ -410,7 +461,7 @@ async fn main() -> Result<()> {
     let config = OrchestratorConfig {
         db_path: cli.db_path.clone(),
         output_dir: cli.output_dir.clone(),
-        bootstrap_slot: cli.bootstrap_slot,
+        init_point,
         signing_domain: cli
             .signing_domain
             .as_deref()
@@ -437,7 +488,7 @@ async fn main() -> Result<()> {
     };
 
     // Built before the first beacon call, so a missing ELF or proving key fails
-    // now rather than after a bootstrap has already been paid for.
+    // now rather than after the registry walk has already been paid for.
     let prover = cli.build_prover(cli.chain.config(), pipeline)?;
 
     info!(
@@ -488,6 +539,14 @@ async fn stopped() {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
+}
+
+/// `stage=host:port`, for `--prover-route`.
+fn parse_route(value: &str) -> Result<(Stage, String)> {
+    let (stage, addr) = value
+        .split_once('=')
+        .with_context(|| format!("expected stage=host:port, got {value:?}"))?;
+    Ok((stage.parse()?, addr.to_string()))
 }
 
 fn parse_hex_bytes32(s: &str) -> Result<[u8; 32]> {

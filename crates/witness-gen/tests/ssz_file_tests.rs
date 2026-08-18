@@ -282,29 +282,35 @@ fn load_two_states() -> (SszFileApi, u64, u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: bootstrap witness generation from SSZ file
+// Test: init point taken from a real mainnet SSZ state
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "downloads ~320MB, takes ~2min"]
-async fn test_ssz_file_bootstrap() {
+async fn test_ssz_file_init_point() {
     init_tracing();
     const CONFIG: ChainConfig = ChainConfig::MAINNET;
 
     let (api, slot) = load_one_state();
     let epoch = slot / CONFIG.slots_per_epoch;
-    eprintln!("testing bootstrap at slot {slot} (epoch {epoch})");
+    eprintln!("taking an init point at slot {slot} (epoch {epoch})");
 
-    let (witness, _tree, _epoch_state, total_active_balance, num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
+        .await
+        .unwrap();
 
-    assert!(num_validators > 0);
-    assert!(total_active_balance > 0);
-    assert_eq!(witness.epoch, epoch);
-    assert_eq!(witness.validators.len(), num_validators as usize);
-    assert_eq!(witness.state_to_validators_siblings.len(), 6);
+    assert!(init.num_validators > 0);
+    assert!(init.total_active_balance > 0);
+    assert_eq!(init.epoch, epoch);
+    assert_eq!(init.state_to_validators_siblings.len(), 6);
+    assert_eq!(init.acc_root, snapshot.tree.root());
+    init.check().unwrap();
+
+    // The branch in the init point has to open the real registry to the real
+    // state root, which is the binding the deleted bootstrap proof used to make.
+    zkasper_witness_gen::init_point::open(&api, &CONFIG, "mainnet", &init)
+        .await
+        .expect("the init point opens against the state it was taken from");
 }
 
 // ---------------------------------------------------------------------------
@@ -396,11 +402,15 @@ async fn test_ssz_file_epoch_diff() {
         "testing epoch diff: slot {slot_1} (epoch {epoch_1}) -> slot {slot_2} (epoch {epoch_2})"
     );
 
-    // Bootstrap at slot_1
-    let (_witness, mut tree, epoch_state, total_active_balance, _num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot_1)
-            .await
-            .unwrap();
+    // Start at slot_1
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot_1)
+        .await
+        .unwrap();
+    let (mut tree, epoch_state, total_active_balance) = (
+        snapshot.tree,
+        snapshot.epoch_state,
+        init.total_active_balance,
+    );
 
     // Epoch diff
     let (diff_witness, _new_epoch_state, new_balance, _new_num_validators) =
@@ -460,10 +470,14 @@ async fn bench_epoch_diff_guest_ops() {
     let epoch_2 = slot_2 / CONFIG.slots_per_epoch;
 
     // Build witness (host-side, not measured)
-    let (_witness, mut tree, epoch_state, total_active_balance, _num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot_1)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot_1)
+        .await
+        .unwrap();
+    let (mut tree, epoch_state, total_active_balance) = (
+        snapshot.tree,
+        snapshot.epoch_state,
+        init.total_active_balance,
+    );
 
     let (diff_witness, _new_epoch_state, _new_balance, _new_num_validators) =
         zkasper_witness_gen::witness_epoch_diff::build(
@@ -699,11 +713,11 @@ async fn test_ssz_file_finality() {
         hex::encode(target_root)
     );
 
-    // Bootstrap: build Poseidon tree + get total_active_balance
-    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
-            .await
-            .unwrap();
+    // The init point builds the Poseidon tree and the total active balance
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
+        .await
+        .unwrap();
+    let (tree, total_active_balance) = (snapshot.tree, init.total_active_balance);
     eprintln!("total_active_balance={total_active_balance}");
 
     // Extract genesis_validators_root and fork_version from SSZ state
@@ -783,25 +797,43 @@ async fn test_ssz_file_finality() {
     );
 
     let commitment = zkasper_common::acc::commitment(&tree.root(), total_active_balance);
-    let justification = zkasper_justification_guest::verify_justification(
-        &zkasper_witness_gen::witness_justification::build(
-            outputs,
-            vec![Vec::new(); slots.len()],
-            commitment,
-            [0; 4],
-            [0; 4],
-            committees.output.clone(),
-            Vec::new(),
-            target_epoch,
-            target_root,
-            total_active_balance,
-            tree.root(),
-        ),
-    );
+    let context = zkasper_witness_gen::witness_justification::Context {
+        accumulator_commitment: commitment,
+        acc_root: tree.root(),
+        target_epoch,
+        target_root,
+        total_active_balance,
+        slot_program_vk: [0; 4],
+        committee_program_vk: [0; 4],
+        justification_program_vk: [0; 4],
+    };
+
+    // Fold two slot proofs at a time, the way the daemon does while the epoch
+    // is still running, rather than all of them into one circuit.
+    let mut justification = None;
+    let mut links = 0;
+    for chunk in outputs.chunks(2) {
+        let opening = justification.is_none();
+        justification = Some(zkasper_justification_guest::verify_justification(
+            &zkasper_witness_gen::witness_justification::build(
+                &context,
+                opening.then(|| committees.output.clone()),
+                Vec::new(),
+                justification,
+                Vec::new(),
+                chunk.to_vec(),
+                vec![Vec::new(); chunk.len()],
+            ),
+        ));
+        links += 1;
+    }
+    let justification = justification.expect("the epoch has slot proofs to fold");
 
     assert_eq!(justification.target_root, target_root);
     assert_eq!(justification.accumulator_commitment, commitment);
-    eprintln!("justification proof verified successfully!");
+    assert_eq!(justification.attesting_balance, attesting_balance);
+    assert!(justification.justified);
+    eprintln!("justification chain of {links} links verified successfully!");
 }
 
 // ---------------------------------------------------------------------------
@@ -839,9 +871,7 @@ async fn test_ssz_file_gnosis_state_root() {
 #[tokio::test]
 #[ignore = "downloads ~320MB"]
 async fn test_ssz_file_streaming_finality() {
-    use zkasper_common::types::{
-        BoundaryAnchor, EpochDiffOutput, JustificationOutput, PreviousJustification,
-    };
+    use zkasper_common::types::{BoundaryAnchor, EpochDiffOutput, PreviousJustification};
     use zkasper_witness_gen::streaming::{self, StreamContext, StreamPolicy};
 
     init_tracing();
@@ -856,10 +886,10 @@ async fn test_ssz_file_streaming_finality() {
     let (target_epoch, target_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
 
-    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
+        .await
+        .unwrap();
+    let (tree, total_active_balance) = (snapshot.tree, init.total_active_balance);
 
     let raw_ssz = &api.get_state(&slot.to_string()).raw_ssz;
     let signing_domain = zkasper_common::bls::compute_domain(
@@ -984,11 +1014,11 @@ async fn test_ssz_file_streaming_finality() {
         &committees,
         &units,
         &plan,
-        PreviousJustification::Batch(JustificationOutput {
-            accumulator_commitment: previous_commitment,
-            target_epoch: target_epoch - 1,
-            target_root: previous_root,
-        }),
+        PreviousJustification::Batch(zkasper_common::test_utils::justified_output(
+            previous_commitment,
+            target_epoch - 1,
+            previous_root,
+        )),
         boundary,
     );
 
@@ -1042,10 +1072,10 @@ async fn test_ssz_file_streaming_schedule() {
     let (target_epoch, target_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
 
-    let (_bootstrap_witness, tree, _epoch_state, total_active_balance, _num_validators) =
-        zkasper_witness_gen::witness_bootstrap::build(&api, &CONFIG, slot)
-            .await
-            .unwrap();
+    let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
+        .await
+        .unwrap();
+    let (tree, total_active_balance) = (snapshot.tree, init.total_active_balance);
 
     let committees = Arc::new(
         zkasper_witness_gen::committee::build(

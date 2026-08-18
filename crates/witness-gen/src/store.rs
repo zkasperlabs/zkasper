@@ -39,7 +39,7 @@ use crate::epoch_state::EpochState;
 use crate::prover::Proof;
 
 const MAGIC: &[u8; 8] = b"ZKASPRD\x01";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// Everything the daemon needs to pick up exactly where it stopped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,13 +47,15 @@ pub struct StoreState {
     /// Chain the accumulator was built for. Pointing a mainnet store at a
     /// gnosis node would otherwise produce a plausible-looking wrong chain.
     pub chain: String,
-    /// Epoch the accumulator was bootstrapped at.
-    pub bootstrap_epoch: u64,
+    /// Epoch the accumulator chain started at — the init point's epoch, or the
+    /// epoch of the last one that had to be taken because the node pruned the
+    /// state this run needed.
+    pub init_epoch: u64,
     /// Epoch the accumulator currently represents.
     pub cursor_epoch: u64,
     pub acc_root: Digest,
     pub acc_commitment: Digest,
-    /// Running hash over every `(epoch, acc_root)` since bootstrap.
+    /// Running hash over every `(epoch, acc_root)` since the init point.
     pub acc_chain_digest: Digest,
     pub total_active_balance: u64,
     pub num_validators: u64,
@@ -105,8 +107,8 @@ pub struct EpochDiffRecord {
 }
 
 impl StoreState {
-    /// Initial state, straight out of bootstrap.
-    pub fn bootstrapped(
+    /// Initial state, straight out of a checked init point.
+    pub fn started(
         chain: String,
         epoch: u64,
         acc_root: Digest,
@@ -115,7 +117,7 @@ impl StoreState {
     ) -> Self {
         Self {
             chain,
-            bootstrap_epoch: epoch,
+            init_epoch: epoch,
             cursor_epoch: epoch,
             acc_root,
             acc_commitment: acc::commitment(&acc_root, total_active_balance),
@@ -176,8 +178,9 @@ impl StoreState {
     /// finalization, if the epoch before it produced one.
     ///
     /// A streaming run consumes its own previous final proof; the first epoch
-    /// after a bootstrap or a batch run consumes that run's justification, which
-    /// is why the circuit takes an enum rather than one type.
+    /// of a run, or the one after a batch run, consumes that run's
+    /// justification, which is why the circuit takes an enum rather than one
+    /// type.
     pub fn previous_justification(&self, for_epoch: u64) -> Option<(PreviousJustification, Proof)> {
         if let Some(record) = &self.last_stream_final {
             if record.output.justified_epoch + 1 == for_epoch {
@@ -252,7 +255,7 @@ impl Store {
         let bytes = std::fs::read(&self.path).context("read store")?;
         let payload = decode(&bytes).with_context(|| {
             format!(
-                "store at {} is damaged; delete it to re-bootstrap",
+                "store at {} is damaged; delete it and start again from an init point",
                 self.path.display(),
             )
         })?;
