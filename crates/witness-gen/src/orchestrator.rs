@@ -886,7 +886,18 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .entered();
             self.observe_start_delay(Stage::SlotProof, target_epoch, attestation_slot);
             let started = Instant::now();
-            self.begin(Stage::SlotProof, target_epoch, Some(attestation_slot), None);
+            // Numbered as well as slotted. A slot proof is a repeat of a stage
+            // inside one epoch, and a consumer that keys stages by
+            // (epoch, stage, index) folds every unnumbered repeat onto one row —
+            // which lost 21 of an epoch's 22 slot proofs, and with them most of
+            // what the epoch cost.
+            let index = aggregator.slot_proofs.len();
+            self.begin(
+                Stage::SlotProof,
+                target_epoch,
+                Some(attestation_slot),
+                Some(index),
+            );
             let witness = SlotProofWitness {
                 accumulator_commitment: aggregator.acc_commitment,
                 committee_root: aggregator.committee_output.committee_root,
@@ -947,6 +958,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     artifact,
                 )
                 .at_slot(attestation_slot)
+                .at_index(index)
                 .with_proof(aggregator.slot_proofs.last().expect("just pushed")),
             );
             tick.slots_proved.push(attestation_slot);

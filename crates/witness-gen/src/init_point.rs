@@ -208,7 +208,7 @@ pub async fn take(
     slot: u64,
 ) -> Result<(InitPoint, Snapshot)> {
     anyhow::ensure!(
-        slot % config.slots_per_epoch == 0,
+        slot.is_multiple_of(config.slots_per_epoch),
         "slot {slot} is not an epoch boundary",
     );
     let epoch = slot / config.slots_per_epoch;

@@ -415,8 +415,7 @@ async fn test_stops_when_the_node_has_thrown_the_state_away() {
     let error = daemon
         .tick()
         .await
-        .err()
-        .expect("a pruned state has to stop the run, not be worked around");
+        .expect_err("a pruned state has to stop the run, not be worked around");
     let error = format!("{error:#}");
     assert!(
         error.contains("no longer serves the state") && error.contains("init point"),

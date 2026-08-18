@@ -104,6 +104,23 @@ zkasperd needs more from a node than a validator does. All three must hold.
 | 1 | `--subscribe-all-subnets` | The `single_attestation` topic only carries subnets the node joined. A default node joins **2 of 64** (`SUBNETS_PER_NODE: 2`), so its feed is 3.1% of gossip. |
 | 2 | `--http-sse-capacity-multiplier` **20000** | Lighthouse buffers each SSE topic in a broadcast ring of `multiplier × 16`. The default multiplier is 1, so **16 messages** against a slot's 28,130. 2000 gives 32,000 — only **1.1 slots** of headroom, so one stalled slot drops attestations. **20000 gives 320,000, about 11 slots, for roughly 128 MB of ring.** Overshoot deliberately: the ring is cheap and a drop is silent and unrecoverable. |
 | 3 | `/eth/v2/debug/beacon/states/{id}` enabled | **Every epoch diff** reads the whole `BeaconState` from it, and so does the boundary anchor a finalization opens. It is a continuous dependency, not a one-off. Startup does not need it: the init point carries its own branch to the `validators` field. |
+| 4 | `--epochs-per-migration` **16** | How far back the node still *has* the states requirement 3 serves. At the default of 1 this node served state only **64 to 95 slots back** (MEASURED 2026-08-18), two or three epochs, and a daemon that spends longer than that on one epoch asks for a state that has been migrated to the freezer and gets a 404. |
+
+**Requirement 4 is what a real prover makes binding.** A witness-only daemon
+never falls two epochs behind, so the default window is invisible. With proofs,
+the first epoch of every run goes through the batch path, and its one
+justification recursively verifies every slot proof of the epoch: **1,224 s over
+22 of them** on an RTX 5090 (MEASURED 2026-08-18, mainnet epoch 469424). A run
+therefore starts about 20 minutes behind the chain and spends the next 20
+catching up. That is far longer than the default window, so the daemon fell
+behind its own startup, 404ed, and crashlooped — 74 restarts in an hour.
+Sixteen epochs of hot states is about 1.7 hours of slack, which absorbs it.
+
+Deleting bootstrap took about two minutes off the front of that but not the
+batch-path tax itself, so requirement 4 stands. The window only widens for
+states finalized *after* the node restarts; states already migrated stay
+migrated. A daemon whose chain depends on one of them can no longer skip forward
+on its own — it stops, and recovery is a fresh init point (§6).
 
 **Subscribe to `single_attestation`, not `attestation`.** Since Electra,
 Lighthouse emits `EventKind::SingleAttestation` for unaggregated attestations and

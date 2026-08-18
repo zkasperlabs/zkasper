@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     };
 
     let init = init_point::generate(&api, &config, chain_name, slot).await?;
-    if cli.out == PathBuf::from("-") {
+    if cli.out.as_os_str() == "-" {
         println!("{}", serde_json::to_string_pretty(&init)?);
     } else {
         init.write(&cli.out)?;

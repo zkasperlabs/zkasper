@@ -114,11 +114,15 @@ const COST_BUCKETS: &[f64] = &[
 ];
 
 /// `T2 - T`, the number the whole streaming pipeline exists to make small.
-/// Measured between 1.2 s and 7 s so far, with the low end packed: the buckets
-/// are dense there and run well past the observed tail, because an epoch that
-/// took 20 s is the one worth seeing.
+/// Measured between 1.2 s and 7 s following live, with the low end packed.
+///
+/// The ladder runs to five minutes because a catch-up epoch is a different
+/// animal — 185 s measured on the first epoch of a run — and a sample
+/// that lands in `+Inf` cannot be quantified at all. Catch-ups are separated by
+/// the `follow` label rather than by being thrown away; see [`observe_latency`].
 const LATENCY_BUCKETS: &[f64] = &[
-    0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0, 30.0,
+    0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0,
+    30.0, 45.0, 60.0, 120.0, 300.0,
 ];
 
 /// How long the trigger held past the threshold. Capped by
@@ -349,10 +353,27 @@ pub fn observe_epoch_cost(cost: &EpochCost, usd_per_hour: Option<f64>) {
 }
 
 /// One epoch's measured latency, the moment it is known.
+///
+/// Split by `follow`, and that label is the whole point. An epoch the daemon
+/// opened mid-flight — the first of a run, or the first after a restart — folds
+/// nothing before the trigger, so its final proof carries the entire epoch
+/// inline and takes minutes rather than seconds. Mixed into one histogram those
+/// samples move every quantile and there is no way to get them back out.
+///
+/// The rule is the manifest's own: a latency is a live follow only when at
+/// least one group was folded before the threshold. Separated rather than
+/// dropped, because a catch-up that is getting slower is still worth seeing.
 pub fn observe_latency(latency: &EpochLatency) {
-    histogram!("zkasper_t2_minus_t_seconds").record(seconds(latency.t2_minus_t_millis));
-    histogram!("zkasper_trigger_wait_seconds").record(seconds(latency.wait_millis));
-    histogram!("zkasper_tail_named").record(latency.tail_named as f64);
+    let follow = if latency.folded_groups > 0 {
+        "live"
+    } else {
+        "catchup"
+    };
+    histogram!("zkasper_t2_minus_t_seconds", "follow" => follow)
+        .record(seconds(latency.t2_minus_t_millis));
+    histogram!("zkasper_trigger_wait_seconds", "follow" => follow)
+        .record(seconds(latency.wait_millis));
+    histogram!("zkasper_tail_named", "follow" => follow).record(latency.tail_named as f64);
     counter!("zkasper_groups_folded_total").increment(latency.folded_groups as u64);
 }
 
@@ -493,7 +514,9 @@ fn describe() {
     describe_histogram!(
         "zkasper_t2_minus_t_seconds",
         Unit::Seconds,
-        "From holding the attestation that crossed the threshold to holding a proof of it."
+        "From holding the attestation that crossed the threshold to holding a proof of it. \
+         `follow=\"live\"` is the number this project quotes; `follow=\"catchup\"` is an epoch \
+         opened mid-flight, which folds nothing and proves the whole epoch inline."
     );
     describe_histogram!(
         "zkasper_trigger_wait_seconds",
