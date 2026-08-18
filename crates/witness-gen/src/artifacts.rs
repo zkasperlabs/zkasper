@@ -259,6 +259,11 @@ pub struct Status {
     /// daemon is reading blocks, and is a slot behind the chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gossip: Option<GossipStatus>,
+    /// How the prover is doing, when it is somewhere this daemon can lose.
+    /// Absent for a prover in this process, which has nothing to report between
+    /// calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prover_health: Option<crate::prover::ProverHealth>,
     /// How the mirror at the public API is keeping up. Absent when the daemon
     /// was not given one to publish to.
     #[serde(skip_serializing_if = "Option::is_none")]

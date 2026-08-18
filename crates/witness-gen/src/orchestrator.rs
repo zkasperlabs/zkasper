@@ -2330,6 +2330,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 .as_ref()
                 .map(|root| hex0x(root)),
             prover_usd_per_hour: self.config.prover_usd_per_hour,
+            prover_health: self.prover.health(),
             prover: self.prover.name().to_string(),
             updated_unix: now_unix(),
             head_slot: self.head_slot,
