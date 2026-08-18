@@ -294,6 +294,32 @@ If it is not 200, wait for the next finalization and repeat. Leave
 `--bootstrap-slot` unset so the daemon takes the node's current finalized
 checkpoint.
 
+### Step 7b — Know that the node's state window slides
+
+A checkpoint-synced Lighthouse serves states from its **split slot** — the
+finalized checkpoint — forward. The split advances every finalization, so the
+window is only about two epochs wide and it moves. Nothing older than the current
+finalized checkpoint is served, and `--archive` is not the answer (it also turns
+on genesis backfill and a week of reconstruction for 418 GiB).
+
+That matters here because **bootstrap takes about two minutes**, and the daemon
+needs its own bootstrap epoch's state again on its first tick. A bootstrap that
+lands shortly before a finalization loses that state underneath itself and fails
+with:
+
+```
+Error: fetch validators for the target epoch
+Caused by: .../states/15020064/validators returned 404 Not Found:
+           {"code":404,"message":"NOT_FOUND: beacon state at slot 15020064"}
+```
+
+It is a race, not a misconfiguration — the same daemon bootstrapped at a
+different moment runs for hours. The supervisor below wins it by deleting the
+store and letting the next attempt bootstrap from the new finalized checkpoint.
+
+Once past its first tick the daemon works on epochs near the head, which are
+always inside the window, so this only ever bites at startup.
+
 ### Step 8 — Run the daemon under a supervisor
 
 **zkasperd has no error handling in its main loop.** `run()` propagates every
@@ -322,17 +348,27 @@ while true; do
   rc=$?
   echo "=== zkasperd exited rc=$rc at $(date -Is) ===" >> "$RUN/zkasperd.log"
 
+  # Two failures are NOT fixed by restarting, and both need the store deleted so
+  # the daemon re-bootstraps. Each costs the accumulator chain a break; drop
+  # these blocks if an unbroken chain matters more than uninterrupted epochs.
+
   # An epoch whose first slot was empty cannot be finalized by the current
-  # circuits, and no number of restarts changes that -- the slot will never gain
-  # a block. Re-bootstrap past it. This breaks the accumulator chain at that
-  # point, which is the price of continuing; drop this block if an unbroken
-  # chain matters more than uninterrupted epochs.
+  # circuits, and the slot will never gain a block.
   if tail -n 40 "$RUN/zkasperd.log" \
        | grep -q "different state than its block produced"; then
     echo "=== empty epoch boundary; re-bootstrapping at $(date -Is) ===" \
       >> "$RUN/zkasperd.log"
     rm -f "$RUN/zkasperd.db"
   fi
+
+  # The node's state window slid past the bootstrap epoch mid-bootstrap.
+  if tail -n 40 "$RUN/zkasperd.log" \
+       | grep -q "NOT_FOUND: beacon state at slot"; then
+    echo "=== bootstrap epoch pruned; re-bootstrapping at $(date -Is) ===" \
+      >> "$RUN/zkasperd.log"
+    rm -f "$RUN/zkasperd.db"
+  fi
+
   sleep 5
 done
 EOF
