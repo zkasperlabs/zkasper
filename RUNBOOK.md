@@ -119,16 +119,24 @@ is not enough.
 
 **Requirement 4 is what a real prover makes binding.** A witness-only daemon
 never falls two epochs behind, so the default window is invisible. With proofs,
-the first epoch of every run goes through the batch path, and its one
-justification recursively verifies every slot proof of the epoch: **1,224 s over
-22 of them** on an RTX 5090 (MEASURED 2026-08-18, mainnet epoch 469424). A run
-therefore starts about 20 minutes behind the chain and spends the next 20
-catching up. That is far longer than the default window, so the daemon fell
-behind its own startup, 404ed, and crashlooped — 74 restarts in an hour.
-Sixteen epochs of hot states is about 1.7 hours of slack, which absorbs it.
+the first epoch of every run goes through the batch path, and that epoch used to
+cost **1,452 s against a 384 s epoch** — of which one justification, verifying
+every slot proof of the epoch in a single circuit, was 1,224 s (MEASURED
+2026-08-18, mainnet epoch 469424). A run started about 20 minutes behind the
+chain and spent the next 20 catching up. That is far longer than the default
+window, so the daemon fell behind its own startup, 404ed, and crashlooped — 74
+restarts in an hour.
 
-Deleting bootstrap took about two minutes off the front of that but not the
-batch-path tax itself, so requirement 4 stands. The window only widens for
+**That epoch is about 320 s now** (MODELLED over measured parts; the recursion
+and committee terms are measured at mainnet scale). Slots are proven in groups
+of eleven and folded into a justification chain, so the epoch's ~22 slots are
+two children rather than twenty-two — and a child is 53.087 s, which is the term
+the whole tax was made of. See BENCHMARKS.md.
+
+**Requirement 4 stands anyway**, because 320 s of proving still runs a run's
+first epoch close to a whole epoch behind, and because a restart mid-epoch
+re-proves from the epoch's first slot. Sixteen epochs of hot states is about
+1.7 hours of slack, which absorbs it with room. The window only widens for
 states finalized *after* the node restarts; states already migrated stay
 migrated. A daemon whose chain depends on one of them can no longer skip forward
 on its own — it stops, and recovery is a fresh init point (§6).
