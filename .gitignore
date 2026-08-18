@@ -4,3 +4,5 @@
 /crates/onchain-verifier/out/
 /crates/onchain-verifier/cache/
 scripts/__pycache__/
+/api/.wrangler/
+/api/node_modules/

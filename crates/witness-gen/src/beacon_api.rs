@@ -13,7 +13,7 @@
 //! - `/eth/v1/beacon/states/{state_id}/fork` — fork version
 //! - `/eth/v1/beacon/states/{state_id}/finality_checkpoints` — where the node is
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use zkasper_common::types::{BlockHeaderFields, Checkpoint};
 
 /// Trait abstracting beacon API access. Implement this for mock-based testing.
@@ -80,7 +80,7 @@ impl BeaconApi for BeaconApiClient {
             "{}/eth/v1/beacon/states/{}/validators",
             self.base_url, state_id
         );
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         let data = resp["data"]
             .as_array()
             .context("missing data array in validators response")?;
@@ -97,7 +97,7 @@ impl BeaconApi for BeaconApiClient {
             "{}/eth/v2/beacon/blocks/{}/attestations",
             self.base_url, block_id
         );
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         let data = resp["data"]
             .as_array()
             .context("missing data array in attestations response")?;
@@ -114,7 +114,7 @@ impl BeaconApi for BeaconApiClient {
             "{}/eth/v1/beacon/states/{}/committees?epoch={}",
             self.base_url, state_id, epoch
         );
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         let data = resp["data"]
             .as_array()
             .context("missing data array in committees response")?;
@@ -128,7 +128,7 @@ impl BeaconApi for BeaconApiClient {
 
     async fn get_header(&self, block_id: &str) -> Result<HeaderResponse> {
         let url = format!("{}/eth/v1/beacon/headers/{}", self.base_url, block_id);
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         let header = &resp["data"]["header"]["message"];
 
         Ok(HeaderResponse {
@@ -149,9 +149,18 @@ impl BeaconApi for BeaconApiClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            // Debug endpoint may not be available on all nodes
+        // `None` means "this node does not serve the endpoint", and the callers
+        // answer it with a synthetic state proof. Only a node that says so may
+        // be taken that way: 404/405/501 are the standard ways of saying it.
+        // Anything else — a 5xx, a 403, a timeout — is one call failing, and
+        // returning `None` for those would swap a real state root for a
+        // fabricated one for as long as the failure lasted, without a log line.
+        let status = resp.status();
+        if matches!(status.as_u16(), 404 | 405 | 501) {
             return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("{url} returned {status}");
         }
 
         let bytes = resp.bytes().await?;
@@ -174,13 +183,13 @@ impl ChainStatusApi for BeaconApiClient {
 
     async fn get_genesis_validators_root(&self) -> Result<[u8; 32]> {
         let url = format!("{}/eth/v1/beacon/genesis", self.base_url);
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         parse_hex_bytes32(&resp["data"], "genesis_validators_root")
     }
 
     async fn get_fork_version(&self, state_id: &str) -> Result<[u8; 4]> {
         let url = format!("{}/eth/v1/beacon/states/{}/fork", self.base_url, state_id);
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         parse_hex_bytes4(&resp["data"], "current_version")
     }
 
@@ -189,7 +198,7 @@ impl ChainStatusApi for BeaconApiClient {
             "{}/eth/v1/beacon/states/{}/finality_checkpoints",
             self.base_url, state_id
         );
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
         let data = &resp["data"];
         Ok(FinalityCheckpoints {
             previous_justified: parse_checkpoint(&data["previous_justified"])?,
@@ -277,6 +286,23 @@ impl HeaderResponse {
 // ---------------------------------------------------------------------------
 // JSON parsing helpers
 // ---------------------------------------------------------------------------
+
+/// Read a response body as JSON, refusing one the node did not say was an answer.
+///
+/// A beacon node reports a missing state as a JSON error object with a 404, and
+/// that object parses. Without this the field lookup is what fails, so a node
+/// that says `NOT_FOUND: beacon state at slot 15019808` reaches the operator as
+/// `missing current_version` — which names the wrong endpoint, the wrong cause
+/// and no slot.
+async fn checked_json(resp: reqwest::Response) -> Result<serde_json::Value> {
+    let status = resp.status();
+    let url = resp.url().clone();
+    let body = resp.text().await.context("read response body")?;
+    if !status.is_success() {
+        bail!("{url} returned {status}: {}", body.trim());
+    }
+    serde_json::from_str(&body).with_context(|| format!("parse the response from {url}"))
+}
 
 fn parse_u64_str(val: &serde_json::Value, field: &str) -> Result<u64> {
     val[field]

@@ -437,3 +437,131 @@ Nothing here has to be taken on trust. To check that epoch `E` was finalized:
 
 Steps 1-5 need nothing from zkasper but the bytes this API serves. Step 6 is what
 makes a *series* of proofs a chain rather than a pile.
+
+## Storage, retention, and what a month costs
+
+**One Durable Object with SQLite storage** holds the epoch index, the stage
+events and the live fan-out; **R2** holds the proof bytes. D1 would be the
+textbook choice for the index, but the daemon is a single writer and the SSE
+fan-out wants a single object anyway, and putting both in one object removes a
+round trip. The account's API token can create neither a D1 database nor a KV
+namespace, and R2 is not enabled on the account at all — see "What is not
+enabled yet" — so today the proof bytes fall back to a chunked blob table inside
+the same object. Switching to R2 is a binding in `api/wrangler.jsonc` and a
+redeploy; nothing else changes.
+
+### What is kept
+
+| what | where | how long |
+| --- | --- | --- |
+| one proof per epoch | R2 (blob table until R2 is enabled) | forever; it is the product |
+| epoch summary, latency, public inputs | SQLite | forever |
+| stage rows | SQLite | 90 days, then only the summary survives |
+| event log for SSE replay | SQLite ring buffer | last 5,000 events, about six hours |
+| status snapshot | SQLite, one row, overwritten | latest only |
+
+Group and aggregate proofs are deliberately not stored. The final proof of an
+epoch recursively verifies every proof beneath it, so keeping them would be
+keeping the same claim several times over.
+
+### A month of mainnet
+
+6,750 epochs. Per epoch the daemon writes about 126 rows — 43 stage events, 45
+progress updates at the 6 s floor, 38 status snapshots at the 10 s floor — posted
+in batches of up to a second's worth.
+
+| resource | a month of mainnet | free tier | fits |
+| --- | --- | --- | --- |
+| Worker and DO requests | ~23,000 / day of ingest, plus readers | 100,000 / day each | yes, with ~77,000 / day left for the dashboard |
+| SQLite rows written | ~28,000 / day | 100,000 / day | yes |
+| SQLite rows read | dominated by readers | 5,000,000 / day | yes |
+| proof bytes at 256 KB each | 1.7 GB | R2 10 GB-month | yes |
+| proof bytes at 1 MB each | 6.6 GB | R2 10 GB-month | yes |
+| the same in the SQLite fallback | 1.7 GB / 6.6 GB | 5 GB total | only under about 700 KB a proof |
+| R2 writes | 6,750 Class A | 1,000,000 / month | yes |
+| egress | whatever the dashboard pulls | free on R2 | yes |
+
+**A proof's size is not measured yet.** The pipeline has never run against a real
+prover for a month, and `--prover native` produces no bytes at all. The API
+records `bytes` on every proof, so the real number exists on day one of the GPU
+month; the table is why it does not change the answer unless a proof turns out to
+be several megabytes. Beyond the free tier R2 is $0.015 per GB-month, so a whole
+year of mainnet at 1 MB a proof is 79 GB, or $1.04 a month.
+
+**Where it does not fit.** `/v1/live` is the one thing that can push this off the
+free plan. A Durable Object is billed for wall-clock time while it is active, and
+an open SSE connection keeps it active: 13,000 GB-s a day against 128 MB is 28
+hours of active time, so **one** continuously connected viewer is about 85% of
+the daily allowance. Further concurrent viewers are free — they share the object
+— but a day with someone watching around the clock will graze the limit, and a
+burst will exceed it. The fix is the $5/month Workers Paid plan, which also lifts
+requests to 10 million a month. Nothing else here needs it.
+
+### What is not enabled yet
+
+Two things need a human in the Cloudflare dashboard. Neither blocks the daemon or
+the dashboard.
+
+1. **R2 is not enabled on the account.** Its S3 endpoint does not complete a TLS
+   handshake, and the API refuses bucket calls with "Please enable R2 through the
+   Cloudflare Dashboard". Enabling it is free. Then create a bucket
+   `zkasper-proofs` — its own bucket, not the `lune.gift` one, even though both
+   zones sit in the same account — add the `PROOFS` binding to
+   `api/wrangler.jsonc`, and redeploy.
+2. **The API token cannot create D1, KV or R2 resources.** It can deploy Workers
+   and Durable Objects, which is why the design uses those. A token with
+   `D1:Edit`, `Workers R2 Storage:Edit` and `Workers KV Storage:Edit` would widen
+   the options; nothing currently needs it.
+
+## Changes since this document was first published
+
+The contract above is what the dashboard should build against. These are the
+points where the running implementation is more specific than the first draft, or
+differs from it. Nothing here renames or removes a field.
+
+1. **`hello`'s `id:` and `data.seq` are the resume anchor, not the head**, when
+   the client connected with `?since=` or `Last-Event-ID`. Anchoring on the head
+   would let a disconnect mid-replay skip the replayed range silently. Without
+   replay it is the head, as before.
+2. **A `status` SSE event is synthesized** when an ingest batch carries a status
+   but no `status`-typed event — which is the normal case, because the daemon
+   attaches its manifest to a batch rather than sending it as an event. Deduped
+   on `updated_unix`, so a replayed spool emits nothing extra.
+3. **`/v1/status` before anything has ever been ingested is `200`**, with
+   `chain`, `prover` and `pipeline` null and
+   `service: {received_unix_millis: null, stale: true}`. Read that as "no daemon
+   yet", not "daemon frozen".
+4. **`/v1/proofs/{epoch}` can return `410 gone`** when inline bytes were evicted
+   under the fallback store's cap. `404` still means the epoch never had bytes,
+   which includes every epoch of a `--prover native` run.
+5. **`verify` and `verify.elf_sha256` may be null.** The daemon sends
+   `elf_sha256` inside the `proof` object; it is null under `--prover native`,
+   which has no ELF, and populated under `--prover zisk`.
+6. **`epoch.closed`'s `summary` is shallow-merged** into `proof`,
+   `public_inputs`, `verify`, `latency` and `accumulator` rather than replacing
+   them, so a richer value an earlier `proof.landed` carried survives.
+7. **Derived server-side only when the daemon did not send them**, never
+   overriding: `stage_count`, `prove_millis_total`, `wall_millis_total`,
+   `next_before`, `service.*`, `current_epoch.attesting_pct` (computed on the
+   u64 strings, so it carries more decimals than the example) and `proof.url`.
+8. **`abandoned_reason` is omitted rather than null** when the epoch was not
+   abandoned.
+9. **`current_epoch.state` is `collecting` or `firing`.** There is no
+   `catching_up`: the daemon cannot honestly tell a catch-up from a live follow
+   at that point, and it reports no latency for such an epoch instead.
+10. **`epoch.opened` also carries `chain`, `pipeline`, `prover` and
+    `opened_unix_millis`**, so an epoch row is complete from its first event.
+11. **Added endpoints:** `GET /v1/health` (and `/health`), and
+    `POST /v1/ingest/reset` behind the same bearer token, which drops and
+    recreates every table. The stream sequence counter deliberately survives a
+    reset, so a connected client's `Last-Event-ID` never points into the future.
+12. **Error codes beyond `not_found`:** `405 method_not_allowed`,
+    `413 too_large`, `400 sha256_mismatch`, `400 bad_request` (a proof whose
+    length is not a multiple of 8), `503 too_many_streams` (more than 200
+    concurrent SSE readers), `401 unauthorized`.
+13. **`access-control-allow-methods` is `GET, HEAD, OPTIONS`.** The write path is
+    deliberately not reachable from a browser.
+14. **Balances are strings everywhere, including in `status.json` on disk.**
+    Mainnet's total active balance in gwei passed 2^53 long ago, so a JSON reader
+    that parses it as a double rounds it. A u64 sent as a JSON number would be
+    corrupted before the API ever saw it.

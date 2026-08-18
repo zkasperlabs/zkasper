@@ -1,0 +1,31 @@
+{
+  // zkasper public API. Deploy from this directory:
+  //   set -a; . ../../.cloudflare-zkasper; set +a
+  //   npx --yes wrangler@4 deploy
+  // Ingest token (server-side secret, read as env.INGEST_TOKEN):
+  //   printf %s "$TOKEN" | npx --yes wrangler@4 secret put INGEST_TOKEN
+  //
+  // Proof bytes are chunked into the Durable Object's own SQLite because R2 is
+  // not enabled on this account. When it is, uncomment the r2_buckets block
+  // below and redeploy: the storage abstraction in src/index.ts picks R2 up
+  // from the binding and nothing else has to change. Blobs already inline stay
+  // readable; new uploads land in R2.
+  "name": "zkasper-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-08-01",
+  "durable_objects": {
+    "bindings": [{ "name": "INDEX", "class_name": "IndexDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["IndexDO"] }],
+  // "r2_buckets": [{ "binding": "PROOFS", "bucket_name": "zkasper-proofs" }],
+  //
+  // api.zkasper.com is attached as a Worker custom domain, but NOT from here:
+  // this API token cannot read /zones/{zone}/workers/routes, so a "routes"
+  // entry makes every `wrangler deploy` exit non-zero after a successful
+  // upload. The domain was bound once, out of band, and survives redeploys:
+  //   curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
+  //     -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "content-type: application/json" \
+  //     --data '{"zone_id":"<zkasper.com zone>","hostname":"api.zkasper.com","service":"zkasper-api","environment":"production"}'
+  "workers_dev": true,
+  "observability": { "enabled": true }
+}

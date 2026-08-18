@@ -455,6 +455,12 @@ impl StreamPolicy {
             .div_ceil(self.threshold_denominator as u128)
     }
 
+    /// What the trigger is aiming at, as a percentage. Published so a consumer
+    /// can draw the line the weight is climbing towards.
+    pub fn threshold_pct(&self) -> f64 {
+        self.threshold_numerator as f64 * 100.0 / self.threshold_denominator as f64
+    }
+
     /// Balance the circuit itself insists on, which is what "enough
     /// attestations exist" means and so what `T` is measured at.
     pub fn quorum_balance(&self, total_active_balance: u64) -> u128 {

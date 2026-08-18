@@ -95,6 +95,22 @@ impl Stage {
             Stage::StreamFinal => "stream_final",
         }
     }
+
+    /// Guest crate whose ELF proves this stage, and whose verification key a
+    /// third party rebuilds to check a proof came from this circuit.
+    pub fn guest(self) -> &'static str {
+        match self {
+            Stage::Bootstrap => "zkasper-bootstrap-guest",
+            Stage::EpochDiff => "zkasper-epoch-diff-guest",
+            Stage::Committee => "zkasper-committee-proof-guest",
+            Stage::SlotProof => "zkasper-slot-proof-guest",
+            Stage::Justification => "zkasper-justification-guest",
+            Stage::Finalization => "zkasper-finalization-guest",
+            Stage::Group => "zkasper-group-proof-guest",
+            Stage::Aggregate => "zkasper-aggregation-guest",
+            Stage::StreamFinal => "zkasper-stream-final-guest",
+        }
+    }
 }
 
 /// What a proof cost inside the prover.
@@ -137,6 +153,12 @@ pub trait Prover: Send + Sync {
 
     /// What the last proof cost, for a prover that produces proofs.
     fn last_cost(&self) -> Option<ProveCost> {
+        None
+    }
+
+    /// SHA-256 of the ELF that proves `stage`, when there is one. Published so
+    /// a verifier can check it rebuilt the same binary before comparing keys.
+    fn program_digest(&self, _stage: Stage) -> Option<String> {
         None
     }
 

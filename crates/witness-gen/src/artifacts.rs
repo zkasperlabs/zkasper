@@ -37,6 +37,10 @@ pub struct StageTiming {
     pub epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<u64>,
+    /// Orders repeats of the same stage inside an epoch: group 0, group 1, and
+    /// so on. `None` for a stage that runs once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
     pub millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prove_millis: Option<u64>,
@@ -44,6 +48,8 @@ pub struct StageTiming {
     pub wrap_millis: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
+    /// Size of the proof this stage produced. Zero on a witness-only run.
+    pub proof_bytes: u64,
 }
 
 impl StageTiming {
@@ -58,15 +64,27 @@ impl StageTiming {
             stage: stage.as_str().to_string(),
             epoch,
             slot: None,
+            index: None,
             millis: started.elapsed().as_millis() as u64,
             prove_millis: cost.map(|c| c.prove_millis),
             wrap_millis: cost.map(|c| c.wrap_millis),
             artifact: Some(artifact),
+            proof_bytes: 0,
         }
     }
 
     pub fn at_slot(mut self, slot: u64) -> Self {
         self.slot = Some(slot);
+        self
+    }
+
+    pub fn at_index(mut self, index: usize) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    pub fn with_proof(mut self, proof: &[u64]) -> Self {
+        self.proof_bytes = (proof.len() * 8) as u64;
         self
     }
 }
@@ -112,8 +130,40 @@ pub struct AccStatus {
     pub commitment: String,
     /// Running hash over every accumulator root since bootstrap.
     pub chain_digest: String,
+    /// A string, not a number: mainnet's total active balance in gwei passed
+    /// 2^53 long ago, and a JSON reader that parses it as a double silently
+    /// rounds it. Every balance this manifest publishes is a string for the
+    /// same reason.
+    #[serde(with = "u64_string")]
     pub total_active_balance: u64,
     pub num_validators: u64,
+}
+
+/// Serializes a `u64` as a decimal string.
+mod u64_string {
+    pub fn serialize<S: serde::Serializer>(value: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&value.to_string())
+    }
+}
+
+/// The epoch being proven right now.
+#[derive(Clone, Debug, Serialize)]
+pub struct CurrentEpoch {
+    pub epoch: u64,
+    pub target_root: String,
+    pub opened_unix_millis: u64,
+    /// `collecting` below the threshold, `firing` once it has been crossed and
+    /// the final proof is what is left.
+    pub state: &'static str,
+    #[serde(with = "u64_string")]
+    pub attesting_balance: u64,
+    #[serde(with = "u64_string")]
+    pub total_active_balance: u64,
+    pub attesting_pct: f64,
+    pub threshold_pct: f64,
+    pub folded_groups: usize,
+    pub slots_held: usize,
+    pub finalizes_epoch: u64,
 }
 
 /// A checkpoint, as published in the manifest.
@@ -158,10 +208,30 @@ pub struct Status {
     pub recent_stages: Vec<StageTiming>,
     /// Measured `T2 - T` for the epochs this daemon streamed, newest last.
     pub recent_latencies: Vec<EpochLatency>,
+    /// The epoch in flight. Absent between epochs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_epoch: Option<CurrentEpoch>,
     /// Attestation gossip, when the daemon is following it. Absent means the
     /// daemon is reading blocks, and is a slot behind the chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gossip: Option<GossipStatus>,
+    /// How the mirror at the public API is keeping up. Absent when the daemon
+    /// was not given one to publish to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishStatus>,
+}
+
+/// What publishing to the API has cost.
+///
+/// `pending` climbing is the API being unreachable, which the daemon rides out;
+/// `dropped` climbing is the outage having outlasted the spool, which is the
+/// only case where the published record has a hole in it.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PublishStatus {
+    pub posted: u64,
+    pub spooled: u64,
+    pub dropped: u64,
+    pub pending: u64,
 }
 
 /// What the attestation event stream has delivered.

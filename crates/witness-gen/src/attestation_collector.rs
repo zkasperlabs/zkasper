@@ -111,6 +111,15 @@ pub struct SlotStream {
     /// Unaggregated attestations, summed per message as they arrive, keyed by
     /// the slot they attest to. The primary path.
     summed: BTreeMap<u64, BTreeMap<DataKey, Summed>>,
+    /// Slots [`Self::forget`] has been called for.
+    ///
+    /// Dropping the maps is not enough to forget a slot: attestations for it
+    /// keep arriving for several slots afterwards, and each one puts the slot
+    /// back. The caller then takes it a second time, and the aggregation circuit
+    /// rejects the epoch with "group proof N counts a slot that was already
+    /// counted" — correctly, because the first group proof already fixed that
+    /// slot's attester set and counting it twice counts its validators twice.
+    closed: BTreeSet<u64>,
 }
 
 impl SlotStream {
@@ -127,6 +136,7 @@ impl SlotStream {
             committees,
             pending: BTreeMap::new(),
             summed: BTreeMap::new(),
+            closed: BTreeSet::new(),
         }
     }
 
@@ -155,6 +165,9 @@ impl SlotStream {
             if att.data_target_epoch != self.target_epoch
                 || att.data_target_root != self.target_root
             {
+                continue;
+            }
+            if self.closed.contains(&att.data_slot) {
                 continue;
             }
 
@@ -358,6 +371,7 @@ impl SlotStream {
     pub fn forget(&mut self, slot: u64) {
         self.pending.remove(&slot);
         self.summed.remove(&slot);
+        self.closed.insert(slot);
     }
 
     /// Attestation slots that have been fed and not yet closed.
