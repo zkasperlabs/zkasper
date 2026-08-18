@@ -28,10 +28,6 @@ name = "zkasper-prover-server"
 path = "src/bin/prover_server.rs"
 
 [[bin]]
-name = "recursion-bench"
-path = "src/bin/recursion_bench.rs"
-
-[[bin]]
 name = "zkasper-init-point"
 path = "src/bin/gen_init_point.rs"
 
