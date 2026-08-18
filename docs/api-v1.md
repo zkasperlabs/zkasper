@@ -512,3 +512,56 @@ the dashboard.
    and Durable Objects, which is why the design uses those. A token with
    `D1:Edit`, `Workers R2 Storage:Edit` and `Workers KV Storage:Edit` would widen
    the options; nothing currently needs it.
+
+## Changes since this document was first published
+
+The contract above is what the dashboard should build against. These are the
+points where the running implementation is more specific than the first draft, or
+differs from it. Nothing here renames or removes a field.
+
+1. **`hello`'s `id:` and `data.seq` are the resume anchor, not the head**, when
+   the client connected with `?since=` or `Last-Event-ID`. Anchoring on the head
+   would let a disconnect mid-replay skip the replayed range silently. Without
+   replay it is the head, as before.
+2. **A `status` SSE event is synthesized** when an ingest batch carries a status
+   but no `status`-typed event — which is the normal case, because the daemon
+   attaches its manifest to a batch rather than sending it as an event. Deduped
+   on `updated_unix`, so a replayed spool emits nothing extra.
+3. **`/v1/status` before anything has ever been ingested is `200`**, with
+   `chain`, `prover` and `pipeline` null and
+   `service: {received_unix_millis: null, stale: true}`. Read that as "no daemon
+   yet", not "daemon frozen".
+4. **`/v1/proofs/{epoch}` can return `410 gone`** when inline bytes were evicted
+   under the fallback store's cap. `404` still means the epoch never had bytes,
+   which includes every epoch of a `--prover native` run.
+5. **`verify` and `verify.elf_sha256` may be null.** The daemon sends
+   `elf_sha256` inside the `proof` object; it is null under `--prover native`,
+   which has no ELF, and populated under `--prover zisk`.
+6. **`epoch.closed`'s `summary` is shallow-merged** into `proof`,
+   `public_inputs`, `verify`, `latency` and `accumulator` rather than replacing
+   them, so a richer value an earlier `proof.landed` carried survives.
+7. **Derived server-side only when the daemon did not send them**, never
+   overriding: `stage_count`, `prove_millis_total`, `wall_millis_total`,
+   `next_before`, `service.*`, `current_epoch.attesting_pct` (computed on the
+   u64 strings, so it carries more decimals than the example) and `proof.url`.
+8. **`abandoned_reason` is omitted rather than null** when the epoch was not
+   abandoned.
+9. **`current_epoch.state` is `collecting` or `firing`.** There is no
+   `catching_up`: the daemon cannot honestly tell a catch-up from a live follow
+   at that point, and it reports no latency for such an epoch instead.
+10. **`epoch.opened` also carries `chain`, `pipeline`, `prover` and
+    `opened_unix_millis`**, so an epoch row is complete from its first event.
+11. **Added endpoints:** `GET /v1/health` (and `/health`), and
+    `POST /v1/ingest/reset` behind the same bearer token, which drops and
+    recreates every table. The stream sequence counter deliberately survives a
+    reset, so a connected client's `Last-Event-ID` never points into the future.
+12. **Error codes beyond `not_found`:** `405 method_not_allowed`,
+    `413 too_large`, `400 sha256_mismatch`, `400 bad_request` (a proof whose
+    length is not a multiple of 8), `503 too_many_streams` (more than 200
+    concurrent SSE readers), `401 unauthorized`.
+13. **`access-control-allow-methods` is `GET, HEAD, OPTIONS`.** The write path is
+    deliberately not reachable from a browser.
+14. **Balances are strings everywhere, including in `status.json` on disk.**
+    Mainnet's total active balance in gwei passed 2^53 long ago, so a JSON reader
+    that parses it as a double rounds it. A u64 sent as a JSON number would be
+    corrupted before the API ever saw it.
