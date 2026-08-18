@@ -227,6 +227,17 @@ struct Cli {
     #[arg(long)]
     prover_spool: Option<PathBuf>,
 
+    /// How long to wait for one proof before giving the connection up.
+    ///
+    /// It has to clear the slowest proof the run will ask for, and that is not
+    /// the one on the critical path: the batch-path justification recursively
+    /// verifies every slot proof of the epoch, and over ~22 of them it took more
+    /// than ten minutes on an RTX 5090 (measured 2026-08-18). A timeout under
+    /// that does not fail — it retries, and the retry is just as slow, so the
+    /// epoch never lands and the card works on proofs nobody is waiting for.
+    #[arg(long, default_value_t = 1800)]
+    prover_timeout_seconds: u64,
+
     /// What an hour of this deployment's proving hardware costs, in US dollars.
     ///
     /// The daemon measures prover milliseconds per epoch and publishes both,
@@ -286,6 +297,7 @@ impl Cli {
                         .clone()
                         .unwrap_or_else(|| self.output_dir.join("prover-spool")),
                 ),
+                request_timeout: Duration::from_secs(self.prover_timeout_seconds),
                 ..RemoteProverConfig::new(
                     chain,
                     &self.prover_addr,

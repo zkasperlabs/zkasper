@@ -393,8 +393,14 @@ pub struct RemoteProverConfig {
     pub connect_timeout: Duration,
     /// Longest one proof may take. It bounds how long a server that has stopped
     /// answering can hold the pipeline, so it can be neither short enough to
-    /// abandon good proofs nor long enough to hide a dead server. The default is
-    /// under two mainnet epochs.
+    /// abandon good proofs nor long enough to hide a dead server.
+    ///
+    /// The slowest proof a run asks for is not the one on the critical path. A
+    /// batch-path justification recursively verifies every slot proof of its
+    /// epoch, and over ~22 of them that took more than ten minutes on an RTX
+    /// 5090 (measured 2026-08-18). A timeout under the slowest proof does not
+    /// fail — it retries, and the retry is just as slow, so the epoch never
+    /// lands and the card spends its time on proofs nobody is waiting for.
     pub request_timeout: Duration,
     /// Held after a failed connect, so an outage costs one attempt per interval
     /// rather than one per stage.
@@ -428,7 +434,7 @@ impl RemoteProverConfig {
             token: token.into(),
             stages: stages.to_vec(),
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(600),
+            request_timeout: Duration::from_secs(1800),
             reconnect_backoff: Duration::from_secs(5),
             spool_dir: None,
             spool_capacity: 256,
