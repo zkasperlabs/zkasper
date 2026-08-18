@@ -16,6 +16,7 @@ pub mod prover;
 pub mod pubkey;
 pub mod publish;
 pub mod remote_prover;
+pub mod split_prover;
 pub mod ssz_state;
 pub mod state_diff;
 pub mod store;

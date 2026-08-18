@@ -76,7 +76,7 @@ pub type Proof = Vec<u64>;
 /// prove every slot, fold them once the epoch is over, pair two justifications.
 /// `Group`, `Aggregate` and `StreamFinal` are the streaming path, which proves
 /// the same thing as attestations arrive and collapses the tail into one proof.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
     Bootstrap,
     EpochDiff,
