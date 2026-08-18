@@ -757,9 +757,51 @@ pushed. They are recorded because they say what a readiness run is for.
    logged `accumulator advanced ... millis=23128` where the previous build had
    logged nothing but `Error: build epoch diff witness` on a five-second loop.
 
-The second one is the reason a day-long run needed rehearsing rather than
-launching: nothing in a fixture-backed test suite produces a skipped epoch
-boundary.
+### The blocker the run found, which is not fixed
+
+**An empty epoch boundary slot still stops the streaming pipeline, permanently.**
+Fixing the epoch diff (bug 2 above) moved the failure one stage later rather than
+removing it. Two epochs on, the final proof for the *next* epoch rejects:
+
+```
+stream_final circuit rejected the witness: assertion `left == right` failed:
+the finalized epoch's accumulator was built from a different state than its
+block produced
+```
+
+`crates/stream-final-guest/src/lib.rs:274`. Observed 26 times in a row on epoch
+469377, which finalizes 469376, whose first slot 15,020,032 has no block. The
+supervisor restarting the daemon does not help, because the slot will never gain
+a block. The daemon makes no further progress until it is re-bootstrapped past
+the affected epoch, which restarts the accumulator chain.
+
+This is exactly the item the README already lists as unfinished:
+
+> Finalizing an epoch whose first slot was empty. The accumulator is built from
+> the state at the epoch boundary, and the finalized header only names that
+> state when a block sits on the boundary slot. Covering the empty case needs
+> the boundary state root proved out of the finalized state's `state_roots`
+> list.
+
+**What it means for a long run.** About 1% of mainnet slots are missed, so an
+epoch boundary is empty roughly once in a hundred epochs — **two to three times
+in a day, and about eighty times in a month.** Each one ends the run. So:
+
+- **A day-long run needs an operator or a supervisor that re-bootstraps on this
+  error**, and each occurrence breaks the accumulator chain at that point.
+- **A month-long run is not possible** until the circuit work above is done.
+  This is the single largest gap between the current daemon and continuous
+  operation, and it is circuit work rather than daemon work.
+
+A crude mitigation, if a day of data matters more than an unbroken chain: have
+the supervisor match `different state than its block produced` in the log,
+delete the store and let the daemon re-bootstrap from the node's current
+finalized checkpoint. That keeps epochs flowing at the cost of a chain break and
+one bootstrap (about 2 minutes) per occurrence.
+
+The two bugs above, and this blocker, are the reason a day-long run needed
+rehearsing rather than launching: nothing in a fixture-backed test suite produces
+a skipped epoch boundary.
 
 ### Health at the end of the window
 
