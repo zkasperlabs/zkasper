@@ -38,13 +38,13 @@ use anyhow::{bail, Result};
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    AggregateOutput, AggregateWitness, BootstrapWitness, CommitteeOutput, CommitteeWitness,
-    EpochDiffOutput, EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
+    AggregateOutput, AggregateWitness, CommitteeOutput, CommitteeWitness, EpochDiffOutput,
+    EpochDiffWitness, FinalizationOutput, FinalizationWitness, GroupProofOutput,
     JustificationOutput, JustificationWitness, SlotProofOutput, SlotProofWitness,
     StreamFinalOutput, StreamFinalWitness,
 };
 
-use crate::prover::{AccOutput, Proof, ProveCost, Prover, ProverHealth, Stage};
+use crate::prover::{Proof, ProveCost, Prover, ProverHealth, Stage};
 
 /// Routes each stage to one of several provers.
 pub struct SplitProver {
@@ -122,10 +122,6 @@ impl Prover for SplitProver {
             total.pending += h.pending;
         }
         any.then_some(total)
-    }
-
-    fn prove_bootstrap(&self, witness: &BootstrapWitness) -> Result<(AccOutput, Proof)> {
-        self.pick(Stage::Bootstrap).prove_bootstrap(witness)
     }
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {
