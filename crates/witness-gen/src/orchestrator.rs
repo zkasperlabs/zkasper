@@ -98,6 +98,12 @@ use crate::{witness_bootstrap, witness_epoch_diff, witness_justification};
 /// How many stage timings the manifest keeps.
 const RECENT_STAGES: usize = 64;
 
+/// How far behind the head an epoch may be and still be called live, in epochs.
+///
+/// Two, because the daemon keeps looking for a checkpoint's attestations for
+/// `attestation_lookahead_epochs` past it. Anything older is a catch-up.
+const LIVE_EPOCHS: f64 = 2.0;
+
 /// How many epochs' measured `T2 - T` the manifest keeps.
 const RECENT_LATENCIES: usize = 16;
 
@@ -2187,6 +2193,16 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         };
         let elapsed = now_unix_millis().saturating_sub(epoch_start) as f64;
         let expected = expected.saturating_sub(epoch_start) as f64;
+
+        // Only an epoch the daemon is following live has an expectation worth
+        // measuring. Proving one that ended an hour ago is a catch-up, and
+        // recording its age as a delay would swamp the distribution with the
+        // one case where being late was the point.
+        let epoch_millis =
+            spe as f64 * self.config.stream_policy.seconds_per_slot * 1000.0 * LIVE_EPOCHS;
+        if elapsed > epoch_millis {
+            return;
+        }
         crate::metrics::observe_proof_start(stage, (elapsed - expected) / 1000.0);
     }
 

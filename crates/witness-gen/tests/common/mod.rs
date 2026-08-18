@@ -61,6 +61,10 @@ pub struct MockBeaconApi {
     /// Block root every `block_id` resolves to, when a test reorgs the chain
     /// under a daemon that is already collecting against the old one.
     pub reorged_to: Mutex<Option<[u8; 32]>>,
+    /// Unix seconds of slot 0. Set so the synthetic chain's epochs are
+    /// happening now, which is what makes the daemon's schedule comparisons
+    /// exercise the live path instead of looking like a fifty-year catch-up.
+    pub genesis_time: u64,
 }
 
 impl MockBeaconApi {
@@ -78,6 +82,7 @@ impl MockBeaconApi {
             attestation_requests: Mutex::new(Vec::new()),
             head: Mutex::new(None),
             reorged_to: Mutex::new(None),
+            genesis_time: 0,
         }
     }
 
@@ -131,7 +136,7 @@ impl ChainStatusApi for MockBeaconApi {
     }
 
     async fn get_genesis_time(&self) -> Result<u64> {
-        Ok(0)
+        Ok(self.genesis_time)
     }
 
     async fn get_fork_version(&self, _state_id: &str) -> Result<[u8; 4]> {
@@ -315,6 +320,10 @@ fn generate_keys(n: usize) -> Vec<Key> {
 /// Validator 0 loses 1 ETH of effective balance every epoch. That is a field the
 /// accumulator leaf commits to, so every epoch has a real mutation to diff *and*
 /// lands on a different accumulator — the case finalization has to work across.
+/// Slot length the synthetic chain is placed on the clock with. Only the
+/// schedule comparisons read it; nothing here waits.
+pub const SECONDS_PER_SLOT: u64 = 12;
+
 pub struct SyntheticChain {
     pub config: ChainConfig,
     pub keys: Vec<Key>,
@@ -517,6 +526,11 @@ impl SyntheticChain {
     /// This chain, in process, with the head at `head_slot`.
     pub fn mock(&self, head_slot: u64) -> MockBeaconApi {
         let mut mock = MockBeaconApi::new();
+        mock.genesis_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+            .saturating_sub(self.first_epoch * self.config.slots_per_epoch * SECONDS_PER_SLOT);
         mock.genesis_validators_root = self.genesis_validators_root;
         mock.fork_version = self.fork_version;
 
