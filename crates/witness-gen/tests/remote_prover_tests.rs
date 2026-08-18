@@ -259,6 +259,42 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
     assert_eq!(spooled_files(spool.path()), 4);
 }
 
+/// A witness too large to frame is not spooled, because a retry of it would
+/// fail identically for ever and re-send the whole thing each time.
+///
+/// Found on mainnet 2026-08-18: a bootstrap witness over 2,338,764 validators
+/// serializes to 916 MB against a 512 MB cap, and the client queued it and kept
+/// trying. The cap is a config value here so the test does not need 512 MB.
+#[test]
+fn refuses_to_queue_a_witness_that_cannot_be_sent() {
+    let spool = tempfile::tempdir().unwrap();
+    let server = Server::bind();
+    let prover = RemoteProver::connect(RemoteProverConfig {
+        max_request_bytes: 64,
+        ..client(&server.addr, Some(spool.path()))
+    })
+    .expect("connect");
+
+    let witness = witness();
+    let (output, _, proof) = prover
+        .prove_group(&witness)
+        .expect("no proof, but no error");
+    assert!(proof.is_empty(), "it was never sent, so there is no proof");
+    let (local, _, _) = NativeProver::new(chain()).prove_group(&witness).unwrap();
+    assert_eq!(
+        output.public_bytes(),
+        local.public_bytes(),
+        "the outputs are the local circuit's either way",
+    );
+
+    let counters = prover.counters();
+    assert_eq!(counters.unproven, 1);
+    assert_eq!(counters.spooled, 0, "a retry of it can never succeed");
+    assert_eq!(counters.pending, 0);
+    assert_eq!(counters.proved, 0, "nothing was ever sent");
+    assert_eq!(spooled_files(spool.path()), 0);
+}
+
 /// The server comes back on the same address. The next proof reconnects without
 /// anything having to restart, and the backlog drains behind it.
 #[test]
