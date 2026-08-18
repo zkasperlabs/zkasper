@@ -17,7 +17,7 @@
 use zkasper_common::types::*;
 use zkasper_common::{committee, ChainConfig};
 use zkasper_witness_gen::attestation_collector::SlotStream;
-use zkasper_witness_gen::beacon_api::AttestationResponse;
+use zkasper_witness_gen::beacon_api::{AttestationResponse, SingleAttester};
 use zkasper_witness_gen::fixture::Epoch;
 
 const ACC_DEPTH: u32 = 4;
@@ -466,5 +466,147 @@ fn the_committees_partition_the_active_balance() {
             .map(|c| c.balance)
             .sum::<u64>(),
         epoch.total_active_balance,
+    );
+}
+
+/// One `SingleAttestation`, as the node publishes unaggregated gossip.
+fn single(epoch: &Epoch, slot_in_epoch: u64, head: [u8; 32], attester: u64) -> AttestationResponse {
+    AttestationResponse {
+        aggregation_bits: Vec::new(),
+        single_attester: Some(SingleAttester {
+            committee_index: 0,
+            attester_index: attester,
+        }),
+        ..aggregate(epoch, slot_in_epoch, head, &[attester])
+    }
+}
+
+/// The primary path: the host sums the singles itself and the circuit is handed
+/// one aggregate for the message.
+///
+/// The signature the collector produces is a G2 sum it computed, not one any
+/// aggregator published, so this is the test that says our arithmetic matches
+/// what the circuit derives from committee-minus-absentees.
+#[test]
+fn singles_are_summed_into_one_aggregate_per_message() {
+    let epoch = fixture();
+    let head = [0x44u8; 32];
+
+    let mut stream = SlotStream::new(
+        &epoch.config,
+        epoch.committees.clone(),
+        epoch.epoch,
+        epoch.target_root,
+    );
+    let members = epoch.committees.members[0].clone();
+    let singles: Vec<AttestationResponse> = members
+        .iter()
+        .map(|&index| single(&epoch, 0, head, index))
+        .collect();
+    stream.ingest(&singles).unwrap();
+
+    let complement = stream.close(epoch.slot(0)).expect("close the slot");
+    assert_eq!(
+        complement.witness.primary.len(),
+        1,
+        "the circuit was handed more than one aggregate for one message",
+    );
+    assert!(complement.witness.absentees.is_empty());
+    assert_eq!(
+        verify(&witness_for(&epoch, &[complement.witness])).attesting_balance,
+        members.len() as u64 * BALANCE_GWEI,
+    );
+}
+
+/// The same validator gossiped twice is summed once.
+///
+/// Nothing downstream would catch it: `sig + sig_v` verifies perfectly well
+/// against `2·pk_v + rest`, so a doubled signature would produce a proof that
+/// passes while the derived key silently disagrees with the committee.
+#[test]
+fn a_validator_gossiped_twice_is_summed_once() {
+    let epoch = fixture();
+    let head = [0x44u8; 32];
+
+    let mut stream = SlotStream::new(
+        &epoch.config,
+        epoch.committees.clone(),
+        epoch.epoch,
+        epoch.target_root,
+    );
+    let members = epoch.committees.members[0].clone();
+    let mut gossip: Vec<AttestationResponse> = members
+        .iter()
+        .map(|&index| single(&epoch, 0, head, index))
+        .collect();
+    gossip.extend(members.iter().map(|&index| single(&epoch, 0, head, index)));
+    stream.ingest(&gossip).unwrap();
+
+    let complement = stream.close(epoch.slot(0)).expect("close the slot");
+    assert_eq!(
+        verify(&witness_for(&epoch, &[complement.witness])).attesting_balance,
+        members.len() as u64 * BALANCE_GWEI,
+    );
+}
+
+/// A network aggregate is a backstop, and only for what the singles missed.
+///
+/// The singles cover every member but one; an aggregate covering the whole
+/// committee overlaps them, so taking it would count everyone twice. It is
+/// refused, and the one uncovered member stays an absentee — while an aggregate
+/// over exactly that member is disjoint, and is taken.
+#[test]
+fn an_overlapping_network_aggregate_is_refused_and_a_disjoint_one_is_taken() {
+    let epoch = fixture();
+    let head = [0x44u8; 32];
+    let members = epoch.committees.members[0].clone();
+    let (missing, covered) = members.split_last().expect("a committee");
+
+    let close = |gossip: Vec<AttestationResponse>| {
+        let mut stream = SlotStream::new(
+            &epoch.config,
+            epoch.committees.clone(),
+            epoch.epoch,
+            epoch.target_root,
+        );
+        stream.ingest(&gossip).unwrap();
+        stream.close(epoch.slot(0)).expect("close the slot")
+    };
+
+    let singles: Vec<AttestationResponse> = covered
+        .iter()
+        .map(|&index| single(&epoch, 0, head, index))
+        .collect();
+
+    let overlapping = close(
+        singles
+            .iter()
+            .cloned()
+            .chain([aggregate(&epoch, 0, head, &members)])
+            .collect(),
+    );
+    assert_eq!(
+        overlapping.witness.absentees.len(),
+        1,
+        "an aggregate overlapping the singles was folded in anyway",
+    );
+    assert_eq!(
+        verify(&witness_for(&epoch, &[overlapping.witness])).attesting_balance,
+        covered.len() as u64 * BALANCE_GWEI,
+    );
+
+    let disjoint = close(
+        singles
+            .into_iter()
+            .chain([aggregate(&epoch, 0, head, &[*missing])])
+            .collect(),
+    );
+    assert!(
+        disjoint.witness.absentees.is_empty(),
+        "the backstop did not fill the hole the singles left",
+    );
+    assert_eq!(
+        verify(&witness_for(&epoch, &[disjoint.witness])).attesting_balance,
+        members.len() as u64 * BALANCE_GWEI,
     );
 }

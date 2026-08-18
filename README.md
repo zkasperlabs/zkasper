@@ -254,7 +254,8 @@ justify.
 `/eth/v1/events?topics=attestation,single_attestation,chain_reorg`, and this is
 an operational dependency rather than an optimisation:
 
-- **The node must subscribe to every attestation subnet** —
+- **The node must subscribe to every attestation subnet**, because unaggregated
+  attestations are the primary source and a partial subnet view is a partial feed —
   `--subscribe-all-subnets` on Lighthouse, `--subscribe-all-subnets` on Prysm and
   Teku, `--subscribeAllSubnets` on Lodestar, `--subscribe-all-subnets` on Nimbus.
   A default node only joins the subnets its own validators need plus a rotating
@@ -275,6 +276,104 @@ an operational dependency rather than an optimisation:
 behind the chain by construction and is there for a node that will not serve the
 event stream; the stream is also the source blocks repair after an outage, which
 the daemon does automatically and reports in `status.json` under `gossip`.
+
+### Where attestations come from, and what it costs
+
+The daemon builds its own aggregates. It subscribes to unaggregated gossip,
+groups by `AttestationData` root, sums the signatures natively on the host and
+hands the circuit **one aggregate per distinct message**. Network aggregates are
+a backstop, taken only where the singles left a hole.
+
+Three reasons, in the order they matter:
+
+- **Coverage is a cost.** A network aggregator publishes the best cover it has
+  seen; an attester missing from it becomes a named absentee in the complement
+  proof at 1.79 ms each. Singles let the daemon find those validators itself.
+- **Four seconds.** Unaggregated attestations are published a third of a slot in;
+  aggregates two thirds. Since the trigger fires when the arrival burst drains,
+  that is four seconds off `T2`.
+- **Minimality by construction.** A single names one validator, so a running sum
+  over singles is disjoint with no cover to choose. A slot's proving cost is
+  dominated by distinct messages — about 51.8M cost units for another message
+  against 53K for another absentee — so one aggregate per message is the shape
+  worth having.
+
+Disjointness at the seam is proved, not assumed: summing a validator's signature
+twice still *verifies* (`sig + sig_v` against `2·pk_v + rest`), so nothing
+downstream would catch a double count. The collector seeds the merge with its own
+summed singles and takes a network aggregate only when its signers are disjoint
+from everything already counted, which in practice means only for a committee the
+singles feed missed entirely.
+
+#### Measured cost, per mainnet slot of 30,030 unaggregated attestations
+
+| | wire | daemon CPU | per attestation |
+|---|---|---|---|
+| JSON frames over SSE | 18.45 MB | 0.121 s | 4.0 us |
+| socket to inbox, end to end | 18.45 MB | 0.204 s | 6.8 us |
+| the same as fixed 240-byte SSZ | 7.21 MB | 0.00016 s | 5.3 ns |
+| summing the signatures (G2) | — | 0.678 s | 22.6 us |
+
+Reproduce with `cargo test --release -p zkasper-witness-gen throughput -- --ignored
+--nocapture`. Ingest and summing together are **0.88 s of one core per slot, 7.3%
+of a 12 s slot**, and both parallelise. The daemon is not the bottleneck, and
+note what the table says about where the cost is: SSZ would remove 0.12 s of the
+0.88 s, while the signature arithmetic — which SSZ does not touch — is 77% of it.
+
+#### The node is the bottleneck, and it takes one flag
+
+Lighthouse holds each SSE topic in a `tokio::sync::broadcast` ring of
+`--http-sse-capacity-multiplier` x 16 messages. The default multiplier is 1, so
+the `single_attestation` topic buffers **sixteen** messages against a slot's
+thirty thousand. A consumer that falls behind gets `Lagged(n)`, which the node
+renders as an SSE *comment* — `error - dropped n messages` — while the
+attestations themselves are gone. A client that ignores comments loses
+attestations and never learns it did.
+
+So:
+
+- Run the node with **`--http-sse-capacity-multiplier 2000`** (32,000 messages,
+  a whole slot). 64 would absorb ordinary millisecond jitter at 30,000 events a
+  second; 2,000 makes loss essentially impossible for about 24 MB of node memory.
+- zkasperd counts those comments and publishes them as `gossip.dropped` in
+  `status.json`, and treats each as a gap to repair from blocks. **Anything but
+  zero there means the node is misconfigured**, not that the daemon is unlucky.
+
+#### What a forked node should expose
+
+Stock Lighthouse is workable with the flag above, so a fork is an optimisation
+rather than a precondition. In increasing order of what it removes:
+
+1. **SSZ event frames.** Length-prefixed fixed-size records on the same event
+   stream: 7.21 MB a slot instead of 18.45 MB, and decoding becomes free
+   (5.3 ns against 4.0 us). Removes 0.12 s of the daemon's 0.88 s.
+2. **Pre-grouped, pre-summed attestations.** This is the one worth building. The
+   node already computes the attestation data root during gossip validation and
+   already holds the signatures, so it can emit, per slot and per distinct
+   `AttestationData`, a running `(data, aggregate signature, participation
+   bitfield)` snapshot at a fixed cadence — 100 ms is finer than the daemon's
+   trigger interval. Epoch 430529 averages 2.8 distinct messages a slot, so that
+   is three events and about two kilobytes a slot instead of 30,030 events and
+   18 MB, and it removes the whole 0.88 s. It also removes the merge seam
+   outright: each snapshot replaces the daemon's running total for that message
+   wholesale, so there is no union to prove disjoint.
+   The cadence matters as much as the content — a single end-of-slot emission
+   would destroy the incremental convergence the trigger reads its arrival rate
+   from.
+3. **A unix socket or shared-memory ring**, if HTTP framing ever shows up in a
+   profile. Nothing measured here says it does.
+
+Embedding `lighthouse_network` and subscribing to the subnets directly is the
+option not to take. Every source above delivers attestations the node has already
+*gossip-validated*; raw libp2p makes that validation ours, and getting it wrong
+lets a peer feed us signatures over arbitrary data. The circuit still rejects a
+bad signature, so this is liveness and denial of service rather than soundness —
+but it is a large amount of consensus code to own for a cost that is already
+7.3% of a core.
+
+All of these sit behind `AttestationSource` in
+`crates/witness-gen/src/gossip.rs`, which is a `drain`, a reorg flag, a gap flag
+and some counters. Swapping the transport does not touch the pipeline.
 
 Output:
 

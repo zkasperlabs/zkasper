@@ -1700,10 +1700,11 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             recent_stages: self.recent.iter().cloned().collect(),
             recent_latencies: self.latencies.iter().cloned().collect(),
             gossip: self.gossip.as_ref().map(|source| {
-                let (attestations, reconnects) = source.counters();
+                let counters = source.counters();
                 GossipStatus {
-                    attestations,
-                    reconnects,
+                    attestations: counters.attestations,
+                    reconnects: counters.reconnects,
+                    dropped: counters.dropped,
                 }
             }),
         })

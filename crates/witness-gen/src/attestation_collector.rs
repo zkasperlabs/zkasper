@@ -13,10 +13,12 @@
 //! slot's support and nothing else. The schedule wants that trade — waiting for
 //! stragglers costs latency and buys a few basis points of weight.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use blst::min_pk::{AggregateSignature, Signature};
 use tracing::info;
 
 use zkasper_common::types::{
@@ -43,6 +45,36 @@ pub struct SlotComplement {
 struct Aggregate {
     attestation: AttestationWitness,
     signers: BTreeSet<u64>,
+}
+
+/// One message's unaggregated attestations, summed as they arrive.
+///
+/// This is the primary path. A `SingleAttestation` names one validator, so a
+/// running total over them is disjoint by construction — there is no cover to
+/// choose and no overlap to resolve, and the circuit is handed exactly one
+/// aggregate per distinct message. Summing here rather than at
+/// [`SlotStream::close`] is what keeps a slot's thirty thousand G2
+/// decompressions off the critical path: they are paid as gossip arrives, and
+/// only the last few land after the threshold.
+struct Summed {
+    /// The message, with `signature` left empty until it is read out.
+    attestation: AttestationWitness,
+    signature: blst::min_pk::AggregateSignature,
+    signers: BTreeSet<u64>,
+}
+
+impl Summed {
+    /// The running total, as an aggregate the rest of the collector can treat
+    /// like any other.
+    fn aggregate(&self) -> Aggregate {
+        Aggregate {
+            attestation: AttestationWitness {
+                signature: BlsSignature(self.signature.to_signature().to_bytes()),
+                ..self.attestation.clone()
+            },
+            signers: self.signers.clone(),
+        }
+    }
 }
 
 /// `AttestationData`, as the key that decides which aggregates share a message.
@@ -73,8 +105,12 @@ pub struct SlotStream {
     target_root: [u8; 32],
     slots_per_epoch: u64,
     committees: Arc<EpochCommittees>,
-    /// Aggregates seen so far, keyed by the slot they attest to.
+    /// Network aggregates seen so far, keyed by the slot they attest to. The
+    /// backstop path: used only where the singles feed has a hole.
     pending: BTreeMap<u64, Vec<Aggregate>>,
+    /// Unaggregated attestations, summed per message as they arrive, keyed by
+    /// the slot they attest to. The primary path.
+    summed: BTreeMap<u64, BTreeMap<DataKey, Summed>>,
 }
 
 impl SlotStream {
@@ -90,6 +126,7 @@ impl SlotStream {
             slots_per_epoch: config.slots_per_epoch,
             committees,
             pending: BTreeMap::new(),
+            summed: BTreeMap::new(),
         }
     }
 
@@ -97,10 +134,17 @@ impl SlotStream {
         &self.committees
     }
 
-    /// Feed one block's attestations.
+    /// Feed whatever has arrived, gossiped or included in a block.
     ///
-    /// Only those targeting this checkpoint are kept, and they are filed under
-    /// the slot they attest to rather than the block that carried them.
+    /// Only attestations targeting this checkpoint are kept, and they are filed
+    /// under the slot they attest to rather than whatever carried them.
+    ///
+    /// An unaggregated attestation goes straight into its message's running
+    /// signature; an aggregate is held aside until [`Self::close`] decides
+    /// whether the singles already cover it. A validator seen twice — the same
+    /// attestation re-gossiped, or a single a later block also carried — is
+    /// added once, because summing a signature twice still verifies and would
+    /// quietly count the validator twice.
     ///
     /// Nothing here materialises a public key. Signers are held as indices, and
     /// the leaf preimages are read off the committee proof's members at
@@ -122,23 +166,66 @@ impl SlotStream {
                 continue;
             }
 
-            self.pending
-                .entry(att.data_slot)
-                .or_default()
-                .push(Aggregate {
-                    attestation: AttestationWitness {
-                        data_slot: att.data_slot,
-                        data_index: att.data_index,
-                        data_beacon_block_root: att.data_beacon_block_root,
-                        data_source_epoch: att.data_source_epoch,
-                        data_source_root: att.data_source_root,
-                        data_target_epoch: att.data_target_epoch,
-                        data_target_root: att.data_target_root,
-                        signature: BlsSignature(att.signature),
-                        attesting_validators: Vec::new(),
-                    },
+            let attestation = AttestationWitness {
+                data_slot: att.data_slot,
+                data_index: att.data_index,
+                data_beacon_block_root: att.data_beacon_block_root,
+                data_source_epoch: att.data_source_epoch,
+                data_source_root: att.data_source_root,
+                data_target_epoch: att.data_target_epoch,
+                data_target_root: att.data_target_root,
+                signature: BlsSignature(att.signature),
+                attesting_validators: Vec::new(),
+            };
+
+            if att.single_attester.is_some() {
+                self.sum_single(attestation, signers)?;
+            } else {
+                self.pending
+                    .entry(att.data_slot)
+                    .or_default()
+                    .push(Aggregate {
+                        attestation,
+                        signers,
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    /// Add one unaggregated attestation to its message's running signature.
+    fn sum_single(
+        &mut self,
+        attestation: AttestationWitness,
+        signers: BTreeSet<u64>,
+    ) -> Result<()> {
+        let signature = Signature::from_bytes(&attestation.signature.0)
+            .map_err(|e| anyhow!("a gossiped signature does not decompress: {e:?}"))?;
+
+        match self
+            .summed
+            .entry(attestation.data_slot)
+            .or_default()
+            .entry(data_key(&attestation))
+        {
+            Entry::Vacant(message) => {
+                message.insert(Summed {
+                    signature: AggregateSignature::from_signature(&signature),
+                    attestation,
                     signers,
                 });
+            }
+            Entry::Occupied(mut message) => {
+                let running = message.get_mut();
+                if signers.iter().all(|index| running.signers.contains(index)) {
+                    return Ok(());
+                }
+                running
+                    .signature
+                    .add_signature(&signature, false)
+                    .map_err(|e| anyhow!("summing a gossiped signature failed: {e:?}"))?;
+                running.signers.extend(signers);
+            }
         }
         Ok(())
     }
@@ -150,7 +237,7 @@ impl SlotStream {
     /// contributes nothing is better left uncounted than counted at zero.
     pub fn close(&mut self, slot: u64) -> Option<SlotComplement> {
         let complement = self.peek(slot)?;
-        self.pending.remove(&slot);
+        self.forget(slot);
         Some(complement)
     }
 
@@ -162,19 +249,37 @@ impl SlotStream {
     /// shrinks as the slot converges. Both are what the trigger is choosing
     /// between — weight it has against work it would pay for.
     pub fn peek(&self, slot: u64) -> Option<SlotComplement> {
-        let aggregates = self.pending.get(&slot)?;
         let slot_in_epoch = slot % self.slots_per_epoch;
         let committee = self.committees.aggregate(slot_in_epoch)?.clone();
         let members = &self.committees.members[slot_in_epoch as usize];
 
-        // Aggregates over one message have to be pairwise disjoint before their
-        // signatures can be summed against one aggregate key, so overlapping
-        // ones are dropped in favour of the larger. On a live chain the later
-        // block's aggregate is a superset of the earlier one's, so this drops
-        // duplicates rather than attesters.
+        // Our own aggregates go in first, one per message, each already the sum
+        // of every unaggregated attestation seen for it. Then the network's, in
+        // decreasing size, and only where they are disjoint from what is already
+        // counted.
+        //
+        // Disjointness is proved here rather than assumed, because summing a
+        // validator's signature twice *verifies*: `sig + sig_v` checks out
+        // against `2·pk_v + rest`, so a double count is not caught downstream by
+        // anything. Seeding with the singles is what makes the rule bite in the
+        // right direction — a network aggregate is taken only for a committee
+        // the singles feed missed entirely, which is what "backstop" means.
+        let ours: Vec<Aggregate> = self
+            .summed
+            .get(&slot)
+            .into_iter()
+            .flat_map(|messages| messages.values().map(Summed::aggregate))
+            .collect();
+        let theirs = self.pending.get(&slot);
+        if ours.is_empty() && theirs.is_none_or(|aggregates| aggregates.is_empty()) {
+            return None;
+        }
+
         let mut by_message: BTreeMap<DataKey, (Vec<&Aggregate>, BTreeSet<u64>)> = BTreeMap::new();
-        let mut order: Vec<&Aggregate> = aggregates.iter().collect();
-        order.sort_by_key(|a| std::cmp::Reverse(a.signers.len()));
+        let mut order: Vec<&Aggregate> = ours.iter().collect();
+        let mut network: Vec<&Aggregate> = theirs.into_iter().flatten().collect();
+        network.sort_by_key(|a| std::cmp::Reverse(a.signers.len()));
+        order.extend(network);
         for aggregate in order {
             let entry = by_message
                 .entry(data_key(&aggregate.attestation))
@@ -252,11 +357,21 @@ impl SlotStream {
     /// later arrivals for it are not collected all over again.
     pub fn forget(&mut self, slot: u64) {
         self.pending.remove(&slot);
+        self.summed.remove(&slot);
     }
 
     /// Attestation slots that have been fed and not yet closed.
     pub fn open_slots(&self) -> Vec<u64> {
-        self.pending.keys().copied().collect()
+        let mut slots: Vec<u64> = self
+            .pending
+            .keys()
+            .chain(self.summed.keys())
+            .copied()
+            .collect();
+        slots.dedup();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
     }
 
     /// The accumulator leaf preimage for one validator, read off the committee
