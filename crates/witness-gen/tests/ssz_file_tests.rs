@@ -205,6 +205,11 @@ impl BeaconApi for SszFileApi {
     async fn get_state_ssz(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         Ok(Some(self.get_state(state_id).raw_ssz.clone()))
     }
+
+    async fn get_state_root(&self, _state_id: &str) -> Result<Option<[u8; 32]>> {
+        // No independent state root here; the caller reads the header instead.
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------

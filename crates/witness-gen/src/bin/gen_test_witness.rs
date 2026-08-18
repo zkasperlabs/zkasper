@@ -92,6 +92,11 @@ impl BeaconApi for MockBeaconApi {
     async fn get_state_ssz(&self, _state_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    async fn get_state_root(&self, _state_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
+        // No independent state root here; the caller reads the header instead.
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------

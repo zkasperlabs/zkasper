@@ -122,13 +122,20 @@ pub async fn build(
                 old_state.state_to_validators_siblings.clone(),
             )
         } else if let Some(raw) = api.get_state_ssz(&slot_1.to_string()).await? {
-            let header = api
-                .get_header(&slot_1.to_string())
-                .await
-                .context("fetch header at slot_1")?;
+            // The state-root endpoint answers for a skipped slot; a header does
+            // not exist for one. Fixture sources return None and keep the header.
+            let expected = match api.get_state_root(&slot_1.to_string()).await? {
+                Some(root) => root,
+                None => {
+                    api.get_header(&slot_1.to_string())
+                        .await
+                        .context("fetch header at slot_1")?
+                        .state_root
+                }
+            };
             let proof = ssz_state::parse_state_proof(&raw, &old_validators_htr, config, slot_1)?;
             anyhow::ensure!(
-                proof.state_root == header.state_root,
+                proof.state_root == expected,
                 "SSZ state root mismatch at slot_1"
             );
             (proof.state_root, proof.siblings)
@@ -138,13 +145,21 @@ pub async fn build(
 
         // New state proof: always compute fresh
         let (sr2, ss2) = if let Some(raw) = api.get_state_ssz(&slot_2_str).await? {
-            let header = api
-                .get_header(&slot_2_str)
-                .await
-                .context("fetch header at slot_2")?;
+            // An empty epoch boundary slot has no header but does have a state
+            // root, and boundaries are skipped often enough that reading the
+            // header wedges the daemon on the first one.
+            let expected = match api.get_state_root(&slot_2_str).await? {
+                Some(root) => root,
+                None => {
+                    api.get_header(&slot_2_str)
+                        .await
+                        .context("fetch header at slot_2")?
+                        .state_root
+                }
+            };
             let proof = ssz_state::parse_state_proof(&raw, &new_validators_htr, config, slot_2)?;
             anyhow::ensure!(
-                proof.state_root == header.state_root,
+                proof.state_root == expected,
                 "SSZ state root mismatch at slot_2"
             );
             (proof.state_root, proof.siblings)

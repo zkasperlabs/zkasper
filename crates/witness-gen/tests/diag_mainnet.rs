@@ -52,6 +52,11 @@ impl BeaconApi for Api {
     async fn get_state_ssz(&self, id: &str) -> Result<Option<Vec<u8>>> {
         Ok(Some(self.states[id].raw_ssz.clone()))
     }
+
+    async fn get_state_root(&self, _state_id: &str) -> Result<Option<[u8; 32]>> {
+        // No independent state root here; the caller reads the header instead.
+        Ok(None)
+    }
 }
 
 fn load_state(api: &mut Api, filename: &str, config: &ChainConfig) -> u64 {

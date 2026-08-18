@@ -181,6 +181,11 @@ impl BeaconApi for MockBeaconApi {
         // Mock API doesn't have raw SSZ state — triggers synthetic state proof fallback
         Ok(None)
     }
+
+    async fn get_state_root(&self, _state_id: &str) -> Result<Option<[u8; 32]>> {
+        // No independent state root here; the caller reads the header instead.
+        Ok(None)
+    }
 }
 
 /// Convert a ValidatorData (test_utils format) to a ValidatorResponse (API format).

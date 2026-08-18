@@ -27,6 +27,20 @@ pub trait BeaconApi {
     /// Fetch the raw SSZ-encoded BeaconState from the debug API endpoint.
     /// Returns `None` if the endpoint is not available (e.g., mock API).
     async fn get_state_ssz(&self, state_id: &str) -> Result<Option<Vec<u8>>>;
+
+    /// State root at `state_id`, when the source can say so on its own.
+    ///
+    /// The epoch diff checks the state it parsed against what the chain says
+    /// that slot's state root is. A block header carries one, but only when that
+    /// slot has a block — and an epoch boundary slot is empty often enough that
+    /// a daemon reading the header stops dead at the first one. A state root is
+    /// defined for a skipped slot; a header is not.
+    ///
+    /// `None` means "read the header instead", which is what every
+    /// fixture-backed source returns. It has no default body on purpose: a
+    /// defaulted `async_trait` method requires `Self: Sync` at every call site,
+    /// which would push a new bound through the orchestrator for nothing.
+    async fn get_state_root(&self, state_id: &str) -> Result<Option<[u8; 32]>>;
 }
 
 /// The chain-following half of the beacon API.
@@ -165,6 +179,12 @@ impl BeaconApi for BeaconApiClient {
 
         let bytes = resp.bytes().await?;
         Ok(Some(bytes.to_vec()))
+    }
+
+    async fn get_state_root(&self, state_id: &str) -> Result<Option<[u8; 32]>> {
+        let url = format!("{}/eth/v1/beacon/states/{}/root", self.base_url, state_id);
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
+        Ok(Some(parse_hex_bytes32(&resp["data"], "root")?))
     }
 }
 
