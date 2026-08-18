@@ -11,6 +11,15 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
         "no slot proofs provided",
     );
 
+    // The two-thirds gate divides by `total_active_balance`, so it has to be the
+    // balance the accumulator commits to and not one the prover picked. The slot
+    // proofs bind their own copy; this binds the copy this proof divides by.
+    assert_eq!(
+        zkasper_common::acc::commitment(&witness.acc_root, witness.total_active_balance),
+        witness.accumulator_commitment,
+        "accumulator commitment mismatch",
+    );
+
     // Every slot proof counted against this committee proof, which is what makes
     // the slot mask below a deduplication of validators rather than of slots.
     let committee_root = zkasper_aggregation_guest::committee_link(

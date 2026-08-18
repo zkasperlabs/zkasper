@@ -313,6 +313,13 @@ pub struct JustificationWitness {
     pub target_root: [u8; 32],
     pub total_active_balance: u64,
 
+    /// Accumulator root behind `accumulator_commitment`.
+    ///
+    /// Present so the guest can rehash the commitment. Without it
+    /// `total_active_balance` is a free scalar and the two-thirds gate below
+    /// divides by whatever the prover chose.
+    pub acc_root: Digest,
+
     /// Verification key of the slot-proof program. Bound into the justification
     /// output so the on-chain verifier can pin which program the slot proofs
     /// came from.

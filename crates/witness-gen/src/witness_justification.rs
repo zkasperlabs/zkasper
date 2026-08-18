@@ -20,12 +20,14 @@ pub fn build(
     target_epoch: u64,
     target_root: [u8; 32],
     total_active_balance: u64,
+    acc_root: Digest,
 ) -> JustificationWitness {
     JustificationWitness {
         accumulator_commitment,
         target_epoch,
         target_root,
         total_active_balance,
+        acc_root,
         slot_program_vk,
         committee_program_vk,
         committee,

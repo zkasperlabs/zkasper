@@ -1063,6 +1063,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             target_epoch,
             aggregator.target_root,
             aggregator.total_active_balance,
+            aggregator.acc_root,
         );
 
         let slots = witness.slot_proof_outputs.len();
