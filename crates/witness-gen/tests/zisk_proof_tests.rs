@@ -27,9 +27,9 @@ use zkasper_common::constants::ACC_TREE_DEPTH;
 use zkasper_common::recursion::verify_child;
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
-use zkasper_witness_gen::prover::{Prover, Stage};
+use zkasper_witness_gen::prover::{Prover, Stage, DEFAULT_ELF_DIR};
 use zkasper_witness_gen::streaming;
-use zkasper_witness_gen::zisk_prover::{ZiskProver, ZiskProverConfig, DEFAULT_ELF_DIR};
+use zkasper_witness_gen::zisk_prover::{ZiskProver, ZiskProverConfig};
 
 /// A test binary runs from its package directory, not the workspace root, so the
 /// ELF directory has to be resolved rather than taken as it stands.
@@ -109,4 +109,77 @@ fn one_warm_prover_serves_two_programs() {
     assert!(!verify_child(&group_proof, &slot_vk, &group.public_bytes()));
     assert!(!verify_child(&slot_proof, &group_vk, &slot.public_bytes()));
     assert!(!verify_child(&group_proof, &group_vk, &slot.public_bytes()));
+}
+
+/// Per-stage cost, warm, with repeats.
+///
+/// `BENCHMARKS.md` quotes the stage floor at 3.640 s, the group proof at
+/// 4.188 s, the slot proof at 4.506 s and the wrap at 48 ms, from `cargo-zisk`
+/// invocations. This measures the same three stages from one warm in-process
+/// prover, which is what the daemon actually pays, and prints every repeat so
+/// the spread is visible rather than averaged away.
+///
+/// The stage floor is the committee proof over 64 members, which is what the
+/// published figure is: 32 slots of 2.
+#[test]
+#[ignore = "needs a Zisk proving key and minutes of proving"]
+fn warm_stage_times() {
+    let repeats: usize = std::env::var("ZKASPER_REPEATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+
+    let chain = ChainConfig::MAINNET;
+    let fixture = stream_fixture(ACC_TREE_DEPTH);
+    let units: Vec<&SlotComplement> = fixture.units[..2].iter().collect();
+    let group = streaming::group_witness(
+        &fixture.context,
+        &fixture.epoch.tree,
+        &fixture.epoch.committees,
+        &units,
+    );
+    let slots = chain.slots_per_epoch;
+    let floor = zkasper_witness_gen::fixture::Epoch::new(chain.clone(), 100, slots, 2);
+
+    let started = Instant::now();
+    let prover = ZiskProver::new(ZiskProverConfig {
+        elf_dir: elf_dir(),
+        gpu: std::env::var_os("ZKASPER_GPU").is_some(),
+        ..ZiskProverConfig::new(chain, &[Stage::Committee, Stage::Group, Stage::SlotProof])
+    })
+    .expect("build a prover");
+    println!("COLD init + setup: {:?}", started.elapsed());
+
+    // Nothing after the first proof pays initialisation. `gap_millis` is what
+    // the call cost outside the prover's own accounting — the native circuit
+    // run and the serialization — and it is the number a warm prover keeps
+    // small.
+    for run in 0..repeats {
+        for stage in [Stage::Committee, Stage::Group, Stage::SlotProof] {
+            let started = Instant::now();
+            match stage {
+                Stage::Committee => {
+                    prover
+                        .prove_committee(&floor.committees.witness)
+                        .expect("committee proof");
+                }
+                Stage::Group => {
+                    prover.prove_group(&group).expect("group proof");
+                }
+                _ => {
+                    prover.prove_slot(&group).expect("slot proof");
+                }
+            }
+            let cost = prover.last_cost().expect("a cost");
+            let elapsed = started.elapsed().as_millis() as u64;
+            println!(
+                "WARM run={run} stage={} prove_millis={} wrap_millis={} \
+                 call_millis={elapsed} gap_millis={}",
+                stage.as_str(),
+                cost.prove_millis,
+                cost.wrap_millis,
+                elapsed.saturating_sub(cost.prove_millis + cost.wrap_millis),
+            );
+        }
+    }
 }

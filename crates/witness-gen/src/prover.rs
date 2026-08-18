@@ -59,6 +59,9 @@ use zkasper_common::types::{
 };
 use zkasper_common::ChainConfig;
 
+/// Where `cargo-zisk build --release` leaves a guest ELF.
+pub const DEFAULT_ELF_DIR: &str = "target/elf/riscv64ima-zisk-zkvm-elf/release";
+
 /// A serialized Zisk proof, as the u64 words a parent proof verifies.
 pub type Proof = Vec<u64>;
 
@@ -110,6 +113,37 @@ impl Stage {
             Stage::Aggregate => "zkasper-aggregation-guest",
             Stage::StreamFinal => "zkasper-stream-final-guest",
         }
+    }
+
+    pub const ALL: [Stage; 9] = [
+        Stage::Bootstrap,
+        Stage::EpochDiff,
+        Stage::Committee,
+        Stage::SlotProof,
+        Stage::Justification,
+        Stage::Finalization,
+        Stage::Group,
+        Stage::Aggregate,
+        Stage::StreamFinal,
+    ];
+}
+
+/// The inverse of [`Stage::as_str`], so a stage list can be given on a command
+/// line. Every ELF costs a ROM setup and gigabytes of `~/.zisk/cache`, so a
+/// prover server is often started for fewer stages than a whole pipeline.
+impl std::str::FromStr for Stage {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Stage::ALL
+            .into_iter()
+            .find(|stage| stage.as_str() == s)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown stage {s:?}; expected one of {}",
+                    Stage::ALL.map(Stage::as_str).join(", "),
+                )
+            })
     }
 }
 

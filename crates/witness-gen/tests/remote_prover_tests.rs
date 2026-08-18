@@ -36,7 +36,11 @@ fn chain() -> ChainConfig {
 }
 
 fn witness() -> SlotProofWitness {
-    let fixture = stream_fixture(ACC_DEPTH);
+    witness_at(ACC_DEPTH)
+}
+
+fn witness_at(depth: u32) -> SlotProofWitness {
+    let fixture = stream_fixture(depth);
     let units: Vec<&SlotComplement> = fixture.units[..2].iter().collect();
     streaming::group_witness(
         &fixture.context,
@@ -359,6 +363,188 @@ fn refuses_a_server_without_the_stages_this_run_needs() {
 #[test]
 fn the_protocol_version_is_checked() {
     assert_eq!(PROTOCOL_VERSION, 1);
+}
+
+/// Against a real prover server, holding a real warm prover.
+///
+/// Everything above runs the client against a [`NativeProver`], which returns an
+/// empty proof: that covers the transport and the failure paths, and none of the
+/// cryptography. This drives a `zkasper-prover-server` process — the one that
+/// holds the GPU — and covers the rest: a real proof checked by `verify_child`
+/// on the client's side, the warm gap measured across the wire, and an outage
+/// and recovery against a server that really goes away and really comes back.
+///
+/// ```text
+/// ZKASPER_PROVER_BIN=target/release/zkasper-prover-server ZKASPER_GPU=1 \
+///   cargo test --release --test remote_prover_tests -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a prover server binary and a Zisk proving key"]
+fn proves_against_a_real_server() {
+    let bin = std::env::var("ZKASPER_PROVER_BIN")
+        .expect("set ZKASPER_PROVER_BIN to a zkasper-prover-server binary");
+    let elf_dir = std::env::var("ZKASPER_ELF_DIR")
+        .unwrap_or_else(|_| zkasper_witness_gen::prover::DEFAULT_ELF_DIR.to_string());
+    let mainnet = ChainConfig::MAINNET;
+    let witness = witness_at(zkasper_common::constants::ACC_TREE_DEPTH);
+
+    let addr = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string();
+    let spool = tempfile::tempdir().unwrap();
+    let mut server = RealServer::spawn(&bin, &addr, &elf_dir);
+
+    let prover = RemoteProver::connect(RemoteProverConfig {
+        spool_dir: Some(spool.path().to_path_buf()),
+        request_timeout: Duration::from_secs(600),
+        backfill_quiet: Duration::from_secs(2),
+        backfill_interval: Duration::from_secs(1),
+        ..RemoteProverConfig::new(mainnet, &addr, TOKEN, STAGES)
+    })
+    .expect("connect to the prover server");
+
+    let group_vk = prover.program_vk(Stage::Group);
+    let slot_vk = prover.program_vk(Stage::SlotProof);
+    assert_ne!(group_vk, slot_vk);
+
+    let started = Instant::now();
+    let (group, _miller, proof) = prover.prove_group(&witness).expect("group proof");
+    let first = started.elapsed();
+    assert!(
+        !proof.is_empty(),
+        "a real server must return proof words, not the native prover's empty proof",
+    );
+    assert!(zkasper_common::recursion::verify_child(
+        &proof,
+        &group_vk,
+        &group.public_bytes(),
+    ));
+    assert!(!zkasper_common::recursion::verify_child(
+        &proof,
+        &slot_vk,
+        &group.public_bytes(),
+    ));
+
+    // Same program, same connection, nothing re-initialised.
+    let started = Instant::now();
+    let (again, _, proof_again) = prover.prove_group(&witness).expect("second group proof");
+    let second = started.elapsed();
+    assert_eq!(again.public_bytes(), group.public_bytes());
+    assert_eq!(proof_again.len(), proof.len());
+
+    // A different program, still on the same warm prover.
+    let started = Instant::now();
+    let (slot, slot_proof) = prover.prove_slot(&witness).expect("slot proof");
+    let third = started.elapsed();
+    assert!(zkasper_common::recursion::verify_child(
+        &slot_proof,
+        &slot_vk,
+        &slot.public_bytes(),
+    ));
+    println!(
+        "REMOTE group={first:?} group_again={second:?} slot={third:?} cost={:?}",
+        prover.last_cost(),
+    );
+
+    // The server disappears mid-run.
+    server.kill();
+    assert!(
+        prover.prove_group(&witness).is_err(),
+        "a proof against a dead server must fail rather than hang",
+    );
+    assert_eq!(prover.program_vk(Stage::Group), group_vk);
+    assert_eq!(prover.counters().pending, 1);
+
+    // And comes back. The next call reconnects, and the backfill proves what the
+    // outage cost — the recovered proof faces the same `verify_child` the live
+    // path applies, so a backfill that produced rubbish would fail here.
+    server.respawn();
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while prover.prove_group(&witness).is_err() {
+        assert!(Instant::now() < deadline, "the server never came back");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    while prover.counters().pending > 0 {
+        assert!(Instant::now() < deadline, "the spool never drained");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert_eq!(prover.counters().recovered, 1);
+    assert_eq!(recovered_files(spool.path()), 1);
+    println!("REMOTE counters={:?}", prover.counters());
+}
+
+/// The real server, as a child process this test can kill.
+struct RealServer {
+    bin: String,
+    addr: String,
+    elf_dir: String,
+    child: Option<std::process::Child>,
+}
+
+impl RealServer {
+    fn spawn(bin: &str, addr: &str, elf_dir: &str) -> Self {
+        let mut server = Self {
+            bin: bin.to_string(),
+            addr: addr.to_string(),
+            elf_dir: elf_dir.to_string(),
+            child: None,
+        };
+        server.respawn();
+        server
+    }
+
+    fn respawn(&mut self) {
+        let mut command = std::process::Command::new(&self.bin);
+        command
+            .arg("--listen")
+            .arg(&self.addr)
+            .arg("--token")
+            .arg(TOKEN)
+            .arg("--elf-dir")
+            .arg(&self.elf_dir)
+            .arg("--stages")
+            .arg("group,slot_proof");
+        if std::env::var_os("ZKASPER_GPU").is_some() {
+            command.arg("--gpu");
+        }
+        self.child = Some(command.spawn().expect("start the prover server"));
+
+        // A cold `EmbeddedClient` is a minute of setup, so wait generously.
+        let deadline = Instant::now() + Duration::from_secs(600);
+        while TcpStream::connect(&self.addr).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the prover server never listened"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while TcpStream::connect(&self.addr).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the prover server never went away"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for RealServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn spooled_files(dir: &Path) -> usize {

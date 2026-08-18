@@ -64,11 +64,17 @@ struct Cli {
     #[arg(long, default_value = "streaming")]
     mode: Mode,
 
+    /// Set up exactly these stages instead, by name: `group,slot_proof`. Each
+    /// costs a ROM setup and gigabytes of `~/.zisk/cache`, so a server that
+    /// serves part of a pipeline should be told so.
+    #[arg(long, value_delimiter = ',')]
+    stages: Vec<Stage>,
+
     #[arg(long, default_value = "mainnet")]
     chain: Chain,
 
     /// Directory holding the guest ELFs.
-    #[arg(long, default_value = zkasper_witness_gen::zisk_prover::DEFAULT_ELF_DIR)]
+    #[arg(long, default_value = zkasper_witness_gen::prover::DEFAULT_ELF_DIR)]
     #[cfg(feature = "zisk-prover")]
     elf_dir: std::path::PathBuf,
 
@@ -127,7 +133,11 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let stages = cli.mode.stages();
+    let stages = if cli.stages.is_empty() {
+        cli.mode.stages()
+    } else {
+        cli.stages.clone()
+    };
     let prover = build_prover(&cli, &stages)?;
     info!(
         prover = prover.name(),

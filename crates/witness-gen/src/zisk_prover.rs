@@ -65,10 +65,7 @@ use zkasper_common::types::{
 };
 use zkasper_common::ChainConfig;
 
-use crate::prover::{run_circuit, AccOutput, Proof, ProveCost, Prover, Stage};
-
-/// Where `cargo-zisk build --release` leaves a guest ELF.
-pub const DEFAULT_ELF_DIR: &str = "target/elf/riscv64ima-zisk-zkvm-elf/release";
+use crate::prover::{run_circuit, AccOutput, Proof, ProveCost, Prover, Stage, DEFAULT_ELF_DIR};
 
 /// How to build a [`ZiskProver`].
 #[derive(Clone, Debug)]

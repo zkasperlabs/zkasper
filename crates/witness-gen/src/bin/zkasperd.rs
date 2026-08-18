@@ -193,7 +193,7 @@ struct Cli {
     prover: Backend,
 
     /// Directory holding the guest ELFs, for `--prover zisk`
-    #[arg(long, default_value = zkasper_witness_gen::zisk_prover::DEFAULT_ELF_DIR)]
+    #[arg(long, default_value = zkasper_witness_gen::prover::DEFAULT_ELF_DIR)]
     #[cfg(feature = "zisk-prover")]
     elf_dir: PathBuf,
 
