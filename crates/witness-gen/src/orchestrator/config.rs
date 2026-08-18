@@ -10,6 +10,13 @@ use crate::streaming::StreamPolicy;
 
 use super::Pipeline;
 
+/// Attestation slots one slot proof covers, by default.
+///
+/// Four, which puts a mainnet epoch's ~22 slots into six proofs instead of
+/// twenty-two. It is bounded rather than unbounded for the same reason the fold
+/// is: a proof whose size is the epoch's is a proof that grows with the chain.
+pub const DEFAULT_SLOT_GROUP_WIDTH: usize = 4;
+
 /// Slot proofs one link of the justification chain absorbs, by default.
 ///
 /// Two, because a link's cost is a floor plus a recursion per child and the
@@ -41,6 +48,14 @@ pub struct OrchestratorConfig {
     pub trigger_interval: Duration,
     /// How many epochs past the target to keep looking for its attestations.
     pub attestation_lookahead_epochs: u64,
+    /// How many attestation slots one slot proof covers.
+    ///
+    /// The batch path used to prove one slot at a time, which spends a
+    /// per-proof floor and a recursive verification on work that costs about a
+    /// hundred accumulator leaves. Grouping them is what the streaming path
+    /// already does, and it divides the recursion the justification chain has to
+    /// do by this number.
+    pub slot_group_width: usize,
     /// How many slot proofs one link of the justification chain absorbs.
     ///
     /// The batch path used to fold the whole epoch at once, which is where its
@@ -82,6 +97,7 @@ impl OrchestratorConfig {
             poll_interval: Duration::from_secs(4),
             trigger_interval: Duration::from_millis(200),
             attestation_lookahead_epochs: 2,
+            slot_group_width: DEFAULT_SLOT_GROUP_WIDTH,
             justification_fold_width: DEFAULT_JUSTIFICATION_FOLD_WIDTH,
             pipeline: Pipeline::default(),
             stream_policy: StreamPolicy::default(),

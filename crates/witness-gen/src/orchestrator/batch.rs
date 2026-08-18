@@ -21,7 +21,7 @@ use zkasper_common::types::{
 };
 
 use crate::artifacts::{hex_digest, StageTiming};
-use crate::attestation_collector::SlotStream;
+use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi};
 use crate::committee::EpochCommittees;
 use crate::prover::{Proof, Prover, Stage};
@@ -65,12 +65,13 @@ struct EpochAggregator {
     attesting_balance: u64,
     /// The justification chain so far, absent until the first link is proven.
     justification: Option<JustificationRecord>,
+    /// Attestation slots closed but not yet proven, waiting for a group.
+    slots: Vec<SlotComplement>,
     /// Slot proofs the chain has not absorbed yet.
     unfolded: Vec<SlotProofOutput>,
     unfolded_proofs: Vec<Proof>,
-    /// Slot proofs proven for this epoch, counted rather than kept: it numbers
-    /// their stage timings, and the proofs themselves leave for the chain.
-    slots_proven: usize,
+    /// Slot proofs proven for this epoch, numbering their stage timings.
+    slot_groups: usize,
     /// Links of the justification chain proven so far, numbering theirs.
     folds: usize,
 }
@@ -150,97 +151,20 @@ impl EpochPipeline for BatchPipeline {
                 continue;
             };
 
-            let _span = info_span!(
-                "stage",
-                stage = "slot_proof",
-                epoch = target_epoch,
-                slot = attestation_slot,
-            )
-            .entered();
-            engine.chain.observe_start_delay(
-                &engine.config,
-                Stage::SlotProof,
-                target_epoch,
-                attestation_slot,
-            );
-            let started = Instant::now();
-            // Numbered as well as slotted. A slot proof is a repeat of a stage
-            // inside one epoch, and a consumer that keys stages by
-            // (epoch, stage, index) folds every unnumbered repeat onto one row —
-            // which lost 21 of an epoch's 22 slot proofs, and with them most of
-            // what the epoch cost.
-            let index = aggregator.slots_proven;
-            engine.report.begin(
-                Stage::SlotProof,
-                target_epoch,
-                Some(attestation_slot),
-                Some(index),
-            );
-            let witness = SlotProofWitness {
-                accumulator_commitment: aggregator.acc_commitment,
-                committee_root: aggregator.committee_output.committee_root,
-                target_epoch,
-                target_root: aggregator.target_root,
-                signing_domain: aggregator.signing_domain,
-                acc_root: aggregator.acc_root,
-                total_active_balance: aggregator.total_active_balance,
-                acc_multi_proof: engine
-                    .snapshot
-                    .tree
-                    .build_multi_proof(&complement.named_indices),
-                committee_multi_proof: aggregator
-                    .committees
-                    .multi_proof(&[complement.witness.slot_in_epoch]),
-                slots: vec![complement.witness],
-            };
-
-            let (output, proof) = engine
-                .prover
-                .prove_slot(&witness)
-                .with_context(|| format!("slot proof for attestation slot {attestation_slot}"))?;
-
-            let artifact = engine.sink.write_witness(
-                target_epoch,
-                &format!("slot_proof_{attestation_slot}"),
-                &witness,
-            )?;
-            write_proof(
-                &engine.sink,
-                target_epoch,
-                &format!("slot_proof_{attestation_slot}"),
-                &proof,
-            )?;
-
-            aggregator.attesting_balance += output.attesting_balance;
-            aggregator.unfolded.push(output);
-            aggregator.unfolded_proofs.push(proof);
-            aggregator.slots_proven += 1;
-
-            let millis = started.elapsed().as_millis() as u64;
-            info!(
-                slot = attestation_slot,
-                absentees = witness.slots[0].absentees.len(),
-                attesting_balance = aggregator.attesting_balance,
-                pct = percent_of(
-                    aggregator.attesting_balance,
-                    aggregator.total_active_balance
-                ),
-                millis,
-                "slot proof",
-            );
-            engine.report.record(
-                StageTiming::new(
-                    Stage::SlotProof,
-                    target_epoch,
-                    started,
-                    engine.prover.last_cost(),
-                    artifact,
-                )
-                .at_slot(attestation_slot)
-                .at_index(index)
-                .with_proof(aggregator.unfolded_proofs.last().expect("just pushed")),
-            );
+            // A slot proof over several slots costs barely more than one over a
+            // slot — the epoch's weight is a committee aggregate either way, and
+            // the absentees are a hundred leaves — while it is one child rather
+            // than several to whatever verifies it. So slots queue up here and
+            // leave in batches, exactly as the streaming path groups them.
+            aggregator.attesting_balance += complement.marginal_balance;
+            aggregator.slots.push(complement);
             tick.slots_proved.push(attestation_slot);
+
+            if aggregator.slots.len() >= engine.config.slot_group_width
+                && !aggregator.threshold_reached()
+            {
+                Self::prove_slot_group(engine, &mut aggregator).await?;
+            }
 
             // Fold what has piled up, unless the epoch is over: the link that
             // closes it takes the rest, and one link is cheaper than two.
@@ -330,11 +254,103 @@ impl BatchPipeline {
             scan_end: (target_epoch + engine.config.attestation_lookahead_epochs) * spe,
             attesting_balance: 0,
             justification: None,
+            slots: Vec::new(),
             unfolded: Vec::new(),
             unfolded_proofs: Vec::new(),
-            slots_proven: 0,
+            slot_groups: 0,
             folds: 0,
         })
+    }
+
+    /// Prove one slot proof over every slot waiting on the aggregator.
+    ///
+    /// The batch path used to prove one slot at a time, which is a per-proof
+    /// floor and a recursive verification each. Both are wasted: the marginal
+    /// cost of another slot inside one proof is its committee opening and about
+    /// a hundred accumulator leaves.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "slot_proof", epoch = aggregator.target_epoch),
+    )]
+    async fn prove_slot_group<A: BeaconApi + ChainStatusApi>(
+        engine: &mut Engine<A>,
+        aggregator: &mut EpochAggregator,
+    ) -> Result<()> {
+        let target_epoch = aggregator.target_epoch;
+        let slots = std::mem::take(&mut aggregator.slots);
+        let first = slots.first().expect("a group with no slots").slot;
+        let last = slots.last().expect("a group with no slots").slot;
+
+        engine
+            .chain
+            .observe_start_delay(&engine.config, Stage::SlotProof, target_epoch, last);
+        let started = Instant::now();
+        // Numbered as well as slotted. A slot proof is a repeat of a stage
+        // inside one epoch, and a consumer that keys stages by
+        // (epoch, stage, index) folds every unnumbered repeat onto one row —
+        // which lost 21 of an epoch's 22 slot proofs, and with them most of
+        // what the epoch cost.
+        let index = aggregator.slot_groups;
+        engine
+            .report
+            .begin(Stage::SlotProof, target_epoch, Some(last), Some(index));
+
+        let named: Vec<u64> = slots
+            .iter()
+            .flat_map(|s| s.named_indices.iter().copied())
+            .collect();
+        let covered: Vec<u64> = slots.iter().map(|s| s.witness.slot_in_epoch).collect();
+        let witness = SlotProofWitness {
+            accumulator_commitment: aggregator.acc_commitment,
+            committee_root: aggregator.committee_output.committee_root,
+            target_epoch,
+            target_root: aggregator.target_root,
+            signing_domain: aggregator.signing_domain,
+            acc_root: aggregator.acc_root,
+            total_active_balance: aggregator.total_active_balance,
+            acc_multi_proof: engine.snapshot.tree.build_multi_proof(&named),
+            committee_multi_proof: aggregator.committees.multi_proof(&covered),
+            slots: slots.into_iter().map(|s| s.witness).collect(),
+        };
+
+        let (output, proof) = engine
+            .prover
+            .prove_slot(&witness)
+            .with_context(|| format!("slot proof for attestation slots {first}..={last}"))?;
+
+        let name = format!("slot_proof_{first}");
+        let artifact = engine.sink.write_witness(target_epoch, &name, &witness)?;
+        write_proof(&engine.sink, target_epoch, &name, &proof)?;
+
+        info!(
+            first,
+            last,
+            attesting_balance = aggregator.attesting_balance,
+            pct = percent_of(
+                aggregator.attesting_balance,
+                aggregator.total_active_balance
+            ),
+            millis = started.elapsed().as_millis() as u64,
+            "slot proof",
+        );
+        engine.report.record(
+            StageTiming::new(
+                Stage::SlotProof,
+                target_epoch,
+                started,
+                engine.prover.last_cost(),
+                artifact,
+            )
+            .at_slot(last)
+            .at_index(index)
+            .with_proof(&proof),
+        );
+
+        aggregator.unfolded.push(output);
+        aggregator.unfolded_proofs.push(proof);
+        aggregator.slot_groups += 1;
+        Ok(())
     }
 
     /// Absorb the slot proofs waiting on the aggregator into its justification
@@ -430,9 +446,12 @@ impl BatchPipeline {
     ) -> Result<()> {
         let target_epoch = aggregator.target_epoch;
 
-        // The link that crosses the threshold. Whatever the epoch proved since
-        // the last fold is still waiting, so this always has something to
-        // absorb — the loop stops folding once the balance is there.
+        // The slots that crossed the threshold, and the link that absorbs
+        // them. The loop stops proving and folding once the balance is there,
+        // so both of these always have something to take.
+        if !aggregator.slots.is_empty() {
+            Self::prove_slot_group(engine, &mut aggregator).await?;
+        }
         Self::fold_justification(engine, &mut aggregator).await?;
         let record = aggregator
             .justification
@@ -453,7 +472,7 @@ impl BatchPipeline {
         }
         info!(
             target_epoch,
-            slots = aggregator.slots_proven,
+            slot_proofs = aggregator.slot_groups,
             folds = aggregator.folds,
             attesting_balance = record.output.attesting_balance,
             "justified",

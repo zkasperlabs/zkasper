@@ -117,16 +117,21 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     );
 
     // The threshold fired partway through the epoch rather than at the end of
-    // it. The first epoch of a run has nothing to finalize and goes
-    // through the batch path, which proves one slot at a time — so its artifacts
-    // are the record of where the daemon stopped counting.
+    // it. The first epoch of a run has nothing to finalize and goes through the
+    // batch path, which proves slots in groups and names each proof after the
+    // group's first slot — so its artifacts are the record of where the daemon
+    // stopped counting.
     let first = out.join(format!("epoch-{FIRST_EPOCH:09}"));
+    let groups: Vec<u64> = (0..SPE)
+        .step_by(zkasper_witness_gen::orchestrator::DEFAULT_SLOT_GROUP_WIDTH)
+        .filter(|&slot| slot < crossing)
+        .collect();
     for slot in 0..SPE {
         assert_eq!(
             first
                 .join(format!("slot_proof_{}.bin", FIRST_EPOCH * SPE + slot))
                 .exists(),
-            slot < crossing,
+            groups.contains(&slot),
             "slot {slot} of epoch {FIRST_EPOCH} against a threshold at {crossing}",
         );
     }

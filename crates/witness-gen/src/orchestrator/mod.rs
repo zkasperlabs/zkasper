@@ -48,7 +48,7 @@ mod pipeline;
 mod reporter;
 mod stream;
 
-pub use config::OrchestratorConfig;
+pub use config::{OrchestratorConfig, DEFAULT_SLOT_GROUP_WIDTH};
 pub use pipeline::Pipeline;
 
 use std::sync::Arc;

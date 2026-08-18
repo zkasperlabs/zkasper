@@ -171,7 +171,11 @@ async fn test_follows_four_epochs_end_to_end() {
             epoch_dir.join("justification_0.bin").exists(),
             "epoch {epoch}"
         );
-        for i in 0..SLOTS_TO_THRESHOLD {
+        // Slots are proven in groups, and a group's proof is named after its
+        // first slot.
+        for i in (0..SLOTS_TO_THRESHOLD)
+            .step_by(zkasper_witness_gen::orchestrator::DEFAULT_SLOT_GROUP_WIDTH)
+        {
             let slot = epoch * SPE + i;
             assert!(
                 epoch_dir.join(format!("slot_proof_{slot}.bin")).exists(),

@@ -207,6 +207,31 @@ over the same message adds their public keys and their signatures in step.
 
 ## 3. Accepted risks
 
+### Nothing pins which program a child proof came from
+
+Every recursive verification in this repository reads the key it checks the
+child against **out of the witness**: `slot_program_vk`, `committee_program_vk`,
+`justification_program_vk`, `group_program_vk`, `aggregate_program_vk`,
+`epoch_diff_program_vk` and `previous_program_vk` are all fields a prover fills
+in. `verify_child` then requires the child proof to carry that key and to
+verify under it — which it does — but nothing requires the key to be *this
+pipeline's* guest.
+
+A prover can therefore write a guest of their own that emits whatever
+`SlotProofOutput` they like, prove it honestly, hand the parent its key, and get
+a real proof out of the honest parent circuit. The parent's own key is
+unchanged, so a verifier that pins only the top-level program accepts it. The
+Solidity verifier pins exactly that and no more.
+
+**What closes it is baking the child keys into the guests** as build-time
+constants, so the whole tree is pinned by the one key the verifier holds. Until
+then a consumer has to compare every `program_vk` and `program_digest` the API
+publishes against keys they derived themselves from the guest ELFs.
+
+This is not new to the justification chain; it is how every stage has always
+worked. It is written down here because a fold chain adds one more of them, and
+because it is the kind of gap that is invisible until someone looks for it.
+
 ### The slashed-validator gap
 
 `ValidatorData` carries no `slashed` field, and the SSZ field verifier treats
