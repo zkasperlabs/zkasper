@@ -10,6 +10,7 @@ pub mod gossip;
 pub mod orchestrator;
 pub mod prover;
 pub mod pubkey;
+pub mod publish;
 pub mod ssz_state;
 pub mod state_diff;
 pub mod store;

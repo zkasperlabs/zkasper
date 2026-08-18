@@ -51,6 +51,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
+use sha2::Digest as _;
 use tracing::info;
 use zisk_sdk::{EmbeddedClient, GuestProgram, ProofKind, ProverClient, ZiskStdin};
 
@@ -102,6 +103,8 @@ struct StageProgram {
     stage: Stage,
     program: GuestProgram,
     vk: ProgramVk,
+    /// SHA-256 of the ELF, so a published proof says which binary made it.
+    elf_sha256: String,
 }
 
 pub struct ZiskProver {
@@ -236,14 +239,14 @@ impl ZiskProver {
 
 impl StageProgram {
     fn setup(client: &EmbeddedClient, stage: Stage, elf_dir: &Path) -> Result<Self> {
-        let path = elf_dir.join(elf_name(stage));
+        let path = elf_dir.join(stage.guest());
         let program = GuestProgram::from_uri(&path.display().to_string()).with_context(|| {
             format!(
                 "load the {} guest ELF from {}; build it with \
                  `cargo-zisk build --release -p {}`",
                 stage.as_str(),
                 path.display(),
-                elf_name(stage),
+                stage.guest(),
             )
         })?;
 
@@ -273,22 +276,15 @@ impl StageProgram {
             millis = started.elapsed().as_millis() as u64,
             "program set up",
         );
-        Ok(Self { stage, program, vk })
-    }
-}
-
-/// Guest ELF that proves a stage.
-fn elf_name(stage: Stage) -> &'static str {
-    match stage {
-        Stage::Bootstrap => "zkasper-bootstrap-guest",
-        Stage::Committee => "zkasper-committee-proof-guest",
-        Stage::EpochDiff => "zkasper-epoch-diff-guest",
-        Stage::SlotProof => "zkasper-slot-proof-guest",
-        Stage::Justification => "zkasper-justification-guest",
-        Stage::Finalization => "zkasper-finalization-guest",
-        Stage::Group => "zkasper-group-proof-guest",
-        Stage::Aggregate => "zkasper-aggregation-guest",
-        Stage::StreamFinal => "zkasper-stream-final-guest",
+        Ok(Self {
+            stage,
+            program,
+            vk,
+            elf_sha256: crate::artifacts::hex0x(
+                sha2::Sha256::digest(std::fs::read(&path).context("read the guest ELF")?)
+                    .as_slice(),
+            ),
+        })
     }
 }
 
@@ -299,6 +295,10 @@ impl Prover for ZiskProver {
 
     fn program_vk(&self, stage: Stage) -> ProgramVk {
         self.program(stage).vk
+    }
+
+    fn program_digest(&self, stage: Stage) -> Option<String> {
+        Some(self.program(stage).elf_sha256.clone())
     }
 
     fn last_cost(&self) -> Option<ProveCost> {
