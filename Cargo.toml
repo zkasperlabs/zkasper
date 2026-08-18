@@ -5,6 +5,7 @@ members = [
     "crates/epoch-diff-guest",
     "crates/bootstrap-guest",
     "crates/slot-proof-guest",
+    "crates/committee-proof-guest",
     "crates/justification-guest",
     "crates/finalization-guest",
     "crates/group-proof-guest",

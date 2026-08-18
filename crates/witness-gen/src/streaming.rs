@@ -36,169 +36,22 @@
 //! circuit enforces exactly 2/3 and does not know what margin the schedule used,
 //! so a margin that is too thin costs a retry, never soundness.
 
-use std::collections::BTreeSet;
-
-use zkasper_common::acc::{self, Digest};
+use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
-use zkasper_common::dedup::{self, Bitmap, DedupProof, EMPTY_BITMAP, LEAF_BITS};
 use zkasper_common::recursion::ProgramVk;
 use zkasper_common::types::{
-    AccMultiProof, AggregateOutput, AggregateWitness, AttestationWitness, BlockHeaderFields,
+    AccMultiProof, AggregateOutput, AggregateWitness, BlockHeaderFields, CommitteeOutput,
     EpochDiffOutput, GroupProofOutput, MillerAccumulator, PreviousJustification, SlotProofWitness,
     StreamFinalWitness,
 };
 
 use crate::acc_tree::AccTree;
-
-// ---------------------------------------------------------------------------
-// The counted-set tree, host side
-// ---------------------------------------------------------------------------
-
-/// Host-side counted-set tree: one bit per validator, 256 bits to a leaf.
-///
-/// Dense, because the whole thing is 2^14 leaves for a 2^22 index space — half a
-/// megabyte — and rebuilding it costs 32,768 permutations, which is nothing next
-/// to the proof it feeds.
-#[derive(Clone)]
-pub struct DedupTree {
-    depth: u32,
-    bitmaps: Vec<Bitmap>,
-    /// `levels[0]` are leaf digests, `levels[depth]` the root.
-    levels: Vec<Vec<Digest>>,
-}
-
-impl DedupTree {
-    pub fn new(depth: u32) -> Self {
-        let mut this = Self {
-            depth,
-            bitmaps: vec![EMPTY_BITMAP; 1usize << depth],
-            levels: Vec::new(),
-        };
-        this.rebuild();
-        this
-    }
-
-    fn rebuild(&mut self) {
-        let mut levels: Vec<Vec<Digest>> = vec![self.bitmaps.iter().map(dedup::leaf).collect()];
-        for d in 0..self.depth as usize {
-            let parents = levels[d]
-                .chunks_exact(2)
-                .map(|pair| acc::compress(&pair[0], &pair[1]))
-                .collect();
-            levels.push(parents);
-        }
-        self.levels = levels;
-    }
-
-    pub fn root(&self) -> Digest {
-        self.levels[self.depth as usize][0]
-    }
-
-    /// Is this validator already counted?
-    pub fn is_counted(&self, index: u64) -> bool {
-        let bit = (index % LEAF_BITS) as usize;
-        self.bitmaps[(index / LEAF_BITS) as usize][bit / 32] & (1u32 << (bit % 32)) != 0
-    }
-
-    /// Build the opening a proof needs for `indices`, which must be sorted.
-    ///
-    /// Auxiliaries come out bottom-up, left child before right, ascending parent
-    /// order — the order [`zkasper_common::merkle::batch_root`] consumes them in.
-    /// The loop below deliberately mirrors that scan.
-    pub fn proof(&self, indices: &[u64]) -> DedupProof {
-        let mut idx: Vec<u64> = indices.iter().map(|i| i / LEAF_BITS).collect();
-        idx.dedup();
-
-        let bitmaps = idx.iter().map(|&l| self.bitmaps[l as usize]).collect();
-
-        let mut auxiliaries = Vec::new();
-        let mut next: Vec<u64> = Vec::with_capacity(idx.len());
-        for level in 0..self.depth as usize {
-            next.clear();
-            let mut i = 0usize;
-            while i < idx.len() {
-                let k = idx[i];
-                if k & 1 == 0 {
-                    if i + 1 < idx.len() && idx[i + 1] == k + 1 {
-                        i += 2;
-                    } else {
-                        auxiliaries.push(self.levels[level][(k + 1) as usize]);
-                        i += 1;
-                    }
-                } else {
-                    auxiliaries.push(self.levels[level][(k - 1) as usize]);
-                    i += 1;
-                }
-                next.push(k >> 1);
-            }
-            std::mem::swap(&mut idx, &mut next);
-        }
-
-        DedupProof {
-            bitmaps,
-            auxiliaries,
-        }
-    }
-
-    /// Mark `indices` counted.
-    pub fn apply(&mut self, indices: &[u64]) {
-        for &index in indices {
-            let bit = (index % LEAF_BITS) as usize;
-            self.bitmaps[(index / LEAF_BITS) as usize][bit / 32] |= 1u32 << (bit % 32);
-        }
-        self.rebuild();
-    }
-}
+use crate::attestation_collector::SlotComplement;
+use crate::committee::EpochCommittees;
 
 // ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
-
-/// One aggregate attestation, and what proving it would add to the epoch.
-#[derive(Clone, Debug)]
-pub struct StreamUnit {
-    /// Slot of the block that included it — when the prover could start, which
-    /// is what the schedule is about. Not the slot it attests to.
-    pub slot: u64,
-    pub attestation: AttestationWitness,
-    /// Balance of the attesters this unit is the first to count.
-    pub marginal_balance: u64,
-}
-
-impl StreamUnit {
-    /// Wrap an attestation, reading its marginal weight off the `count_balance`
-    /// flags the collector already set.
-    pub fn new(slot: u64, attestation: AttestationWitness) -> Self {
-        let marginal_balance = attestation
-            .attesting_validators
-            .iter()
-            .filter(|v| v.count_balance)
-            .map(|v| v.active_effective_balance)
-            .sum();
-        Self {
-            slot,
-            attestation,
-            marginal_balance,
-        }
-    }
-
-    pub fn counted_indices(&self) -> Vec<u64> {
-        self.attestation
-            .attesting_validators
-            .iter()
-            .filter(|v| v.count_balance)
-            .map(|v| v.validator_index)
-            .collect()
-    }
-
-    pub fn all_indices(&self) -> Vec<u64> {
-        self.attestation
-            .attesting_validators
-            .iter()
-            .map(|v| v.validator_index)
-            .collect()
-    }
-}
 
 /// How to cut an epoch.
 #[derive(Clone, Debug)]
@@ -244,10 +97,16 @@ pub struct StreamPlan {
     pub threshold_reached: bool,
 }
 
-/// Cut a stream of units into geometrically shrinking groups plus an inline tail.
+/// Cut a stream of slot complements into geometrically shrinking groups plus an
+/// inline tail.
 ///
-/// Units must be in ascending slot order — the order a node publishes them.
-pub fn plan(units: &[StreamUnit], total_active_balance: u64, policy: &StreamPolicy) -> StreamPlan {
+/// Units must be in ascending attestation-slot order, which is also the order a
+/// node publishes the blocks that carry them.
+pub fn plan(
+    units: &[SlotComplement],
+    total_active_balance: u64,
+    policy: &StreamPolicy,
+) -> StreamPlan {
     let target = policy.target_balance(total_active_balance);
 
     // Where the threshold actually crosses, from measured weight. This is the
@@ -346,6 +205,7 @@ pub struct StreamContext {
     pub aggregate_program_vk: ProgramVk,
     pub previous_program_vk: ProgramVk,
     pub epoch_diff_program_vk: ProgramVk,
+    pub committee_program_vk: ProgramVk,
     /// The diff that carried the accumulator into this epoch, with its proof.
     ///
     /// Verified by the fold that opens the epoch, which is as early as it can
@@ -353,72 +213,64 @@ pub struct StreamContext {
     /// inherits the link rather than re-verifying it.
     pub epoch_diff: EpochDiffOutput,
     pub epoch_diff_proof: Vec<u64>,
+    /// This epoch's committee proof, on the same terms: known an epoch ahead,
+    /// verified once by the fold that opens the epoch.
+    pub committee: CommitteeOutput,
+    pub committee_proof: Vec<u64>,
     pub acc_depth: u32,
-}
-
-impl StreamContext {
-    pub fn dedup_depth(&self) -> u32 {
-        dedup::tree_depth(self.acc_depth)
-    }
 }
 
 /// Build the witness for one group proof.
 pub fn group_witness(
     context: &StreamContext,
     tree: &AccTree,
-    units: &[&StreamUnit],
+    committees: &EpochCommittees,
+    units: &[&SlotComplement],
 ) -> SlotProofWitness {
-    let attestations: Vec<AttestationWitness> =
-        units.iter().map(|u| u.attestation.clone()).collect();
-
     SlotProofWitness {
         accumulator_commitment: context.accumulator_commitment,
+        committee_root: committees.root(),
         target_epoch: context.target_epoch,
         target_root: context.target_root,
         signing_domain: context.signing_domain,
         acc_root: context.acc_root,
         total_active_balance: context.total_active_balance,
-        acc_multi_proof: multi_proof(tree, units),
-        attestations,
+        acc_multi_proof: acc_multi_proof(tree, units),
+        committee_multi_proof: committee_multi_proof(committees, units),
+        slots: units.iter().map(|u| u.witness.clone()).collect(),
     }
 }
 
-/// Accumulator opening over every attester the units name, counted or not.
-fn multi_proof(tree: &AccTree, units: &[&StreamUnit]) -> AccMultiProof {
-    let indices: BTreeSet<u64> = units.iter().flat_map(|u| u.all_indices()).collect();
-    tree.build_multi_proof(&indices.into_iter().collect::<Vec<_>>())
+/// Accumulator opening over every validator the units name — their absentees and
+/// whatever minority-message signers they enumerate. Not their attesters, which
+/// is the point.
+fn acc_multi_proof(tree: &AccTree, units: &[&SlotComplement]) -> AccMultiProof {
+    let indices: Vec<u64> = units
+        .iter()
+        .flat_map(|u| u.named_indices.iter().copied())
+        .collect();
+    tree.build_multi_proof(&indices)
 }
 
-/// Sorted counted indices for a set of units.
-pub fn counted_indices(units: &[&StreamUnit]) -> Vec<u64> {
-    let set: BTreeSet<u64> = units.iter().flat_map(|u| u.counted_indices()).collect();
-    set.into_iter().collect()
+/// Committee-tree opening over the slots the units cover.
+fn committee_multi_proof(committees: &EpochCommittees, units: &[&SlotComplement]) -> AccMultiProof {
+    let slots: Vec<u64> = units.iter().map(|u| u.witness.slot_in_epoch).collect();
+    committees.multi_proof(&slots)
 }
 
 /// Build the witness that folds finished group proofs into the running aggregate.
-///
-/// `dedup` is advanced by this call, because the aggregate the witness produces
-/// commits to the tree *after* the insert.
 #[allow(clippy::too_many_arguments)]
 pub fn aggregate_witness(
     context: &StreamContext,
-    dedup_tree: &mut DedupTree,
     previous: Option<AggregateOutput>,
     previous_proof: Vec<u64>,
     previous_miller: Fp12,
     groups: Vec<GroupProofOutput>,
     group_proofs: Vec<Vec<u64>>,
     group_millers: Vec<Fp12>,
-    counted_indices_per_group: Vec<Vec<u64>>,
 ) -> AggregateWitness {
-    let mut added: Vec<u64> = counted_indices_per_group.concat();
-    added.sort_unstable();
-
-    let dedup_proof = dedup_tree.proof(&added);
-    dedup_tree.apply(&added);
-
-    // Only the fold that opens the epoch needs the diff; the rest inherit the
-    // link from the aggregate they extend.
+    // Only the fold that opens the epoch needs the diff and the committee proof;
+    // the rest inherit both from the aggregate they extend.
     let opens_the_epoch = previous.is_none();
 
     AggregateWitness {
@@ -428,9 +280,16 @@ pub fn aggregate_witness(
         group_program_vk: context.group_program_vk,
         aggregate_program_vk: context.aggregate_program_vk,
         epoch_diff_program_vk: context.epoch_diff_program_vk,
+        committee_program_vk: context.committee_program_vk,
         epoch_diff: opens_the_epoch.then(|| context.epoch_diff.clone()),
         epoch_diff_proof: if opens_the_epoch {
             context.epoch_diff_proof.clone()
+        } else {
+            Vec::new()
+        },
+        committee: opens_the_epoch.then(|| context.committee.clone()),
+        committee_proof: if opens_the_epoch {
+            context.committee_proof.clone()
         } else {
             Vec::new()
         },
@@ -440,8 +299,6 @@ pub fn aggregate_witness(
         groups,
         group_proofs,
         group_millers: group_millers.into_iter().map(MillerAccumulator).collect(),
-        counted_indices_per_group,
-        dedup_proof,
     }
 }
 
@@ -453,23 +310,18 @@ pub fn aggregate_witness(
 pub fn final_witness(
     context: &StreamContext,
     tree: &AccTree,
-    dedup_tree: &DedupTree,
+    committees: &EpochCommittees,
     aggregate: Option<AggregateOutput>,
     aggregate_proof: Vec<u64>,
     aggregate_miller: Fp12,
     groups: Vec<GroupProofOutput>,
     group_proofs: Vec<Vec<u64>>,
     group_millers: Vec<Fp12>,
-    counted_indices_per_group: Vec<Vec<u64>>,
-    tail: &[&StreamUnit],
+    tail: &[&SlotComplement],
     previous_justification: PreviousJustification,
     previous_justification_proof: Vec<u64>,
     finalized_header: BlockHeaderFields,
 ) -> StreamFinalWitness {
-    let mut counted: Vec<u64> = counted_indices_per_group.concat();
-    counted.extend(counted_indices(tail));
-    counted.sort_unstable();
-
     StreamFinalWitness {
         accumulator_commitment: context.accumulator_commitment,
         target_epoch: context.target_epoch,
@@ -481,10 +333,17 @@ pub fn final_witness(
         aggregate_program_vk: context.aggregate_program_vk,
         previous_program_vk: context.previous_program_vk,
         epoch_diff_program_vk: context.epoch_diff_program_vk,
-        // Needed only when there is no aggregate to inherit the link from.
+        committee_program_vk: context.committee_program_vk,
+        // Needed only when there is no aggregate to inherit the links from.
         epoch_diff: aggregate.is_none().then(|| context.epoch_diff.clone()),
         epoch_diff_proof: if aggregate.is_none() {
             context.epoch_diff_proof.clone()
+        } else {
+            Vec::new()
+        },
+        committee: aggregate.is_none().then(|| context.committee.clone()),
+        committee_proof: if aggregate.is_none() {
+            context.committee_proof.clone()
         } else {
             Vec::new()
         },
@@ -494,10 +353,9 @@ pub fn final_witness(
         groups,
         group_proofs,
         group_millers: group_millers.into_iter().map(MillerAccumulator).collect(),
-        counted_indices_per_group,
-        tail: tail.iter().map(|u| u.attestation.clone()).collect(),
-        tail_acc_multi_proof: multi_proof(tree, tail),
-        dedup_proof: dedup_tree.proof(&counted),
+        tail: tail.iter().map(|u| u.witness.clone()).collect(),
+        tail_acc_multi_proof: acc_multi_proof(tree, tail),
+        tail_committee_multi_proof: committee_multi_proof(committees, tail),
         previous_justification,
         previous_justification_proof,
         finalized_header,
@@ -535,13 +393,12 @@ pub struct StreamRun {
 pub fn run_native(
     context: &StreamContext,
     tree: &AccTree,
-    units: &[StreamUnit],
+    committees: &EpochCommittees,
+    units: &[SlotComplement],
     plan: &StreamPlan,
     previous_justification: PreviousJustification,
     finalized_header: BlockHeaderFields,
 ) -> StreamRun {
-    let mut dedup_tree = DedupTree::new(context.dedup_depth());
-
     let mut group_witnesses = Vec::new();
     let mut group_outputs = Vec::new();
     let mut aggregate_witnesses = Vec::new();
@@ -551,8 +408,8 @@ pub fn run_native(
     let mut aggregate_miller = zkasper_common::bls::FP12_ONE;
 
     for group in &plan.groups {
-        let members: Vec<&StreamUnit> = group.iter().map(|&i| &units[i]).collect();
-        let witness = group_witness(context, tree, &members);
+        let members: Vec<&SlotComplement> = group.iter().map(|&i| &units[i]).collect();
+        let witness = group_witness(context, tree, committees, &members);
 
         // The circuit produces the output; the host keeps the Miller
         // accumulator, which the output only commits to.
@@ -562,19 +419,14 @@ pub fn run_native(
 
         let aggregate_witness = aggregate_witness(
             context,
-            &mut dedup_tree,
             aggregate.clone(),
             Vec::new(),
             aggregate_miller,
             vec![output.clone()],
             vec![Vec::new()],
             vec![attested.miller],
-            vec![counted_indices(&members)],
         );
-        let next = zkasper_aggregation_guest::verify_aggregate_with_depth(
-            &aggregate_witness,
-            context.dedup_depth(),
-        );
+        let next = zkasper_aggregation_guest::verify_aggregate(&aggregate_witness);
 
         aggregate_miller = zkasper_common::bls::fp12_mul(&aggregate_miller, &attested.miller);
         aggregate = Some(next.clone());
@@ -585,15 +437,14 @@ pub fn run_native(
         aggregate_outputs.push(next);
     }
 
-    let tail: Vec<&StreamUnit> = plan.tail.iter().map(|&i| &units[i]).collect();
+    let tail: Vec<&SlotComplement> = plan.tail.iter().map(|&i| &units[i]).collect();
     let final_witness = final_witness(
         context,
         tree,
-        &dedup_tree,
+        committees,
         aggregate,
         Vec::new(),
         aggregate_miller,
-        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -621,38 +472,44 @@ pub fn run_native(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zkasper_common::types::{AttestingValidator, BlsSignature};
+    use zkasper_common::types::{
+        AttestationWitness, BlsSignature, CommitteeAggregate, SlotComplementWitness,
+    };
 
-    fn unit(slot: u64, balance: u64, indices: &[u64]) -> StreamUnit {
-        StreamUnit {
+    /// A complement worth `balance`, with no absentees: the schedule only reads
+    /// `slot` and `marginal_balance` off it.
+    fn unit(slot: u64, balance: u64) -> SlotComplement {
+        SlotComplement {
             slot,
             marginal_balance: balance,
-            attestation: AttestationWitness {
-                data_slot: slot,
-                data_index: 0,
-                data_beacon_block_root: [0; 32],
-                data_source_epoch: 0,
-                data_source_root: [0; 32],
-                data_target_epoch: 1,
-                data_target_root: [0; 32],
-                signature: BlsSignature([0; 96]),
-                attesting_validators: indices
-                    .iter()
-                    .map(|&i| AttestingValidator {
-                        validator_index: i,
-                        pubkey: [0; 12],
-                        active_effective_balance: balance / indices.len().max(1) as u64,
-                        count_balance: true,
-                    })
-                    .collect(),
+            named_indices: Vec::new(),
+            witness: SlotComplementWitness {
+                slot_in_epoch: slot % 32,
+                committee: CommitteeAggregate {
+                    pubkey: [0; 12],
+                    balance,
+                },
+                primary: vec![AttestationWitness {
+                    data_slot: slot,
+                    data_index: 0,
+                    data_beacon_block_root: [0; 32],
+                    data_source_epoch: 0,
+                    data_source_root: [0; 32],
+                    data_target_epoch: 1,
+                    data_target_root: [0; 32],
+                    signature: BlsSignature([0; 96]),
+                    attesting_validators: Vec::new(),
+                }],
+                secondary: Vec::new(),
+                absentees: Vec::new(),
             },
         }
     }
 
-    /// One unit per slot, each worth 4% of the stake: the threshold at 70%
+    /// One slot per unit, each worth 4% of the stake: the threshold at 70%
     /// crosses at slot 17, and nothing past it is planned.
-    fn even_epoch() -> Vec<StreamUnit> {
-        (0..32).map(|s| unit(s, 4, &[s])).collect()
+    fn even_epoch() -> Vec<SlotComplement> {
+        (0..32).map(|s| unit(s, 4)).collect()
     }
 
     #[test]
@@ -671,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn the_critical_path_holds_one_unit_however_big_the_epoch() {
+    fn the_critical_path_holds_one_slot_however_big_the_epoch() {
         for shrink in [2, 3, 4] {
             let policy = StreamPolicy {
                 shrink,
@@ -695,57 +552,11 @@ mod tests {
     /// the plan says so rather than pretending.
     #[test]
     fn a_low_participation_epoch_is_reported_not_faked() {
-        let units: Vec<StreamUnit> = (0..32).map(|s| unit(s, 2, &[s])).collect();
+        let units: Vec<SlotComplement> = (0..32).map(|s| unit(s, 2)).collect();
         let plan = plan(&units, 100, &StreamPolicy::default());
 
         assert!(!plan.threshold_reached);
         assert_eq!(plan.attesting_balance, 64);
         assert_eq!(plan.tail, vec![31]);
-    }
-
-    #[test]
-    fn several_aggregates_in_one_slot_stay_in_one_group() {
-        let mut units = Vec::new();
-        for slot in 0..8u64 {
-            for k in 0..4u64 {
-                units.push(unit(slot, 3, &[slot * 4 + k]));
-            }
-        }
-        let plan = plan(&units, 100, &StreamPolicy::default());
-
-        // Groups are cut on slot boundaries, so no group holds part of a slot
-        // except the one that ends at the crossing unit.
-        for group in plan.groups.iter().take(plan.groups.len() - 1) {
-            let slots: BTreeSet<u64> = group.iter().map(|&i| units[i].slot).collect();
-            let first = *slots.iter().next().unwrap();
-            let last = *slots.iter().next_back().unwrap();
-            for slot in first..=last {
-                assert_eq!(
-                    group.iter().filter(|&&i| units[i].slot == slot).count(),
-                    4,
-                    "slot {slot} split across groups",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_counted_set_tree_agrees_with_a_plain_set() {
-        let mut tree = DedupTree::new(4);
-        let mut reference: BTreeSet<u64> = BTreeSet::new();
-
-        for batch in [vec![0u64, 300, 4000], vec![1, 2, 299, 301]] {
-            let proof = tree.proof(&batch);
-            let update = dedup::apply(&batch, &proof, 4).expect("apply");
-            assert_eq!(update.old_root, tree.root());
-
-            tree.apply(&batch);
-            reference.extend(&batch);
-            assert_eq!(update.new_root, tree.root());
-        }
-
-        for i in 0..4096u64 {
-            assert_eq!(tree.is_counted(i), reference.contains(&i), "index {i}");
-        }
     }
 }

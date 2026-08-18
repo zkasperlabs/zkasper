@@ -26,6 +26,7 @@ use common::stream_fixture;
 use zkasper_common::constants::ACC_TREE_DEPTH;
 use zkasper_common::recursion::verify_child;
 use zkasper_common::ChainConfig;
+use zkasper_witness_gen::attestation_collector::SlotComplement;
 use zkasper_witness_gen::prover::{Prover, Stage};
 use zkasper_witness_gen::streaming;
 use zkasper_witness_gen::zisk_prover::{ZiskProver, ZiskProverConfig, DEFAULT_ELF_DIR};
@@ -53,8 +54,13 @@ fn elf_dir() -> std::path::PathBuf {
 #[ignore = "needs a Zisk proving key and minutes of proving"]
 fn one_warm_prover_serves_two_programs() {
     let fixture = stream_fixture(ACC_TREE_DEPTH);
-    let units: Vec<&streaming::StreamUnit> = fixture.units[..2].iter().collect();
-    let witness = streaming::group_witness(&fixture.context, &fixture.tree, &units);
+    let units: Vec<&SlotComplement> = fixture.units[..2].iter().collect();
+    let witness = streaming::group_witness(
+        &fixture.context,
+        &fixture.epoch.tree,
+        &fixture.epoch.committees,
+        &units,
+    );
 
     let started = Instant::now();
     let prover = ZiskProver::new(ZiskProverConfig {

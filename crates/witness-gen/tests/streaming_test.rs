@@ -1,22 +1,22 @@
 //! The streaming pipeline, end to end, with real BLS signatures.
 //!
-//! Sixteen validators, one aggregate per slot, a tree depth of 4. Small enough
-//! to run in a second and shaped exactly like a mainnet epoch: group proofs that
-//! never finish a pairing, a running aggregate that folds them, and one final
-//! proof that does the marginal attestation inline and settles every signature
-//! in the epoch with a single final exponentiation.
+//! Sixteen validators in eight committees of two, a tree depth of 4. Small
+//! enough to run in a second and shaped exactly like a mainnet epoch: a
+//! committee proof that sums every slot's committee out of the accumulator,
+//! group proofs that never finish a pairing, a running aggregate that folds
+//! them, and one final proof that does the marginal slot inline and settles
+//! every signature in the epoch with a single final exponentiation.
 
 mod common;
 
 use common::{
-    stream_fixture, stream_sign as sign, StreamFixture as Fixture,
-    STREAM_BALANCE_GWEI as BALANCE_GWEI, STREAM_EPOCH as EPOCH,
+    stream_fixture, StreamFixture as Fixture, STREAM_BALANCE_GWEI as BALANCE_GWEI,
+    STREAM_EPOCH as EPOCH,
 };
 
-use zkasper_common::bls::compute_signing_root;
-use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::types::*;
-use zkasper_witness_gen::streaming::{self, DedupTree, StreamPolicy, StreamUnit};
+use zkasper_witness_gen::attestation_collector::SlotComplement;
+use zkasper_witness_gen::streaming::{self, StreamPolicy};
 
 /// Small enough to run in a second. A guest ELF is compiled against the
 /// production depth instead; see `zisk_proof_tests`.
@@ -46,7 +46,8 @@ fn rejection(what: &str, f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 fn run(fixture: &Fixture, plan: &streaming::StreamPlan) -> streaming::StreamRun {
     streaming::run_native(
         &fixture.context,
-        &fixture.tree,
+        &fixture.epoch.tree,
+        &fixture.epoch.committees,
         &fixture.units,
         plan,
         fixture.previous.clone(),
@@ -68,7 +69,7 @@ fn streaming_pipeline_justifies_and_finalizes() {
     );
 
     assert!(plan.threshold_reached);
-    // 70% of 16 validators is 11.2, so the 6th aggregate — the 12th validator —
+    // 70% of 16 validators is 11.2, so the 6th committee — the 12th validator —
     // is the one that crosses, and nothing after it is proven at all.
     assert_eq!(plan.tail, vec![5]);
     assert!(plan.groups.concat().iter().all(|&i| i < 5));
@@ -94,9 +95,9 @@ fn streaming_pipeline_justifies_and_finalizes() {
         fixture.previous.accumulator_commitment(),
     );
 
-    // Twelve validators of sixteen, which is the 2/3 the circuit demands.
+    // Five committees of two, folded before the tail crossed the threshold.
     let aggregate = run.aggregate_outputs.last().unwrap();
-    assert_eq!(aggregate.num_counted_validators, 10);
+    assert_eq!(aggregate.slots_mask, 0b11111);
     assert_eq!(aggregate.attesting_balance, 10 * BALANCE_GWEI);
 }
 
@@ -107,20 +108,13 @@ fn streaming_pipeline_justifies_and_finalizes() {
 fn a_bad_signature_survives_its_group_proof_and_fails_the_final_one() {
     let mut fixture = fixture();
 
-    // Re-sign unit 0 with the wrong key. Everything else about it is untouched:
-    // the attesters, their balances, their accumulator leaves.
-    let data_root = attestation_data_root(
-        0,
-        0,
-        &[0; 32],
-        EPOCH - 1,
-        &[0x01; 32],
-        EPOCH,
-        &fixture.context.target_root,
+    // Re-sign slot 0's primary aggregate with the wrong key. Everything else
+    // about it is untouched: the committee, its balance, its absentees.
+    fixture.units[0].witness.primary[0].signature = BlsSignature(
+        fixture
+            .epoch
+            .sign(&[15], &fixture.epoch.signing_root(0, [0u8; 32])),
     );
-    let signing_root = compute_signing_root(&data_root, &fixture.context.signing_domain);
-    fixture.units[0].attestation.signature =
-        BlsSignature(sign(&[&fixture.keys[15]], &signing_root));
 
     let plan = streaming::plan(
         &fixture.units,
@@ -128,9 +122,15 @@ fn a_bad_signature_survives_its_group_proof_and_fails_the_final_one() {
         &StreamPolicy::default(),
     );
 
-    // The group proof accepts it. It only ever claimed membership and balances.
-    let members: Vec<&StreamUnit> = plan.groups[0].iter().map(|&i| &fixture.units[i]).collect();
-    let witness = streaming::group_witness(&fixture.context, &fixture.tree, &members);
+    // The group proof accepts it. It only ever claimed committee membership and
+    // balances.
+    let members: Vec<&SlotComplement> = plan.groups[0].iter().map(|&i| &fixture.units[i]).collect();
+    let witness = streaming::group_witness(
+        &fixture.context,
+        &fixture.epoch.tree,
+        &fixture.epoch.committees,
+        &members,
+    );
     let group = zkasper_slot_proof_guest::verify_group_proof_with_depth(&witness, ACC_DEPTH);
     assert_eq!(group.target_epoch, EPOCH);
 
@@ -175,63 +175,63 @@ fn a_groups_balance_cannot_be_counted_without_its_pairings() {
     zkasper_stream_final_guest::verify_stream_final_with_depth(&run.final_witness, ACC_DEPTH);
 }
 
-/// Counting a validator in two different groups is what the counted-set tree
-/// exists to stop, and it stops it at the fold that adds the second one.
+/// Counting a slot twice is counting its whole committee twice, because the
+/// committee proof gave every validator exactly one slot. The fold that adds the
+/// second one is where that stops.
 #[test]
-fn a_validator_cannot_be_counted_by_two_groups() {
+fn a_slot_cannot_be_counted_by_two_groups() {
     let fixture = fixture();
-    let dedup_depth = fixture.context.dedup_depth();
-    let mut dedup_tree = DedupTree::new(dedup_depth);
 
-    let first: Vec<&StreamUnit> = vec![&fixture.units[0]];
-    let witness = streaming::group_witness(&fixture.context, &fixture.tree, &first);
+    let first: Vec<&SlotComplement> = vec![&fixture.units[0]];
+    let witness = streaming::group_witness(
+        &fixture.context,
+        &fixture.epoch.tree,
+        &fixture.epoch.committees,
+        &first,
+    );
     let attested = zkasper_slot_proof_guest::attest(&witness, ACC_DEPTH);
     let output = zkasper_slot_proof_guest::verify_group_proof_with_depth(&witness, ACC_DEPTH);
-    let counted = streaming::counted_indices(&first);
 
     let fold = streaming::aggregate_witness(
         &fixture.context,
-        &mut dedup_tree,
         None,
         Vec::new(),
         zkasper_common::bls::FP12_ONE,
         vec![output.clone()],
         vec![Vec::new()],
         vec![attested.miller],
-        vec![counted.clone()],
     );
-    let aggregate = zkasper_aggregation_guest::verify_aggregate_with_depth(&fold, dedup_depth);
+    let aggregate = zkasper_aggregation_guest::verify_aggregate(&fold);
+    assert_eq!(aggregate.slots_mask, 1);
 
     // Fold the very same group again. Its own proof is still valid; what is not
-    // valid is counting those validators a second time.
+    // valid is counting that committee a second time.
     let again = streaming::aggregate_witness(
         &fixture.context,
-        &mut dedup_tree.clone(),
-        Some(aggregate.clone()),
+        Some(aggregate),
         Vec::new(),
         attested.miller,
         vec![output],
         vec![Vec::new()],
         vec![attested.miller],
-        vec![counted],
     );
 
-    let message = rejection("a validator was counted twice", || {
-        zkasper_aggregation_guest::verify_aggregate_with_depth(&again, dedup_depth);
+    let message = rejection("a slot was counted twice", || {
+        zkasper_aggregation_guest::verify_aggregate(&again);
     });
     assert!(
-        message.contains("counted twice"),
+        message.contains("already counted"),
         "unexpected failure: {message}",
     );
 }
 
-/// The critical path is one proof deep, and it holds one unit.
+/// The critical path is one proof deep, and it holds one slot.
 ///
 /// This is the claim the whole design rests on, so it is asserted rather than
 /// left to the benchmark script: whatever the epoch's size, what runs after the
-/// last attestation is a single proof over a single aggregate.
+/// last attestation is a single proof over a single committee's complement.
 #[test]
-fn only_one_proof_and_one_unit_sit_after_the_last_attestation() {
+fn only_one_proof_and_one_slot_sit_after_the_last_attestation() {
     let fixture = fixture();
     let plan = streaming::plan(
         &fixture.units,
@@ -279,26 +279,21 @@ fn group_proofs_do_not_depend_on_each_other() {
         &StreamPolicy::default(),
     );
 
-    let outputs: Vec<GroupProofOutput> = plan
-        .groups
-        .iter()
-        .map(|group| {
-            let members: Vec<&StreamUnit> = group.iter().map(|&i| &fixture.units[i]).collect();
-            let witness = streaming::group_witness(&fixture.context, &fixture.tree, &members);
-            zkasper_slot_proof_guest::verify_group_proof_with_depth(&witness, ACC_DEPTH)
-        })
-        .collect();
+    let prove = |group: &Vec<usize>| {
+        let members: Vec<&SlotComplement> = group.iter().map(|&i| &fixture.units[i]).collect();
+        zkasper_slot_proof_guest::verify_group_proof_with_depth(
+            &streaming::group_witness(
+                &fixture.context,
+                &fixture.epoch.tree,
+                &fixture.epoch.committees,
+                &members,
+            ),
+            ACC_DEPTH,
+        )
+    };
 
-    let reversed: Vec<GroupProofOutput> = plan
-        .groups
-        .iter()
-        .rev()
-        .map(|group| {
-            let members: Vec<&StreamUnit> = group.iter().map(|&i| &fixture.units[i]).collect();
-            let witness = streaming::group_witness(&fixture.context, &fixture.tree, &members);
-            zkasper_slot_proof_guest::verify_group_proof_with_depth(&witness, ACC_DEPTH)
-        })
-        .collect();
+    let outputs: Vec<GroupProofOutput> = plan.groups.iter().map(prove).collect();
+    let reversed: Vec<GroupProofOutput> = plan.groups.iter().rev().map(prove).collect();
 
     assert_eq!(
         outputs,

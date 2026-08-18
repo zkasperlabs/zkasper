@@ -1,9 +1,9 @@
 //! Continuous mode against a mock beacon node.
 //!
-//! Drives four epochs through the whole pipeline — bootstrap, epoch diff, slot
-//! proofs, justification, finalization — with real BLS signatures, then kills
-//! the daemon in the middle of an epoch and checks that a fresh one picks up
-//! exactly where it stopped.
+//! Drives four epochs through the whole pipeline — bootstrap, epoch diff,
+//! committee, slot proofs, justification, finalization — with real BLS
+//! signatures, then kills the daemon in the middle of an epoch and checks that
+//! a fresh one picks up exactly where it stopped.
 //!
 //! The synthetic chain drops one validator's effective balance by 1 ETH every
 //! epoch, so the accumulator commitment and the total active balance are
@@ -25,15 +25,16 @@ use zkasper_common::ssz::attestation_data_root;
 use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::artifacts::hex0x;
-use zkasper_witness_gen::beacon_api::{
-    AttestationResponse, CommitteeResponse, HeaderResponse, ValidatorResponse,
-};
+use zkasper_witness_gen::beacon_api::{AttestationResponse, HeaderResponse, ValidatorResponse};
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline, Tick};
 use zkasper_witness_gen::prover::NativeProver;
 use zkasper_witness_gen::store::{Store, StoreState};
 
 const TEST_CONFIG: ChainConfig = ChainConfig {
-    slots_per_epoch: 4,
+    // Twice as many slots as there are validators to attest at them, so the
+    // epoch still has blocks left when the threshold is crossed — otherwise
+    // stopping early and running out of epoch look the same from outside.
+    slots_per_epoch: 8,
     validators_tree_depth: 2,
     acc_tree_depth: 2,
     beacon_state_validators_field_index: 11,
@@ -48,7 +49,8 @@ const BALANCE_GWEI: u64 = 32_000_000_000;
 const VALIDATORS: usize = 4;
 
 /// Cumulative balance crosses 2/3 of 128 ETH at the third attesting validator,
-/// so a streaming aggregator should stop after the epoch's third slot.
+/// so a streaming aggregator should stop after the epoch's third attestation
+/// slot.
 const SLOTS_TO_THRESHOLD: u64 = 3;
 
 // ---------------------------------------------------------------------------
@@ -190,24 +192,16 @@ fn build_chain(keys: &[Key], head_slot: u64) -> (MockBeaconApi, [u8; 32]) {
         mock.headers.insert(hex0x(&target_root), header);
         mock.block_roots.insert(boundary.to_string(), target_root);
 
-        // One committee per slot, holding one validator.
-        mock.committees.insert(
-            (boundary.to_string(), epoch),
-            (0..VALIDATORS)
-                .map(|i| CommitteeResponse {
-                    slot: boundary + i as u64,
-                    index: 0,
-                    validators: vec![i as u64],
-                })
-                .collect(),
-        );
+        mock.set_committees(epoch, &responses, SPE);
 
-        // Validator i attests in the block at slot boundary + i.
+        // Validator i attests to slot boundary + i, and the next block carries
+        // it — the earliest one that can, and the block the aggregator waits for
+        // before it closes the slot.
         let source_root = checkpoint_root(epoch - 1, keys);
         for (i, key) in keys.iter().enumerate() {
             let slot = boundary + i as u64;
             mock.attestations.insert(
-                slot.to_string(),
+                (slot + 1).to_string(),
                 vec![attestation_from(
                     key,
                     slot,
@@ -284,8 +278,8 @@ async fn test_follows_four_epochs_end_to_end() {
     assert_eq!(last.epoch, LAST_EPOCH - 1);
     assert_eq!(last.root, checkpoint_root(LAST_EPOCH - 1, &keys));
 
-    // Streaming: each epoch stopped at the slot that crossed 2/3, and the
-    // fourth slot's block was never even fetched.
+    // Streaming: each epoch stopped at the attestation slot that crossed 2/3,
+    // and the block carrying the fourth slot's attestations was never fetched.
     for epoch in FIRST_EPOCH..=LAST_EPOCH {
         let boundary = epoch * SPE;
         let proved: Vec<u64> = ticks
@@ -303,7 +297,9 @@ async fn test_follows_four_epochs_end_to_end() {
     }
     let requested = daemon.api().requested_blocks();
     for epoch in FIRST_EPOCH..=LAST_EPOCH {
-        let unreached = (epoch * SPE + SLOTS_TO_THRESHOLD).to_string();
+        // Slot `s` is closed by the block at `s + 1`, so the first block the
+        // aggregator had no reason to ask for is one past the threshold slot's.
+        let unreached = (epoch * SPE + SLOTS_TO_THRESHOLD + 1).to_string();
         assert!(
             !requested.contains(&unreached),
             "slot {unreached} was fetched after the threshold had been crossed",
@@ -318,6 +314,7 @@ async fn test_follows_four_epochs_end_to_end() {
         .exists());
     for epoch in FIRST_EPOCH..=LAST_EPOCH {
         let epoch_dir = out.join(format!("epoch-{epoch:09}"));
+        assert!(epoch_dir.join("committee.bin").exists(), "epoch {epoch}");
         assert!(
             epoch_dir.join("justification.bin").exists(),
             "epoch {epoch}"
@@ -383,8 +380,11 @@ async fn test_streams_an_epoch_and_measures_its_latency() {
 
     let stream_epoch = FIRST_EPOCH + 1;
     let boundary = stream_epoch * SPE;
+    // The head has to lead the last counted slot by one: a slot's attestations
+    // are carried by the block after it, so that is the earliest the daemon can
+    // close it.
     let mut ticks = Vec::new();
-    for slot in boundary..boundary + SLOTS_TO_THRESHOLD {
+    for slot in boundary..=boundary + SLOTS_TO_THRESHOLD {
         daemon.api().set_head(make_header(
             slot,
             &validators_at(stream_epoch, &keys),
@@ -443,9 +443,9 @@ async fn test_resumes_after_a_crash_mid_epoch() {
         daemon.state().clone()
     };
 
-    // Head one slot into epoch 12: the accumulator reaches 12, but only two of
-    // the three slots it takes to justify 12 exist yet.
-    let (mock, _) = build_chain(&keys, 12 * SPE + 1);
+    // Head two slots into epoch 12: the accumulator reaches 12, but only two of
+    // the three slots it takes to justify 12 have been closed yet.
+    let (mock, _) = build_chain(&keys, 12 * SPE + 2);
     let first_run = {
         let mut daemon = open(dir.path(), mock).await;
         daemon.catch_up().await.unwrap();

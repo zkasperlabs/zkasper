@@ -4,7 +4,7 @@ extern crate alloc;
 
 pub mod acc;
 pub mod bls;
-pub mod dedup;
+pub mod committee;
 pub mod merkle;
 pub mod miller;
 #[cfg(feature = "count-ops")]

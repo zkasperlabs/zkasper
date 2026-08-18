@@ -436,6 +436,13 @@ Aggregates slot proofs until attesting balance ≥ 2/3 of total. This is a recur
 
 **Cross-slot balance deduplication**: A validator may attest in multiple blocks (included in different slots). Its balance must only be counted once toward the 2/3 threshold across all slot proofs for the same target checkpoint. This is a critical correctness requirement.
 
+**Superseded.** Complement proving replaced all of this with a slot mask: a
+committee proof assigns every validator to exactly one slot, so counting a slot
+at most once counts a validator at most once, and the check is an `AND` against
+zero. What follows is the design it replaced, kept because the alternatives
+weighed here are still the right ones to weigh. See
+`crates/common/src/committee.rs`.
+
 **Approach — witness-generator dedup with in-circuit uniqueness check**:
 The witness generator tracks which validators have already been counted across earlier slots (via a running `seen_validators` set). For each slot witness, each validator carries a `count_balance` flag — `true` only for its first occurrence globally. The circuit enforces correctness by:
 1. Within each slot proof: all validators with `count_balance=true` must have strictly increasing indices (no intra-slot duplicates)
