@@ -409,7 +409,7 @@ output directory on local disk, not on network storage.
 
 | Signal | Condition | Meaning |
 |---|---|---|
-| `recent_latencies[].late_groups` | `> 0` | The daemon fell behind: attestations arrived that had not been folded when the trigger fired. It is a throughput symptom, not a correctness one. Currently 0 or 1 by construction. |
+| `recent_latencies[].late_groups` | `> 0` | The daemon fell behind: attestations arrived that had not been folded when the trigger fired. It is a throughput symptom, not a correctness one. Currently 0 or 1 by construction. **Expected on the first streaming epoch after a bootstrap or a restart**, which opens mid-epoch and so folds nothing before the trigger — read it together with `folded_groups`, and only treat it as real when `folded_groups` is also non-zero. |
 | `gossip.reconnects` | rising | The node or the network is unstable. Epochs around each reconnect were sourced from blocks, so their `T2 - T` is not representative — exclude them from any latency claim. |
 | `gossip` | **absent** | The daemon is reading blocks instead of gossip and is a slot behind by construction. Either `--no-gossip` is set or the pipeline is `batch`. |
 | `recent_latencies[].t2_minus_t_millis` | drifting up | Compare against the baseline in §8. |
