@@ -394,7 +394,7 @@ impl AttestationSource for FakeGossip {
         false
     }
 
-    fn counters(&self) -> (u64, u64) {
-        (0, 0)
+    fn counters(&self) -> zkasper_witness_gen::gossip::Counters {
+        zkasper_witness_gen::gossip::Counters::default()
     }
 }

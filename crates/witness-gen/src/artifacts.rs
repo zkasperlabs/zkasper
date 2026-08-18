@@ -171,6 +171,10 @@ pub struct GossipStatus {
     /// Reconnections. Each one is a hole in gossip that blocks had to repair, so
     /// a number that climbs says the epochs around it were not sourced live.
     pub reconnects: u64,
+    /// Times the node reported dropping events because its own SSE channel
+    /// overflowed. Anything but zero is a misconfigured node: raise
+    /// `--http-sse-capacity-multiplier` until it stays at zero.
+    pub dropped: u64,
 }
 
 /// Writes artifacts under an output directory.
