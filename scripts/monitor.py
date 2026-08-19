@@ -139,6 +139,15 @@ def daemon():
         # check paged on every healthy epoch until 2026-08-19. Only 2 or more is
         # a real signal, since the fire path holds at most one group and a
         # second means the pipeline is behind.
+        # folded_groups is a readout of prover latency, not of attestation volume:
+        # a group is however many slots piled up while the previous proof ran, so
+        # 1 is the healthy shape and a large number means the cycle time collapsed.
+        # Epoch 469539 folded 19 against dead provers and still published as
+        # "proven" -- the fold count said so before anything else did.
+        worst_folded = max((l.get("folded_groups") or 0) for l in lat[-5:])
+        out.append(check("cycle", worst_folded <= 5,
+                         f"worst folded_groups in last {min(len(lat),5)}: {worst_folded}"
+                         + ("" if worst_folded <= 5 else " -- the prover is answering too fast to be proving")))
         worst_late = max((l.get("late_groups") or 0) for l in lat[-5:])
         out.append(check("latency", worst_late < 2,
                          f"T2-T {last.get('t2_minus_t_millis')}ms, "
