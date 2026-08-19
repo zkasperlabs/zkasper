@@ -57,6 +57,42 @@
 //! - A background thread drains the spool onto the same connection once it is
 //!   back, oldest first, and writes the recovered proofs under `recovered/`.
 //!
+//! # When the server does not come back
+//!
+//! All of that is for a prover that is *away*. A prover that is *gone* — the
+//! rented card's credit ran out, the box was reclaimed — is a different fault
+//! wearing the same clothes, and treating it as an outage is how a loud failure
+//! becomes a silent one. On 2026-08-19 both cards vanished at 09:50 and the
+//! daemon spooled and retried into an empty socket until it was stopped by hand:
+//! a live process, a stale manifest, and nothing on the log but the same two
+//! lines. The supervisor deliberately has no restart loop, but it only speaks
+//! when the daemon *exits*, so a daemon that never exits is the one shape it
+//! cannot report.
+//!
+//! So [`RemoteProverConfig::unreachable_deadline`] bounds the retrying. Once the
+//! prover has failed **continuously** for that long, it is declared gone: the
+//! next proof asked of it returns an error naming the address and the duration
+//! instead of the empty proof, and that error travels the `?` chain the
+//! orchestrator already has out through `run` and out of the process, where the
+//! supervisor's "NOT restarting" path is waiting. The declaration is one-way. A
+//! prover that comes back after the deadline has already cost more epochs than a
+//! restart does, and whether to trust that card again is an operator's decision
+//! rather than the process's.
+//!
+//! The clock runs from the **first failure after the last success**, not from
+//! the last success itself: an idle link that fails on its first use in an hour
+//! has been down for one request, not for an hour. Every successful frame — a
+//! proof, or a refusal, which is equally proof the server is alive — clears it.
+//! A server that accepts the witness and then says nothing is bounded by
+//! `request_timeout` rather than by this: it fails no request until that
+//! expires, so there is nothing for the clock to run on until it does.
+//!
+//! Each [`RemoteProver`] carries its own clock, so with
+//! `--prover-route committee=<second card>` the two cards fail independently and
+//! the one that failed is the one the message names. Either is fatal, because a
+//! parent proof binds its children: a stage nothing can prove poisons every
+//! epoch that folds it, whichever card owed it.
+//!
 //! A witness the server *reached and refused* is a different thing and is an
 //! error. The circuit rejected those bytes and will reject them again, so it is
 //! reported where it happened rather than queued.
@@ -98,7 +134,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::{verify_child, ProgramVk};
@@ -427,6 +463,23 @@ pub struct RemoteProverConfig {
     /// Held after a failed connect, so an outage costs one attempt per interval
     /// rather than one per stage.
     pub reconnect_backoff: Duration,
+    /// How long the prover may fail continuously before it is called gone
+    /// rather than away, and the daemon stops.
+    ///
+    /// A prover that is restarting answers again in seconds and the spool
+    /// exists to cover exactly that, so this must clear any restart of the
+    /// server on the far card. A prover that has been taken away never answers
+    /// again, and retrying it for ever is what turns an outage into a silent
+    /// failure: the process stays up, the manifest goes stale, and the
+    /// supervisor never gets to say it is not restarting.
+    ///
+    /// Ten minutes is a little over one and a half mainnet epochs. Long enough
+    /// that no server restart reaches it, short enough that an operator finds a
+    /// daemon that stopped rather than a night of unproven epochs.
+    ///
+    /// `Duration::ZERO` never stops, for a run that would rather publish
+    /// unproven epochs than stop.
+    pub unreachable_deadline: Duration,
     /// Where unproven witnesses go when the server cannot be reached. `None`
     /// drops them, which loses the epoch's proof rather than delaying it.
     pub spool_dir: Option<PathBuf>,
@@ -458,6 +511,7 @@ impl RemoteProverConfig {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(1800),
             reconnect_backoff: Duration::from_secs(5),
+            unreachable_deadline: Duration::from_secs(600),
             spool_dir: None,
             spool_capacity: 256,
             backfill_quiet: Duration::from_secs(30),
@@ -503,6 +557,22 @@ struct Counters {
 struct Link {
     stream: Option<TcpStream>,
     retry_at: Option<Instant>,
+}
+
+/// How long the prover has been failing, and whether it has failed long enough
+/// to be called gone.
+#[derive(Default)]
+struct Outage {
+    /// The first failure since the last frame that came back. `None` while the
+    /// prover is answering.
+    ///
+    /// Wall clock from the first failure rather than a count of failures: how
+    /// often this end retries is an implementation detail, and an operator
+    /// reasons about a card in minutes.
+    since: Option<Instant>,
+    /// Set once [`RemoteProverConfig::unreachable_deadline`] passed, and never
+    /// cleared. See the module doc on why the declaration is one-way.
+    gone: Option<String>,
 }
 
 /// A witness the server never took, kept so the epoch can be proven late.
@@ -613,6 +683,9 @@ struct Inner {
     /// witness builders bind it, so it has to answer through an outage.
     programs: Vec<ProgramInfo>,
     conn: Mutex<Link>,
+    /// Apart from `conn`, because the backfill thread only ever *tries* for the
+    /// connection and must be able to record a failure it did take.
+    outage: Mutex<Outage>,
     spool: Option<Mutex<Spool>>,
     last_cost: Mutex<Option<ProveCost>>,
     counters: Counters,
@@ -678,6 +751,7 @@ impl RemoteProver {
                 stream: Some(stream),
                 retry_at: None,
             }),
+            outage: Mutex::new(Outage::default()),
             spool,
             last_cost: Mutex::new(None),
             counters: Counters::default(),
@@ -833,23 +907,93 @@ impl Inner {
     ///
     /// Proving is a pure function of the witness, so re-sending after a half
     /// written request costs a proof and never correctness.
+    ///
+    /// This is the one place either end of the link is observed, so it is where
+    /// the outage clock is kept. Both callers — the pipeline and the backfill —
+    /// come through here, and errors that are not the link's fault (a proof that
+    /// does not verify, a spool that cannot be written) are raised by them
+    /// afterwards and never reach the clock.
     fn attempt(&self, link: &mut Link, request: &Request) -> Result<Reply> {
         match self.roundtrip(link, request) {
-            Ok(reply) => Ok(reply),
+            Ok(reply) => {
+                self.note_reachable();
+                Ok(reply)
+            }
             Err(first) => {
                 if is_timeout(&first) {
                     self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
                 }
                 link.stream = None;
                 match self.roundtrip(link, request) {
-                    Ok(reply) => Ok(reply),
+                    Ok(reply) => {
+                        self.note_reachable();
+                        Ok(reply)
+                    }
                     Err(_) => {
                         link.stream = None;
+                        self.note_failure(&first);
                         Err(first)
                     }
                 }
             }
         }
+    }
+
+    /// The prover answered, so whatever outage was running is over.
+    ///
+    /// A refusal counts: the server reached the witness to refuse it, which is
+    /// the thing being measured.
+    fn note_reachable(&self) {
+        self.outage.lock().unwrap().since = None;
+    }
+
+    /// The prover did not answer. Start the clock, or decide it has run out.
+    ///
+    /// Declaring it here rather than at the call sites means the line an
+    /// operator reads is written once, by whichever of the two threads was
+    /// first to see the deadline pass.
+    fn note_failure(&self, error: &anyhow::Error) {
+        let mut outage = self.outage.lock().unwrap();
+        if outage.gone.is_some() {
+            return;
+        }
+        let down = outage.since.get_or_insert_with(Instant::now).elapsed();
+        let limit = self.config.unreachable_deadline;
+        if limit.is_zero() || down < limit {
+            return;
+        }
+        // Named so the next reader goes to the card and not to the daemon.
+        // The address is the machine to walk to and the duration is why this
+        // is not the outage the spool covers; the error messages that
+        // diagnosed themselves on 2026-08-19 cost minutes and the ones that
+        // did not cost hours.
+        let spool = match &self.config.spool_dir {
+            Some(dir) => format!(
+                "the witnesses spooled at {} drain on the next run",
+                dir.display()
+            ),
+            None => "no spool was configured, so the epochs it spanned have no proofs".to_string(),
+        };
+        let message = format!(
+            "the prover at {} has been unreachable for {:.1?}, past the {:.1?} this run \
+             allows; it is gone rather than restarting, so zkasperd is stopping instead of \
+             spooling witnesses nothing will prove. Check the prover server on that machine \
+             and start zkasperd again -- {spool}",
+            self.config.addr, down, limit,
+        );
+        error!(
+            addr = %self.config.addr,
+            unreachable_seconds = down.as_secs(),
+            limit_seconds = limit.as_secs(),
+            error = %format!("{error:#}"),
+            "the prover is gone rather than restarting; stopping the daemon",
+        );
+        outage.gone = Some(message);
+    }
+
+    /// Why the daemon is stopping, once the prover has been declared gone.
+    fn gone(&self) -> Option<String> {
+        self.outage.lock().unwrap().gone.clone()
     }
 
     fn prove(&self, stage: Stage, witness: &impl Serialize, publics: &[u8]) -> Result<Proof> {
@@ -861,6 +1005,14 @@ impl Inner {
     }
 
     fn prove_bytes(&self, stage: Stage, witness: Vec<u8>, publics: &[u8]) -> Result<Proof> {
+        // Already declared gone. Every stage from here is an error rather than
+        // an empty proof, including one this call might have got through if the
+        // card happened to be back: past the deadline the run has lost more
+        // epochs than a restart costs, and a card that comes back after that is
+        // an operator's decision rather than the process's.
+        if let Some(why) = self.gone() {
+            bail!(why);
+        }
         // A witness that cannot be framed can never be sent, so spooling it
         // would queue a retry that fails identically for ever -- and re-sending
         // it costs the link its whole bandwidth each time. Measured on mainnet
@@ -915,10 +1067,19 @@ impl Inner {
             // proof a witness-only run would: the daemon has its own outputs, so
             // it keeps following the chain and the epoch is published without a
             // proof rather than not published at all.
+            //
+            // Unless it has been not there for `unreachable_deadline`, at which
+            // point it is gone rather than away and the witness is worth keeping
+            // for the next run but not worth carrying on for. The error goes up
+            // the orchestrator's `?` chain and out of the process, which is the
+            // only way the supervisor gets to say it is not restarting.
             Err(e) => {
                 let Request::Prove { witness, .. } = request;
                 self.spool(stage, witness, publics, &e);
-                Ok(Proof::new())
+                match self.gone() {
+                    Some(why) => Err(e.context(why)),
+                    None => Ok(Proof::new()),
+                }
             }
         }
     }
@@ -1031,15 +1192,38 @@ impl Inner {
 }
 
 fn backfill_loop(inner: &Arc<Inner>, stop: &Arc<AtomicBool>) {
+    let mut failures: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(inner.config.backfill_interval);
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        if let Err(e) = inner.backfill_once() {
-            // The server is still away. The spool keeps its place and the next
-            // pass tries again; `dial` holds the backoff.
-            warn!(error = %format!("{e:#}"), "could not backfill a spooled witness");
+        match inner.backfill_once() {
+            Ok(()) => failures = 0,
+            Err(e) => {
+                // The prover has been declared gone, by this thread or by the
+                // pipeline. The pipeline raises it on the next proof it asks
+                // for; there is nothing here left to drain into.
+                if inner.gone().is_some() {
+                    return;
+                }
+                // The server is still away. The spool keeps its place and the
+                // next pass tries again; `dial` holds the backoff.
+                //
+                // Logged on the doubling rather than every pass. An outage is
+                // bounded now, but it is still minutes of a five-second loop,
+                // and a warning repeated 120 times says nothing the first one
+                // did not — while burying whatever else the daemon had to say.
+                failures += 1;
+                if failures.is_power_of_two() {
+                    warn!(
+                        addr = %inner.config.addr,
+                        failures,
+                        error = %format!("{e:#}"),
+                        "could not backfill a spooled witness",
+                    );
+                }
+            }
         }
     }
 }

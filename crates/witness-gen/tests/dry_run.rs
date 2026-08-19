@@ -157,7 +157,21 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     );
     let latency = &status["recent_latencies"][0];
     assert_eq!(latency["epoch"], FIRST_EPOCH + 1);
-    assert_eq!(latency["tail"], 1, "one attestation on the critical path");
+    // The whole of the epoch the aggregate has not already swallowed goes
+    // inline, because a group the final proof has to absorb is a recursion and
+    // the slots are complement work. On this chain the threshold crosses in nine
+    // slots and the daemon never gets a group folded before it, so all nine are
+    // on the critical path and nothing is absorbed. It used to be one attestation
+    // inline and the other eight as a child.
+    assert_eq!(
+        latency["tail"],
+        chain.slots_to_threshold(FIRST_EPOCH + 1),
+        "the final proof did not carry the plan's tail",
+    );
+    assert_eq!(
+        latency["late_groups"], 0,
+        "a group proof on the critical path",
+    );
     assert!(
         latency["t2_minus_t_millis"].is_number(),
         "no measured T2 - T: {latency}",

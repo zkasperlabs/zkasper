@@ -6,7 +6,7 @@
 //! the epoch before the threshold crossed. There is no third case: the fold
 //! lives in the `!fire` branch of the streaming pipeline, so an epoch that is
 //! already past its threshold on the tick it opens goes straight down the fire
-//! path and the final proof absorbs its whole backlog as one recursion child.
+//! path and the final proof carries its whole backlog inline.
 //!
 //! That is not a gate that fails to open — it is the correct decision, because
 //! folding after `T` is never a win: the fold is itself a proof over the group,
@@ -15,6 +15,12 @@
 //! added to it. What makes folding pay is running it *before* `T`, against
 //! attestations that have already arrived, which is only possible if the epoch
 //! is open before its own threshold slot.
+//!
+//! The backlog used to become a group proof on the fire path and then a
+//! recursion child of the final proof — 53 s on a mainnet card. It goes inline
+//! now, because that is what the plan's tail asks for and the fire path stopped
+//! overriding it: the same attestations, as complement work rather than as a
+//! child.
 //!
 //! # Why this is worth a test
 //!
@@ -245,53 +251,52 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
         "an epoch opened past its own threshold has no tick on which to fold",
     );
     assert_eq!(
-        latency["late_groups"], 1,
-        "so the final proof absorbs the backlog as a recursion child instead",
+        latency["late_groups"], 0,
+        "the backlog became a recursion child instead of going inline",
     );
-    assert_eq!(latency["tail"], 1, "one attestation on the critical path");
+    assert_eq!(
+        latency["tail"], SLOTS_TO_THRESHOLD,
+        "the final proof did not carry the whole backlog inline",
+    );
 
-    // Nothing was folded, so no aggregate was ever written; the backlog was
-    // proven once, as a single group, on the firing tick.
+    // Nothing was folded and nothing was grouped: the epoch is one proof.
     let epoch_dir = epoch_dir(dir.path(), stream_epoch);
     assert!(
-        epoch_dir.join("group_0.bin").exists(),
-        "the backlog is proven as one group",
+        !epoch_dir.join("group_0.bin").exists(),
+        "the backlog was proven as a group the final proof then had to verify",
     );
     assert!(
         !epoch_dir.join("aggregate_0.bin").exists(),
         "nothing was folded, so there is no aggregate",
     );
 
-    // The group proof sits between `T` and the final proof, and it is reported
-    // as itself. This is the measurement that says the window cannot absorb a
-    // fold: it is already full, of proving rather than of waiting.
+    // Which is what empties the window between `T` and the final proof. It used
+    // to hold a whole group proof — the measurement that said the window could
+    // not absorb a fold because it was already full of proving.
     let late_group = latency["late_group_millis"]
         .as_u64()
         .expect("late_group_millis");
-    assert!(
-        late_group >= GROUP_PROVE.as_millis() as u64,
-        "late_group_millis ({late_group} ms) should be the late group proof \
-         ({} ms), which runs between the trigger firing and the final proof",
-        GROUP_PROVE.as_millis(),
+    assert_eq!(
+        late_group, 0,
+        "there is no late group left to charge to the critical path",
     );
 
-    // And it is not charged to the trigger. This is the assertion that was
-    // inverted: the daemon never held back here at all — it fired on the first
-    // tick that evaluated the trigger — and the old stamp reported the whole
-    // group proof as a wait.
+    // And it is not charged to the trigger either. This is the assertion that
+    // was inverted once already: the daemon never held back here at all — it
+    // fired on the first tick that evaluated the trigger — and an older stamp
+    // reported the fire path's work as a wait.
     let wait = latency["wait_millis"].as_u64().expect("wait_millis");
     assert!(
         wait < GROUP_PROVE.as_millis() as u64,
-        "wait_millis ({wait} ms) contains the group proof ({} ms) again; the \
-         fired timestamp has drifted back into the fire path's work",
+        "wait_millis ({wait} ms) contains a group proof ({} ms); the fired \
+         timestamp has drifted back into the fire path's work",
         GROUP_PROVE.as_millis(),
     );
 
     let t2_minus_t = latency["t2_minus_t_millis"].as_u64().expect("t2_minus_t");
     assert!(
-        t2_minus_t >= wait + late_group,
-        "T2 - T ({t2_minus_t} ms) covers the wait ({wait} ms), the late group \
-         ({late_group} ms) and the final proof",
+        t2_minus_t >= wait,
+        "T2 - T ({t2_minus_t} ms) covers the wait ({wait} ms) and the final proof",
     );
 }
 

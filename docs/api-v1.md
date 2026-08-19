@@ -138,8 +138,10 @@ default) and by what the tail is worth, since `tail_named` leaves cost
 A value far above either bound means a proof is being charged to the trigger.
 
 `late_group_millis` and `late_groups` above zero both say the same thing: the
-daemon reached the epoch after its threshold had already crossed, so its backlog
-was proven on the critical path instead of being folded before `T`.
+daemon fell behind the plan it fired on, far enough that the final proof could
+not carry the whole remainder inline, so part of it was proven as a group on the
+critical path. Both are zero on a run that keeps up, and on one that opens an
+epoch already past its threshold — the backlog goes inline there.
 
 ### `proof`
 

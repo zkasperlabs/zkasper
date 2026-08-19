@@ -656,7 +656,7 @@ output directory on local disk, not on network storage.
 
 | Signal | Condition | Meaning |
 |---|---|---|
-| `recent_latencies[].late_groups` | `> 1` | 0 or 1 by construction: the final proof absorbs at most one group, so this is a flag rather than a count. **1 is the planned shape on a real prover, not a symptom** — the schedule's own optimum leaves the last group unfolded, because folding it costs a floor and a recursion more and cannot finish before `T` anyway. The `late_groups = 0` runs in §8 were `--prover native`, where a fold is milliseconds. What to watch on a GPU is `late_group_millis`, which is the same group proven *after* `T` instead of before it, and `observation_millis`, which is the same blind tick seen from the other side and is the larger of the two. |
+| `recent_latencies[].late_groups` | `>= 1` | 0 or 1 by construction: the final proof absorbs at most one group, so this is a flag rather than a count. **0 is the planned shape and 1 says the daemon fell behind its own plan.** The plan puts the slots the aggregate does not cover inline, because a group the final proof absorbs is a recursion — 53 s — where the same slots inline are complement work; a 1 means the daemon had folded less than the plan assumed and needed a group for the difference. This inverted when the inline tail stopped being capped at four slots: **1 was the planned shape before that**, and rows in §8 recorded under the old shape are not a symptom. What to watch beside it is `late_group_millis`, which is what that group cost after `T`. |
 | `recent_latencies[].observation_millis` | more than one proof | The daemon is not seeing the chain cross until after whatever it was proving finishes, because the trigger is only evaluated on a tick with no proof in flight. It is a real part of `T2 - T` and the largest one on a saturated daemon — a median 105 s on the 2026-08-19 mainnet run. It is also the only term a consumer pays that no faster prover would remove. |
 | `gossip.reconnects` | rising | The node or the network is unstable. Epochs around each reconnect were sourced from blocks, so their `T2 - T` is not representative — exclude them from any latency claim. |
 | `gossip` | **absent** | The daemon is reading blocks instead of gossip and is a slot behind by construction. Either `--no-gossip` is set or the pipeline is `batch`. |
@@ -675,6 +675,10 @@ They are handled, they log a warning, and they resolve themselves:
   `/eth/v2/beacon/blocks/{id}/attestations`, whose errors are swallowed
   silently and produce no other symptom.
 - `no state to read the fork version from; taking head's`
+- `could not backfill a spooled witness` — the prover is away and the spool is
+  waiting for it. Logged on the doubling rather than on every pass, and bounded
+  at both ends: if the prover does not answer within
+  `--prover-unreachable-seconds` the daemon stops instead of repeating this.
 
 ### The health check
 
@@ -741,6 +745,7 @@ voluntary.
 | `store format version N, expected M` | Format bump, no migration exists | Restart from a new init point (§ below). |
 | `the ... circuit rejected the witness` | An unprovable witness | Real bug. Keep the epoch directory under `out/epoch-*` — it is the reproduction. |
 | `the ... proof does not verify against its own program key and outputs` | Prover, ELF or proving-key mismatch | Not a chain problem. Check the ELF against the proving key. |
+| `the prover at HOST:PORT has been unreachable for ... it is gone rather than restarting` | That prover server is not running any more: the card was reclaimed, the credit ran out, or the process died | Go to the machine the message names, not to the daemon. Start `zkasper-prover-server` there, then start the daemon. The witnesses of the epochs the outage spanned are still in the spool and drain behind the first reconnect. A short outage never produces this line — the prover has to fail continuously for `--prover-unreachable-seconds` (default 600) — so seeing it means the server was down for at least ten minutes. |
 | `fetch header at slot N` / `NOT_FOUND: beacon block at slot N`, repeating forever | **The epoch boundary slot was skipped.** Fixed — the epoch diff now reads the state root from `/eth/v1/beacon/states/{slot}/root`, which is defined for a skipped slot, instead of from a block header, which is not. On a build before that fix the daemon crash-loops permanently, because the slot will never gain a block. | Rebuild. To get moving without one, take a fresh init point past the skipped boundary. |
 | Wedged, repeating the same epoch | The node cannot serve that epoch's state | Restart from a new init point (§ below). |
 | `accumulator_commitment ... does not bind acc_root ... and total_active_balance ...` | The init point's three accumulator fields disagree | The file is wrong or was edited. Take it again with `zkasper-init-point`; do not patch it by hand. |
@@ -1148,9 +1153,11 @@ is what three epochs can support.
 
 - **`late_groups = 0` on all three steady-state epochs, and 1 on every catch-up.**
   The daemon keeps up with the chain once it is on it — *under `--prover
-  native`*, where a group proof is 4.8 s and a fold is milliseconds. On a real
-  prover a fold is 109.8 s and folding the last group is neither possible nor
-  wanted, so `late_groups = 1` is the steady state there and 0 is not the target.
+  native`*, where a group proof is 4.8 s and a fold is milliseconds. This was
+  read at the time as an artifact of the native prover, on the reasoning that a
+  109.8 s fold makes `late_groups = 1` the steady state on a GPU. That is no
+  longer the shape: the plan inlines those slots rather than grouping them, so 0
+  is the target on both provers and the catch-up rows would read 0 today too.
   See BENCHMARKS.md.
 - **`wait_millis` is 82–92% of `T2 - T`.** Under `--prover native` the prover is
   not on the critical path; the trigger holding for in-flight attestations is. A

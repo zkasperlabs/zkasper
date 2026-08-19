@@ -389,11 +389,15 @@ look worse than it is.
 
 **Modelled, not measured**:
 
-- **`T2 - T` is 117.7 s in a model** over measured per-stage times, on two GPUs.
-  A production stream-final proof took 148.2 s four times within ±1.1 s, so the
-  model and the one real measurement agree to within the difference between a
-  synthetic epoch and a live one. **The 5.5 s this document used to quote was
-  computed with recursion priced at zero and is withdrawn.**
+- **`T2 - T` is 67.8 s in a model** over measured per-stage times, on two GPUs.
+  **No prover has run this shape.** It was 112.8 s while the final proof's inline
+  tail was capped at four slots and the epoch's end had to be a group it then
+  verified as a child; uncapping it removes that child. Every measurement below
+  was taken against the capped shape: a production stream-final proof took 148.2 s
+  four times within ±1.1 s, and the folded path ran at 116.5 to 124.2 s against a
+  117.7 s model — an earlier revision of this model, which no longer reproduces.
+  **The 5.5 s this document used to quote was computed with recursion priced at
+  zero and is withdrawn.**
 - **The Fp2-tower rate is fitted**, with a bracket from 162M to 268M units per
   second. Nothing in the campaign runs BLS at mainnet scale.
 - **The committee proof cost at mainnet scale is an extrapolation** from

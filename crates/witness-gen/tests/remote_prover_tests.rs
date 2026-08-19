@@ -29,6 +29,13 @@ const ACC_DEPTH: u32 = 4;
 const TOKEN: &str = "a-shared-secret";
 const STAGES: &[Stage] = &[Stage::Group, Stage::SlotProof];
 
+/// How long a prover may fail before the tests that check it expect a stop.
+///
+/// Short, because a test cannot wait out the ten minutes a deployment allows,
+/// and the boundary is the same one either way: the first failure starts the
+/// clock and never trips it, and a failure after the clock has run does.
+const DEADLINE: Duration = Duration::from_millis(500);
+
 fn chain() -> ChainConfig {
     ChainConfig {
         acc_tree_depth: ACC_DEPTH,
@@ -258,6 +265,159 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
     assert_eq!(counters.pending, 4);
     assert_eq!(counters.dropped, 0);
     assert_eq!(spooled_files(spool.path()), 4);
+}
+
+/// A prover that is *away* must still be ridden out. The whole point of the
+/// spool is that a server restarting on the far card costs proofs and not the
+/// run, so the deadline that stops a daemon must not fire on a reconnect.
+#[test]
+fn a_prover_that_comes_back_is_ridden_out() {
+    let spool = tempfile::tempdir().unwrap();
+    let mut server = Server::bind();
+    let prover = RemoteProver::connect(RemoteProverConfig {
+        // Real enough to be checked, far longer than this outage lasts.
+        unreachable_deadline: Duration::from_secs(60),
+        ..client(&server.addr, Some(spool.path()))
+    })
+    .expect("connect");
+    let witness = witness();
+
+    server.stop();
+    for _ in 0..3 {
+        let (_, _, proof) = prover
+            .prove_group(&witness)
+            .expect("an outage is not a fault");
+        assert!(proof.is_empty(), "there is nothing to prove against");
+    }
+    server.restart();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while prover.counters().proved == 0 {
+        assert!(Instant::now() < deadline, "never reconnected");
+        prover.prove_group(&witness).expect("still not a fault");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // And the clock reset with it: the outage that was is not held against the
+    // next one.
+    server.stop();
+    prover
+        .prove_group(&witness)
+        .expect("the second outage starts from zero");
+}
+
+/// A prover that is *gone* is a stop condition, not a retry condition.
+///
+/// The GPU credit ran out on 2026-08-19 and both cards vanished. The daemon
+/// spooled and retried into an empty socket for hours, filling the log and
+/// making no progress, until it was stopped by hand: nothing exits, so the
+/// supervisor's "NOT restarting" path — the one arrangement meant to make a
+/// failure loud — never runs. Past the deadline the call fails instead, and the
+/// error is what leaves the process.
+#[test]
+fn a_prover_that_never_comes_back_stops_the_daemon() {
+    let spool = tempfile::tempdir().unwrap();
+    let mut server = Server::bind();
+    let prover = RemoteProver::connect(RemoteProverConfig {
+        unreachable_deadline: DEADLINE,
+        ..client(&server.addr, Some(spool.path()))
+    })
+    .expect("connect");
+    let witness = witness();
+
+    server.stop();
+    // The first failure only starts the clock. One failure is not a verdict:
+    // this is the call that must still ride a reconnect out.
+    prover
+        .prove_group(&witness)
+        .expect("one failure is not a verdict");
+
+    std::thread::sleep(2 * DEADLINE);
+    let Err(error) = prover.prove_group(&witness) else {
+        panic!("a prover that never came back never stopped the daemon");
+    };
+    let error = format!("{error:#}");
+
+    // The message has to send the next reader to the card rather than to the
+    // daemon, so it names the address and how long it was unreachable.
+    assert!(error.contains(&server.addr), "unexpected error: {error}");
+    assert!(
+        error.contains("unreachable for"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("Check the prover server"),
+        "the message must send the reader to the card: {error}",
+    );
+
+    // The witnesses are still kept: the next run picks the spool back up.
+    assert!(spooled_files(spool.path()) > 0);
+
+    // And the verdict is one-way. A card that comes back after the deadline has
+    // already cost more epochs than a restart does, and whether to trust it
+    // again is an operator's call rather than the process's.
+    server.restart();
+    assert!(
+        prover.prove_group(&witness).is_err(),
+        "a prover declared gone must stay gone",
+    );
+}
+
+/// Two cards fail independently, and the message names the one that failed.
+///
+/// `--prover-route committee=<second card>` puts one stage on a second card.
+/// Losing it must not be reported as losing the other: the operator is being
+/// sent to a machine, and the wrong address costs the hours the last outage did.
+#[test]
+fn one_card_going_away_names_that_card() {
+    let groups = Server::bind_with(&[Stage::Group]);
+    let mut slots = Server::bind_with(&[Stage::SlotProof]);
+    let group_spool = tempfile::tempdir().unwrap();
+    let slot_spool = tempfile::tempdir().unwrap();
+
+    let split = SplitProver::new(
+        Box::new(
+            RemoteProver::connect(RemoteProverConfig {
+                stages: vec![Stage::Group],
+                unreachable_deadline: DEADLINE,
+                ..client(&groups.addr, Some(group_spool.path()))
+            })
+            .expect("connect to the group prover"),
+        ),
+        vec![(
+            Stage::SlotProof,
+            Box::new(
+                RemoteProver::connect(RemoteProverConfig {
+                    stages: vec![Stage::SlotProof],
+                    unreachable_deadline: DEADLINE,
+                    ..client(&slots.addr, Some(slot_spool.path()))
+                })
+                .expect("connect to the slot prover"),
+            ) as Box<dyn Prover>,
+        )],
+    )
+    .expect("split");
+
+    let witness = witness();
+    slots.stop();
+    split
+        .prove_slot(&witness)
+        .expect("one failure is not a verdict");
+
+    std::thread::sleep(2 * DEADLINE);
+    let Err(error) = split.prove_slot(&witness) else {
+        panic!("the lost card never stopped the run");
+    };
+    let error = format!("{error:#}");
+
+    assert!(error.contains(&slots.addr), "unexpected error: {error}");
+    assert!(
+        !error.contains(&groups.addr),
+        "the card that is up must not be named: {error}",
+    );
+    split
+        .prove_group(&witness)
+        .expect("the live card is unaffected by the dead one");
 }
 
 /// Two provers, one stage each, and every proof lands on the right one.

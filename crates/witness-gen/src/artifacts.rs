@@ -226,13 +226,13 @@ pub struct EpochLatency {
     /// realised it. The fire path holds at most one, so this is 0 or 1 and
     /// never a count of late slots: a backlog of nine slots is one group.
     ///
-    /// **1 is the schedule's own optimum on a real prover, not a shortfall.**
-    /// A fold is `ProverModel::fold_s(1)` — 109.8 s — and the last group's
-    /// slots arrive one slot before the crossing, so it can neither be folded
-    /// in time nor be worth folding: absorbing it costs one recursion where
-    /// folding it costs a floor and a recursion, in series in front of the
-    /// final proof rather than inside it. What says the daemon was behind is
-    /// `late_group_millis`, not this.
+    /// **0 is the schedule's own optimum, and 1 used to be.** A group the final
+    /// proof absorbs is one recursion — 53.087 s — where the slots under it are
+    /// complement work worth a few seconds, so the plan puts them inline and
+    /// leaves nothing to absorb. It could not before: `StreamPlan::tail` was
+    /// capped at four slots and the rest of the epoch's end had to be a group.
+    /// A 1 here now says the daemon fell behind its own plan and needed a group
+    /// for the difference; `late_group_millis` is what that cost.
     pub late_groups: usize,
     /// Attestations the final proof verified inline.
     pub tail: usize,
