@@ -13,6 +13,16 @@
 //! is never cleared, so a client cannot even be dropped and rebuilt. One
 //! [`ZiskProver`] per daemon, shared, is the only thing that works.
 //!
+//! # Why nothing is compressed
+//!
+//! `wrap_proof(.., VadcopFinalMinimal)` costs 0.192 s here and about 34 s in
+//! every guest that then verifies the result. A compressed proof has Merkle
+//! arity 2, which fixes the in-guest STARK verifier's hash width at 8, and the
+//! `poseidon1` precompile only accepts width 16 — so the whole Merkle and FRI
+//! path runs in software. The uncompressed `vadcop_final` proof is 369,224
+//! bytes against 254,624, and costs a verifying guest 10.9 M steps against
+//! 242.8 M. It is also the only input the PLONK wrap accepts.
+//!
 //! # What a proof is checked against
 //!
 //! Every proof goes through [`verify_child`] before it is returned, against the
@@ -53,7 +63,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use sha2::Digest as _;
 use tracing::info;
-use zisk_sdk::{EmbeddedClient, GuestProgram, ProofKind, ProverClient, ZiskStdin};
+use zisk_sdk::{EmbeddedClient, GuestProgram, ProverClient, ZiskStdin};
 
 use zkasper_common::bls::Fp12;
 use zkasper_common::recursion::{verify_child, ProgramVk};
@@ -195,20 +205,7 @@ impl ZiskProver {
             .map_err(|e| anyhow!("{} proof: {e}", stage.as_str()))?;
         let prove_millis = started.elapsed().as_millis() as u64;
 
-        // Compression is its own call rather than `prove(..).wrap(..)` so that
-        // what it costs is visible. Both run on the client that is already warm,
-        // which is the whole point: `cargo-zisk wrap --minimal` measures 18.4 s
-        // of which 0.192 s is the compression.
-        let started = Instant::now();
-        let wrapped = self
-            .client
-            .wrap_proof(proven.get_proof(), ProofKind::VadcopFinalMinimal)
-            .run_sync()
-            .map_err(|e| anyhow!("compress the {} proof: {e}", stage.as_str()))?;
-        let wrap_millis = started.elapsed().as_millis() as u64;
-
-        let proof = wrapped
-            .get_proof()
+        let proof = proven
             .get_proof_u64()
             .map_err(|e| anyhow!("serialize the {} proof: {e}", stage.as_str()))?;
 
@@ -221,13 +218,12 @@ impl ZiskProver {
 
         *self.last_cost.lock().unwrap() = Some(ProveCost {
             prove_millis,
-            wrap_millis,
+            wrap_millis: 0,
         });
         info!(
             stage = stage.as_str(),
             words = proof.len(),
             prove_millis,
-            wrap_millis,
             "proved",
         );
         Ok(proof)

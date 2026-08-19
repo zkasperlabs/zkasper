@@ -759,9 +759,13 @@ fn refuses_a_server_without_the_stages_this_run_needs() {
 /// published `program_vk` for the one key a program cannot bake — its own. Four
 /// witness types and three output types moved at once, which is exactly the
 /// shape of frame an old peer would read as a plausible lie.
+///
+/// 5 is the proof itself: children are uncompressed `vadcop_final` proofs now,
+/// so the program key sits one word later and a version-4 peer would read a
+/// plausible lie out of the bytes rather than fail to parse them.
 #[test]
 fn the_protocol_version_is_checked() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
 }
 
 /// Against a real prover server, holding a real warm prover.

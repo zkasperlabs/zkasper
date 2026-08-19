@@ -345,6 +345,35 @@ fixtures carry stub child proofs, and a guest rejects an empty proof, so every
 earlier attempt to measure this had to remove the recursion first and measured
 the remainder.
 
+### Almost all of it was the compression
+
+MEASURED 2026-08-19 with `ziskemu -X` on a guest that calls `verify_zisk_proof`
+and does nothing else, fed 0, 1, 2 and 3 copies of one real slot proof. The
+slope is exact and has no timing noise in it: `TOTAL` is the trace area a prove
+has to cover, so the difference between `n` and `n + 1` children is one
+recursion in the currency the prover charges in.
+
+| per child | compressed (`VadcopFinalMinimal`) | uncompressed (`VadcopFinal`) | |
+|---|---:|---:|---:|
+| RISC-V steps | 242,778,258 | 10,902,201 | **22.3x** |
+| trace area (`TOTAL`) | 24,933,840,298 | 1,078,785,018 | **23.1x** |
+| `poseidon1` precompile calls | 306 | 3,877 | |
+| Goldilocks `mul`, one child | 8,675,665 | 227,511 | |
+| serialized bytes | 254,624 | 369,224 | |
+
+The precompile counts are the mechanism. `proofman`'s compressed verifier is
+`stark_verify::<Poseidon1_8, Poseidon1_8, Poseidon1_16, Poseidon1_8>` because
+its Merkle arity is 2 and `arity * 4 == WIDTH`; the uncompressed one is
+`Poseidon1_16` in the first three positions because its arity is 4.
+`poseidon1_hash` only reaches `syscall_poseidon1` when `W == 16`, so under a
+compressed child the whole Merkle and FRI path runs the software Hades
+permutation — 13.8 kB of code in the shipped ELF against a 652-byte syscall
+stub — and only the transcript's 306 width-16 hashes stay precompiled.
+
+So the 35.629 s a child above is a compression artefact, not the price of
+recursion. The pipeline stopped paying it on 2026-08-19; the wall-clock number
+that replaces it is a GPU measurement and is not in this document yet.
+
 ## `T2 - T`
 
 `T` is the moment the chain has published enough attestations to justify a
@@ -653,7 +682,8 @@ against Zisk **v1.0.0-alpha**, which is the newest release whose SNARK proving
 key exists. The guest is a stub that commits its input verbatim, fed the real
 176 public bytes of `/v1/proofs/469426`. That substitution is faithful: the wrap
 circuits are fixed size and never read the guest, which is why every zkasper
-proof is 254,624 bytes whatever stage produced it.
+proof is one size whatever stage produced it — 369,224 bytes since the
+compression was dropped, 254,624 before it.
 
 | step | time | output |
 | --- | --- | --- |
