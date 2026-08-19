@@ -238,10 +238,23 @@ def published_gaps():
                      + (f", UNPROVEN {unproven}" if unproven else ""))
     known = set(nums) | set(unproven)
     missing = [n for n in range(nums[0], nums[-1]) if n not in known]
-    return check("chain", not missing and not unproven,
-                 f"proven {nums[0]}-{nums[-1]}, "
-                 + (f"HOLES at {missing}" if missing else "contiguous")
-                 + (f", UNPROVEN {unproven}" if unproven else ""))
+    # An epoch left in `proving` below the proven high-water mark is stuck: the
+    # daemon has moved past it and nothing will finish it. To a consumer it reads
+    # exactly like one still in flight, so they poll for ever. 469570 got there by
+    # being proved while the daemon ran with a truncated argv and no --api-url, so
+    # it was neither published nor spooled.
+    stuck = sorted(e["epoch"] for e in epochs
+                   if e.get("status") == "proving" and e["epoch"] < nums[-1])
+    bits = [f"proven {nums[0]}-{nums[-1]}"]
+    if missing:
+        bits.append(f"HOLES at {missing}")
+    if unproven:
+        bits.append(f"UNPROVEN {unproven}")
+    if stuck:
+        bits.append(f"STUCK proving {stuck}")
+    if not (missing or unproven or stuck):
+        bits.append("contiguous")
+    return check("chain", not (missing or unproven or stuck), ", ".join(bits))
 
 
 def main():
