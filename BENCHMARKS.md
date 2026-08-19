@@ -525,11 +525,27 @@ The first half cannot be recovered without preempting a proof in flight. **The
 second can**: those are proofs the daemon queued because it did not know the
 threshold had gone by, and 11 of them were started across 9 of the 29 epochs.
 The epochs that queued nothing blind observed the crossing a median **65.5 s**
-late; the epochs that queued work blind, **133.3 s**. That is where the next
-effort belongs — evaluating the trigger above the in-flight-proof early return in
-`StreamPipeline::drive`, so the daemon stops enqueueing work once the epoch is
-already justifiable. It is worth about 40 s of the ~99 s median, and it buys no
-prover time at all.
+late; the epochs that queued work blind, **133.3 s**.
+
+**Fixed.** Nine of the ten were the same proof — the fold that `collect` started
+the instant a group landed, one arm below the in-flight-proof early return and so
+above any evaluation of the trigger. A tick that collects a group now carries on
+into the trigger instead of returning, and the fold is started only by the
+`!fire` branch; a group that lands on an epoch already holding enough to justify
+is held and handed whole to the final proof.
+
+It is not free, and the ledger is worth stating. Losing the fold means losing the
+aggregate, and `final_witness` attaches the epoch diff and the committee proof as
+children of the final proof whenever there is no aggregate to inherit those links
+from — measured at **41.5 s** over the 35 epochs of this run's interleaved window
+(157.8 s against 116.3 s). Against a 112 s fold plus the late group it displaces,
+the nine epochs net **76 to 130 s each**. Replayed over the run: the observation
+delay's median falls **91.1 s to 41.4 s** across the 29, and the corrected
+`T2 - T` of the ten published epochs falls **228.2 s to 189.5 s**.
+
+The 41.5 s is the next thing to take, and it is a circuit change rather than a
+scheduling one: the final proof could inherit the diff and committee links from
+the group it absorbs, as it already does from an aggregate.
 
 **`001b250` did not change this, and could not have.** It moved proving off the
 drive loop so the tick returns while a proof runs, which is what it was for and
