@@ -565,6 +565,62 @@ circuit enforces.
 start and GPU allocation per proof. That is what a long-running prover saves,
 and it is why `crates/witness-gen/src/prover.rs` takes `&self`.
 
+## The on-chain wrap
+
+MEASURED 2026-08-18 on a rented RTX 5090 box (64 cores, 251 GB RAM, 300 GB disk)
+against Zisk **v1.0.0-alpha**, which is the newest release whose SNARK proving
+key exists. The guest is a stub that commits its input verbatim, fed the real
+176 public bytes of `/v1/proofs/469426`. That substitution is faithful: the wrap
+circuits are fixed size and never read the guest, which is why every zkasper
+proof is 254,624 bytes whatever stage produced it.
+
+| step | time | output |
+| --- | --- | --- |
+| `prove`, full VadcopFinal | 689 s | 381,643 bytes |
+| `wrap --plonk` | **436 s** | 2,769 bytes: 768 of proof, 1,997 of verifying key and publics |
+| `wrap --minimal` | 34 s | 297,790 bytes |
+| `wrap --plonk` over a **minimal** proof | fails | `Error generating witness for instance id 0 [0:0] of type RecursiveF` |
+
+**These are CPU numbers.** `cargo-zisk` reported itself as the `[gpu]` build, but
+the card held 0% utilisation and 2 MiB of VRAM for the whole run while load
+average sat near 48. Treat 436 s as an upper bound; the GPU path is unmeasured.
+
+**A PLONK wrap consumes the uncompressed proof.** `backend.plonk()` builds
+`VadcopFinalProof::new(.., compressed: false, ..)` on both v1.0.0-alpha and
+v1.1.0-alpha, and the last row above is that in practice. `ZiskProver::prove_input`
+compresses to `VadcopFinalMinimal` and returns only the compressed words, so
+nothing the pipeline keeps today can be wrapped.
+
+Disk, on the same box:
+
+| | |
+| --- | --- |
+| `provingKey` download | 3.2 GB, 216 s including const-tree regeneration |
+| `provingKey` on disk | 61 GB |
+| `provingKeySnark` download | 21.93 GB, 396 s at ~55 MB/s |
+| md5 of that tarball | 55 s |
+| extraction | 215 s |
+| `provingKeySnark` on disk | 26 GB |
+| `~/.zisk/cache`, one ELF | 1.5 GB |
+| filesystem after the run | **92 GB** |
+
+So about 90 GB of disk and 25 GB of download on top of a working Zisk install,
+and roughly 25 minutes of setup on a fast link before the first wrap.
+
+**Neither published SNARK key installs without hand-holding.**
+`zisk-provingkey-plonk-1.1.0-alpha.tar.gz` is 660,919 bytes and holds one file,
+`provingKeySnark/recursivef/recursivef.dylib` -- a macOS library. Its published
+`.md5` matches, so it is not a truncated download. The 1.0.0-alpha key is
+complete at 21,932,082,134 bytes, but its `.md5` names
+`zisk-provingkey-plonk-pre-1.0.0-alfa.tar.gz`, so `ziskup setup_snark` fails its
+own `md5sum -c` every time. The digest is correct; only the filename is stale.
+
+Two operational notes. `cargo-zisk verify` on a PLONK proof shells out to
+`snarkjs`, which nothing in the toolchain installs, so verification of the wrap
+is not self-contained. And `export-solidity-calldata` emits a 256-byte
+`publicValues` on v1.0.0-alpha (the u32 view) against 512 on v1.1.0-alpha (the
+u64 view), so the on-chain hash preimage differs between the two releases.
+
 ## What one GPU holds
 
 The prover does not allocate what the witness needs. It reads free VRAM at
@@ -663,3 +719,6 @@ steps, and pointing the curve precompile at the running sum cut it to 254.
   Fp2-tower bracket.
 - **A streaming epoch, proven end to end.** `scripts/gpu_bench.sh` is what that
   needs. Until it runs, `T2 - T` is a model.
+- **The PLONK wrap on a GPU.** The 436 s above is a CPU number on v1.0.0-alpha.
+  The card was idle throughout, and v1.1.0-alpha cannot be measured at all until
+  upstream republishes its SNARK key.
