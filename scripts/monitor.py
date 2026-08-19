@@ -170,36 +170,35 @@ def daemon():
         out.append(check("folds", worst_late < 2,
                          f"worst late_groups in last {min(len(lat),5)}: {worst_late}"))
 
-    # How far behind the chain the daemon closes an epoch, and which way it is
-    # moving. This is the signal `T2 - T` mostly measures and the one an operator
-    # can act on: an epoch closed 3.5 epochs late is a backlog, not a slow proof,
-    # and the only question that matters is whether the backlog is shrinking.
-    # Measured 2026-08-19: 3.89 epochs late, then 3.55, gaining 0.34 an epoch on
-    # one card at an 87% duty cycle -- an hour to catch up, and hours behind
-    # after any hiccup.
+    # Whether the daemon keeps up, measured as the interval between epochs it
+    # closes against the interval the chain runs at.
     #
-    # `slot_seconds` and genesis come out of the data rather than a constant:
-    # `threshold_unix_millis` is by construction `genesis + slot * slot_seconds`,
-    # so two epochs of latency determine both, and the check cannot drift from
-    # the chain the daemon is actually following.
+    # This read "epochs behind the chain", distance from the epoch's own start,
+    # and that number has a **floor of 0.656 that is not lag**: two thirds of the
+    # stake cannot have attested until slot 21, which is 252 s into a 384 s
+    # epoch. So a daemon doing everything right and firing the instant it could
+    # still reads 0.66, and the 0.80-0.90 it sat at all evening was ~75 s of
+    # `T2 - T`, not most of an epoch of backlog. I reported it as backlog.
+    #
+    # A rate has no such floor. One close per epoch is keeping up whatever the
+    # phase; more than one epoch between closes is falling behind and is the
+    # thing that compounds. `slot_seconds` comes out of the data rather than a
+    # constant -- `threshold_unix_millis` is by construction `genesis + slot *
+    # slot_seconds` -- so the check cannot drift from the chain being followed.
     done = [l for l in lat if l.get("t2_minus_t_millis")]
-    if len(done) >= 2:
-        a, b = done[-2], done[-1]
+    if len(done) >= 3:
+        a, b = done[0], done[-1]
         span_slots = b["threshold_slot"] - a["threshold_slot"]
         slot_s = ((b["threshold_unix_millis"] - a["threshold_unix_millis"]) / 1000
                   / span_slots) if span_slots else 0
-        if slot_s > 0:
-            spe = 32
-            genesis = b["threshold_unix_millis"] / 1000 - b["threshold_slot"] * slot_s
-            lag = [(l["proof_unix_millis"] / 1000
-                    - (genesis + l["epoch"] * spe * slot_s)) / (spe * slot_s)
-                   for l in done[-4:]]
-            trend = lag[-1] - lag[0]
-            out.append(check("lag", trend <= 0 or lag[-1] < 1.0,
-                             f"closes {lag[-1]:.2f} epochs behind the chain, "
-                             + (f"gaining {-trend / max(len(lag) - 1, 1):.2f} an epoch"
-                                if trend < 0 else
-                                f"LOSING {trend / max(len(lag) - 1, 1):.2f} an epoch")))
+        epochs_closed = b["epoch"] - a["epoch"]
+        if slot_s > 0 and epochs_closed > 0:
+            epoch_s = 32 * slot_s
+            cycle_s = (b["proof_unix_millis"] - a["proof_unix_millis"]) / 1000 / epochs_closed
+            out.append(check("keeping up", cycle_s <= epoch_s,
+                             f"{cycle_s:.0f}s a close against a {epoch_s:.0f}s epoch"
+                             f" over {epochs_closed}"
+                             + ("" if cycle_s <= epoch_s else " -- FALLING BEHIND")))
 
     # Cost per epoch: sum the prover time of a whole epoch's stages and price it.
     stages = s.get("recent_stages") or []
