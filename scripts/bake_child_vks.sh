@@ -114,7 +114,17 @@ HEADER
   # Four u64s on one line is over the width rustfmt wants, so a generated file
   # that is not formatted here fails `cargo fmt --check` the moment it is
   # committed -- and the next bake undoes whoever formatted it by hand.
-  rustfmt --edition 2021 "$file" 2>/dev/null || true
+  #
+  # Do not swallow this. `rustfmt` is a rustup shim that exists on PATH even when
+  # the component is not installed for the toolchain, so `2>/dev/null || true`
+  # turned a missing rustfmt into a silent no-op -- which is how the card baked
+  # unformatted constants that only failed once they reached CI.
+  if ! rustfmt --edition 2021 "$file"; then
+    echo "WARNING: $file is NOT formatted -- rustfmt failed above." >&2
+    echo "         Run \`rustup component add rustfmt\` here, or format it where" >&2
+    echo "         you commit it. \`cargo fmt --check\` rejects it as written." >&2
+    UNFORMATTED=1
+  fi
   echo "wrote $file"
 }
 
@@ -155,3 +165,9 @@ echo "=== keys ==="
 cat "$VKS"
 echo
 echo "Commit the four crates/*/src/child_vks.rs files with the ELFs they describe."
+if [ -n "${UNFORMATTED:-}" ]; then
+  echo
+  echo "The keys are correct but at least one file is unformatted -- see the" >&2
+  echo "warnings above. Format before committing." >&2
+  exit 2
+fi
