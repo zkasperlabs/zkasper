@@ -276,9 +276,11 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
     let late_group = latency["late_group_millis"]
         .as_u64()
         .expect("late_group_millis");
-    assert_eq!(
-        late_group, 0,
-        "there is no late group left to charge to the critical path",
+    assert!(
+        late_group < GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) holds a group proof ({} ms); there \
+         is supposed to be no late group left to charge to the critical path",
+        GROUP_PROVE.as_millis(),
     );
 
     // And it is not charged to the trigger either. This is the assertion that

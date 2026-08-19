@@ -45,22 +45,30 @@
 //!
 //! A child costs [`ProverModel::recursion_verify_s`] — 53.087 s, MEASURED —
 //! against a 3.640 s floor, so the sentences above are true and no longer the
-//! point. `T2 − T` on mainnet 430529 is **67.8 s**, of which 53 is the one
-//! recursive verification [`ProverModel::final_s`] charges a folded final proof:
-//! the running aggregate the epoch was folded into. It was 112.8 s while the
-//! epoch's end had to be a second child on top of that, and the two together
-//! were 106 of it. How to cut the groups and how many cards to use is the rest,
-//! and it is small. Where the tail begins is not: it decides whether there is a
-//! group left for the final proof to absorb at all.
+//! point. `T2 − T` on mainnet 430529 is **124.3 s**, of which 106 is the two
+//! recursive verifications [`ProverModel::final_s`] charges a folded final
+//! proof: the running aggregate the epoch was folded into, and the previous
+//! epoch's justification. It was 166.0 s while the epoch's end had to be a
+//! third child on top of those. How to cut the groups and how many cards to use
+//! is the rest, and it is small. Where the tail begins is not: it decides
+//! whether there is a group left for the final proof to absorb at all.
+//!
+//! **The justification child went uncharged until 2026-08-19.** `final_s`
+//! charged `absorbed + 1` on the folded path where `stream-final-guest`
+//! verifies `absorbed + 2`, and `fold_s` charged the epoch-opening fold one
+//! predecessor where `aggregation-guest` verifies the epoch diff *and* the
+//! committee proof. Both were one child short on every path. See `BENCHMARKS.md`
+//! for what that cost and for the live run that found it.
 //!
 //! Three things follow, and they are the opposite of what a free recursion
 //! implied.
 //!
-//! **A slot is cheaper inline than in a group the final proof absorbs.** Eleven
-//! mainnet slots of complement work is under ten seconds against 53 s for the
-//! child. [`StreamPlan::tail`] used to stop at four slots on the pre-recursion
-//! reasoning that a group is one floor either way; lifting that takes modelled
-//! `T2 − T` on 430529 from 112.8 s to 67.8 s, with nothing left to absorb.
+//! **A slot is cheaper inline than in a group the final proof absorbs.**
+//! Fifteen mainnet slots of complement work is about thirteen seconds against
+//! 53 s for the child. [`StreamPlan::tail`] used to stop at four slots on the
+//! pre-recursion reasoning that a group is one floor either way; lifting that
+//! takes modelled `T2 − T` on 430529 from 166.0 s to 124.3 s, with nothing left
+//! to absorb.
 //!
 //! **A fold is worth its floor now.** It used to buy nothing: absorbing a group
 //! into the final proof was free, so a fold was a wasted floor and the schedule
@@ -403,9 +411,14 @@ impl ProverModel {
     ///
     /// Nothing but the floor and an Fp12 multiply each: cross-slot deduplication
     /// is a `slots_mask` now, so a fold no longer opens a counted-set tree.
-    pub fn fold_s(&self, groups: f64) -> f64 {
+    ///
+    /// `opening` is the fold that starts an epoch. `aggregation-guest` takes the
+    /// `previous == None` branch there, which verifies the epoch diff and the
+    /// committee proof rather than one predecessor — two children where every
+    /// later fold has one.
+    pub fn fold_s(&self, groups: f64, opening: bool) -> f64 {
         self.stage_floor_s
-            + (groups + 1.0) * self.recursion_verify_s
+            + (groups + if opening { 2.0 } else { 1.0 }) * self.recursion_verify_s
             + groups * self.bls_s(cost::FP12_MUL + cost::COMMIT_FP12)
     }
 
@@ -426,9 +439,13 @@ impl ProverModel {
                 0.0
             }
             + self.bls_s(cost::FINAL_EXP)
-            // With no fold to inherit from, the final proof verifies the epoch
-            // diff and the committee proof itself, on the critical path.
-            + (absorbed + if folded { 1.0 } else { 2.0 }) * self.recursion_verify_s
+            // The previous epoch's justification is a child on every path —
+            // `stream-final-guest` verifies it unconditionally, and it is the
+            // one recursion the guest's own module doc calls irreducible. On
+            // top of it the folded path verifies the running aggregate; the
+            // unfolded path has no fold to inherit from, so it verifies the
+            // epoch diff and the committee proof itself instead.
+            + (absorbed + if folded { 2.0 } else { 3.0 }) * self.recursion_verify_s
             + (absorbed + 1.0) * self.bls_s(cost::FP12_MUL + cost::COMMIT_FP12)
     }
 
@@ -1128,7 +1145,7 @@ fn simulate(
         while cursor < order.len() && group_end[order[cursor]] <= ready {
             cursor += 1;
         }
-        let duration = model.fold_s((cursor - first) as f64);
+        let duration = model.fold_s((cursor - first) as f64, folds.is_empty());
         let (lane, start) = lanes.peek(&policy.eligible(Stage::Fold(folds.len())), ready, duration);
         if start + duration > deadline_s {
             cursor = first;
@@ -1744,8 +1761,8 @@ mod tests {
         let measured = schedule(&units, 100, &with_floor(MEASURED_FLOOR_S));
         let doubled = schedule(&units, 100, &with_floor(2.0 * MEASURED_FLOOR_S));
 
-        assert_eq!(measured.plan.tail.len(), 11);
-        assert_eq!(doubled.plan.tail.len(), 12);
+        assert_eq!(measured.plan.tail.len(), 15);
+        assert_eq!(doubled.plan.tail.len(), 16);
         assert!(doubled.latency_s() > measured.latency_s());
     }
 
@@ -2024,7 +2041,7 @@ mod tests {
     fn folding_the_last_group_costs_a_floor_and_a_recursion_more() {
         let m = ProverModel::default();
         let absorbed = m.final_s(130.0, 1.0, 3.0, 1.0, true);
-        let folded = m.fold_s(1.0) + m.final_s(130.0, 1.0, 3.0, 0.0, true);
+        let folded = m.fold_s(1.0, false) + m.final_s(130.0, 1.0, 3.0, 0.0, true);
         assert!(
             ((folded - absorbed) - (m.stage_floor_s + m.recursion_verify_s)).abs() < 0.01,
             "folding costs {:.2}s against absorbing's {absorbed:.2}s",
@@ -2058,8 +2075,8 @@ mod tests {
     /// same policy — the 4-card budget, the measured 3.640 s floor, the active
     /// set as the committee proof's size — and the only difference is the bound
     /// on the inline tail. Capped at four, the epoch's end is a group the final
-    /// proof has to absorb: 112.8 s. Uncapped, the same eleven slots go inline
-    /// and there is no child at all: 67.8 s.
+    /// proof has to absorb: 166.0 s. Uncapped, fifteen slots go inline and
+    /// there is no group left: 124.3 s.
     ///
     /// `test_ssz_file_streaming_schedule` prints exactly these two numbers off
     /// the 320 MB state download that [`EPOCH_430529`] was taken from; this runs
@@ -2075,9 +2092,9 @@ mod tests {
         let capped = schedule_capped(&units, TOTAL_ACTIVE_BALANCE_430529, &policy, 4);
         let uncapped = schedule(&units, TOTAL_ACTIVE_BALANCE_430529, &policy);
 
-        assert_eq!(capped.plan.tail.len(), 1);
+        assert_eq!(capped.plan.tail.len(), 2);
         assert_eq!(capped.plan.absorbed.len(), 1);
-        assert_eq!(uncapped.plan.tail.len(), 11);
+        assert_eq!(uncapped.plan.tail.len(), 15);
         assert!(
             uncapped.plan.absorbed.is_empty(),
             "still a group to absorb: {:?}",
@@ -2086,8 +2103,8 @@ mod tests {
 
         // In tenths, because that is the precision the constants underneath
         // carry and the precision `better` compares at.
-        assert_eq!((capped.latency_s() * 10.0).round(), 1128.0);
-        assert_eq!((uncapped.latency_s() * 10.0).round(), 678.0);
+        assert_eq!((capped.latency_s() * 10.0).round(), 1660.0);
+        assert_eq!((uncapped.latency_s() * 10.0).round(), 1243.0);
 
         // And it is cheaper, not a latency-for-throughput trade: a group's floor
         // and its complement work both leave the epoch with the group.
