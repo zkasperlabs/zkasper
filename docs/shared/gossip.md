@@ -78,7 +78,7 @@ Run the node with `--http-sse-capacity-multiplier 2000`. That is 32,000
 messages, a whole slot, for about 24 MB of node memory. 64 absorbs ordinary
 millisecond jitter at 30,000 events a second, and 2,000 makes loss essentially
 impossible. `zkasperd` counts the comments and publishes them as
-`gossip.dropped` in `status.json`, and it repairs each gap from blocks.
+a reconnect counter in `status.json`, and it repairs each gap from blocks.
 
 ## What a forked node can expose
 
