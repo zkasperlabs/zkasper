@@ -81,6 +81,58 @@ fn test_find_mutations_activation_change() {
 }
 
 #[test]
+fn test_find_mutations_withdrawal_credentials_change() {
+    // A switch-to-compounding request rewrites the first byte of the
+    // credentials and nothing else. Mainnet epoch 469594 died on exactly this:
+    // validator 1339600 went 0x01 to 0x02, no other field moved, and the
+    // registry root the daemon carried forward stopped matching the chain's.
+    let v0 = make_response(0, 32);
+    let mut v0_new = make_response(0, 32);
+    v0_new.withdrawal_credentials[0] = 0x02;
+
+    let old = vec![v0];
+    let new = vec![v0_new];
+
+    let changed = find_mutations(&old, &new, 100, 100);
+    assert_eq!(changed, vec![0]);
+}
+
+#[test]
+fn test_credentials_change_keeps_registry_root_honest() {
+    use zkasper_common::ssz::list_hash_tree_root;
+    use zkasper_witness_gen::state_diff::{
+        build_validator_roots, build_validators_ssz_tree, validator_response_to_field_leaves,
+    };
+
+    let old: Vec<ValidatorResponse> = (0..4).map(|i| make_response(i, 32)).collect();
+    let mut new = old.clone();
+    new[2].withdrawal_credentials[0] = 0x02;
+
+    let registry_root = |vs: &[ValidatorResponse]| {
+        let (data_root, _) =
+            build_validators_ssz_tree(&build_validator_roots(vs), TEST_DEPTH, &[0]);
+        list_hash_tree_root(&data_root, vs.len() as u64)
+    };
+
+    // What the daemon carries forward: the old roots, patched only where
+    // find_mutations pointed. It has to land on the root a full recompute gives,
+    // because the circuit checks that root against the beacon state's own.
+    let mut roots = build_validator_roots(&old);
+    for &i in &find_mutations(&old, &new, 100, 100) {
+        roots[i as usize] = zkasper_common::ssz::validator_hash_tree_root(
+            &validator_response_to_field_leaves(&new[i as usize]),
+        );
+    }
+    let (data_root, _) = build_validators_ssz_tree(&roots, TEST_DEPTH, &[0]);
+
+    assert_ne!(registry_root(&old), registry_root(&new));
+    assert_eq!(
+        list_hash_tree_root(&data_root, new.len() as u64),
+        registry_root(&new),
+    );
+}
+
+#[test]
 fn test_find_mutations_epoch_boundary_activation() {
     // Validator activates at epoch 101 — no SSZ field changes between states
     let mut v = make_response(0, 32);

@@ -85,8 +85,13 @@ pub fn find_mutations(
         let old = &old_validators[i];
         let new = &new_validators[i];
 
-        // SSZ field changes
+        // SSZ field changes. Withdrawal credentials are in here because they
+        // move on their own: a switch-to-compounding request flips 0x01 to 0x02
+        // and a BLS-to-execution change flips 0x00 to 0x01, both without
+        // touching a balance or an epoch. Leaving them out let a validator's
+        // root go stale, and the registry root with it.
         let ssz_changed = old.effective_balance != new.effective_balance
+            || old.withdrawal_credentials != new.withdrawal_credentials
             || old.activation_epoch != new.activation_epoch
             || old.exit_epoch != new.exit_epoch
             || old.slashed != new.slashed
