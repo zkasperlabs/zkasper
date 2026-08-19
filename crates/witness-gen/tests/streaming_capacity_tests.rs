@@ -301,12 +301,19 @@ fn epoch_dir(dir: &Path, epoch: u64) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 /// A daemon that reaches the epoch only after its threshold has already crossed
-/// folds nothing, and the final proof absorbs the whole backlog as one child.
+/// folds nothing, and proves the backlog as one group with a one-slot tail.
 ///
 /// This is the production shape when the prover is saturated: the epoch is
 /// opened so late that the very first evaluation of the trigger already holds
 /// enough stake to justify, so the pipeline fires on that tick and the `!fire`
 /// branch — the only place a fold happens — never runs at all.
+///
+/// **The backlog used to go inline instead, and that inverted in `9f10d05`.**
+/// While a child cost 35.629 s the final proof carried all three slots itself;
+/// at the measured 1.520 s plus 0.83 s for a proof's first child, a group is
+/// cheaper than the two extra slots it saves inlining. `folded_groups` is still
+/// 0 — being behind leaves no tick to fold on, which is what this test is about
+/// — and what moved is only where the backlog is proven.
 ///
 /// It also pins what `wait_millis` is made of. The late group proof runs between
 /// the threshold timestamp and the fired timestamp, so the "wait" is occupied by
@@ -343,35 +350,41 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
         "an epoch opened past its own threshold has no tick on which to fold",
     );
     assert_eq!(
-        latency["late_groups"], 0,
-        "the backlog became a recursion child instead of going inline",
+        latency["late_groups"], 1,
+        "the backlog is one group now that a child is cheaper than inlining it",
     );
     assert_eq!(
-        latency["tail"], SLOTS_TO_THRESHOLD,
-        "the final proof did not carry the whole backlog inline",
+        latency["tail"],
+        1,
+        "the crossing slot goes inline; the {} before it are the group",
+        SLOTS_TO_THRESHOLD - 1,
     );
 
-    // Nothing was folded and nothing was grouped: the epoch is one proof.
+    // One group, and still nothing folded: a fold needs a tick the daemon never
+    // gets here, and the final proof verifies the group directly instead.
     let epoch_dir = epoch_dir(dir.path(), stream_epoch);
     assert!(
-        !epoch_dir.join("group_0.bin").exists(),
-        "the backlog was proven as a group the final proof then had to verify",
+        epoch_dir.join("group_0.bin").exists(),
+        "the backlog should be a group the final proof verifies as a child",
     );
     assert!(
         !epoch_dir.join("aggregate_0.bin").exists(),
         "nothing was folded, so there is no aggregate",
     );
 
-    // Which is what empties the window between `T` and the final proof. It used
-    // to hold a whole group proof — the measurement that said the window could
-    // not absorb a fold because it was already full of proving.
+    // The window between `T` and the final proof holds that group, and the
+    // repricing is what put it there: this asserted the window was *empty* while
+    // a child cost 35.629 s and inlining three slots beat proving one group.
+    // Charging it is the point of the metric — `late_group_millis` is the term
+    // that names work done after `T` — so the invariant is that it accounts for
+    // the group rather than that no group exists.
     let late_group = latency["late_group_millis"]
         .as_u64()
         .expect("late_group_millis");
     assert!(
-        late_group < GROUP_PROVE.as_millis() as u64,
-        "late_group_millis ({late_group} ms) holds a group proof ({} ms); there \
-         is supposed to be no late group left to charge to the critical path",
+        late_group >= GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) is under one group proof ({} ms), \
+         so the group the plan puts after `T` is not being charged to it",
         GROUP_PROVE.as_millis(),
     );
 
