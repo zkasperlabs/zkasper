@@ -15,7 +15,9 @@
 mod common;
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{FakeGossip, MockBeaconApi, SyntheticChain, BALANCE_GWEI};
 
@@ -79,6 +81,21 @@ async fn config_from(dir: &Path, mock: &MockBeaconApi) -> OrchestratorConfig {
         ),
         ..config(dir)
     }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// The most recent epoch's measured `T2 - T`, as the manifest publishes it.
+fn latency(dir: &Path) -> serde_json::Value {
+    let status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("out").join("status.json")).unwrap())
+            .unwrap();
+    status["recent_latencies"][0].clone()
 }
 
 async fn open(dir: &Path, mock: MockBeaconApi) -> Orchestrator<MockBeaconApi> {
@@ -334,6 +351,120 @@ async fn test_streams_an_epoch_from_gossip_without_reading_blocks() {
     assert!(
         past_the_boundary.is_empty(),
         "the epoch was read out of blocks after all: {past_the_boundary:?}",
+    );
+}
+
+/// The trigger fires on a view that includes what arrived after the tick began.
+///
+/// A tick is not an instant. It drains gossip, walks blocks to fill in what an
+/// outage swallowed, waits on a proof and re-resolves a root, and only then asks
+/// the trigger — so a decision made on the drain it opened with is a decision
+/// made on a view as old as everything in between.
+///
+/// On mainnet epoch 469606 that was seven seconds. The epoch opened 4.05 s into
+/// its crossing slot, spent 8.01 s busy walking 22 blocks — `time.idle=17.3ms`,
+/// so essentially none of it was the node — and fired at 11.96 s on the drain it
+/// had taken at ~4.5 s. A crossing slot's gossip arrives in two waves: the
+/// unaggregated union reaches 60.3% at 5.0 s and stops at 76-77%, and the
+/// network aggregates land in one piece at 8.1-8.2 s and take it to 99.7%. The
+/// daemon's primary covered 59.6%, three seconds after the aggregates were on
+/// the wire, and `named_indices.len()` is exactly `committee size - primary
+/// coverage` — so that stale drain, and nothing else, is why the tail was 11,379
+/// leaves.
+///
+/// Here the attestation that carries the epoch over the threshold is gossiped
+/// while the daemon is inside the block walk, and it is on gossip alone — the
+/// block that would have carried it is empty. A trigger that decides on the
+/// drain at the top of the tick cannot see it and has to be asked again on the
+/// next tick; this asserts the epoch fires before the tick that walked the
+/// blocks has returned.
+#[tokio::test]
+async fn test_the_trigger_sees_gossip_that_arrived_after_the_tick_began() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let stream_epoch = FIRST_EPOCH + 1;
+    let boundary = stream_epoch * SPE;
+    // The attestation slot whose weight carries the epoch over two thirds.
+    let crossing = SLOTS_TO_THRESHOLD - 1;
+
+    let mut mock = chain.mock(boundary);
+    // The block that would carry the crossing slot's attestation carries
+    // nothing, so gossip is its only route into the epoch. Without this the
+    // walk itself would deliver it and the test would pin nothing.
+    mock.attestations
+        .insert((boundary + crossing + 1).to_string(), Vec::new());
+
+    let config = OrchestratorConfig {
+        pipeline: Pipeline::Streaming,
+        ..config_from(dir.path(), &mock).await
+    };
+    let gossip = FakeGossip::default();
+    let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
+        .await
+        .expect("orchestrator opens")
+        .with_gossip(Box::new(gossip.clone()));
+
+    // Reach the streaming epoch with the head on its first slot, so that the
+    // epoch is open and its walk is done before the tick under test.
+    daemon.catch_up().await.unwrap();
+
+    // Everything short of the threshold, on gossip before the tick starts.
+    for index in 0..crossing as usize {
+        gossip.publish(vec![chain.attestation(stream_epoch, index)]);
+    }
+    daemon
+        .api()
+        .set_head(chain.header_at(boundary + SLOTS_TO_THRESHOLD));
+
+    // The outage is what makes the tick walk blocks at all, which is the long
+    // thing gossip has to be able to arrive during. The attestation that
+    // crosses the threshold lands on the first block of that walk.
+    let late = chain.attestation(stream_epoch, crossing as usize);
+    let arrived = Arc::new(AtomicU64::new(0));
+    daemon.api().during_block_fetch({
+        let gossip = gossip.clone();
+        let arrived = arrived.clone();
+        move |_| {
+            if arrived.load(Ordering::SeqCst) == 0 {
+                arrived.store(unix_millis(), Ordering::SeqCst);
+                gossip.publish(vec![late.clone()]);
+            }
+        }
+    });
+    gossip.gap();
+
+    let began = unix_millis();
+    let mut ticks = vec![daemon.tick().await.unwrap()];
+    let returned = unix_millis();
+
+    let arrived = arrived.load(Ordering::SeqCst);
+    assert!(
+        arrived >= began,
+        "the premise: the attestation has to arrive after the tick began, not before it",
+    );
+
+    for _ in 0..8 {
+        if ticks.iter().any(|tick| tick.justified.is_some()) {
+            break;
+        }
+        ticks.extend(daemon.catch_up().await.unwrap());
+    }
+    assert_eq!(
+        ticks.iter().filter_map(|t| t.justified).collect::<Vec<_>>(),
+        vec![stream_epoch],
+    );
+
+    let latency = latency(dir.path());
+    assert_eq!(latency["epoch"], stream_epoch);
+    let fired = latency["fired_unix_millis"]
+        .as_u64()
+        .expect("fired_unix_millis");
+    assert!(
+        fired >= arrived && fired <= returned,
+        "the epoch fired at {fired}, outside the tick that began at {began} and \
+         returned at {returned} — so the trigger was asked about a view drained \
+         before the attestation arrived at {arrived}, and needed a whole further \
+         tick to notice it",
     );
 }
 

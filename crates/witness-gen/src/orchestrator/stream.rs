@@ -509,22 +509,16 @@ impl StreamPipeline {
 
         // Gossip is the source. Blocks repair what an outage swallowed, and are
         // the whole source when there is no stream — the fixture-replay tests.
-        match &engine.gossip {
-            Some(source) => {
-                aggregator.stream.ingest(&source.drain())?;
-                aggregator.reorged |= source.took_reorg();
-                if source.took_gap() {
-                    // An outage does not say what it swallowed, so the repair
-                    // rescans the epoch rather than resuming from a cursor.
-                    warn!(target_epoch, "gossip gap; repairing this epoch from blocks");
-                    aggregator.next_slot = target_epoch * spe;
-                    aggregator.gap = true;
-                }
-            }
-            None => aggregator.gap = true,
+        if engine.gossip.is_none() {
+            aggregator.gap = true;
         }
-        if aggregator.gap {
-            Self::repair_from_blocks(engine, &mut aggregator).await?;
+        Self::absorb_gossip(engine, &mut aggregator, spe)?;
+        // Not once the trigger has fired. The fire closed every slot it took
+        // and the tail is already cut, so a repair after it can only spend
+        // round trips and committee resolution on the critical path for a
+        // stream nothing will read again.
+        if aggregator.gap && !self.fired() {
+            Self::repair_from_blocks(engine, &mut aggregator, spe).await?;
         }
 
         let policy = engine.config.stream_policy.clone();
@@ -546,13 +540,7 @@ impl StreamPipeline {
         // tick that already knows the answer must not pay to learn it again.
         if aggregator.crossed_unix_millis.is_none() {
             let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
-            if held.balance as u128 >= policy.quorum_balance(total) {
-                let crossed = now_unix_millis();
-                aggregator.crossed_unix_millis = Some(crossed);
-                if let Some(publish) = engine.report.publisher() {
-                    publish.threshold_crossed(target_epoch, crossed, held.balance, total);
-                }
-            }
+            Self::observe_crossing(engine, &mut aggregator, &policy, held.balance);
         }
 
         // A proof started on an earlier tick. Until it lands the pipeline must
@@ -632,7 +620,30 @@ impl StreamPipeline {
             aggregator.blocked_millis += now_unix_millis().saturating_sub(since.max(crossed));
         }
 
+        // Everything gossip has delivered *since the top of this tick* — the
+        // block walk above, the proof settled below it, the reorg round trip —
+        // so that the view the trigger decides on is as fresh as the decision
+        // and not as fresh as the tick.
+        //
+        // Measured on 1.08M live mainnet gossip events, epoch 469606. The epoch
+        // opened 4.05 s into its crossing slot; the tick then spent 8.01 s busy
+        // walking 22 blocks without yielding and fired at 11.96 s on the drain
+        // it had taken at ~4.5 s. A crossing slot's gossip arrives in two waves:
+        // the singles union reaches 60.3% at 5.0 s and stops at 76-77%, and the
+        // network aggregates land in one piece at 8.1-8.2 s and carry it to
+        // 99.7%. The primary covered 59.6% — the singles union at ~5 s — three
+        // seconds after the aggregates were on the wire. `named_indices.len()`
+        // is exactly `committee size - primary coverage`, so that one drain
+        // decided a tail of 11,379 leaves, every one of them
+        // [`streaming::ProverModel::per_named_s`] on the critical path.
+        Self::absorb_gossip(engine, &mut aggregator, spe)?;
+
         let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
+        // Again here, because the reading above is no longer the one the trigger
+        // acts on: an epoch can cross on gossip that arrived after the hoist and
+        // fire on the same tick, and a fire with no observation stamped has no
+        // `T2 - T` to publish at all.
+        Self::observe_crossing(engine, &mut aggregator, &policy, held.balance);
 
         let enough = held.balance as u128 >= policy.target_balance(total);
         let fire = enough && !aggregator.worth_waiting(&policy, held.filling);
@@ -752,17 +763,97 @@ impl StreamPipeline {
         Ok(())
     }
 
+    /// Whether the trigger has already fired on this epoch.
+    ///
+    /// Both of these hold the backlog the fire decided on, so nothing arriving
+    /// after them can change what the epoch proves.
+    fn fired(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(Pending::Late { .. } | Pending::Final { .. })
+        )
+    }
+
+    /// Take everything gossip has delivered since the last call.
+    ///
+    /// Called wherever the epoch is about to be read rather than once at the
+    /// top of the tick, because a drain is only as good as the instant it was
+    /// taken and a tick is not an instant — see the call above
+    /// [`StreamAggregator::held`] for what one stale drain cost.
+    ///
+    /// A gap rewinds the block walk rather than resuming it: an outage does not
+    /// say what it swallowed, so the repair rescans the epoch.
+    fn absorb_gossip<A: BeaconApi + ChainStatusApi>(
+        engine: &Engine<A>,
+        aggregator: &mut StreamAggregator,
+        spe: u64,
+    ) -> Result<()> {
+        let Some(source) = &engine.gossip else {
+            return Ok(());
+        };
+        aggregator.stream.ingest(&source.drain())?;
+        aggregator.reorged |= source.took_reorg();
+        if source.took_gap() {
+            let target_epoch = aggregator.context.target_epoch;
+            warn!(target_epoch, "gossip gap; repairing this epoch from blocks");
+            aggregator.next_slot = target_epoch * spe;
+            aggregator.gap = true;
+        }
+        Ok(())
+    }
+
+    /// Stamp the instant the daemon first saw the epoch hold what the circuit
+    /// insists on, and tell the world.
+    ///
+    /// Read twice a tick off two different readings, because the placement of
+    /// the first one is load-bearing and the second one is what the trigger
+    /// actually acts on. The first is above the in-flight early return, so that
+    /// a proof still running at the crossing is charged to
+    /// [`EpochLatency::blocked_millis`] instead of to the wait. The second is
+    /// beside the fire decision, so that an epoch which crosses on gossip that
+    /// arrived after the first reading still has an observation to measure
+    /// `T2 - T` from.
+    fn observe_crossing<A: BeaconApi + ChainStatusApi>(
+        engine: &Engine<A>,
+        aggregator: &mut StreamAggregator,
+        policy: &StreamPolicy,
+        balance: u64,
+    ) {
+        let total = aggregator.context.total_active_balance;
+        if aggregator.crossed_unix_millis.is_some()
+            || (balance as u128) < policy.quorum_balance(total)
+        {
+            return;
+        }
+        let crossed = now_unix_millis();
+        aggregator.crossed_unix_millis = Some(crossed);
+        if let Some(publish) = engine.report.publisher() {
+            publish.threshold_crossed(aggregator.context.target_epoch, crossed, balance, total);
+        }
+    }
+
     /// Fill in from blocks what gossip did not deliver.
     ///
     /// Only two things need it: an epoch that opened after its own attestations
     /// were gossiped, and a stream that dropped. Both are repairs — the union of
     /// a block and a gossip view of a slot is the gossip view, because the
     /// collector converges on an attester set rather than a list.
+    ///
+    /// It is the longest thing a tick does and almost none of it is the round
+    /// trip: 22 blocks of a mainnet epoch measured 8.01 s busy against 17.3 ms
+    /// idle, because a block's aggregates are resolved against committees of
+    /// tens of thousands and none of that awaits. So the walk drains gossip and
+    /// yields between blocks — the stream stays current across it instead of
+    /// being 8 s behind at the end of it, and a reader task sharing the runtime
+    /// is not off-core for its whole length.
     async fn repair_from_blocks<A: BeaconApi + ChainStatusApi>(
         engine: &mut Engine<A>,
         aggregator: &mut StreamAggregator,
+        spe: u64,
     ) -> Result<()> {
-        while aggregator.next_slot <= engine.chain.head_slot()
+        aggregator.gap = false;
+        while !aggregator.gap
+            && aggregator.next_slot <= engine.chain.head_slot()
             && aggregator.next_slot < aggregator.scan_end
         {
             let slot = aggregator.next_slot;
@@ -773,8 +864,13 @@ impl StreamPipeline {
             if let Ok(attestations) = engine.api.get_block_attestations(&slot.to_string()).await {
                 aggregator.stream.ingest(&attestations)?;
             }
+
+            // An outage announced mid-walk ends the walk rather than being
+            // scanned over: the rewind above put the cursor back at the epoch's
+            // first slot, and the next tick starts again from there.
+            Self::absorb_gossip(engine, aggregator, spe)?;
+            tokio::task::yield_now().await;
         }
-        aggregator.gap = false;
         Ok(())
     }
 
