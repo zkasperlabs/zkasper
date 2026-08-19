@@ -845,7 +845,13 @@ pub fn schedule(
     total_active_balance: u64,
     policy: &StreamPolicy,
 ) -> Schedule {
-    schedule_capped(units, total_active_balance, policy, usize::MAX)
+    // 24, not unbounded, from 2026-08-19: an uncapped tail ran the stream_final
+    // guest past DEFAULT_MAX_STEPS (~68.7e9) on epoch 469569 and killed the run.
+    // That is a runaway rather than a budget overrun -- the whole fused shuffle
+    // proof is ~841e6 steps -- so the cap is a guard, not the fix. 24 is the
+    // value the win was modelled at (112.4 -> 83.1 s) and bounds the blast
+    // radius while the interaction with the held-group tail range is diagnosed.
+    schedule_capped(units, total_active_balance, policy, 24)
 }
 
 /// The same, with the inline tail capped at `max_tail` units.
