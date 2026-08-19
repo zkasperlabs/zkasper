@@ -53,24 +53,31 @@ struct Aggregate {
 /// One committee's unaggregated attestations over one message, summed as they
 /// arrive.
 ///
-/// This is the primary path. A `SingleAttestation` names one validator, so a
-/// running total over them is disjoint by construction — there is no cover to
-/// choose and no overlap to resolve. Summing here rather than at
-/// [`SlotStream::close`] is what keeps a slot's thirty thousand G2
-/// decompressions off the critical path: they are paid as gossip arrives, and
-/// only the last few land after the threshold.
+/// This is the primary path, and the one cover that is **divisible**: a
+/// `SingleAttestation` names one validator, so any subset of what this bucket
+/// holds can still be summed into a signature over exactly that subset. A
+/// network aggregate cannot be cut that way, which is what makes the two behave
+/// differently at [`SlotStream::peek`] — the aggregates are what a cover has to
+/// choose between, and these are what fills whatever the choice missed.
+///
+/// The running total is kept alongside the individual signatures because it is
+/// what the common case reads: the whole bucket, when no chosen aggregate
+/// carries any of it. Summing as gossip arrives rather than at
+/// [`SlotStream::close`] is also what keeps a slot's thirty thousand G2
+/// decompressions off the critical path — they are paid on arrival, and only
+/// the last few land after the threshold.
 ///
 /// The bucket is a committee and not a message, because a network aggregate is
 /// a committee's worth of signers and the two have to be comparable. Post-
 /// Electra `AttestationData.index` is pinned to 0, so every committee of a slot
-/// voting the same head shares one message; a running total over all of them
-/// would be a 28,000-signer block that no 440-signer aggregate can ever be
-/// disjoint from. See [`SlotStream::peek`].
+/// voting the same head shares one message.
 struct Summed {
     /// The message, with `signature` left empty until it is read out.
     attestation: AttestationWitness,
     signature: blst::min_pk::AggregateSignature,
-    signers: BTreeSet<u64>,
+    /// Every signer, with the signature it arrived under, so that a subset of
+    /// them can be summed on its own.
+    signers: BTreeMap<u64, Signature>,
 }
 
 impl Summed {
@@ -84,8 +91,40 @@ impl Summed {
                 ..self.attestation.clone()
             },
             signature,
-            signers: self.signers.clone(),
+            signers: self.signers.keys().copied().collect(),
         }
+    }
+
+    /// The part of this bucket that `covered` does not already carry.
+    ///
+    /// `None` when it carries all of it. The whole-bucket case is answered from
+    /// the running total, so the per-signature sum below is only ever paid for
+    /// the handful of members a chosen aggregate missed.
+    fn residual(&self, covered: &BTreeSet<u64>) -> Option<Aggregate> {
+        if !self.signers.keys().any(|index| covered.contains(index)) {
+            return Some(self.aggregate());
+        }
+        let mut sum: Option<AggregateSignature> = None;
+        let mut signers = BTreeSet::new();
+        for (&index, signature) in &self.signers {
+            if covered.contains(&index) {
+                continue;
+            }
+            match &mut sum {
+                None => sum = Some(AggregateSignature::from_signature(signature)),
+                Some(sum) => sum.add_signature(signature, false).ok()?,
+            }
+            signers.insert(index);
+        }
+        let signature = sum?.to_signature();
+        Some(Aggregate {
+            attestation: AttestationWitness {
+                signature: BlsSignature(signature.to_bytes()),
+                ..self.attestation.clone()
+            },
+            signature,
+            signers,
+        })
     }
 }
 
@@ -135,8 +174,8 @@ pub struct SlotStream {
     target_root: [u8; 32],
     slots_per_epoch: u64,
     committees: Arc<EpochCommittees>,
-    /// Network aggregates seen so far, keyed by the slot they attest to. They
-    /// compete with the summed singles rather than backstopping them.
+    /// Network aggregates seen so far, keyed by the slot they attest to. The
+    /// only covers a slot has to choose between, because they cannot be cut.
     pending: BTreeMap<u64, Vec<Aggregate>>,
     /// Unaggregated attestations, summed per message and committee as they
     /// arrive, keyed by the slot they attest to. The primary path.
@@ -222,7 +261,9 @@ impl SlotStream {
             };
 
             match att.single_attester {
-                Some(single) => self.sum_single(attestation, single.committee_index, signers)?,
+                Some(single) => {
+                    self.sum_single(attestation, single.committee_index, single.attester_index)?
+                }
                 None => {
                     // A backstop the node published and we cannot read is one
                     // less cover to choose from, not a reason to fail the tick.
@@ -244,11 +285,16 @@ impl SlotStream {
     }
 
     /// Add one unaggregated attestation to its committee's running signature.
+    ///
+    /// Takes the attester rather than a signer set because the signature is
+    /// filed under it: a subset of the bucket is summed out of these, so a
+    /// signature stored against a validator it does not sign for would produce
+    /// a residual that pairs against the wrong key.
     fn sum_single(
         &mut self,
         attestation: AttestationWitness,
         committee_index: u64,
-        signers: BTreeSet<u64>,
+        attester: u64,
     ) -> Result<()> {
         let signature = Signature::from_bytes(&attestation.signature.0)
             .map_err(|e| anyhow!("a gossiped signature does not decompress: {e:?}"))?;
@@ -263,19 +309,19 @@ impl SlotStream {
                 message.insert(Summed {
                     signature: AggregateSignature::from_signature(&signature),
                     attestation,
-                    signers,
+                    signers: BTreeMap::from([(attester, signature)]),
                 });
             }
             Entry::Occupied(mut message) => {
                 let running = message.get_mut();
-                if signers.iter().all(|index| running.signers.contains(index)) {
+                if running.signers.contains_key(&attester) {
                     return Ok(());
                 }
                 running
                     .signature
                     .add_signature(&signature, false)
                     .map_err(|e| anyhow!("summing a gossiped signature failed: {e:?}"))?;
-                running.signers.extend(signers);
+                running.signers.insert(attester, signature);
             }
         }
         Ok(())
@@ -299,45 +345,85 @@ impl SlotStream {
     /// into the derived key, so `marginal_balance` climbs and `named_indices`
     /// shrinks as the slot converges. Both are what the trigger is choosing
     /// between — weight it has against work it would pay for.
+    ///
+    /// # What the cover may be
+    ///
+    /// A named leaf is a committee member the derived key does not cover, so
+    /// `named_indices.len()` is exactly `committee size − primary coverage` and
+    /// the only question this asks is how much of the committee one message's
+    /// aggregates can be made to reach.
+    ///
+    /// Disjointness is the whole constraint, and it is proved here rather than
+    /// assumed, because summing a validator's signature twice *verifies*:
+    /// `sig + sig_v` checks out against `2·pk_v + rest`, so a double count is
+    /// not caught downstream by anything. Nothing else is: the guest folds any
+    /// number of aggregates over one message by adding their signatures, and it
+    /// never sees this choice — a cover that is wrong produces a proof that
+    /// fails to verify rather than one that lies.
     pub fn peek(&self, slot: u64) -> Option<SlotComplement> {
         let slot_in_epoch = slot % self.slots_per_epoch;
         let committee = self.committees.aggregate(slot_in_epoch)?.clone();
         let members = &self.committees.members[slot_in_epoch as usize];
 
-        // Every cover the slot has — our own per-committee sums of the
-        // unaggregated feed, and the network's aggregates — taken largest
-        // first, and only where disjoint from what is already counted.
-        //
-        // Disjointness is proved here rather than assumed, because summing a
-        // validator's signature twice *verifies*: `sig + sig_v` checks out
-        // against `2·pk_v + rest`, so a double count is not caught downstream by
-        // anything. What cannot be assumed either is that ours is the better
-        // cover. It used to be seeded first unconditionally, and that is what
-        // made the daemon skip epochs the chain had justified: an overlapping
-        // aggregate was refused however much more of the committee it carried,
-        // so a slot repaired from blocks at 99.7% collapsed to 0.02% the moment
-        // four late singles arrived for it, and a slot on gossip alone stalled
-        // at whatever the unaggregated feed happened to deliver — 62% to 76% on
-        // mainnet, against 99.7% on chain. Size is the rule instead, and a tie
-        // still goes to ours because a sum we built is one we can account for.
-        let ours: Vec<Aggregate> = self
-            .summed
-            .get(&slot)
-            .into_iter()
-            .flat_map(|messages| messages.values().map(Summed::aggregate))
-            .collect();
+        let summed = self.summed.get(&slot);
         let theirs = self.pending.get(&slot);
-        if ours.is_empty() && theirs.is_none_or(|aggregates| aggregates.is_empty()) {
+        if summed.is_none_or(|messages| messages.is_empty())
+            && theirs.is_none_or(|aggregates| aggregates.is_empty())
+        {
             return None;
         }
 
-        let mut by_message: BTreeMap<DataKey, (Vec<&Aggregate>, BTreeSet<u64>)> = BTreeMap::new();
-        let mut order: Vec<&Aggregate> = ours.iter().chain(theirs.into_iter().flatten()).collect();
+        // The network's aggregates, largest first and only where disjoint from
+        // what is already counted. They are the only atoms in the slot: a
+        // signature over a set of signers cannot be cut down to a subset of it,
+        // so an aggregate overlapping one already taken is refused however much
+        // more it carries. This is the one place a cover is *chosen*.
+        let mut packed: BTreeMap<DataKey, BTreeSet<u64>> = BTreeMap::new();
+        let mut chosen: Vec<(DataKey, &Aggregate)> = Vec::new();
+        let mut order: Vec<&Aggregate> = theirs.into_iter().flatten().collect();
         order.sort_by_key(|a| std::cmp::Reverse(a.signers.len()));
         for aggregate in order {
-            let entry = by_message
-                .entry(data_key(&aggregate.attestation))
-                .or_default();
+            let key = data_key(&aggregate.attestation);
+            let signers = packed.entry(key).or_default();
+            if signers.intersection(&aggregate.signers).next().is_some() {
+                continue;
+            }
+            signers.extend(&aggregate.signers);
+            chosen.push((key, aggregate));
+        }
+
+        // Then every unaggregated attestation that packing missed. A single
+        // names one validator, so ours are divisible where an aggregate is not,
+        // and the part of a committee's sum that a chosen aggregate does not
+        // carry can still be summed on its own. That makes the cover at least
+        // the union of everything the node has heard, whatever the packing
+        // chose — which is the property the old rule did not have. It weighed
+        // our sums against the aggregates by size and threw away the loser
+        // whole, so a slot on gossip alone kept whichever wave happened to be
+        // ahead: 64% to 77% from the unaggregated feed against 99.7% from the
+        // aggregates, and either could displace the other.
+        let empty = BTreeSet::new();
+        let ours: Vec<(DataKey, Aggregate)> = summed
+            .into_iter()
+            .flatten()
+            .filter_map(|((key, _committee), summed)| {
+                Some((*key, summed.residual(packed.get(key).unwrap_or(&empty))?))
+            })
+            .collect();
+
+        let mut by_message: BTreeMap<DataKey, (Vec<&Aggregate>, BTreeSet<u64>)> = packed
+            .into_iter()
+            .map(|(key, signers)| (key, (Vec::new(), signers)))
+            .collect();
+        for (key, aggregate) in chosen {
+            by_message.entry(key).or_default().0.push(aggregate);
+        }
+        // A residual is disjoint from the packing by construction and from
+        // every other residual because committees partition the slot. It is
+        // still proved rather than assumed: a validator counted twice is a
+        // proof that fails, and nothing before this point would catch it.
+        for (key, aggregate) in &ours {
+            let entry = by_message.entry(*key).or_default();
             if entry.1.intersection(&aggregate.signers).next().is_some() {
                 continue;
             }
