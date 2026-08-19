@@ -345,6 +345,7 @@ impl Publisher {
             fired.epoch,
             json!({
                 "fired_unix_millis": fired.fired_unix_millis,
+                "blocked_millis": fired.blocked_millis,
                 "wait_millis": fired.wait_millis,
                 "late_group_millis": fired.late_group_millis,
                 "tail": fired.tail,
@@ -474,14 +475,18 @@ impl Publisher {
 /// How far an epoch in flight has got.
 /// The trigger firing, and what `T2 - T` is about to be spent on.
 ///
-/// `wait_millis` is the decision — how long the trigger held past the threshold
-/// — and `late_group_millis` is the work that follows it, proving the backlog
-/// the epoch opened with. They were one number until the fired timestamp moved
-/// out of the final proof's own span, and a reader could not tell a trigger that
-/// held from a prover that was behind.
+/// Three numbers, because the interval between the crossing and the fire is
+/// made of three different things. `blocked_millis` is the prover finishing a
+/// proof it started before the crossing, `wait_millis` is the decision — how
+/// long the trigger held once it was free to fire — and `late_group_millis` is
+/// the work that follows the fire, proving the backlog the epoch opened with.
+/// All three were one number until the fired timestamp moved out of the final
+/// proof's own span, and the first two were one number until 2026-08-19: a
+/// reader could not tell a trigger that held from a prover that was behind.
 pub struct ThresholdFired {
     pub epoch: u64,
     pub fired_unix_millis: u64,
+    pub blocked_millis: u64,
     pub wait_millis: u64,
     pub late_group_millis: u64,
     pub tail: usize,

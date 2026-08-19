@@ -34,18 +34,33 @@
 //!
 //! # `wait_millis` is not idle time, and no longer claims to be
 //!
-//! `wait_millis` is `fired - crossed`, and the late group proof used to run
-//! between those two timestamps: the fired stamp was taken at the top of
-//! `close`, which the fire path reaches only after proving the backlog. So the
-//! manifest reported a 141 s group proof as a 141 s trigger hold — against a cap
-//! of 10 s, into a histogram whose top bucket is 12 s — and three separate
-//! analyses read it as the trigger waiting.
+//! `wait_millis` was `fired - crossed`, and a proof has twice got inside those
+//! two timestamps.
 //!
-//! The stamp is now taken where the trigger actually fires, and the group proof
-//! is reported as `late_group_millis` beside it. The two tests below pin the
-//! split from both sides, and [`test_the_reported_wait_never_exceeds_what_the_tail_is_worth`]
-//! pins the bound that makes `wait_millis` readable at all: a wait can never be
-//! worth more than the tail it is waiting for.
+//! **After the fire.** The fired stamp used to be taken at the top of `close`,
+//! which the fire path reaches only after proving the backlog, so the manifest
+//! reported a 141 s group proof as a 141 s trigger hold — against a cap of 10 s,
+//! into a histogram whose top bucket is 12 s — and three separate analyses read
+//! it as the trigger waiting. The stamp moved to where the trigger fires and
+//! that proof is `late_group_millis` now.
+//!
+//! **Before the crossing.** Then the crossing stamp moved *above* the
+//! in-flight-proof early return, which is what made `observation_millis` honest,
+//! and the fire decision stayed below it — so any proof already running when the
+//! chain crossed was charged to the wait from the other end. On the live mainnet
+//! run that read 27-30 s, matched the epoch's own group proof to within 0.6 s
+//! over 13 consecutive epochs, and once read 55 s. Which of the two names the
+//! *identical* proof landed under was decided by whether it started a few
+//! hundred milliseconds before the stamp or after the fire.
+//!
+//! That interval is `blocked_millis` now, and
+//! [`test_a_proof_in_flight_at_the_crossing_is_not_a_wait`] is the test that
+//! would have caught it: it holds the daemon behind a proof it started before
+//! the crossing and asserts the wait does not contain it. The tests below pin
+//! the rest of the split from both sides, and
+//! [`test_the_reported_wait_never_exceeds_what_the_tail_is_worth`] pins the
+//! bound that makes `wait_millis` readable at all: a wait can never be worth
+//! more than the tail it is waiting for.
 
 mod common;
 
@@ -113,30 +128,50 @@ const FOLD_PROVE: Duration = Duration::from_millis(1200);
 #[derive(Clone, Default)]
 struct CrossDuringGroup(Arc<Mutex<Option<Crossing>>>);
 
+/// Which proof the chain crosses underneath.
+///
+/// Both are production shapes and they measure different things. A group is
+/// what a daemon at the head meets, and it is short. A fold is what one that
+/// has fallen behind meets — 110 s on a mainnet card against a 12 s slot — and
+/// it is the shape in which the daemon is certain to be holding enough to
+/// justify while the prover is busy with something it started earlier.
+#[derive(Clone, Copy, PartialEq)]
+enum During {
+    Group,
+    Fold,
+}
+
 struct Crossing {
     head: Arc<Mutex<Option<HeaderResponse>>>,
     header: HeaderResponse,
+    during: During,
     /// Unix ms at which the head moved: the earliest the daemon could have seen
     /// the chain cross, and so what its observation is measured against.
     crossed_unix_millis: Option<u64>,
 }
 
 impl CrossDuringGroup {
-    /// Move the head the next time a group is proven, and not again.
-    fn arm(&self, head: Arc<Mutex<Option<HeaderResponse>>>, header: HeaderResponse) {
+    /// Move the head the next time `during` is proven, and not again.
+    fn arm(
+        &self,
+        head: Arc<Mutex<Option<HeaderResponse>>>,
+        header: HeaderResponse,
+        during: During,
+    ) {
         *self.0.lock().unwrap() = Some(Crossing {
             head,
             header,
+            during,
             crossed_unix_millis: None,
         });
     }
 
-    fn take(&self) {
+    fn take(&self, during: During) {
         let mut armed = self.0.lock().unwrap();
         let Some(crossing) = armed.as_mut() else {
             return;
         };
-        if crossing.crossed_unix_millis.is_some() {
+        if crossing.during != during || crossing.crossed_unix_millis.is_some() {
             return;
         }
         *crossing.head.lock().unwrap() = Some(crossing.header.clone());
@@ -219,12 +254,13 @@ impl Prover for SlowGroupProver {
         // Before the sleep, so the tick that collects this proof has already
         // ingested the crossing — which is what a daemon on gossip has too, its
         // loop still running while the prover works.
-        self.crossing.take();
+        self.crossing.take(During::Group);
         std::thread::sleep(GROUP_PROVE);
         self.inner.prove_group(witness)
     }
 
     fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)> {
+        self.crossing.take(During::Fold);
         std::thread::sleep(FOLD_PROVE);
         self.inner.prove_aggregate(witness)
     }
@@ -489,16 +525,20 @@ async fn test_t_is_the_crossing_slot_even_when_the_daemon_noticed_late() {
         proof - observed,
     );
 
-    // The four terms are in order and do not overlap, so a reader can attribute
-    // the number rather than only compare it.
-    let wait = latency["wait_millis"].as_u64().expect("wait_millis");
-    let late_group = latency["late_group_millis"]
-        .as_u64()
-        .expect("late_group_millis");
-    assert!(
-        observation + wait + late_group <= t2_minus_t,
-        "T2 - T ({t2_minus_t} ms) must cover the delay ({observation} ms), the \
-         wait ({wait} ms), the late group ({late_group} ms) and the final proof",
+    // The five terms are in order, do not overlap, and account for `T2 - T`
+    // exactly, so a reader can attribute the number rather than only compare
+    // it. Exactly, not `<=`: a bound would have been satisfied all through the
+    // months `wait_millis` carried a group proof, and additivity is what makes
+    // the split worth publishing at all.
+    let term = |name: &str| latency[name].as_u64().unwrap_or_else(|| panic!("{name}"));
+    let (blocked, wait) = (term("blocked_millis"), term("wait_millis"));
+    let (late_group, final_proof) = (term("late_group_millis"), term("final_proof_millis"));
+    assert_eq!(
+        observation + blocked + wait + late_group + final_proof,
+        t2_minus_t,
+        "T2 - T ({t2_minus_t} ms) is the delay ({observation} ms), the block \
+         ({blocked} ms), the wait ({wait} ms), the late group ({late_group} ms) \
+         and the final proof ({final_proof} ms), and nothing else",
     );
 }
 
@@ -619,6 +659,7 @@ async fn test_a_group_that_lands_on_a_justifiable_epoch_is_not_folded_first() {
     crossing.arm(
         daemon.api().head_handle(),
         chain.header_at(boundary + SLOTS_TO_THRESHOLD),
+        During::Group,
     );
 
     // Driven until the epoch closes rather than in one call, because a tick that
@@ -694,6 +735,122 @@ async fn test_a_group_that_lands_on_a_justifiable_epoch_is_not_folded_first() {
         "late_group_millis ({late_group} ms) contains a group proof ({} ms); the \
          fire path had a landed group to absorb and should have proven nothing",
         GROUP_PROVE.as_millis(),
+    );
+}
+
+/// A proof already in flight when the chain crosses is not a wait, and is not
+/// the same term as a proof the fire path starts.
+///
+/// This is the defect the whole split exists for. `crossed_unix_millis` is
+/// stamped *above* `drive_epoch`'s in-flight early return — deliberately, and it
+/// must stay there, because it is what made `observation_millis` measure gossip
+/// arrival rather than the prover's occupancy. The fire decision is below that
+/// return. So every millisecond of a proof that was already running when the
+/// chain crossed fell between the two stamps, and `wait_millis` was
+/// `fired - crossed`.
+///
+/// On the live mainnet run that read **27-30 s** and matched the epoch's own
+/// backlog group proof to within 0.6 s over 13 consecutive epochs — 469608:
+/// 55.6 s of group against 55.0 s of "wait"; 469612: 27.9 against 27.4. Epoch
+/// 469611 fired 34 ms after the prover came free. The documented bound is
+/// `--max-trigger-wait-millis`, 10 s.
+///
+/// And it was not even a stable misnomer. When the same backlog happened to
+/// start *after* the fire instead it landed in `late_group_millis` (469613:
+/// 33.7 against 33.9), so one proof had two names and a few hundred
+/// milliseconds chose between them.
+///
+/// The shape here is a fold rather than a group, because a fold is the one
+/// proof the daemon is certain to be running while it already holds enough to
+/// justify: it is started by the `!fire` branch on a tick that does not yet hold
+/// the threshold, and it is 110 s on a mainnet card against a 12 s slot.
+#[tokio::test]
+async fn test_a_proof_in_flight_at_the_crossing_is_not_a_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let crossing = CrossDuringGroup::default();
+    let mut daemon = streaming_daemon_with(dir.path(), &chain, crossing.clone()).await;
+
+    let stream_epoch = FIRST_EPOCH + 1;
+    let boundary = stream_epoch * SPE;
+
+    // One slot on the chain: a quarter of the stake, so the daemon closes it,
+    // proves it as a group, and — still short of the threshold — folds it.
+    daemon.api().set_head(chain.header_at(boundary + 1));
+
+    // The rest of the epoch arrives inside that fold. The daemon is holding
+    // enough to justify and cannot act on it, because one prover proves one
+    // thing at a time and this one was started before the chain got there.
+    crossing.arm(
+        daemon.api().head_handle(),
+        chain.header_at(boundary + SLOTS_TO_THRESHOLD),
+        During::Fold,
+    );
+
+    let mut ticks = Vec::new();
+    for _ in 0..6 {
+        ticks.extend(daemon.catch_up().await.unwrap());
+        if ticks.iter().any(|tick| tick.justified.is_some()) {
+            break;
+        }
+    }
+    assert_eq!(
+        ticks.iter().filter_map(|t| t.justified).collect::<Vec<_>>(),
+        vec![stream_epoch],
+    );
+
+    let latency = latency(dir.path());
+    assert_eq!(latency["epoch"], stream_epoch);
+    let term = |name: &str| latency[name].as_u64().unwrap_or_else(|| panic!("{name}"));
+    let (observation, blocked) = (term("observation_millis"), term("blocked_millis"));
+    let (wait, late_group) = (term("wait_millis"), term("late_group_millis"));
+    let (final_proof, t2_minus_t) = (term("final_proof_millis"), term("t2_minus_t_millis"));
+
+    // The premise. Without a fold running at the crossing the test would pass
+    // under the old definition too and pin nothing.
+    assert_eq!(
+        latency["folded_groups"], 1,
+        "the daemon was supposed to be folding when the chain crossed",
+    );
+
+    // The assertion. Under the old definition this whole fold was the wait.
+    assert!(
+        wait < GROUP_PROVE.as_millis() as u64,
+        "wait_millis ({wait} ms) contains the fold that was in flight when the \
+         chain crossed ({} ms). The trigger was never asked during it: \
+         `drive_epoch` returns above the trigger while a proof is running.",
+        FOLD_PROVE.as_millis(),
+    );
+
+    // And it is charged to the term that names it instead of vanishing.
+    assert!(
+        blocked > wait && blocked >= FOLD_PROVE.as_millis() as u64 / 2,
+        "blocked_millis ({blocked} ms) does not account for the fold ({} ms) \
+         the daemon was held behind; the interval has to go somewhere and the \
+         only wrong answer is the trigger",
+        FOLD_PROVE.as_millis(),
+    );
+
+    // The wait is bounded by the trigger's own cap, which is the bound the live
+    // run violated by 5.5x with a proof inside this term.
+    assert!(
+        wait <= OrchestratorConfig::new(TEST_CONFIG, "test")
+            .stream_policy
+            .max_wait_s as u64
+            * 1000,
+        "wait_millis ({wait} ms) is past --max-trigger-wait-millis, which is the \
+         only thing that can end a wait the trigger chose to take",
+    );
+
+    // Additivity is the point of the decomposition: five terms, in order, that
+    // account for `T2 - T` exactly. A split that only bounds it lets a term be
+    // wrong without anything noticing, which is how this got to production.
+    assert_eq!(
+        observation + blocked + wait + late_group + final_proof,
+        t2_minus_t,
+        "the five terms must be T2 - T exactly: observing {observation}, \
+         blocked {blocked}, waiting {wait}, late group {late_group}, final proof \
+         {final_proof} against {t2_minus_t}",
     );
 }
 

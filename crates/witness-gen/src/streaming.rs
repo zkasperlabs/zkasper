@@ -742,10 +742,15 @@ impl StreamPolicy {
     /// The rule can only ever cost latency. `T` is measured at the threshold the
     /// circuit itself enforces, so waiting past it changes what a proof costs
     /// and never what it proves. It is also the only thing between `T` and the
-    /// final proof that is a *decision*: the late group proof on the fire path
-    /// is work rather than waiting, it is far larger than any wait this rule can
-    /// authorise, and it is measured on its own — see
-    /// `EpochLatency::late_group_millis`.
+    /// final proof that is a *decision*: the epoch's backlog group is work
+    /// rather than waiting, it is far larger than any wait this rule can
+    /// authorise, and it is measured on its own on both sides of the fire — see
+    /// `EpochLatency::blocked_millis` and `EpochLatency::late_group_millis`.
+    ///
+    /// Which makes what this rule costs measurable, and it is 79 ms median on
+    /// the live mainnet run: the wait it authorises never ran there at all,
+    /// because `held` marks a slot filling only at or past the chain head and
+    /// this daemon fires slots behind it.
     pub fn worth_waiting(
         &self,
         filling: Filling,

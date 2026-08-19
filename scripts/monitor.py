@@ -313,10 +313,10 @@ def published_latency():
     # Chronological first, then sorted for the percentiles. Slicing a sorted
     # list for "the last ten" takes the ten slowest, which is exactly backwards
     # for a check meant to notice steady state degrading.
-    series = sorted(((e["epoch"], e["latency"]["t2_minus_t_millis"] / 1000)
-                     for e in epochs
-                     if (e.get("latency") or {}).get("t2_minus_t_millis")
-                     and (init is None or e.get("epoch", 0) >= init)),
+    live = [e["latency"] for e in epochs
+            if (e.get("latency") or {}).get("t2_minus_t_millis")
+            and (init is None or e.get("epoch", 0) >= init)]
+    series = sorted(((l["epoch"], l["t2_minus_t_millis"] / 1000) for l in live),
                     key=lambda row: row[0])
     v = sorted(t for _, t in series)
     if len(v) < 3:
@@ -327,7 +327,34 @@ def published_latency():
                  f"p90 {v[int(0.9 * (len(v) - 1))]:.0f}s over {len(v)}"
                  f" ({len(v)}/100 for the criterion)"
                  + (f", last {len(recent)} median {recent[len(recent) // 2]:.0f}s"
-                    if len(v) > 10 else ""))
+                    if len(v) > 10 else "")
+                 + latency_split(live))
+
+
+def latency_split(latencies):
+    """Where the median epoch's `T2 - T` went, term by term.
+
+    The distribution alone says the number is large and nothing about which of
+    the five things it is made of, and they have different owners: observation
+    and blocked are the daemon's schedule, wait is the trigger rule, and the
+    final proof is the prover. Reported as the median of each term rather than
+    the terms of the median epoch -- they will not sum to the median `T2 - T`,
+    and each one is still the right summary of its own column.
+
+    Rows from a daemon before 2026-08-19 have no `blocked_millis` and carry it
+    inside `wait_millis`; they are skipped rather than mixed in, since a wait of
+    30 s and a wait of 79 ms are not samples of the same quantity.
+    """
+    terms = ("observation_millis", "blocked_millis", "wait_millis",
+             "late_group_millis", "final_proof_millis")
+    split = [l for l in latencies if all(l.get(t) is not None for t in terms)]
+    if not split:
+        return ""
+    med = {t: sorted(l[t] for l in split)[len(split) // 2] / 1000 for t in terms}
+    return (f"; median split over {len(split)}: "
+            + " ".join(f"{name} {med[t]:.1f}s" for name, t in
+                       zip(("observing", "blocked", "waiting", "late group", "final proof"),
+                           terms)))
 
 
 def published_gaps():

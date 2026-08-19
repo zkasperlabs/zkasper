@@ -136,6 +136,25 @@ impl StageTiming {
 /// was largest exactly when the daemon was furthest behind — which is when the
 /// number matters. [`Self::observation_millis`] is that gap, kept rather than
 /// folded away, because it is the pipeline's own defect and not the prover's.
+///
+/// # The split
+///
+/// `T2 - T` is `observation_millis + blocked_millis + wait_millis +
+/// late_group_millis + final_proof_millis`, exactly, in that order. Each term
+/// names one mechanism, so an operator reading the row learns *where* the time
+/// went and not only how much of it there was:
+///
+/// | term | the daemon was |
+/// |---|---|
+/// | `observation_millis` | not looking — the chain had crossed and the gossip had not arrived, or the tick had not come round |
+/// | `blocked_millis` | looking, and unable to act: the prover was finishing a proof started before the crossing |
+/// | `wait_millis` | free to fire and choosing not to, for attestations still in flight |
+/// | `late_group_millis` | proving a backlog group the fire path could not skip |
+/// | `final_proof_millis` | proving the epoch |
+///
+/// `blocked_millis` did not exist until 2026-08-19 and its 27-30 s was reported
+/// as a wait against a 10 s cap. See its own docs; the correction changed no
+/// timestamp and no decision, only which term each interval is charged to.
 #[derive(Clone, Debug, Serialize)]
 pub struct EpochLatency {
     pub epoch: u64,
@@ -184,37 +203,76 @@ pub struct EpochLatency {
     pub fired_unix_millis: u64,
     pub proof_unix_millis: u64,
     /// The number this project exists to minimise, `proof_unix_millis -
-    /// threshold_unix_millis`. It splits into four, in order and without
-    /// overlap: `observation_millis`, `wait_millis`, `late_group_millis`, and
-    /// the final proof itself as the remainder.
+    /// threshold_unix_millis`. It splits into five, in order and without
+    /// overlap: `observation_millis`, `blocked_millis`, `wait_millis`,
+    /// `late_group_millis` and `final_proof_millis`, which sum to it exactly.
     pub t2_minus_t_millis: u64,
-    /// The part of `t2_minus_t_millis` that was the trigger holding back rather
-    /// than the prover working, measured from `observed_unix_millis`: the
-    /// trigger cannot hold back before the daemon knows there is anything to
-    /// hold back for. Reading it against `tail_named` is what says
-    /// whether the wait bought what the model says it should have, and
-    /// `StreamPolicy::wait_budget_s` is the bound: a tail of `tail_named` leaves
-    /// is worth `tail_named * per_named_s` of proving, so a wait longer than
-    /// that lost time on every outcome available to it.
+    /// The part of `t2_minus_t_millis` in which the daemon knew the chain had
+    /// crossed and could not act on it, because the prover was still finishing
+    /// a proof it had started before.
     ///
-    /// Bounded by `--max-trigger-wait-millis`, 10 s by default. It was not,
-    /// until the fired timestamp moved out of `close`: the late group proof ran
-    /// between `T` and the old stamp, so a 141 s group proof was reported as a
-    /// 141 s wait against a 10 s cap, and `late_group_millis` is where it went.
+    /// One prover proves one thing at a time, and the tick that finds a proof
+    /// in flight returns above the trigger, so a group started a moment before
+    /// the crossing holds the epoch for its whole remaining length. That is not
+    /// a decision and no cap governs it: it is the schedule's own backlog,
+    /// landing on the critical path because it was still running when the
+    /// chain got there.
+    ///
+    /// **This is where the 27-30 s of the 2026-08-19 mainnet run went, and it
+    /// had no name until 2026-08-19.** It was charged to `wait_millis`, which
+    /// matched the epoch's group proof to within 0.6 s over 13 consecutive
+    /// epochs and read 55 s against a 10 s cap. Whether that same proof landed
+    /// here or in `late_group_millis` was decided by a few hundred
+    /// milliseconds — whether it started before the crossing was stamped or
+    /// after the trigger fired. Both are the backlog, so
+    /// `blocked_millis + late_group_millis` is what it cost wherever the race
+    /// put it; what neither of them is, is a wait.
+    pub blocked_millis: u64,
+    /// The part of `t2_minus_t_millis` that was the trigger holding back rather
+    /// than the prover working: `fired_unix_millis - observed_unix_millis`,
+    /// less `blocked_millis`. The trigger cannot hold back before the daemon
+    /// knows there is anything to hold back for, and it is not holding back
+    /// while it is not being asked.
+    ///
+    /// Reading it against `tail_named` is what says whether the wait bought
+    /// what the model says it should have, and `StreamPolicy::wait_budget_s` is
+    /// the bound: a tail of `tail_named` leaves is worth `tail_named *
+    /// per_named_s` of proving, so a wait longer than that lost time on every
+    /// outcome available to it.
+    ///
+    /// Bounded by `--max-trigger-wait-millis`, 10 s by default, plus the
+    /// trigger interval the daemon cannot fire inside. It was not, while the
+    /// prover's own backlog was charged here: the crossing is stamped above the
+    /// in-flight-proof early return and the fire decision is below it, so every
+    /// proof running at the crossing became a wait. On the mainnet run this
+    /// term is **79 ms median** once that proof is taken out of it, and
+    /// `StreamAggregator::worth_waiting` never ran at all.
     pub wait_millis: u64,
-    /// The late group proof, which is the rest of `t2_minus_t_millis` before the
-    /// final proof itself.
+    /// A group proof the fire path started *after* the trigger fired, because
+    /// the backlog it fired on was not proven yet: `fired_unix_millis` to the
+    /// instant the final proof's own stage began.
     ///
     /// Zero on a daemon that had proven `late_groups` before `T`, which is
     /// where the schedule puts it: the absorbed group *finishes* at the
-    /// threshold, and only its recursion is meant to land after it. Above zero
-    /// it is that same group started at `T` instead, because the trigger is
-    /// evaluated only on a tick with no proof in flight and the tick that fires
-    /// is therefore the first one after a fold. It was called the whole of the
-    /// gap between the measured `T2 - T` and the modelled one; it is the smaller
-    /// half of it, and `observation_millis` — the same blind tick, seen from the
-    /// other side — is the larger.
+    /// threshold, and only its recursion is meant to land after it.
+    ///
+    /// It is the same backlog `blocked_millis` holds, on the other side of the
+    /// fire — a group already running when the chain crossed lands there, a
+    /// group the fire path has to start lands here, and a few hundred
+    /// milliseconds decide which. The two were both charged to `wait_millis`
+    /// before the fired stamp moved out of `close`, and this one alone
+    /// afterwards, which is why one epoch could report 33.9 s here and the next
+    /// 27.4 s of the identical proof somewhere else.
     pub late_group_millis: u64,
+    /// The one proof on the critical path: `proof_unix_millis` less the instant
+    /// its stage began, witness build included.
+    ///
+    /// The remainder of the split, published rather than left to be derived, so
+    /// that a consumer can check the five terms against `t2_minus_t_millis`
+    /// without knowing how the pipeline is shaped. It is the only term that is
+    /// irreducible work — everything before it is the daemon not looking, the
+    /// prover busy with the backlog, or the trigger choosing to hold.
+    pub final_proof_millis: u64,
     /// Accumulator leaves the final proof opened for its inline tail — the
     /// absentees the wait did not remove. Every one of them is
     /// `ProverModel::per_named_s` on the critical path.

@@ -129,14 +129,17 @@ const LATENCY_BUCKETS: &[f64] = &[
 /// `--max-trigger-wait-millis`, which defaults to 10 s, and by the tail's own
 /// worth — see `StreamPolicy::wait_budget_s`. A sample past the top of this
 /// ladder is a bug in the trigger, not a slow epoch; every live sample landed in
-/// `+Inf` while the late group proof was being charged to the wait.
+/// `+Inf` while the prover's own backlog was being charged to the wait, and the
+/// live median is 79 ms now that `zkasper_blocked_seconds` carries it instead.
 const WAIT_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0,
 ];
 
-/// The late group proof, which is unbounded by anything the trigger controls: it
-/// is the backlog the epoch opened with, and it scales with the slots in it.
-const LATE_GROUP_BUCKETS: &[f64] = &[
+/// The backlog the epoch opened with, on either side of the fire — a group the
+/// prover was still running when the chain crossed, or one the fire path had to
+/// start. Unbounded by anything the trigger controls: it scales with the slots
+/// in it, and 27-30 s is the live steady state.
+const BACKLOG_BUCKETS: &[f64] = &[
     0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 300.0,
 ];
 
@@ -163,7 +166,8 @@ const BUCKETS: &[(&str, &[f64])] = &[
     ("zkasper_t2_minus_t_seconds", LATENCY_BUCKETS),
     ("zkasper_threshold_observation_seconds", LATENCY_BUCKETS),
     ("zkasper_trigger_wait_seconds", WAIT_BUCKETS),
-    ("zkasper_late_group_seconds", LATE_GROUP_BUCKETS),
+    ("zkasper_blocked_seconds", BACKLOG_BUCKETS),
+    ("zkasper_late_group_seconds", BACKLOG_BUCKETS),
     ("zkasper_tail_named", TAIL_BUCKETS),
 ];
 
@@ -408,6 +412,11 @@ pub fn observe_latency(latency: &EpochLatency) {
     // blind, and only one of those is fixed by buying a card.
     histogram!("zkasper_threshold_observation_seconds", "follow" => follow)
         .record(seconds(latency.observation_millis));
+    // The largest term on a saturated daemon, and the one that reads as a
+    // trigger fault if it is not separated: it is the prover finishing the
+    // epoch's backlog while the chain has already crossed.
+    histogram!("zkasper_blocked_seconds", "follow" => follow)
+        .record(seconds(latency.blocked_millis));
     histogram!("zkasper_trigger_wait_seconds", "follow" => follow)
         .record(seconds(latency.wait_millis));
     histogram!("zkasper_late_group_seconds", "follow" => follow)

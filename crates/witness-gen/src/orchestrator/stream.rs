@@ -119,6 +119,18 @@ struct StreamAggregator {
     /// takes that from the chain. This is only ever as early as the first tick
     /// with no proof in flight, so it is the observation and not the event.
     crossed_unix_millis: Option<u64>,
+    /// Unix ms at which the proof now in flight was started, while one is.
+    /// Cleared by the first tick that finds the prover free, which is the only
+    /// place a tick can reach the trigger.
+    proving_since: Option<u64>,
+    /// Wall time since [`Self::crossed_unix_millis`] that a proof started
+    /// before the trigger fired was still running — see
+    /// [`EpochLatency::blocked_millis`]. Accumulated rather than taken as one
+    /// difference, because the daemon can be blocked, freed and blocked again
+    /// while a configured threshold above the circuit's own quorum has not been
+    /// reached, and every one of those intervals is the prover and not the
+    /// trigger.
+    blocked_millis: u64,
 }
 
 /// A finished group proof, waiting to be folded or handed to the final proof.
@@ -601,6 +613,25 @@ impl StreamPipeline {
             return Ok(());
         }
 
+        // The prover is free here, and only here: every path that reaches this
+        // line took `self.pending` above and collected whatever it held. So
+        // this is the first instant since a proof started on which the trigger
+        // could be asked anything, and everything between the crossing and it
+        // is the prover working — the epoch's own backlog, still running when
+        // the chain got there.
+        //
+        // Charging it to `wait_millis` is what made a 55 s group proof read as
+        // a 55 s wait against a 10 s cap. The crossing is stamped above the
+        // in-flight early return, deliberately, and the fire decision is below
+        // it; the interval between the two belongs to neither the trigger nor
+        // the daemon's blindness, and had no term of its own until 2026-08-19.
+        if let (Some(crossed), Some(since)) = (
+            aggregator.crossed_unix_millis,
+            aggregator.proving_since.take(),
+        ) {
+            aggregator.blocked_millis += now_unix_millis().saturating_sub(since.max(crossed));
+        }
+
         let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
 
         let enough = held.balance as u128 >= policy.target_balance(total);
@@ -645,6 +676,12 @@ impl StreamPipeline {
                         &aggregator,
                         aggregator.proved..aggregator.units.len(),
                     )));
+                }
+                // The only proofs that can be running when the chain crosses
+                // are started here, so this is the whole of what
+                // `blocked_millis` measures from.
+                if self.pending.is_some() {
+                    aggregator.proving_since = Some(now_unix_millis());
                 }
             }
             // Again here, and not only when the epoch opened. The boundary the
@@ -843,6 +880,8 @@ impl StreamPipeline {
             boundary,
             opened_unix_millis: now_unix_millis(),
             crossed_unix_millis: None,
+            proving_since: None,
+            blocked_millis: 0,
         })
     }
 
@@ -1137,9 +1176,11 @@ impl StreamPipeline {
             publish.threshold_fired(&publish::ThresholdFired {
                 epoch: target_epoch,
                 fired_unix_millis: closing.fired_unix_millis,
+                blocked_millis: aggregator.blocked_millis,
                 wait_millis: closing
                     .fired_unix_millis
-                    .saturating_sub(aggregator.crossed_unix_millis.unwrap_or_default()),
+                    .saturating_sub(aggregator.crossed_unix_millis.unwrap_or_default())
+                    .saturating_sub(aggregator.blocked_millis),
                 late_group_millis,
                 tail: closing.tail,
                 tail_named,
@@ -1280,17 +1321,26 @@ impl StreamPipeline {
         if let (Some((threshold_slot, threshold_unix_millis)), Some(observed_unix_millis)) =
             (threshold, aggregator.crossed_unix_millis)
         {
+            // The window the trigger owned, and how much of it it never got to
+            // hold: the prover's own backlog, clamped to the window so that the
+            // five terms sum to `t2_minus_t_millis` whatever the wall clock did
+            // between the stamps.
+            let held_back = fired_unix_millis.saturating_sub(observed_unix_millis);
+            let blocked_millis = aggregator.blocked_millis.min(held_back);
             let latency = EpochLatency {
                 epoch: target_epoch,
                 threshold_slot,
                 threshold_unix_millis,
                 observed_unix_millis,
                 observation_millis: observed_unix_millis.saturating_sub(threshold_unix_millis),
+                blocked_millis,
                 fired_unix_millis,
                 proof_unix_millis,
                 t2_minus_t_millis: proof_unix_millis.saturating_sub(threshold_unix_millis),
-                wait_millis: fired_unix_millis.saturating_sub(observed_unix_millis),
+                wait_millis: held_back - blocked_millis,
                 late_group_millis,
+                final_proof_millis: proof_unix_millis
+                    .saturating_sub(fired_unix_millis + late_group_millis),
                 tail_named,
                 folded_groups: aggregator.folded_groups,
                 late_groups,
@@ -1300,8 +1350,10 @@ impl StreamPipeline {
                 t2_minus_t_millis = latency.t2_minus_t_millis,
                 threshold_slot = latency.threshold_slot,
                 observation_millis = latency.observation_millis,
+                blocked_millis = latency.blocked_millis,
                 wait_millis = latency.wait_millis,
                 late_group_millis = latency.late_group_millis,
+                final_proof_millis = latency.final_proof_millis,
                 tail_named = latency.tail_named,
                 folded_groups = latency.folded_groups,
                 late_groups = latency.late_groups,

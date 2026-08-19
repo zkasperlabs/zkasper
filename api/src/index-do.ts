@@ -462,6 +462,11 @@ export class IndexDO extends DurableObject {
         if (epoch === null) return;
         this.mergeLatency(epoch, {
           fired_unix_millis: num(d.fired_unix_millis) ?? num(d.unix_millis) ?? undefined,
+          // The prover finishing a proof it started before the crossing.
+          // Absent from daemons before 2026-08-19, which reported it inside
+          // wait_millis; a wait far above --max-trigger-wait-millis on an old
+          // row is this, not a trigger that held.
+          blocked_millis: num(d.blocked_millis) ?? undefined,
           wait_millis: num(d.wait_millis) ?? undefined,
           late_group_millis: num(d.late_group_millis) ?? undefined,
           tail: num(d.tail) ?? undefined,
