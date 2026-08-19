@@ -48,11 +48,19 @@ const EPOCH: u64 = 10;
 
 /// Seconds `justification-guest` spends verifying one child.
 ///
-/// Not [`ProverModel::recursion_verify_s`], which is the price in the streaming
-/// guests. A child is not one price across guests: 35.629 s in
-/// `aggregation-guest` and `stream-final-guest`, 53.087 s here. MEASURED by
-/// `recursion_cost_curve` at two, three and four children, and by mainnet epoch
-/// 469424 verifying 23 in 1,224 s in production. `BENCHMARKS.md` has both.
+/// The same 1.520 s as [`ProverModel::recursion_verify_s`], and it is one price
+/// across guests. The work of a child is a property of the proof format — 10.9 M
+/// RISC-V steps, identical to five decimal places whichever guest verifies it
+/// and whichever guest produced it — so there is no per-guest price to carry
+/// here. The 53.087 s this constant held, and the 35.629 s the streaming model
+/// held, were the same compressed child on two different rented boxes; the same
+/// card spans 1.25x on a CPU affinity change alone. `BENCHMARKS.md` has the
+/// ladder that separated the floor, the per-proof Poseidon step and the child.
+///
+/// **Held at 53.087 until the schedule is re-derived**, for the reason
+/// [`ProverModel::recursion_verify_s`] gives: repricing a child changes which
+/// shape the daemon should plan, and that is a decision rather than a constant
+/// swap.
 const JUSTIFICATION_RECURSION_S: f64 = 53.087;
 
 fn config(dir: &Path, pipeline: Pipeline) -> OrchestratorConfig {
