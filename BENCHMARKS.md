@@ -322,14 +322,25 @@ the final proof of an epoch verifies two children it cannot avoid — the runnin
 aggregate and the previous epoch's justification. Those two are 106 s of the
 117.7, and everything the schedule can actually choose is the remaining 12.
 
-The production run agrees, independently and from the other direction: a real
-stream-final proof took **148.2 s over four epochs, within ±1.1 s**, and did not
-move when its nominal work did — `tail_named` ranged from 54 to 1,319 attesters
-for the same 148 s. A cost that ignores the work in front of it is a cost per
-child.
+The production run confirms that the cost is **per child**, from the other
+direction: a real stream-final proof took **148.2 s over four epochs, within
+±1.1 s**, and did not move when its nominal work did — `tail_named` ranged from
+54 to 1,319 attesters for the same 148 s. A cost that ignores the work in front
+of it is a cost per child.
 
-**This is a model over measured per-stage times, and it is now anchored at both
-ends: per-stage times measured warm, and a whole epoch measured in production.**
+**It does not corroborate the 117.7 s figure, and this document previously
+claimed it did.** Those 148.2 s were measured on the *unfolded* path, where the
+stream-final proof verifies the epoch diff and the committee proof inline
+because no opening fold has done it — four children. The 117.7 s model describes
+the folded path, which has two. The two numbers describe different circuits, so
+one cannot anchor the other. Note also that 53.087 s per child reproduces
+neither: 2 children gives 110 s, 3 gives 163 s, 4 gives 216 s, and none of those
+is 148.2 s.
+
+**So this is a model over measured per-stage times, anchored at one end only.**
+No production epoch has yet run the folded path — every epoch this pipeline has
+ever proved reports `folded_groups=0`, because the daemon has never had the spare
+capacity to fold. Until one does, 117.7 s is unvalidated.
 
 What it is sensitive to:
 
