@@ -131,6 +131,10 @@ impl Prover for SplitProver {
         self.pick(stage).program_digest(stage)
     }
 
+    fn route(&self, stage: Stage) -> usize {
+        self.routes.get(&stage).copied().unwrap_or(0)
+    }
+
     fn last_cost(&self) -> Option<ProveCost> {
         let index = self
             .last

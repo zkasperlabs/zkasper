@@ -202,6 +202,19 @@ pub trait Prover: Send + Sync {
     /// program cannot contain its own key.
     fn program_vk(&self, stage: Stage) -> ProgramVk;
 
+    /// Which prover serves `stage`, for a caller that must not put two proofs
+    /// on one card.
+    ///
+    /// One prover is one process holding one GPU and Proofman serialises
+    /// proving on a mutex, so two stages that answer the same index queue and
+    /// two that answer different ones run at once. A prover that is one card
+    /// answers 0 to everything; [`crate::split_prover::SplitProver`] answers
+    /// where it routes. The orchestrator asks rather than naming a stage of its
+    /// own, because which stage goes where is configuration.
+    fn route(&self, _stage: Stage) -> usize {
+        0
+    }
+
     /// What the last proof cost, for a prover that produces proofs.
     fn last_cost(&self) -> Option<ProveCost> {
         None

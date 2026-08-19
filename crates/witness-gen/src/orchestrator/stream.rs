@@ -217,9 +217,10 @@ impl<T: Send + 'static> Proving<T> {
 /// A proof this pipeline started and has not collected, and what the tick that
 /// collects it will do with the result.
 ///
-/// At most one exists at a time, so the ordering the circuits require is kept by
-/// construction: a group is folded only once it has landed, and the final proof
-/// binds an aggregate that is already finished.
+/// One exists per prover at most, and the ordering the circuits require is kept
+/// by the branches that start these rather than by there being one: a group is
+/// folded only once it has landed, folds chain so only one runs at a time, and
+/// the final proof does not fire while anything is in flight.
 enum Pending {
     /// A group off the critical path, folded when it lands.
     Group(GroupInFlight),
@@ -250,6 +251,24 @@ struct GroupInFlight {
 }
 
 impl Pending {
+    /// The stage this proves, which is what decides the prover it is on.
+    fn stage(&self) -> Stage {
+        match self {
+            Pending::Group(_) | Pending::Late { .. } => Stage::Group,
+            Pending::Fold { .. } => Stage::Aggregate,
+            Pending::Final { .. } => Stage::StreamFinal,
+        }
+    }
+
+    /// Whether a wait has already had this one's answer.
+    fn landed(&self) -> bool {
+        match self {
+            Pending::Group(group) | Pending::Late { group, .. } => group.proving.landed.is_some(),
+            Pending::Fold { proving, .. } => proving.landed.is_some(),
+            Pending::Final { proving, .. } => proving.landed.is_some(),
+        }
+    }
+
     async fn settle(&mut self, within: Duration) -> bool {
         match self {
             Pending::Group(group) | Pending::Late { group, .. } => {
@@ -444,8 +463,11 @@ impl StreamAggregator {
 #[derive(Default)]
 pub(super) struct StreamPipeline {
     aggregator: Option<StreamAggregator>,
-    /// The proof this epoch is waiting on, if any. See [`Proving`].
-    pending: Option<Pending>,
+    /// The proofs this epoch is waiting on, at most one per prover. See
+    /// [`Proving`] for what one is, and [`Prover::route`] for what a prover is:
+    /// one card holds one GPU, so what a second card buys is a second proof in
+    /// flight and nothing else.
+    pending: Vec<Pending>,
 }
 
 impl EpochPipeline for StreamPipeline {
@@ -461,7 +483,7 @@ impl EpochPipeline for StreamPipeline {
             _ => {
                 // Every proof in flight was bound to the epoch being replaced,
                 // so none of it is worth collecting.
-                self.pending = None;
+                self.pending.clear();
                 Self::open(engine, target_epoch).await?
             }
         };
@@ -480,11 +502,77 @@ impl EpochPipeline for StreamPipeline {
         // Dropping the handle detaches the task rather than stopping it —
         // nothing interrupts a proof already on a blocking thread — but the
         // task writes nothing, so what it leaves behind is prover time.
-        self.pending = None;
+        self.pending.clear();
     }
 }
 
 impl StreamPipeline {
+    /// Whether a proof this pipeline started is on the prover `stage` routes
+    /// to. One prover is one card and one GPU, so a second proof sent there
+    /// would queue behind the first rather than run beside it.
+    fn busy(&self, prover: &dyn Prover, stage: Stage) -> bool {
+        let route = prover.route(stage);
+        self.pending
+            .iter()
+            .any(|pending| prover.route(pending.stage()) == route)
+    }
+
+    /// How far the epoch will be proved once what is in flight has landed,
+    /// which is where the next group starts. A fold that has not landed still
+    /// covers the units it was handed.
+    fn proved_ahead(&self, aggregator: &StreamAggregator) -> usize {
+        self.pending
+            .iter()
+            .filter_map(|pending| match pending {
+                Pending::Fold { proved, .. } => Some(*proved),
+                _ => None,
+            })
+            .fold(aggregator.proved, usize::max)
+    }
+
+    /// Whether the tick has to stop at the settle, or may carry on and put work
+    /// on a prover that is free.
+    ///
+    /// It may carry on for exactly one shape: a fold, on a prover the group
+    /// stage does not share. A fold is the one proof nothing else in the epoch
+    /// waits behind — the next group covers units the fold was already handed,
+    /// and the trigger will not fire while anything is in flight — so proving
+    /// that group beside it is the concurrency a second card buys. A group in
+    /// flight is the group the trigger would fire on and the final proof is the
+    /// epoch, so either of those is still a return.
+    fn blocked(&self, prover: &dyn Prover) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        !self
+            .pending
+            .iter()
+            .all(|pending| matches!(pending, Pending::Fold { .. }))
+            || self.busy(prover, Stage::Group)
+    }
+
+    /// Wait for what is in flight, but never past `within`, and hand back
+    /// whatever landed.
+    ///
+    /// One budget across all of them rather than one each: the interval exists
+    /// so that the loop gets back to refreshing the head, and a pipeline
+    /// holding two proofs must not take twice as long to do it. A proof that
+    /// lands while another is being waited on is still collected — a settled
+    /// handle answers a wait of no length at all — one tick later at worst.
+    async fn settle(&mut self, within: Duration) -> Vec<Pending> {
+        let deadline = Instant::now() + within;
+        for pending in &mut self.pending {
+            pending
+                .settle(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        let (landed, waiting) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(Pending::landed);
+        self.pending = waiting;
+        landed
+    }
+
     /// One tick of the epoch in flight, under the span that names it.
     async fn drive_epoch<A: BeaconApi + ChainStatusApi>(
         &mut self,
@@ -543,13 +631,14 @@ impl StreamPipeline {
             }
         }
 
-        // A proof started on an earlier tick. Until it lands the pipeline must
-        // not start another — one prover proves one thing at a time — so a tick
-        // that finds one still running does the work that does not need the
-        // prover and returns. Asking again for the next epoch's opening proofs
-        // is the whole point of returning: this tick is short, so the head it
-        // asks against is current, and a boundary that did not exist when the
-        // epoch opened exists by now.
+        // Proofs started on earlier ticks. One prover proves one thing at a
+        // time, so a tick may not start a second proof on a prover that is
+        // already busy — but that is a bound per prover and not per pipeline,
+        // and a tick blocked on every prover it needs does the work that needs
+        // no prover and returns. Asking again for the next epoch's opening
+        // proofs is the whole point of returning: this tick is short, so the
+        // head it asks against is current, and a boundary that did not exist
+        // when the epoch opened exists by now.
         //
         // A tick that *collects* a group carries on past this point instead of
         // returning, and that is what keeps the trigger from being consulted
@@ -564,17 +653,27 @@ impl StreamPipeline {
         // final proof verifies the group directly if it is not folded — so the
         // decision belongs to the branch that knows whether the epoch is
         // justifiable, which is below.
-        if let Some(mut pending) = self.pending.take() {
-            if !pending.settle(engine.config.trigger_interval).await {
+        if !self.pending.is_empty() {
+            let mut landed = self
+                .settle(engine.config.trigger_interval)
+                .await
+                .into_iter();
+            loop {
+                let Some(pending) = landed.next() else { break };
+                let Some(collected) = self.collect(engine, aggregator, pending, tick).await? else {
+                    // Anything else that landed is still this epoch's and is
+                    // collected by the tick after this one, which is the tick
+                    // that knows what the trigger decided about it.
+                    self.pending.extend(landed);
+                    return Ok(());
+                };
+                aggregator = collected;
+            }
+            if self.blocked(engine.prover.as_ref()) {
                 engine.speculate(target_epoch + 1).await;
-                self.pending = Some(pending);
                 self.aggregator = Some(aggregator);
                 return Ok(());
             }
-            let Some(collected) = self.collect(engine, aggregator, pending, tick).await? else {
-                return Ok(());
-            };
-            aggregator = collected;
         }
 
         // A reorg can take the checkpoint out from under an epoch that is
@@ -604,7 +703,12 @@ impl StreamPipeline {
         let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
 
         let enough = held.balance as u128 >= policy.target_balance(total);
-        let fire = enough && !aggregator.worth_waiting(&policy, held.filling);
+        // Never while anything is still in flight. A fold holds the aggregate
+        // the final proof binds and a group holds units the tail would cut
+        // across, so the tick that collects the last of them is the tick that
+        // may fire — one trigger interval later at worst.
+        let fire =
+            enough && self.pending.is_empty() && !aggregator.worth_waiting(&policy, held.filling);
         aggregator.last_filling = held
             .filling
             .map(|(slot, named, aggregates)| (Instant::now(), slot, named, aggregates));
@@ -636,15 +740,31 @@ impl StreamPipeline {
             // would sit between the chain crossing and the daemon seeing it and
             // take nothing off the critical path in exchange, and a group would
             // become a recursion child of slots the tail carries inline.
+            //
+            // Each on the prover its own stage routes to, and only if that
+            // prover is free — a second proof sent to a busy card queues behind
+            // the first rather than running beside it, which is the whole
+            // difference a second card makes.
             if !enough {
-                if let Some((proved, group)) = aggregator.unfolded.take() {
-                    self.pending = Some(Self::start_fold(engine, &mut aggregator, proved, group));
-                } else if aggregator.proved < aggregator.units.len() {
-                    self.pending = Some(Pending::Group(Self::start_group(
-                        engine,
-                        &aggregator,
-                        aggregator.proved..aggregator.units.len(),
-                    )));
+                let held_group = aggregator.unfolded.is_some();
+                if let Some((proved, group)) = aggregator
+                    .unfolded
+                    .take_if(|_| !self.busy(engine.prover.as_ref(), Stage::Aggregate))
+                {
+                    self.pending
+                        .push(Self::start_fold(engine, &mut aggregator, proved, group));
+                } else if !held_group && !self.busy(engine.prover.as_ref(), Stage::Group) {
+                    // From where the fold in flight will leave the epoch rather
+                    // than where it left it: the units it was handed are
+                    // already covered, and this group is the next ones.
+                    let proved = self.proved_ahead(&aggregator);
+                    if proved < aggregator.units.len() {
+                        self.pending.push(Pending::Group(Self::start_group(
+                            engine,
+                            &aggregator,
+                            proved..aggregator.units.len(),
+                        )));
+                    }
                 }
             }
             // Again here, and not only when the epoch opened. The boundary the
@@ -666,9 +786,9 @@ impl StreamPipeline {
                 engine.snapshot.state.attempted_epoch = Some(target_epoch);
                 engine.store.save(&engine.snapshot)?;
                 // Including whatever was being proved for it. An abandoned
-                // epoch has nobody left to collect that proof, and a loop that
+                // epoch has nobody left to collect those proofs, and a loop that
                 // waits for one nothing will collect never returns.
-                self.pending = None;
+                self.pending.clear();
                 tick.gave_up_on = Some(target_epoch);
             } else {
                 self.aggregator = Some(aggregator);
@@ -703,7 +823,7 @@ impl StreamPipeline {
         // final proof absorbs, so the fire path has nothing left to prove before
         // the one proof on `T2 - T`.
         let unfolded = aggregator.unfolded.take();
-        self.pending = Some(match unfolded {
+        self.pending.push(match unfolded {
             Some((_, group)) => Self::start_final(engine, &aggregator, Some(group), fired)?,
             None if aggregator.proved < tail.start => Pending::Late {
                 group: Self::start_group(engine, &aggregator, aggregator.proved..tail.start),
@@ -1080,7 +1200,8 @@ impl StreamPipeline {
             }
             Pending::Late { group, fired } => {
                 let group = Self::finish_group(engine, &aggregator, group, tick).await?;
-                self.pending = Some(Self::start_final(engine, &aggregator, Some(group), fired)?);
+                self.pending
+                    .push(Self::start_final(engine, &aggregator, Some(group), fired)?);
             }
             Pending::Final {
                 closing,
@@ -1390,7 +1511,7 @@ impl StreamPipeline {
     /// this so that [`super::Orchestrator::catch_up`] waits for work it asked
     /// for rather than returning half-done.
     pub(super) fn proving(&self) -> bool {
-        self.pending.is_some()
+        !self.pending.is_empty()
     }
 
     /// The epoch in flight, as the manifest reports it.
