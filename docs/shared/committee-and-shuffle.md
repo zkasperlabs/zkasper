@@ -66,8 +66,35 @@ Finality does not need the assignment proven and is unharmed by it. FCR cannot
 exist without it. It is one proof because splitting it would mean reading every
 leaf twice.
 
-## What is still open
+## What it costs: 44.2 s an epoch
 
-The **cost** of the shuffle inside the proof -- 90 rounds of swap-or-not over
-~2.34M validators -- and how much of it the existing scan absorbs. That number
-decides the fleet, not the design.
+Measured, not modelled. `crates/shuffle-bench-guest` computes each validator's
+assigned slot every way worth computing it, `V_SELFTEST` holds them all to a
+transcription of `compute_shuffled_index`, and the results were proved on an
+RTX 5090 over the **901,001-validator mainnet active set** -- the active set,
+not the 2.34M registry, because that is what `get_active_validator_indices`
+returns and what committees are formed from.
+
+| how the assignment is computed | proved |
+|---|---:|
+| `compute_shuffled_index` per validator, as the spec writes it | 10,207 s |
+| whole-set swap-or-not over a `u32` index array, what clients do | 115.3 s |
+| the same permutation over 5-bit slot labels | 91.7 s |
+| the same, bit-sliced into five bitplanes | **44.2 s** |
+
+44.2 s in a 384 s epoch is **11.5% of one card**, once an epoch, with a full
+epoch of lead time and zero marginal cost per slot proof.
+
+Two corrections to what this note used to say:
+
+- **The shuffle is not absorbed by the existing scan.** The 90 rounds are a pass
+  over their own array. All the committee scan shares is reading the finished
+  label out, which is 4.3 s of the 44.2 s -- 9.7%. The shuffle is additive, and
+  the reason to fuse it into the committee proof is the stage floor and the
+  recursive child it saves (39.3 s together), not the pass.
+- **It is not hash work.** Once each round's source block is shared 256 ways the
+  guest hashes 158,641 times an epoch, 6.1% of the cost. 60% of it is `Main`,
+  one row per executed instruction, so instruction count is the only lever.
+
+The campaign, the soundness bindings this drags in, and the sampled scheme that
+was measured and rejected are in `zkasper-pm/technical/shuffle-proof-cost.md`.

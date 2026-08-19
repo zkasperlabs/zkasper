@@ -7965,6 +7965,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkasper-shuffle-bench-guest"
+version = "0.1.0"
+dependencies = [
+ "ziskos",
+]
+
+[[package]]
 name = "zkasper-slot-proof-guest"
 version = "0.1.0"
 dependencies = [
