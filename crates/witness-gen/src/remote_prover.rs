@@ -129,6 +129,59 @@
 //! The token is sent in the clear, so run the link over a private network or a
 //! tunnel. It authenticates the client to the server; what protects the daemon
 //! from a bad server is `verify_child`, not the token.
+//!
+//! # The committee witness does not cross whole
+//!
+//! One stage pays for all of this. The committee witness measured **120,267,568
+//! bytes** on mainnet epoch 430529, and the committee card's link runs at 1.61
+//! MB/s — so the transfer alone was about 70 s of a round trip that took 201-214
+//! s, against a chain that crosses two thirds at +252 s and a serial floor of
+//! ~162 s. The daemon was opening the epoch at ~+255 s: just *after* the epoch it
+//! was opening had already crossed, and just the wrong side of a cliff where
+//! opening at ≤254.9 s costs the late group 0.1 s and opening at ≥256 s costs it
+//! 24-62 s. The margin was there; it was being spent on bytes.
+//!
+//! A faster link was the obvious answer and it is closed. Zisk overwrote
+//! `zisk-provingkey-1.1.0-alpha.tar.gz` at the same URL on 2026-08-19 with
+//! bucket versioning off, so a card provisioned today gets a different trusted
+//! setup and produces proofs our two cards cannot interoperate with. A
+//! replacement card measured 48.7 MB/s and proved invalid. **No new prover can
+//! be provisioned, so the transfer had to get smaller.**
+//!
+//! It is 95% public keys, and a validator's key never changes. So the server
+//! keeps them and [`Request::ProveCommittee`] names them by index, carrying only
+//! the epoch's own columns and whatever validators activated since. Measured on
+//! the same witness: **7,845,411 bytes**, or **15.3x** less, which is about 5 s
+//! of wire instead of 70. See [`crate::committee_cache`] for the encoding.
+//!
+//! Nothing about the proof changes. The server rebuilds the witness and hashes
+//! it against a digest the client computed over the bytes it would otherwise
+//! have sent, so the circuit is fed byte-identical input or it is fed nothing.
+//!
+//! # What a server that has forgotten the keys does
+//!
+//! It says so. That is the whole of the failure design, and it matters more than
+//! the saving: a cache that guessed would be a prover quietly proving a
+//! statement about a validator set nobody asked about.
+//!
+//! - **A restarted server** holds nothing. It reports that at the handshake, and
+//!   because a restart drops the connection there is always a handshake. The
+//!   client's belief is reconciled there and the next request carries the keys.
+//! - **A server that lost the table any other way**, or a second client that
+//!   replaced it, answers [`Reply::NeedMemberTable`]. It has reconstructed
+//!   nothing at that point. The client sends the keys and the epoch still lands,
+//!   one round trip later.
+//! - **A different server behind the same address** reports a table this end
+//!   cannot name. A reported digest is only ever grounds to *forget* — this end
+//!   can build on a table only if it knows what went into it — so that too falls
+//!   back to sending them. With `--prover-route committee=<second card>` the two
+//!   servers keep independent caches and neither is told about the other's.
+//! - **A daemon restart** forgets its own belief, so the first committee witness
+//!   of a run always carries the keys whatever the server says it holds.
+//!
+//! The table lives in server memory and nowhere else. It cannot outlive the
+//! process, because a table that survived a restart would be a claim about keys
+//! nothing in the new process ever saw.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -138,7 +191,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -154,6 +207,9 @@ use zkasper_common::types::{
 use zkasper_common::ChainConfig;
 
 use crate::artifacts::{now_unix_millis, write_atomic};
+use crate::committee_cache::{
+    self, CommitteeDelta, MemberCache, MemberTable, TableBelief, TableDigest,
+};
 use crate::prover::{NativeProver, Proof, ProveCost, Prover, Stage};
 
 /// Bumped when a frame changes meaning. A client and a server that disagree are
@@ -184,7 +240,16 @@ use crate::prover::{NativeProver, Proof, ProveCost, Prover, Stage};
 /// a different length, a different layout, and one a version-4 client would
 /// read a program key one word short of. Daemon and prover servers redeploy
 /// together.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// Version 6 is the committee member cache: [`Request`] gained
+/// `ProveCommittee`, [`Reply`] gained `NeedMemberTable`, and
+/// [`HelloReply::Ready`] gained the table the server is holding. This one has
+/// to be refused at the handshake rather than at the first proof. A version-5
+/// server reads the new request's discriminant as nothing it has, and a
+/// version-5 `HelloReply` read by a version-6 client leaves the client
+/// believing a plausible lie about which keys the far end holds — which is the
+/// one thing this whole scheme must never do.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Cap on one frame. The committee witness is about 115 MB; nothing else is
 /// close, and a length that claims more is a bad peer rather than a big proof.
@@ -213,13 +278,36 @@ pub enum HelloReply {
     Ready {
         prover: String,
         programs: Vec<ProgramInfo>,
+        /// The member table this server is holding, if any. A restarted server
+        /// holds none and says so here, which is the cheap way for the client
+        /// to learn it before it has spent an epoch's delta finding out.
+        member_table: Option<TableDigest>,
     },
     Rejected(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Prove { stage: Stage, witness: Vec<u8> },
+    Prove {
+        stage: Stage,
+        witness: Vec<u8>,
+    },
+    /// The committee witness, with the public keys named rather than sent. See
+    /// [`crate::committee_cache`] for what is in the columns and what the two
+    /// digests are each for.
+    ///
+    /// Its own variant rather than a flag on `Prove`, because it is the one
+    /// stage whose witness is worth the machinery: 96 of every 120 bytes of a
+    /// 120 MB witness is a key the far end already has.
+    ProveCommittee {
+        table: MemberTable,
+        /// Boxed only so a `Request` is small to move; bincode writes a `Box`
+        /// exactly as it writes what is in it, so the wire is unaffected.
+        delta: Box<CommitteeDelta>,
+        /// What the reconstruction must hash to. The server proves these bytes
+        /// or it proves nothing.
+        witness_digest: TableDigest,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,6 +319,11 @@ pub enum Reply {
     /// The server reached the witness and would not prove it. Retrying sends the
     /// same bytes to the same circuit, so the client does not.
     Failed(String),
+    /// The server does not hold the member table the request builds on, so it
+    /// has not reconstructed anything. Unlike [`Reply::Failed`] this says
+    /// nothing about the witness — it is the server refusing to guess at keys
+    /// it has never seen, and the client answers it by sending them.
+    NeedMemberTable,
 }
 
 fn write_frame<T: Serialize>(w: &mut impl Write, value: &T) -> Result<()> {
@@ -292,6 +385,14 @@ pub struct ServerConfig {
     /// client reconnects on its next proof, so this costs a handshake and not an
     /// epoch.
     pub idle_timeout: Duration,
+    /// The committee public keys this process is holding for its clients.
+    ///
+    /// Shared across connections and cloned by reference, because it belongs to
+    /// the process and not to the socket: a client that reconnects between
+    /// epochs must find its table still there, or the saving is one epoch in
+    /// two. It is process memory and nothing else, so it dies with the process
+    /// — see [`MemberCache`] on why that is the point rather than a limitation.
+    pub members: Arc<MemberCache>,
 }
 
 impl ServerConfig {
@@ -300,6 +401,7 @@ impl ServerConfig {
             token: token.into(),
             stages: stages.to_vec(),
             idle_timeout: Duration::from_secs(900),
+            members: Arc::new(MemberCache::new()),
         }
     }
 }
@@ -388,6 +490,7 @@ pub fn serve_client(
         &HelloReply::Ready {
             prover: prover.name().to_string(),
             programs,
+            member_table: config.members.digest(),
         },
     )?;
 
@@ -397,29 +500,99 @@ pub fn serve_client(
             Err(e) if is_disconnect(&e) => return Ok(()),
             Err(e) => return Err(e.context("read a request")),
         };
-        let Request::Prove { stage, witness } = request;
         let started = Instant::now();
-        let reply = match prove_stage(prover, stage, &witness) {
-            Ok(proof) => {
-                info!(
-                    stage = stage.as_str(),
-                    witness_bytes = witness.len(),
-                    words = proof.len(),
-                    millis = started.elapsed().as_millis() as u64,
-                    "proved for a client",
-                );
-                Reply::Proved {
-                    proof,
-                    cost: prover.last_cost().unwrap_or_default(),
+        let reply = match request {
+            Request::Prove { stage, witness } => {
+                answer(prover, stage, witness.len(), started, || {
+                    prove_stage(prover, stage, &witness)
+                })
+            }
+            Request::ProveCommittee {
+                table,
+                delta,
+                witness_digest,
+            } => match reconstruct(&config.members, &table, &delta, witness_digest) {
+                Ok(None) => {
+                    info!(
+                        holds_a_table = config.members.digest().is_some(),
+                        "a client named a member table this server does not hold; asking for it",
+                    );
+                    Reply::NeedMemberTable
                 }
-            }
-            Err(e) => {
-                warn!(stage = stage.as_str(), error = %format!("{e:#}"), "refused a witness");
-                Reply::Failed(format!("{e:#}"))
-            }
+                // The witness size is what was rebuilt and proven, not what the
+                // frame carried, so one log line still says what an epoch cost.
+                Ok(Some((witness, witness_bytes))) => {
+                    answer(prover, Stage::Committee, witness_bytes, started, || {
+                        Ok(prover.prove_committee(&witness)?.1)
+                    })
+                }
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "could not rebuild a committee witness");
+                    Reply::Failed(format!("{e:#}"))
+                }
+            },
         };
         write_frame(&mut stream, &reply).context("write a reply")?;
     }
+}
+
+/// Prove one witness and say on the log what it cost.
+fn answer(
+    prover: &dyn Prover,
+    stage: Stage,
+    witness_bytes: usize,
+    started: Instant,
+    prove: impl FnOnce() -> Result<Proof>,
+) -> Reply {
+    match prove() {
+        Ok(proof) => {
+            info!(
+                stage = stage.as_str(),
+                witness_bytes,
+                words = proof.len(),
+                millis = started.elapsed().as_millis() as u64,
+                "proved for a client",
+            );
+            Reply::Proved {
+                proof,
+                cost: prover.last_cost().unwrap_or_default(),
+            }
+        }
+        Err(e) => {
+            warn!(stage = stage.as_str(), error = %format!("{e:#}"), "refused a witness");
+            Reply::Failed(format!("{e:#}"))
+        }
+    }
+}
+
+/// Put the client's committee witness back together and check it is the one the
+/// client meant.
+///
+/// `Ok(None)` is the server not holding the table, which is a thing to ask for
+/// and not a fault. Everything else is: a digest that does not match means the
+/// bytes this server would prove are not the bytes the client computed its
+/// outputs from, and proving them would produce a proof of the wrong statement
+/// that verified against the right key. There is no recovering from that
+/// downstream, so it stops here.
+fn reconstruct(
+    cache: &MemberCache,
+    table: &MemberTable,
+    delta: &CommitteeDelta,
+    expected: TableDigest,
+) -> Result<Option<(CommitteeWitness, usize)>> {
+    let Some(witness) = cache.rebuild(table, delta)? else {
+        return Ok(None);
+    };
+    let bytes = bincode::serialize(&witness).context("re-serialize a committee witness")?;
+    let digest = committee_cache::witness_digest(&bytes);
+    ensure!(
+        digest == expected,
+        "the rebuilt committee witness hashes to {} and the client sent {}; \
+         this server's member table is not the one the client believes it has",
+        hex::encode(digest),
+        hex::encode(expected),
+    );
+    Ok(Some((witness, bytes.len())))
 }
 
 /// Deserialize a witness for `stage` and prove it.
@@ -588,6 +761,41 @@ struct Outage {
     gone: Option<String>,
 }
 
+/// One request, with whatever this end must keep in case the far end will not
+/// take it as sent.
+struct Delivery {
+    request: Request,
+    /// The whole witness, for a request that does not carry it. `None` when the
+    /// request is the witness and the spool can take it back out.
+    spool_bytes: Option<Vec<u8>>,
+    /// Every key, for a server that turns out to hold none of them. `None` for
+    /// a stage with no table, and for a request already carrying them all.
+    with_table: Option<MemberTable>,
+}
+
+impl Delivery {
+    /// How large the frame this sends is, near enough to judge against the cap
+    /// the far end reads with.
+    ///
+    /// Counted from the shapes rather than by serializing a copy or by walking
+    /// one: `bincode::serialized_size` visits a `Vec<u8>` a byte at a time, and
+    /// the largest witness a run sends is 916 MB of exactly that. It undercounts
+    /// by the frame's own headers, which is nothing against a 512 MB cap.
+    fn request_bytes(&self) -> usize {
+        match &self.request {
+            Request::Prove { witness, .. } => witness.len(),
+            Request::ProveCommittee { table, delta, .. } => {
+                table.len() * (8 + 96)
+                    + delta.index_gaps.len()
+                    + delta.slots.len()
+                    + delta.balance_ids.len()
+                    + delta.balances.len() * 8
+                    + delta.acc_multi_proof.auxiliaries.len() * 32
+            }
+        }
+    }
+}
+
 /// A witness the server never took, kept so the epoch can be proven late.
 #[derive(Debug, Serialize, Deserialize)]
 struct Spooled {
@@ -700,6 +908,11 @@ struct Inner {
     /// connection and must be able to record a failure it did take.
     outage: Mutex<Outage>,
     spool: Option<Mutex<Spool>>,
+    /// Which committee public keys the server is believed to be holding.
+    ///
+    /// Apart from `conn` because it is reconciled from inside `dial`, which
+    /// already holds that lock.
+    members: Mutex<TableBelief>,
     last_cost: Mutex<Option<ProveCost>>,
     counters: Counters,
     /// Unix millis of the last foreground proof, so the backfill can stay out of
@@ -727,7 +940,12 @@ impl RemoteProver {
     /// that a daemon restarted *during* an outage cannot start until the server
     /// is back; its supervisor retries, and the store is untouched.
     pub fn connect(config: RemoteProverConfig) -> Result<Self> {
-        let (stream, server, programs) = handshake(&config)?;
+        let Handshake {
+            stream,
+            server,
+            programs,
+            ..
+        } = handshake(&config)?;
         for &stage in &config.stages {
             if !programs.iter().any(|p| p.stage == stage) {
                 bail!(
@@ -766,6 +984,11 @@ impl RemoteProver {
             }),
             outage: Mutex::new(Outage::default()),
             spool,
+            // Empty whatever this server reports it holds: a table can only be
+            // built on by an end that knows what went into it, and a daemon
+            // that has just started knows nothing. The first committee witness
+            // of a run therefore carries the keys.
+            members: Mutex::new(TableBelief::default()),
             last_cost: Mutex::new(None),
             counters: Counters::default(),
             last_foreground: AtomicU64::new(now_unix_millis()),
@@ -830,7 +1053,16 @@ fn is_timeout(error: &anyhow::Error) -> bool {
 }
 
 /// Open a connection and learn what the server can prove.
-fn handshake(config: &RemoteProverConfig) -> Result<(TcpStream, String, Vec<ProgramInfo>)> {
+/// The connection, who answered it, what it can prove, and which member table
+/// it is holding.
+struct Handshake {
+    stream: TcpStream,
+    server: String,
+    programs: Vec<ProgramInfo>,
+    member_table: Option<TableDigest>,
+}
+
+fn handshake(config: &RemoteProverConfig) -> Result<Handshake> {
     let addr = config
         .addr
         .to_socket_addrs()
@@ -852,7 +1084,16 @@ fn handshake(config: &RemoteProverConfig) -> Result<(TcpStream, String, Vec<Prog
     )
     .context("send the handshake")?;
     match read_frame(&mut stream).context("read the handshake reply")? {
-        HelloReply::Ready { prover, programs } => Ok((stream, prover, programs)),
+        HelloReply::Ready {
+            prover,
+            programs,
+            member_table,
+        } => Ok(Handshake {
+            stream,
+            server: prover,
+            programs,
+            member_table,
+        }),
         HelloReply::Rejected(reason) => {
             bail!(
                 "the prover at {} refused this client: {reason}",
@@ -885,11 +1126,11 @@ impl Inner {
                 );
             }
             match handshake(&self.config) {
-                Ok((stream, server, programs)) => {
+                Ok(fresh) => {
                     // A server that came back with different ELFs is a different
                     // program to every proof already published against the old
                     // keys. Refuse it rather than silently switch.
-                    if programs != self.programs {
+                    if fresh.programs != self.programs {
                         link.retry_at = Some(Instant::now() + self.config.reconnect_backoff);
                         bail!(
                             "the prover at {} came back with different programs; \
@@ -897,8 +1138,19 @@ impl Inner {
                             self.config.addr,
                         );
                     }
-                    info!(addr = %self.config.addr, server, "reconnected to the prover server");
-                    link.stream = Some(stream);
+                    // Every reconnect is a chance that this is not the process
+                    // that took the last table — a restarted server, or another
+                    // one behind the same address. Whatever it says it holds,
+                    // anything but the table already believed puts this end
+                    // back to sending the keys whole.
+                    self.members.lock().unwrap().reconcile(fresh.member_table);
+                    info!(
+                        addr = %self.config.addr,
+                        server = fresh.server,
+                        member_table = fresh.member_table.is_some(),
+                        "reconnected to the prover server",
+                    );
+                    link.stream = Some(fresh.stream);
                     link.retry_at = None;
                 }
                 Err(e) => {
@@ -1030,7 +1282,55 @@ impl Inner {
         )
     }
 
+    /// The committee witness, with the keys named instead of sent.
+    ///
+    /// The witness is serialised here whatever happens, because its digest is
+    /// what the far end is held to and because those are the bytes the spool
+    /// wants if the link fails. What this saves is the *sending* of them.
+    fn prove_committee(&self, witness: &CommitteeWitness, publics: &[u8]) -> Result<Proof> {
+        let bytes = bincode::serialize(witness).context("serialize witness")?;
+        let Some(delta) = committee_cache::encode(witness) else {
+            // A witness the columns cannot carry. Nothing is wrong with it —
+            // `committee::build` does not produce this shape — so it goes whole
+            // rather than costing the epoch its proof.
+            warn!(
+                members = witness.members.len(),
+                "this committee witness does not pack into columns; sending it whole",
+            );
+            return self.prove_bytes(Stage::Committee, bytes, publics);
+        };
+        let table = self.members.lock().unwrap().plan(&witness.members);
+        let delivery = Delivery {
+            // A request already carrying every key has nothing to fall back to.
+            with_table: match table {
+                MemberTable::Full(_) => None,
+                MemberTable::Append { .. } => Some(MemberTable::full(&witness.members)),
+            },
+            request: Request::ProveCommittee {
+                table,
+                delta: Box::new(delta),
+                witness_digest: committee_cache::witness_digest(&bytes),
+            },
+            spool_bytes: Some(bytes),
+        };
+        self.deliver(Stage::Committee, delivery, publics)
+    }
+
     fn prove_bytes(&self, stage: Stage, witness: Vec<u8>, publics: &[u8]) -> Result<Proof> {
+        self.deliver(
+            stage,
+            Delivery {
+                request: Request::Prove { stage, witness },
+                spool_bytes: None,
+                with_table: None,
+            },
+            publics,
+        )
+    }
+
+    /// Send one request, and keep the epoch on any answer that leaves one to
+    /// keep.
+    fn deliver(&self, stage: Stage, mut delivery: Delivery, publics: &[u8]) -> Result<Proof> {
         // Already declared gone. Every stage from here is an error rather than
         // an empty proof, including one this call might have got through if the
         // card happened to be back: past the deadline the run has lost more
@@ -1049,11 +1349,12 @@ impl Inner {
         // a witness-only run gives: the daemon holds the outputs its own
         // circuits computed, so it keeps following the chain and the epoch is
         // published without a proof for this stage.
-        if witness.len() > self.config.max_request_bytes {
+        let request_bytes = delivery.request_bytes();
+        if request_bytes > self.config.max_request_bytes {
             self.note_unproven();
             warn!(
                 stage = stage.as_str(),
-                witness_bytes = witness.len(),
+                witness_bytes = request_bytes,
                 cap_bytes = self.config.max_request_bytes,
                 "this witness is larger than one frame and cannot be proven remotely",
             );
@@ -1062,8 +1363,46 @@ impl Inner {
         self.last_foreground
             .store(now_unix_millis(), Ordering::Relaxed);
         let started = Instant::now();
-        let request = Request::Prove { stage, witness };
+        let mut request = delivery.request;
         let mut result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+        // The server does not hold the member table this request names its keys
+        // out of, so it has reconstructed nothing and there is nothing here to
+        // retry -- only something to send. This is the whole recovery path for
+        // a prover that restarted, a second prover behind one address, and a
+        // table the far end took while the answer was lost on the way back.
+        //
+        // Once. A server that asks for the table it has just been sent is not
+        // one more send away from working.
+        if let Ok(Reply::NeedMemberTable) = &result {
+            match (&mut request, delivery.with_table.take()) {
+                (Request::ProveCommittee { table, .. }, Some(every_key)) => {
+                    info!(
+                        addr = %self.config.addr,
+                        keys = every_key.len(),
+                        "the prover is not holding this run's member table; sending the keys",
+                    );
+                    *table = every_key;
+                    result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+                }
+                // Either a stage with no table asked for one, or the request
+                // already carried every key. Neither is one more send away
+                // from working.
+                _ => bail!(
+                    "the prover at {} asked for a member table that was already sent",
+                    self.config.addr,
+                ),
+            }
+        }
+        // The server applies a table update before it does anything else, so
+        // any answer but the one above is proof it took these keys. Recorded
+        // even when the witness was then refused: what the far end holds and
+        // what it made of the witness are two different facts, and conflating
+        // them costs a full table on the epoch after every refusal.
+        if matches!(&result, Ok(reply) if !matches!(reply, Reply::NeedMemberTable)) {
+            if let Request::ProveCommittee { table, .. } = &request {
+                self.members.lock().unwrap().adopt(table);
+            }
+        }
         // A refused witness is offered once more, and once only.
         //
         // The circuit said no, which is usually the witness: the same bytes
@@ -1093,11 +1432,31 @@ impl Inner {
             // already does. Another card is no better: `--prover-route` sets
             // each server up for exactly the stages it is routed, so the other
             // one holds no program this witness could be proven against.
+            //
+            // The same witness, but not the same table: the first ask handed
+            // over whatever keys it carried, so naming the base it was built on
+            // would name a table the server has already moved off, and the
+            // second ask would come back asking for keys instead of judging the
+            // witness. That would cost the run the one thing the second ask is
+            // for -- telling a sick prover from a bad witness.
+            if let Request::ProveCommittee { table, .. } = &mut request {
+                if let Some(settled) = self.members.lock().unwrap().settled() {
+                    *table = settled;
+                }
+            }
             result = self.attempt(&mut self.conn.lock().unwrap(), &request);
             let outcome = match &result {
                 Ok(Reply::Proved { .. }) => "proved; the prover was the fault and not the witness",
                 Ok(Reply::Failed(_)) => {
                     "refused again; the witness is what the circuit will not take"
+                }
+                // The second ask named the table the server had just taken,
+                // so a server asking for it again is one that stopped holding
+                // it between the two asks -- a prover restarting under the
+                // run, which is also the likeliest reading of the refusal that
+                // came before it.
+                Ok(Reply::NeedMemberTable) => {
+                    "asked for the member table; the prover restarted between the two"
                 }
                 Err(_) => "unanswered; the link went before the circuit could say",
             };
@@ -1149,8 +1508,47 @@ impl Inner {
             // A witness refused once and then unanswered lands here too: the
             // link is what failed the second time, and a spooled witness the
             // circuit refuses again is dropped by the backfill.
+            // Asked for the table on an ask that could name no fresher one:
+            // either the keys had just been sent whole, or a refusal's second
+            // ask named the table the server had taken a moment earlier. Both
+            // read as a prover restarting under the run, and neither is one
+            // more send away from working. The epoch is lost; the next one
+            // starts from a belief the handshake has cleared.
+            Ok(Reply::NeedMemberTable) => bail!(
+                "the prover at {} asked for a member table it had just been given; \
+                 it is restarting under the run",
+                self.config.addr,
+            ),
+            // The server is not there. Keep the witness, and hand back the empty
+            // proof a witness-only run would: the daemon has its own outputs, so
+            // it keeps following the chain and the epoch is published without a
+            // proof rather than not published at all.
+            //
+            // Unless it has been not there for `unreachable_deadline`, at which
+            // point it is gone rather than away and the witness is worth keeping
+            // for the next run but not worth carrying on for. The error goes up
+            // the orchestrator's `?` chain and out of the process, which is the
+            // only way the supervisor gets to say it is not restarting.
+            //
+            // A witness refused once and then unanswered lands here too: the
+            // link is what failed the second time, and a spooled witness the
+            // circuit refuses again is dropped by the backfill.
+            //
+            // The spool always takes the witness whole, whatever shape the
+            // request was. A witness that has waited out an outage is being
+            // proven by the backfill against whatever server is there by then,
+            // and one that names keys is one that would have to name them to a
+            // server that has never heard of this run.
             Err(e) => {
-                let Request::Prove { witness, .. } = request;
+                let witness =
+                    delivery.spool_bytes.unwrap_or_else(|| match request {
+                        Request::Prove { witness, .. } => witness,
+                        // Built only by `prove_committee`, which had to serialize
+                        // the witness to hash it and hands those same bytes over.
+                        Request::ProveCommittee { .. } => unreachable!(
+                            "a cached request is delivered with the witness it stands for",
+                        ),
+                    });
                 self.spool(stage, witness, publics, &e);
                 match self.gone() {
                     Some(why) => Err(e.context(why)),
@@ -1288,6 +1686,17 @@ impl Inner {
                 );
                 spool.lock().unwrap().pop(&self.counters);
             }
+            // The backfill sends every witness whole and names no keys, so
+            // there is no table for a server to be missing. Dropped rather
+            // than retried: a server answering this to a witness that asked
+            // nothing of its cache will answer it again.
+            Reply::NeedMemberTable => {
+                warn!(
+                    stage = entry.stage.as_str(),
+                    "the prover asked for a member table for a witness that was sent whole",
+                );
+                spool.lock().unwrap().pop(&self.counters);
+            }
         }
         Ok(())
     }
@@ -1372,7 +1781,7 @@ impl Prover for RemoteProver {
         let (output, _) = self.native.prove_committee(witness)?;
         let proof = self
             .inner
-            .prove(Stage::Committee, witness, &output.public_bytes())?;
+            .prove_committee(witness, &output.public_bytes())?;
         Ok((output, proof))
     }
 

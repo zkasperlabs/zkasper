@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use common::stream_fixture;
 
-use zkasper_common::types::SlotProofWitness;
+use zkasper_common::types::{CommitteeWitness, SlotProofWitness};
 use zkasper_common::ChainConfig;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
+use zkasper_witness_gen::committee_cache::{self, MemberCache, MemberTable};
 use zkasper_witness_gen::prover::{NativeProver, Prover, Stage};
 use zkasper_witness_gen::remote_prover::{
     serve_client, Hello, HelloReply, ProgramInfo, RemoteProver, RemoteProverConfig, Reply, Request,
@@ -69,6 +70,9 @@ struct Server {
     stages: Vec<Stage>,
     running: Arc<AtomicBool>,
     open: Arc<Mutex<Vec<TcpStream>>>,
+    /// The keys this instance is holding. Replaced by `start`, so `restart`
+    /// forgets them exactly as a new process would.
+    members: Arc<MemberCache>,
 }
 
 impl Server {
@@ -88,6 +92,7 @@ impl Server {
             stages: stages.to_vec(),
             running: Arc::new(AtomicBool::new(false)),
             open: Arc::new(Mutex::new(Vec::new())),
+            members: Arc::new(MemberCache::new()),
         };
         server.start();
         server
@@ -100,7 +105,11 @@ impl Server {
         self.open = Arc::new(Mutex::new(Vec::new()));
         let running = self.running.clone();
         let open = self.open.clone();
-        let config = ServerConfig::new(TOKEN, &self.stages);
+        self.members = Arc::new(MemberCache::new());
+        let config = ServerConfig {
+            members: self.members.clone(),
+            ..ServerConfig::new(TOKEN, &self.stages)
+        };
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -580,6 +589,7 @@ impl EmptyProver {
                     let ready = HelloReply::Ready {
                         prover: "a prover that answers with nothing".to_string(),
                         programs,
+                        member_table: None,
                     };
                     if write_frame(&mut stream, &ready).is_err() {
                         return;
@@ -723,6 +733,7 @@ impl FickleProver {
                     let ready = HelloReply::Ready {
                         prover: "a prover that is sick and then is not".to_string(),
                         programs,
+                        member_table: None,
                     };
                     if write_frame(&mut stream, &ready).is_err() {
                         return;
@@ -934,9 +945,16 @@ fn refuses_a_server_without_the_stages_this_run_needs() {
 /// 5 is the proof itself: children are uncompressed `vadcop_final` proofs now,
 /// so the program key sits one word later and a version-4 peer would read a
 /// plausible lie out of the bytes rather than fail to parse them.
+///
+/// 6 is the committee member cache: a new `Request`, a new `Reply`, and a
+/// `HelloReply` that reports which keys the server is holding. The last of
+/// those is why this one cannot wait to be discovered at the first proof — a
+/// version-5 `HelloReply` read by a version-6 client leaves the client
+/// believing a server holds keys it has never seen, which is the one mistake
+/// the cache exists to make impossible.
 #[test]
 fn the_protocol_version_is_checked() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
 }
 
 /// Against a real prover server, holding a real warm prover.
@@ -1142,4 +1160,320 @@ fn count(dir: &Path, extension: &str) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// The committee member cache
+// ---------------------------------------------------------------------------
+//
+// The committee witness is 95% public keys the far end already has, and the
+// link is 1.61 MB/s. These cover the three things that have to hold for the
+// keys to be left there safely: they cross once, a server that has forgotten
+// them says so, and a witness rebuilt out of the wrong ones is refused rather
+// than proven.
+
+const COMMITTEE_STAGES: &[Stage] = &[Stage::Committee];
+
+fn committee_witness() -> CommitteeWitness {
+    stream_fixture(ACC_DEPTH).epoch.committees.witness.clone()
+}
+
+fn committee_client(addr: &str) -> RemoteProverConfig {
+    RemoteProverConfig {
+        stages: COMMITTEE_STAGES.to_vec(),
+        ..client(addr, None)
+    }
+}
+
+/// What one `ProveCommittee` request carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sent {
+    every_key: bool,
+    keys: usize,
+    frame_bytes: usize,
+}
+
+/// A server that records what it is sent, and can be told to forget the keys
+/// without dropping the connection.
+///
+/// It answers with the empty proof, which the client takes because no ELF
+/// digest is offered — the same shape as a witness-only server. What is under
+/// test here is the wire and not the cryptography.
+struct Recorder {
+    addr: String,
+    sent: Arc<Mutex<Vec<Sent>>>,
+    forget: Arc<AtomicBool>,
+}
+
+impl Recorder {
+    fn bind() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let native = NativeProver::new(chain());
+        let programs: Vec<ProgramInfo> = COMMITTEE_STAGES
+            .iter()
+            .map(|&stage| ProgramInfo {
+                stage,
+                vk: native.program_vk(stage),
+                elf_sha256: None,
+            })
+            .collect();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let forget = Arc::new(AtomicBool::new(false));
+        let (recorded, forgotten) = (sent.clone(), forget.clone());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let programs = programs.clone();
+                let recorded = recorded.clone();
+                let forgotten = forgotten.clone();
+                std::thread::spawn(move || {
+                    let Ok(hello) = read_frame::<Hello>(&mut stream) else {
+                        return;
+                    };
+                    assert_eq!(hello.version, PROTOCOL_VERSION);
+                    let ready = HelloReply::Ready {
+                        prover: "a prover that writes down what it is sent".to_string(),
+                        programs,
+                        member_table: None,
+                    };
+                    if write_frame(&mut stream, &ready).is_err() {
+                        return;
+                    }
+                    while let Ok(request) = read_frame::<Request>(&mut stream) {
+                        let frame_bytes = bincode::serialized_size(&request).unwrap() as usize;
+                        let Request::ProveCommittee { table, .. } = &request else {
+                            panic!("the committee stage should not be sent whole");
+                        };
+                        recorded.lock().unwrap().push(Sent {
+                            every_key: matches!(table, MemberTable::Full(_)),
+                            keys: table.len(),
+                            frame_bytes,
+                        });
+                        // Forgotten once, so the client's answer to it is what
+                        // the next frame shows.
+                        let reply = if forgotten.swap(false, Ordering::Relaxed) {
+                            Reply::NeedMemberTable
+                        } else {
+                            Reply::Proved {
+                                proof: Vec::new(),
+                                cost: Default::default(),
+                            }
+                        };
+                        if write_frame(&mut stream, &reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { addr, sent, forget }
+    }
+
+    fn sent(&self) -> Vec<Sent> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// The keys cross once. Everything after is the epoch's own columns.
+///
+/// This is the whole point of the change: at 1.61 MB/s the committee witness
+/// was 70 s of wire on a budget with 90 s of margin, and it opened the epoch
+/// just after the chain had already crossed two thirds.
+#[test]
+fn a_cold_prover_is_sent_every_key_and_a_warm_one_is_not() {
+    let server = Recorder::bind();
+    let prover = RemoteProver::connect(committee_client(&server.addr)).expect("connect");
+    let witness = committee_witness();
+
+    prover.prove_committee(&witness).expect("the first epoch");
+    prover.prove_committee(&witness).expect("the second epoch");
+
+    let sent = server.sent();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].every_key, "a cold server is sent the table");
+    assert_eq!(sent[0].keys, witness.members.len());
+    assert!(!sent[1].every_key, "a warm server is not");
+    assert_eq!(sent[1].keys, 0, "and nothing activated between the two");
+    assert!(
+        sent[1].frame_bytes * 4 < sent[0].frame_bytes,
+        "the warm epoch should be a fraction of the cold one: {sent:?}",
+    );
+}
+
+/// A server that has forgotten the keys says so, and is sent them.
+///
+/// The connection is deliberately kept up, because this is the case the
+/// handshake cannot cover: a prover restarted between two epochs is caught when
+/// the client redials, but one that lost its table any other way is only ever
+/// found out by asking it to use it.
+#[test]
+fn a_prover_that_forgot_the_keys_is_sent_them_again() {
+    let server = Recorder::bind();
+    let prover = RemoteProver::connect(committee_client(&server.addr)).expect("connect");
+    let witness = committee_witness();
+
+    prover.prove_committee(&witness).expect("the first epoch");
+    server.forget.store(true, Ordering::Relaxed);
+    prover
+        .prove_committee(&witness)
+        .expect("the epoch still lands after the keys are asked for again");
+
+    let sent = server.sent();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(sent[0].every_key, "cold");
+    assert!(!sent[1].every_key, "warm, and refused");
+    assert!(sent[2].every_key, "so the keys go again");
+    assert_eq!(sent[2].keys, witness.members.len());
+
+    // And the run is warm again afterwards rather than stuck resending.
+    prover.prove_committee(&witness).expect("the third epoch");
+    assert!(!server.sent()[3].every_key, "{:?}", server.sent());
+}
+
+/// A restarted prover is sent the keys off the handshake, without spending an
+/// epoch's columns to find out.
+#[test]
+fn a_restarted_prover_is_sent_the_keys_without_asking() {
+    let mut server = Server::bind_with(COMMITTEE_STAGES);
+    let prover = RemoteProver::connect(committee_client(&server.addr)).expect("connect");
+    let witness = committee_witness();
+
+    prover.prove_committee(&witness).expect("the first epoch");
+    let held = server.members.digest().expect("the server took the keys");
+
+    // A new process on the same address, holding nothing.
+    server.stop();
+    server.restart();
+    assert_eq!(server.members.digest(), None, "a restart forgets the table");
+
+    prover
+        .prove_committee(&witness)
+        .expect("the epoch after a prover restart");
+    assert_eq!(
+        server.members.digest(),
+        Some(held),
+        "the same keys, so the same table",
+    );
+}
+
+/// Two servers, two caches, and neither one's table is the other's.
+///
+/// `--prover-route committee=<second card>` puts the committee stage on its own
+/// server, and a daemon that fails over to another one must send it the keys
+/// rather than name a table that server has never held.
+#[test]
+fn a_second_prover_gets_its_own_table() {
+    let first = Server::bind_with(COMMITTEE_STAGES);
+    let second = Server::bind_with(COMMITTEE_STAGES);
+    let witness = committee_witness();
+
+    let to_first = RemoteProver::connect(committee_client(&first.addr)).expect("connect");
+    to_first.prove_committee(&witness).expect("the first card");
+
+    let to_second = RemoteProver::connect(committee_client(&second.addr)).expect("connect");
+    to_second
+        .prove_committee(&witness)
+        .expect("the second card");
+
+    assert_eq!(
+        first.members.digest(),
+        second.members.digest(),
+        "the same keys either side, because it is the same epoch",
+    );
+    // Each card was sent them, rather than one being told the other holds them.
+    assert!(first.members.digest().is_some());
+    assert!(second.members.digest().is_some());
+}
+
+/// A witness rebuilt out of keys the client did not use is refused, not proven.
+///
+/// This is the backstop the whole scheme rests on. Everything above is about
+/// keeping the far end's table right; this is what happens when it is wrong
+/// anyway. The server hashes what it rebuilt against the digest the client
+/// computed over the bytes it would have sent, so the alternative to a matching
+/// digest is a refusal and never a proof of something else.
+#[test]
+fn a_rebuilt_witness_that_does_not_hash_to_the_clients_is_refused() {
+    let server = Server::bind_with(COMMITTEE_STAGES);
+    let witness = committee_witness();
+    let delta = committee_cache::encode(&witness).expect("it encodes");
+    let table = MemberTable::full(&witness.members);
+
+    // The witness the client is claiming, which is not the one the columns
+    // describe. A stale table on the far end lands in exactly this shape.
+    let mut other = committee_witness();
+    other.total_active_balance += 1;
+    let claimed = committee_cache::witness_digest(&bincode::serialize(&other).unwrap());
+
+    let mut stream = TcpStream::connect(&server.addr).unwrap();
+    write_frame(
+        &mut stream,
+        &Hello {
+            version: PROTOCOL_VERSION,
+            token: TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    let reply: HelloReply = read_frame(&mut stream).unwrap();
+    assert!(matches!(reply, HelloReply::Ready { .. }));
+
+    write_frame(
+        &mut stream,
+        &Request::ProveCommittee {
+            table,
+            delta: Box::new(delta),
+            witness_digest: claimed,
+        },
+    )
+    .unwrap();
+    match read_frame::<Reply>(&mut stream).unwrap() {
+        Reply::Failed(reason) => assert!(
+            reason.contains("not the one the client believes"),
+            "the refusal should name the fault: {reason}",
+        ),
+        other => panic!("a witness that does not hash to its digest was not refused: {other:?}"),
+    }
+}
+
+/// The far end can still be sent a committee witness whole, and it proves the
+/// same thing.
+///
+/// The spool drains that way — a witness that waited out an outage names no
+/// keys, because the server it eventually reaches has never heard of this run.
+#[test]
+fn a_committee_witness_sent_whole_is_still_served() {
+    let server = Server::bind_with(COMMITTEE_STAGES);
+    let witness = committee_witness();
+
+    let mut stream = TcpStream::connect(&server.addr).unwrap();
+    write_frame(
+        &mut stream,
+        &Hello {
+            version: PROTOCOL_VERSION,
+            token: TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    let _: HelloReply = read_frame(&mut stream).unwrap();
+
+    write_frame(
+        &mut stream,
+        &Request::Prove {
+            stage: Stage::Committee,
+            witness: bincode::serialize(&witness).unwrap(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            read_frame::<Reply>(&mut stream).unwrap(),
+            Reply::Proved { .. }
+        ),
+        "a whole committee witness should still prove",
+    );
+    assert_eq!(
+        server.members.digest(),
+        None,
+        "and it should not have put anything in the cache",
+    );
 }
