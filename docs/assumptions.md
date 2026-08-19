@@ -106,6 +106,59 @@ attested to.
 
 ## 2. What the circuits trust
 
+### Is the shuffle necessary? Yes to compute, no to prove
+
+**Settled. Do not reopen without new evidence** -- this gets asked repeatedly
+because the two halves are easy to confuse for each other.
+
+**Computing it: necessary.** The host must use the real swap-or-not shuffle. A
+validator's signature is over AttestationData, which contains the **slot**, so a
+bucket can only pair against a message its members actually signed. Feed the
+circuit a made-up assignment and the multi-pairing fails and **no proof comes
+out**. The shuffle is not optional anywhere in this system.
+
+**Proving it: not necessary.** The circuit does not recompute the shuffle and
+does not bind the RANDAO seed, and this costs nothing in soundness.
+
+#### The objection, stated plainly
+
+*"Without checking the shuffle, a validator can fake attestations into whatever
+slot they like."*
+
+They can sign for a slot they were not assigned -- nothing prevents producing
+that signature, and Ethereum would reject the attestation where this circuit
+accepts it. **It gains them nothing**, because the quantity proved is a sum over
+*validators*, not over slots:
+
+- **Counting one validator twice is blocked by disjointness.** Leaves are
+  consumed in strictly increasing index order, so each validator lands in exactly
+  one bucket whatever the witness claims. Moving someone from bucket 5 to bucket
+  7 adds no balance; it is the same validator, counted once either way.
+- **Counting a validator who did not sign is blocked by the pairing.** It forces
+  the bucket minus its absentees to be exactly the signers of that slot's
+  message. Pad a bucket with a non-signer and the aggregate key comes out wrong;
+  name them as an absentee and their balance is subtracted anyway.
+- **Moving balance away from a key is blocked by the leaf.** One Poseidon2 hash
+  over pubkey and active effective balance, summed in the same pass, so a
+  validator cannot lend its key to one total and a different balance to the other.
+
+The adversary's own stake counts once whichever bucket it sits in, and honest
+stake is untouched. No arrangement of buckets inflates the total.
+
+#### What it means precisely
+
+The proof establishes **"validators holding at least two thirds of active stake
+signed this target"**. It does **not** establish "Ethereum's fork choice
+justified this epoch under its own committee rule". Those coincide whenever
+validators attest in their assigned slots, which honest validators always do. An
+adversary attesting off-slot produces something Ethereum discards and this
+circuit counts -- and still cannot inflate the total.
+
+A consumer needing the second statement rather than the first would require the
+shuffle bound in circuit, and this section would stop applying. **Nobody has
+asked for that**, and it would put 90 rounds of swap-or-not over a million
+validators on the prover.
+
 ### Committee assignment is unproven witness
 
 **This is the subtlest assumption in the system, and it is deliberate.** The
