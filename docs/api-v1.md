@@ -320,7 +320,7 @@ everything here also arrives on `/v1/live` as a `status` event.
 Recent epochs, newest first.
 
 Query: `limit` (default 50, max 200), `before` (return epochs strictly below this
-number, for paging), `status` (`proven`, `proving`, `abandoned`).
+number, for paging), `status` (`proven`, `unproven`, `proving`, `abandoned`).
 
 ```json
 {
@@ -351,11 +351,25 @@ number, for paging), `status` (`proven`, `proving`, `abandoned`).
 
 `status`:
 - `proving` — open, no final proof yet. `latency`, `finalized` and `proof` are null.
-- `proven` — a final proof exists.
+- `proven` — a final proof exists. `proof.available` is true and `proof.bytes` is
+  above zero, always: `proven` is a claim about bytes you can fetch and check,
+  and nothing else.
+- `unproven` — the epoch closed without a proof. Everything else about it is
+  real — the checkpoints, the accumulator link, the timings — but `proof` has
+  `available: false` and `/v1/proofs/{epoch}` will 404. Poll it as long as you
+  like; no proof is coming. A witness-only run publishes every epoch this way,
+  and so does a run whose prover was unreachable when the epoch closed.
 - `abandoned` — the chain never justified the checkpoint, or it reorged out from
   under the daemon. `abandoned_reason` says which.
 
-The first epoch of a run is `proven` with `finalized: null` and a `proof` whose
+`unproven` is separate from `abandoned` because the epoch is not in doubt, only
+its proof; and separate from a missing epoch because a hole is something you can
+see. It exists so that no epoch is ever `proven` with nothing behind it — that
+is the one fault a consumer cannot check for themselves, because an empty answer
+looks the same as their own mistake. Filter on `status=proven` and every row you
+get back has bytes.
+
+The first epoch of a run closes with `finalized: null` and a `proof` whose
 stage is `justification`. It has nothing before it to finalize — the epoch a run
 starts on has no previous justification to pair with — so a justification is the
 only proof it will ever have. Every epoch after it is closed by `stream_final`.
@@ -395,7 +409,7 @@ One epoch, with every stage that ran.
 
 `stages` is ordered by `started_unix_millis`. 404 for an epoch this daemon never
 opened. Cache: `public, max-age=5` while `proving`, `public, max-age=86400`
-once `proven` or `abandoned`.
+once `proven`, `unproven` or `abandoned`.
 
 ### What an epoch cost
 

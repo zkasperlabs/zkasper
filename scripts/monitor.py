@@ -216,13 +216,23 @@ def published_gaps():
             d = json.loads(r.read())
     except Exception as e:
         return check("chain", True, f"not checked: {e}")
-    nums = sorted(e["epoch"] for e in d.get("epochs", []) if e.get("status") == "proven")
+    epochs = d.get("epochs", [])
+    nums = sorted(e["epoch"] for e in epochs if e.get("status") == "proven")
+    # An epoch that closed without a proof is the same hole, published rather
+    # than absent. It is named apart because the two are fixed differently: a
+    # gap is an epoch the daemon never finished, and `unproven` is one it
+    # finished with no prover behind it.
+    unproven = sorted(e["epoch"] for e in epochs if e.get("status") == "unproven")
     if len(nums) < 2:
-        return check("chain", True, f"{len(nums)} proven, too few to judge")
-    missing = [n for n in range(nums[0], nums[-1]) if n not in set(nums)]
-    return check("chain", not missing,
+        return check("chain", not unproven,
+                     f"{len(nums)} proven, too few to judge"
+                     + (f", UNPROVEN {unproven}" if unproven else ""))
+    known = set(nums) | set(unproven)
+    missing = [n for n in range(nums[0], nums[-1]) if n not in known]
+    return check("chain", not missing and not unproven,
                  f"proven {nums[0]}-{nums[-1]}, "
-                 + (f"HOLES at {missing}" if missing else "contiguous"))
+                 + (f"HOLES at {missing}" if missing else "contiguous")
+                 + (f", UNPROVEN {unproven}" if unproven else ""))
 
 
 def main():

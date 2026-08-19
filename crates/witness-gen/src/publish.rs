@@ -379,7 +379,7 @@ impl Publisher {
             json!({
                 "summary": {
                     "epoch": closed.epoch,
-                    "status": "proven",
+                    "status": epoch_status(&closed.proof),
                     "chain": self.daemon.chain,
                     "pipeline": self.daemon.pipeline,
                     "prover": self.daemon.prover,
@@ -513,6 +513,35 @@ pub struct ClosedEpoch {
     pub latency: Option<Value>,
     pub proof: Value,
     pub public_inputs: Value,
+}
+
+/// What an epoch closed as, from the only thing that decides it: whether there
+/// are proof bytes.
+///
+/// `proven` is a claim about bytes and nothing else — that a consumer can fetch
+/// a proof and check it. An epoch the daemon followed and could not prove is
+/// `unproven`: a witness-only run, a prover that was not there, a witness too
+/// large for one frame. The epoch is otherwise whole, which is why it is still
+/// published rather than dropped — the checkpoints, the accumulator link and
+/// the timings are all real — but it has no proof and must not say it has.
+///
+/// Derived here rather than passed in so that it cannot disagree with the proof
+/// beside it in the same record. It was a literal `"proven"` until 2026-08-19,
+/// and mainnet epochs 469538 and 469539 published as proven with zero bytes
+/// against provers that had already exited. That is the failure this project
+/// says must never ship: a consumer asking for those proofs gets nothing back
+/// and has no way to tell a lying service from their own mistake.
+///
+/// Fail closed. A summary that cannot show bytes is not proven, whatever else
+/// it carries.
+pub fn epoch_status(proof: &Value) -> &'static str {
+    let available = proof.get("available").and_then(Value::as_bool) == Some(true);
+    let bytes = proof.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+    if available && bytes > 0 {
+        "proven"
+    } else {
+        "unproven"
+    }
 }
 
 /// What is published about a proof, apart from its bytes.

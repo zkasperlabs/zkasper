@@ -996,6 +996,19 @@ impl Inner {
         self.outage.lock().unwrap().gone.clone()
     }
 
+    /// A stage came back with no proof. The run carries on — the daemon holds
+    /// the outputs its own circuits computed — but nothing about this stage may
+    /// be reported as if a proof had been made.
+    ///
+    /// The cost is cleared as well as counted. `last_cost` is what the
+    /// orchestrator charges the stage that just ran, and leaving the last real
+    /// proof's figure in it charged mainnet epochs 469538 and 469539 a combined
+    /// 566 s of proving that never happened.
+    fn note_unproven(&self) {
+        *self.last_cost.lock().unwrap() = None;
+        self.counters.unproven.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn prove(&self, stage: Stage, witness: &impl Serialize, publics: &[u8]) -> Result<Proof> {
         self.prove_bytes(
             stage,
@@ -1024,7 +1037,7 @@ impl Inner {
         // circuits computed, so it keeps following the chain and the epoch is
         // published without a proof for this stage.
         if witness.len() > self.config.max_request_bytes {
-            self.counters.unproven.fetch_add(1, Ordering::Relaxed);
+            self.note_unproven();
             warn!(
                 stage = stage.as_str(),
                 witness_bytes = witness.len(),
@@ -1043,6 +1056,7 @@ impl Inner {
 
         match result {
             Ok(Reply::Proved { proof, cost }) => {
+                self.reject_empty(stage, &proof)?;
                 self.check(stage, &proof, publics)?;
                 *self.last_cost.lock().unwrap() = Some(cost);
                 self.counters.proved.fetch_add(1, Ordering::Relaxed);
@@ -1084,6 +1098,31 @@ impl Inner {
         }
     }
 
+    /// A reply of no words is not a proof, whatever the frame calls it.
+    ///
+    /// `check` will not catch one: off-target `verify_child` accepts an empty
+    /// proof so circuit logic can be exercised without a prover, which is right
+    /// for a guest and blind here. So the reply is judged on what the server
+    /// said it was at the handshake. No ELF digest means no ELF means no
+    /// prover — a witness-only server, whose empty answer is the documented
+    /// mode and the same non-answer an outage gives. A digest means it holds
+    /// the program for this stage and returned nothing anyway, which is a
+    /// fault, and one that would otherwise reach a consumer as a proven epoch
+    /// with no proof behind it.
+    ///
+    /// Raised rather than spooled, for the reason a refusal is: the same server
+    /// would answer a retry the same way.
+    fn reject_empty(&self, stage: Stage, proof: &Proof) -> Result<()> {
+        if !proof.is_empty() || self.program(stage).elf_sha256.is_none() {
+            return Ok(());
+        }
+        bail!(
+            "the prover at {} answered the {} witness with an empty proof",
+            self.config.addr,
+            stage.as_str(),
+        )
+    }
+
     /// A proof is only a proof if this end accepts it, under the key the
     /// handshake reported and the publics the local circuit committed.
     fn check(&self, stage: Stage, proof: &Proof, publics: &[u8]) -> Result<()> {
@@ -1098,7 +1137,7 @@ impl Inner {
     }
 
     fn spool(&self, stage: Stage, witness: Vec<u8>, publics: &[u8], error: &anyhow::Error) {
-        self.counters.unproven.fetch_add(1, Ordering::Relaxed);
+        self.note_unproven();
         let Some(spool) = &self.spool else {
             warn!(
                 stage = stage.as_str(),
@@ -1161,6 +1200,7 @@ impl Inner {
         };
         match self.attempt(&mut link, &request)? {
             Reply::Proved { proof, .. } => {
+                self.reject_empty(entry.stage, &proof)?;
                 self.check(entry.stage, &proof, &entry.publics)?;
                 let name = path
                     .file_stem()

@@ -343,6 +343,18 @@ async fn test_the_daemon_publishes_the_whole_run() {
         .collect();
     for closed in &closed_epochs {
         let summary = &closed["summary"];
+        // The whole run is witness-only, so every epoch of it closed with a
+        // proof reference and no proof. Saying `proven` over that is the fault
+        // that reaches a consumer as a 404 they cannot explain, and it is the
+        // real daemon publishing here rather than a test calling the publisher.
+        assert_eq!(
+            summary["proof"]["available"], false,
+            "the fixture has to be the case under test: {summary}",
+        );
+        assert_eq!(
+            summary["status"], "unproven",
+            "a run that proved nothing must not publish proven epochs: {summary}",
+        );
         assert!(
             summary["stage_count"].as_u64().is_some_and(|n| n > 0),
             "an epoch closed without any stages: {summary}",

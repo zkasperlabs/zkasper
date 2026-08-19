@@ -2,6 +2,7 @@
 // the SSE ring buffer, and (when no R2 bucket is bound) the proof blobs themselves.
 // There is exactly one daemon, so one object is the whole store.
 import { DurableObject } from "cloudflare:workers";
+import { proofAvailable, statusForProof } from "./status";
 
 const RING_EVENTS = 5000;
 const MAX_STREAMS = 200;
@@ -471,11 +472,13 @@ export class IndexDO extends DurableObject {
       }
       case "proof.landed": {
         if (epoch === null) return;
+        // A proof landing is not the same as a proof existing: a witness-only
+        // run and an outage both land a reference with no bytes behind it.
         const patch: Record<string, any> = {
           proof: this.jcol(d.proof),
           public_inputs: this.jcol(d.public_inputs),
           verify: this.jcol(d.verify),
-          status: "proven",
+          status: proofAvailable(d.proof) ? "proven" : "unproven",
         };
         if (d.latency && typeof d.latency === "object") patch.latency = JSON.stringify({ epoch, ...d.latency });
         this.setEpoch(epoch, patch);
@@ -484,9 +487,12 @@ export class IndexDO extends DurableObject {
       case "epoch.closed": {
         if (epoch === null) return;
         const s = d.summary && typeof d.summary === "object" ? d.summary : {};
+        // A summary need not repeat the proof an earlier proof.landed carried,
+        // so the stored one stands in when it does not.
+        const closingProof = s.proof ?? jparse(this.one("SELECT proof FROM epochs WHERE epoch = ?", epoch)?.proof);
         this.setEpoch(epoch, {
           summary: this.jcol(d.summary),
-          status: typeof s.status === "string" ? s.status : undefined,
+          status: statusForProof(s.status, closingProof),
           target_root: typeof s.target_root === "string" ? s.target_root : undefined,
           pipeline: typeof s.pipeline === "string" ? s.pipeline : undefined,
           prover: typeof s.prover === "string" ? s.prover : undefined,
@@ -723,7 +729,7 @@ export class IndexDO extends DurableObject {
       public_inputs: publicInputs,
       verify: this.verifyObject(r, proof, publicInputs),
     };
-    const settled = r.status === "proven" || r.status === "abandoned";
+    const settled = r.status === "proven" || r.status === "unproven" || r.status === "abandoned";
     return jsonResponse(body, {
       headers: { "cache-control": settled ? "public, max-age=86400" : "public, max-age=5" },
     });
