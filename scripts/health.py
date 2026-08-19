@@ -16,11 +16,6 @@ WHAT THE THRESHOLDS MEAN. Each is a claim about the deployment, not a taste:
                      interval otherwise. Two minutes of silence is a dead or
                      wedged daemon, and every other field is then untrustworthy.
 
-  gossip.dropped     The node's SSE ring overflowed and attestations are simply
-                     gone. Lighthouse reports it as an SSE comment and the
-                     daemon counts it. Anything but zero is a misconfigured
-                     node: raise --http-sse-capacity-multiplier. It is never
-                     bad luck and it never fixes itself.
 
   gossip absent      The daemon is reading attestations out of blocks, which is
                      a slot behind the chain by construction. Expected only

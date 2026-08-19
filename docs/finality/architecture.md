@@ -265,7 +265,6 @@ the node on the stable machine, and send witnesses over the network instead.
   Lighthouse with
   `--http-sse-capacity-multiplier 2000`. That is a whole slot of messages for
   about 24 MB of node memory. `zkasperd` counts the comments and publishes them
-  as `gossip.dropped`. Anything but zero there means the node is misconfigured.
 - **`/eth/v2/debug/beacon/states/{id}`.** Every epoch diff reads the whole
   `BeaconState` as SSZ from it, and so does the boundary anchor a finalization
   opens out of the justified checkpoint's `state_roots`. It is a continuous

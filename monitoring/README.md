@@ -60,7 +60,6 @@ histogram wherever the distribution is the point.
 
 | Metric | |
 |---|---|
-| `zkasper_gossip_dropped_total` | The node threw attestation events away because its own SSE channel overflowed. **The nastiest failure here**: the epoch is quietly short of weight and it looks exactly like a slow chain. It never self-heals. With the SSE ring sized for slots of stall rather than one, this is not a knob to tune — it must simply always be zero, and any increase is a page. |
 | `zkasper_gossip_reconnects_total` | Each one is a hole gossip did not deliver and blocks had to repair. |
 | `zkasper_gossip_attestations_total` | Delivered. |
 

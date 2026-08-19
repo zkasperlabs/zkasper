@@ -135,10 +135,17 @@ def daemon():
 
     g = s.get("gossip") or {}
     if g:
-        dropped = g.get("dropped", 0)
-        out.append(check("gossip", dropped == 0,
-                         f"dropped {dropped}, reconnects {g.get('reconnects', 0)}"))
+        # `dropped` is not reported. It has been 0 on every check ever taken,
+        # --http-sse-capacity-multiplier 2000 makes it structurally unable to
+        # fire, and it stayed 0 through the worst data loss this project has had
+        # -- the collector discarding every network aggregate, ~35 points of
+        # stake missing and four justified epochs skipped. It measures the SSE
+        # ring, not whether attestations are used, so a green reading here is
+        # evidence of nothing. `reconnects` still tells you the node bounced.
+        out.append(check("gossip", True,
+                         f"reconnects {g.get('reconnects', 0)}"))
 
+    s_manifest = s
     lat = s.get("recent_latencies") or []
     if lat:
         last = lat[-1]
@@ -158,10 +165,32 @@ def daemon():
                          f"worst folded_groups in last {min(len(lat),5)}: {worst_folded}"
                          + ("" if worst_folded <= 5 else " -- the prover is answering too fast to be proving")))
         worst_late = max((l.get("late_groups") or 0) for l in lat[-5:])
-        out.append(check("latency", worst_late < 2,
-                         f"T2-T {last.get('t2_minus_t_millis')}ms, "
-                         f"tail {last.get('tail_named')}, "
+        # The three that matter: every epoch proven, and the cost and time of
+        # proving them. Everything else here is plumbing.
+        done = [l for l in lat if l.get("t2_minus_t_millis")]
+        if len(done) >= 3:
+            v = sorted(l["t2_minus_t_millis"] / 1000 for l in done)
+            med = v[len(v) // 2]
+            p90 = v[int(0.9 * (len(v) - 1))]
+            out.append(check("time", True,
+                             f"T2-T median {med:.0f}s p90 {p90:.0f}s over {len(v)}"))
+        out.append(check("folds", worst_late < 2,
                          f"worst late_groups in last {min(len(lat),5)}: {worst_late}"))
+
+    # Cost per epoch: sum the prover time of a whole epoch's stages and price it.
+    stages = s.get("recent_stages") or []
+    rate = s.get("prover_usd_per_hour")
+    if stages and rate:
+        by_epoch = {}
+        for st in stages:
+            by_epoch.setdefault(st.get("epoch"), 0)
+            by_epoch[st["epoch"]] += st.get("prove_millis") or 0
+        full = [v for v in by_epoch.values() if v]
+        if full:
+            avg = sum(full) / len(full)
+            out.append(check("cost", True,
+                             f"${avg / 3_600_000 * rate:.4f}/epoch, "
+                             f"{avg / 1000:.0f}s prover over {len(full)}"))
 
     pub = s.get("publish") or {}
     if pub:

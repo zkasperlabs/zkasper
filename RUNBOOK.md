@@ -649,7 +649,6 @@ output directory on local disk, not on network storage.
 | Signal | Condition | Meaning |
 |---|---|---|
 | `updated_unix` | older than 120 s | The daemon is dead or wedged. Nothing else in the file can be trusted. |
-| `gossip.dropped` | `> 0` | **The node's SSE buffer is too small.** Raise `--http-sse-capacity-multiplier`. This is a node misconfiguration, never bad luck, and every drop costs an epoch its live-gossip sourcing. |
 | restart rate | more than 2 per hour | The supervisor is masking a real fault. Read the log. |
 | `head_slot` | more than 4 slots behind the node | The daemon is not keeping up with the chain. |
 
