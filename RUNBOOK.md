@@ -834,6 +834,24 @@ Sizing from `scripts/gpu_bench.sh`: **150 GB disk** (the proving key reaches
 driver ≥ 525.60.13. For the from-source `--features zisk-prover` build add the
 cargo target directory and take **250 GB**.
 
+**A rented box may provision itself, for the wrong release.** On 2026-08-19 a
+fresh instance came up already running a saved vast template's onstart: it
+installed **zisk 1.0.0-alpha and the plonk proving key**, and it ran *instead of*
+the `--onstart` script given at creation, so that script's log never appeared and
+anything waiting on its completion marker span for ever. The box looked
+provisioned and was provisioned for the wrong toolchain, which 1.1.0-alpha's
+guests cannot use — that release changed the guest linker script.
+
+Check the version before building anything, and do not trust a populated
+`~/.zisk` as evidence the box is ready:
+
+```sh
+~/.zisk/bin/cargo-zisk --version      # must say 1.1.0-alpha
+```
+
+Reinstalling over the top works. Delete `~/.zisk` first: 180 GB does not hold a
+26 GB stale key and the ~105 GB one 1.1.0-alpha expands to, plus a cargo target.
+
 - **One day, on-demand:** $8.06–12.72 for the card, plus ~$1–4 storage.
 - **One day, interruptible:** $4.80–6.72.
 - **One month, on-demand:** $242–382. **Interruptible:** $144–202.
