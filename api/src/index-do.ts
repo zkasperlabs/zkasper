@@ -2,7 +2,7 @@
 // the SSE ring buffer, and (when no R2 bucket is bound) the proof blobs themselves.
 // There is exactly one daemon, so one object is the whole store.
 import { DurableObject } from "cloudflare:workers";
-import { proofAvailable, statusForProof } from "./status";
+import { isSettled, isStranded, proofAvailable, statusForProof } from "./status";
 
 const RING_EVENTS = 5000;
 const MAX_STREAMS = 200;
@@ -205,6 +205,7 @@ export class IndexDO extends DurableObject {
     try {
       if (p === "/do/ingest") return await this.ingest(request);
       if (p === "/do/reset") return this.reset();
+      if (p === "/do/reap") return this.reap();
       if (p === "/do/status") return this.serveStatus();
       if (p === "/do/epochs") return this.serveEpochs(url);
       if (p.startsWith("/do/epoch/")) return this.serveEpoch(Number(p.slice("/do/epoch/".length)));
@@ -264,6 +265,15 @@ export class IndexDO extends DurableObject {
         const r = this.record(daemonId + "#status", key, "status", { type: "status", seq: key, unix_millis: now, status }, now);
         if (r !== null) outgoing.push({ seq: r.seq, type: "status", data: r.data });
       }
+    }
+
+    // Only when something newer arrived. An epoch becomes stranded by being
+    // outlived, so nothing can become stranded on a batch that did not move the
+    // high-water mark, and the steady state costs one MAX(epoch) and no scan.
+    const highest = this.highestEpoch();
+    if (highest !== null && highest > (this.getKvNum("highest_epoch") ?? -1)) {
+      this.setKv("highest_epoch", String(highest));
+      for (const o of this.reapStranded(highest, now)) outgoing.push(o);
     }
 
     this.setKv("last_daemon_seq", String(lastDaemonSeq));
@@ -534,6 +544,73 @@ export class IndexDO extends DurableObject {
     }
   }
 
+  /** The highest epoch this index has ever heard of at all, proved or not. */
+  private highestEpoch(): number | null {
+    return num(this.one("SELECT MAX(epoch) AS m FROM epochs")?.m);
+  }
+
+  // Close out the epochs a daemon opened and never came back to.
+  //
+  // A run that dies mid-epoch does not get to say so — that is the whole
+  // problem, and it is why this cannot live in the daemon. The daemon that
+  // died is gone, and the one that replaces it may be starting from a fresh
+  // init point with an empty store, so it does not know what its predecessor
+  // left open either. The index is the only party that still holds the record,
+  // so the index is the only party that can correct it.
+  //
+  // What it corrects is not a cosmetic detail. An epoch left in `proving` is
+  // indistinguishable from one still in flight: the API says work is happening,
+  // no work is happening, and a consumer polls for ever with nothing to tell
+  // them otherwise. Thirteen mainnet epochs between 469421 and 469598 were in
+  // that state on 2026-08-19.
+  //
+  // `isStranded` carries the argument for why this is sound and not a
+  // heuristic. Returns what it reaped, so the caller can tell a live consumer:
+  // somebody holding /v1/live was told the work started and would otherwise
+  // never be told it had stopped.
+  private reapStranded(highest: number, now: number): Array<{ seq: number; type: string; data: any }> {
+    // The SQL narrows to a superset; `isStranded` decides. The rule is stated
+    // once, in status.ts, where it runs under `node --test`.
+    const open = this.all(
+      "SELECT epoch, status FROM epochs WHERE status = 'proving' AND epoch < ? ORDER BY epoch ASC",
+      highest,
+    );
+    const out: Array<{ seq: number; type: string; data: any }> = [];
+    for (const r of open) {
+      const epoch = r.epoch as number;
+      if (!isStranded(r.status, epoch, highest)) continue;
+      // Deliberately no `closed_unix_millis`. `abandoned` gets one because a
+      // live daemon decided at a known instant; this epoch never closed, and
+      // stamping the sweep's own clock on it would report `wall_millis_total`
+      // as however long the outage lasted. An `opened_unix_millis` with
+      // nothing beside it is the honest shape of an epoch that stopped.
+      this.setEpoch(epoch, { status: "stranded" });
+      // Namespaced away from the daemon's own seq space, and keyed on the
+      // epoch, so an epoch can be stranded exactly once however often this runs.
+      const rec = this.record(
+        "api#stranded",
+        epoch,
+        "epoch.stranded",
+        { type: "epoch.stranded", epoch, unix_millis: now, highest_epoch: highest },
+        now,
+      );
+      if (rec !== null) out.push({ seq: rec.seq, type: "epoch.stranded", data: rec.data });
+    }
+    return out;
+  }
+
+  // The one-off, for an index that was already carrying stranded epochs before
+  // the sweep above existed. Idempotent, and reports what it changed.
+  private reap(): Response {
+    const highest = this.highestEpoch();
+    if (highest === null) return jsonResponse({ ok: true, highest_epoch: null, stranded: [] });
+    this.setKv("highest_epoch", String(highest));
+    const events = this.reapStranded(highest, Date.now());
+    for (const o of events) this.broadcast(o.seq, o.type, o.data);
+    this.setKv("stream_seq", String(this.nextSeq - 1));
+    return jsonResponse({ ok: true, highest_epoch: highest, stranded: events.map((e) => e.data.epoch) });
+  }
+
   // ---------------------------------------------------------------- reads
 
   private daemonRecord(): any {
@@ -734,7 +811,7 @@ export class IndexDO extends DurableObject {
       public_inputs: publicInputs,
       verify: this.verifyObject(r, proof, publicInputs),
     };
-    const settled = r.status === "proven" || r.status === "unproven" || r.status === "abandoned";
+    const settled = isSettled(r.status);
     return jsonResponse(body, {
       headers: { "cache-control": settled ? "public, max-age=86400" : "public, max-age=5" },
     });

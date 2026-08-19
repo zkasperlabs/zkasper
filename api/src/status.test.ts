@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { proofAvailable, statusForProof } from "./status.ts";
+import { isSettled, isStranded, proofAvailable, statusForProof } from "./status.ts";
 
 // Exactly what mainnet 469539 carried on 2026-08-19: a whole proof reference,
 // a program, a verification key, committed public bytes — and no proof.
@@ -52,4 +52,59 @@ test("every other status is the daemon's to say", () => {
   assert.equal(statusForProof("abandoned", empty), "abandoned");
   assert.equal(statusForProof(undefined, real), undefined);
   assert.equal(statusForProof(7, real), undefined);
+});
+
+// ---------------------------------------------------------------- stranded
+
+// The real thing, from mainnet on 2026-08-19: 124 proven, 4 abandoned, 2
+// unproven, and 14 epochs still calling themselves `proving` — of which
+// thirteen were opened by daemons that died or were redeployed mid-epoch, and
+// one was the epoch actually being proved at the time.
+const STRANDED = [
+  469421, 469429, 469436, 469441, 469451, 469469, 469470,
+  469569, 469570, 469571, 469572, 469597, 469598,
+];
+const IN_FLIGHT = 469624;
+
+test("an epoch a later one outlived is stranded", () => {
+  for (const epoch of STRANDED) {
+    assert.equal(isStranded("proving", epoch, IN_FLIGHT), true, `epoch ${epoch}`);
+  }
+});
+
+// The one thing this rule is not allowed to get wrong. The daemon holds one
+// epoch open at a time, so the highest epoch the index knows about is the only
+// one that can still be in flight — and it is never below itself.
+test("the epoch actually being proved is not stranded", () => {
+  assert.equal(isStranded("proving", IN_FLIGHT, IN_FLIGHT), false);
+});
+
+test("an epoch opened before anything newer arrived is not stranded", () => {
+  // The first epoch of a run, on the batch that opened it: it is the high-water
+  // mark, and stays in flight until the daemon reaches the next one.
+  assert.equal(isStranded("proving", 469599, 469599), false);
+});
+
+// Stranded is a statement about an epoch nobody closed. An epoch that reached
+// an outcome has one, and keeps it however far the daemon has since walked.
+test("only an open epoch can be stranded", () => {
+  for (const s of ["proven", "unproven", "abandoned", "stranded", null, undefined, ""]) {
+    assert.equal(isStranded(s, 469421, IN_FLIGHT), false, `status: ${s}`);
+  }
+});
+
+// What a consumer is allowed to stop polling, which is also what the epoch
+// route caches for a day. A status missing from here is one that gets served
+// with a 5-second cache for ever.
+test("stranded is settled and proving is not", () => {
+  for (const s of ["proven", "unproven", "abandoned", "stranded"]) {
+    assert.equal(isSettled(s), true, `status: ${s}`);
+  }
+  for (const s of ["proving", "", null, undefined, 7]) {
+    assert.equal(isSettled(s), false, `status: ${s}`);
+  }
+});
+
+test("stranded is the api's word, so a daemon that sent it still passes through", () => {
+  assert.equal(statusForProof("stranded", empty), "stranded");
 });

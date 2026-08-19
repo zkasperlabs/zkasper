@@ -349,7 +349,8 @@ everything here also arrives on `/v1/live` as a `status` event.
 Recent epochs, newest first.
 
 Query: `limit` (default 50, max 200), `before` (return epochs strictly below this
-number, for paging), `status` (`proven`, `unproven`, `proving`, `abandoned`).
+number, for paging), `status` (`proven`, `unproven`, `proving`, `abandoned`,
+`stranded`).
 
 ```json
 {
@@ -388,8 +389,30 @@ number, for paging), `status` (`proven`, `unproven`, `proving`, `abandoned`).
   `available: false` and `/v1/proofs/{epoch}` will 404. Poll it as long as you
   like; no proof is coming. A witness-only run publishes every epoch this way,
   and so does a run whose prover was unreachable when the epoch closed.
-- `abandoned` — the chain never justified the checkpoint, or it reorged out from
-  under the daemon. `abandoned_reason` says which.
+- `abandoned` — the daemon gave the epoch up and said so: the chain never
+  justified the checkpoint, or it reorged out from under the daemon.
+  `abandoned_reason` says which.
+- `stranded` — the daemon opened the epoch and never reported an outcome for it,
+  because the run that owned it died or was replaced mid-epoch. No proof is
+  coming and no reason exists, because nothing was ever decided. Stop polling.
+
+`abandoned` and `stranded` are different words for a reason. `abandoned` is a
+decision a running daemon made and published; the epoch has an outcome, and
+`abandoned_reason` is that outcome. `stranded` is the absence of a decision —
+the daemon stopped, and this is the index saying so on its behalf. Treat them
+the same when you only care whether a proof is coming (it is not, either way);
+tell them apart when you care whether the chain or the service was at fault.
+`stranded` never carries `abandoned_reason`, because there is only ever the one
+reason.
+
+`stranded` is not a guess. The daemon holds exactly one epoch open at a time and
+opens them in strictly increasing order, so an epoch below the highest epoch the
+index has heard of is one the daemon has provably moved past. Thirteen mainnet
+epochs between 469421 and 469598 sat in `proving` for days before this status
+existed: to a consumer they were indistinguishable from an epoch still in
+flight, so the API said work was happening when none was and there was no way to
+find out. The newest epoch is the only one that can honestly be `proving`; if
+the daemon behind it has died, `service.stale` on `/v1/status` is what says so.
 
 `unproven` is separate from `abandoned` because the epoch is not in doubt, only
 its proof; and separate from a missing epoch because a hole is something you can
@@ -438,7 +461,8 @@ One epoch, with every stage that ran.
 
 `stages` is ordered by `started_unix_millis`. 404 for an epoch this daemon never
 opened. Cache: `public, max-age=5` while `proving`, `public, max-age=86400`
-once `proven`, `unproven` or `abandoned`.
+once `proven`, `unproven`, `abandoned` or `stranded` — every status but
+`proving` is final.
 
 ### What an epoch cost
 
@@ -512,6 +536,7 @@ Every `data` object carries `seq` and `unix_millis`.
 | `posting.landed` | a proof is verified on another chain | `{seq, unix_millis, epoch, posting}` |
 | `epoch.closed` | epoch finished | `{seq, unix_millis, epoch, summary}` — `summary` is the `/v1/epochs` entry |
 | `epoch.abandoned` | epoch given up | `{seq, unix_millis, epoch, reason}` |
+| `epoch.stranded` | the index gave up waiting for a daemon that never came back | `{seq, unix_millis, epoch, highest_epoch}` — `highest_epoch` is what outlived it |
 
 Rendering a proof being built needs nothing else: `epoch.opened` draws the row,
 `stage.started` opens a bar, `stage.finished` closes it with its measured
@@ -716,15 +741,19 @@ differs from it. Nothing here renames or removes a field.
    `next_before`, `service.*`, `current_epoch.attesting_pct` (computed on the
    u64 strings, so it carries more decimals than the example) and `proof.url`.
 8. **`abandoned_reason` is omitted rather than null** when the epoch was not
-   abandoned.
+   abandoned, and is never present on a `stranded` epoch.
 9. **`current_epoch.state` is `collecting` or `firing`.** There is no
    `catching_up`: the daemon cannot honestly tell a catch-up from a live follow
    at that point, and it reports no latency for such an epoch instead.
 10. **`epoch.opened` also carries `chain`, `pipeline`, `prover` and
     `opened_unix_millis`**, so an epoch row is complete from its first event.
-11. **Added endpoints:** `GET /v1/health` (and `/health`), and
+11. **Added endpoints:** `GET /v1/health` (and `/health`),
     `POST /v1/ingest/reset` behind the same bearer token, which drops and
-    recreates every table. The stream sequence counter deliberately survives a
+    recreates every table, and `POST /v1/ingest/reap` behind the same token,
+    which marks every epoch a dead daemon left open as `stranded` and returns
+    the list. Ingest sweeps for these on its own whenever the high-water mark
+    moves; the endpoint exists to reap on demand and to clear an index that was
+    already carrying them. Both are idempotent. The stream sequence counter deliberately survives a
     reset, so a connected client's `Last-Event-ID` never points into the future.
 12. **Error codes beyond `not_found`:** `405 method_not_allowed`,
     `413 too_large`, `400 sha256_mismatch`, `400 bad_request` (a proof whose

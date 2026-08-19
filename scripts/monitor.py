@@ -397,13 +397,28 @@ def published_gaps():
         return check("chain", not unproven,
                      f"{len(nums)} proven since init {init}, too few to judge"
                      + (f", UNPROVEN {unproven}" if unproven else ""))
-    known = set(nums) | set(unproven)
+    # `stranded` is an epoch a dead daemon left open and the API has since closed
+    # out on its behalf. It is still a hole in the proof chain -- no proof exists
+    # for it -- so it still fails, but it is named apart from `HOLES`, because
+    # the two say different things about the index: a hole is an epoch nobody
+    # ever published, and a stranded one was published and then correctly
+    # disowned. `abandoned` is deliberately *not* counted as known: an epoch the
+    # chain never justified is the fault this check was written to find.
+    stranded = sorted(e["epoch"] for e in epochs if e.get("status") == "stranded")
+    known = set(nums) | set(unproven) | set(stranded)
     missing = [n for n in range(nums[0], nums[-1]) if n not in known]
-    # An epoch left in `proving` below the proven high-water mark is stuck: the
-    # daemon has moved past it and nothing will finish it. To a consumer it reads
+    # An epoch left in `proving` below the proven high-water mark is one the
+    # daemon has moved past and nothing will ever finish. To a consumer it reads
     # exactly like one still in flight, so they poll for ever. 469570 got there by
     # being proved while the daemon ran with a truncated argv and no --api-url, so
-    # it was neither published nor spooled.
+    # it was neither published nor spooled; twelve more had accumulated by
+    # 2026-08-19 before the API had a word for them.
+    #
+    # The API now marks these `stranded` on the first batch that moves its own
+    # high-water mark, so this list is empty in the steady state. It is non-empty
+    # for exactly two reasons, and both are worth waking up for: a daemon that is
+    # down right now and has not yet been outlived by a successor, or a reaper
+    # that has stopped working and is lying to consumers again.
     stuck = sorted(e["epoch"] for e in epochs
                    if e.get("status") == "proving" and e["epoch"] < nums[-1])
     bits = [f"proven {nums[0]}-{nums[-1]} since init {init}"]
@@ -411,11 +426,13 @@ def published_gaps():
         bits.append(f"HOLES at {missing}")
     if unproven:
         bits.append(f"UNPROVEN {unproven}")
+    if stranded:
+        bits.append(f"STRANDED {stranded}")
     if stuck:
-        bits.append(f"STUCK proving {stuck}")
-    if not (missing or unproven or stuck):
+        bits.append(f"STUCK proving, unreaped {stuck}")
+    if not (missing or unproven or stranded or stuck):
         bits.append("contiguous")
-    return check("chain", not (missing or unproven or stuck), ", ".join(bits))
+    return check("chain", not (missing or unproven or stranded or stuck), ", ".join(bits))
 
 
 def main():
