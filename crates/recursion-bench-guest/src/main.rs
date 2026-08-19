@@ -57,7 +57,9 @@ fn read_words() -> &'static [u64] {
     }
     #[cfg(not(target_os = "zkvm"))]
     {
-        let path = std::env::args().nth(1).unwrap_or_else(|| "input.bin".into());
+        let path = std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "input.bin".into());
         let bytes = std::fs::read(&path).expect("read the input");
         Box::leak(
             bytes
