@@ -494,6 +494,39 @@ core count and not from its affinity mask. The 1.49x between 35.629 s and
 53.087 s needs no mechanism beyond that: this box measured 40.9 s, between the
 two, and neither figure was a property of a guest.
 
+### What it did to production
+
+MEASURED on the mainnet fleet, one RTX 5090 (vast.ai 48101536) serving all eight
+stages over an SSH tunnel, 2026-08-19. Before is commit `28ab33e`, mainnet epochs
+469,565-469,568; after is `77d4b6c`, epochs 469,589-469,591. **The two runs have
+the same schedule shape** — `folded_groups=0`, `late_groups=1`, the whole tail
+inlined into the final proof — so the stages are comparable one to one.
+
+| stage | children | before | after | |
+|---|---|---:|---:|---:|
+| `stream_final` | 2 + inlined tail | 211.3 s | **13.5 s** | **15.6x** |
+| `justification` | slot proofs | 140.1 s | **7.86 s** | **17.8x** |
+| epoch closed (`T` to proof) | | 215.8 s | **18.7 s** | **11.5x** |
+| `committee` | none | 130.6 s | 143.4 s | leaf |
+| `group` | none | 10.7 s | 9.4 s | leaf |
+| `epoch_diff` | none | 3.69 s | 3.99 s | leaf |
+
+**The leaves are the control.** `committee`, `group` and `epoch_diff` verify no
+children, and they did not move; every stage that did move verifies children.
+That is the whole claim, measured on the pipeline rather than on a bench guest.
+
+Medians, `prove_millis` as the prover reports it. `stream_final` is `n = 7` over
+both post-fix deployments (13.34, 13.37, 13.50, 13.55, 13.97, 14.26, 14.39 s);
+the before is `n = 5` (210.1, 211.0, 211.3, 212.9, 214.4 s). `wrap_millis` is
+now 0 by construction — the call is gone — where it was 39-53 ms.
+
+**A proof is 46,153 words rather than 31,828**, which is the 369,224 bytes
+against 254,624 above, and the only cost this change has.
+
+**`committee` is now the pipeline's ceiling.** At 143 s it is 10x the final
+proof and it verifies nothing recursively, so no amount of recursion work
+reaches it. Every stage that recursion priced is now under 15 s.
+
 ## `T2 - T`
 
 `T` is the moment the chain has published enough attestations to justify a
