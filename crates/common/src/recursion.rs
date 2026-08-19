@@ -17,7 +17,17 @@
 //! edge in this pipeline uses except the two a program cannot bake — its own.
 //!
 //! Serialized proof layout, in u64 words:
-//! `[minimal][n_publics][program_vk(4)][publics(64)][proof..][vadcop_vk(4)]`
+//! `[minimal][n_publics][is_vadcop_final][program_vk(4)][publics(64)][proof..][vadcop_vk(4)]`
+//!
+//! The child is an uncompressed `vadcop_final` proof, and that is a performance
+//! decision as much as a format one. A compressed proof has Merkle arity 2, so
+//! `proofman`'s `arity * 4 == WIDTH` fixes the verifier's hash width at 8, and
+//! `syscall_poseidon1` only accepts width 16 — every Merkle and FRI hash inside
+//! the guest falls back to software Poseidon. Measured on a slot proof, that is
+//! 242.8 M RISC-V steps a child against 10.9 M, and 306 precompiled permutations
+//! against 3,877. The uncompressed proof is 369,224 bytes rather than 254,624,
+//! and it is the `is_vadcop_final_proof` flag at index 0 of its public vector
+//! that pushes the program key one word later than a compressed proof's.
 
 use alloc::vec::Vec;
 
@@ -30,9 +40,19 @@ pub const ZISK_PUBLICS: usize = 64;
 /// Public values are committed as u32 slots, so this many bytes fit.
 pub const MAX_PUBLIC_BYTES: usize = ZISK_PUBLICS * 4;
 
-const VK_OFFSET: usize = 2;
+const VK_OFFSET: usize = 3;
 const PUBLICS_OFFSET: usize = VK_OFFSET + PROGRAM_VK_LEN;
 const MIN_PROOF_WORDS: usize = PUBLICS_OFFSET + ZISK_PUBLICS;
+
+/// Whether a proof is laid out the way the offsets above read it.
+///
+/// A compressed proof carries no `is_vadcop_final` flag, so every field after
+/// the header sits one word earlier and the same offsets would read a key out
+/// of the child's own public values. Rejecting it here is what keeps the
+/// binding a parse of the format rather than of one word past it.
+fn is_uncompressed(proof: &[u64]) -> bool {
+    proof.len() >= MIN_PROOF_WORDS && proof[0] == 0
+}
 
 /// Identifies which guest program produced a proof.
 pub type ProgramVk = [u64; PROGRAM_VK_LEN];
@@ -43,7 +63,7 @@ pub const UNSET_VK: ProgramVk = [0; PROGRAM_VK_LEN];
 
 /// The program verification key a proof commits to.
 pub fn child_program_vk(proof: &[u64]) -> Option<ProgramVk> {
-    if proof.len() < MIN_PROOF_WORDS {
+    if !is_uncompressed(proof) {
         return None;
     }
     Some([
@@ -56,7 +76,7 @@ pub fn child_program_vk(proof: &[u64]) -> Option<ProgramVk> {
 
 /// The byte stream the child committed with `ziskos::io::commit_slice`.
 pub fn child_public_bytes(proof: &[u64]) -> Option<[u8; MAX_PUBLIC_BYTES]> {
-    if proof.len() < MIN_PROOF_WORDS {
+    if !is_uncompressed(proof) {
         return None;
     }
     let mut out = [0u8; MAX_PUBLIC_BYTES];
