@@ -859,8 +859,8 @@ async fn test_a_proof_in_flight_at_the_crossing_is_not_a_wait() {
 ///
 /// This is the invariant the live run violated by two orders of magnitude.
 /// Mainnet epoch 469483 reported a 141.6 s wait against a tail of 8,454 leaves —
-/// 13.0 s of proving at [`ProverModel::per_named_s`], so even emptying the tail
-/// entirely would have been a 10:1 loss. Nothing in the trigger could produce
+/// 5.20 s of proving at [`ProverModel::named_s`], so even emptying the tail
+/// entirely would have been a 27:1 loss. Nothing in the trigger could produce
 /// that: `--max-trigger-wait-millis` caps the hold at 10 s. The 141.6 s was the
 /// late group proof, charged to the wait by a timestamp taken in the wrong
 /// place, and the two are separate fields now.
@@ -869,7 +869,7 @@ async fn test_a_proof_in_flight_at_the_crossing_is_not_a_wait() {
 /// proof inside the wait. The behind path is the one that used to fail.
 #[tokio::test]
 async fn test_the_reported_wait_never_exceeds_what_the_tail_is_worth() {
-    let per_named_millis = ProverModel::default().per_named_s() * 1000.0;
+    let prover = ProverModel::default();
 
     for behind in [true, false] {
         let dir = tempfile::tempdir().unwrap();
@@ -898,7 +898,7 @@ async fn test_the_reported_wait_never_exceeds_what_the_tail_is_worth() {
 
         // What the whole tail is worth, plus one trigger interval: the daemon
         // cannot fire between two evaluations, so it may overshoot by one.
-        let budget = tail_named * per_named_millis
+        let budget = prover.named_s(tail_named) * 1000.0
             + OrchestratorConfig::new(TEST_CONFIG, "test")
                 .trigger_interval
                 .as_millis() as f64;
@@ -909,7 +909,7 @@ async fn test_the_reported_wait_never_exceeds_what_the_tail_is_worth() {
              is waiting for, so this is time lost on every outcome — and a wait \
              this far past the budget is a proof charged to the trigger, not a \
              trigger that held.",
-            tail_named * per_named_millis,
+            prover.named_s(tail_named) * 1000.0,
         );
     }
 }

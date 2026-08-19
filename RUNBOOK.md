@@ -946,29 +946,36 @@ flight is one fewer named absentee in the final proof, so one more second of
 waiting pays for itself while arrivals exceed break-even. That rule is capped by
 `--max-trigger-wait-millis`, default 6,000.
 
-**The break-even is 651 validators a second, not 558.** It is not a constant of
-its own — `ProverModel::per_named_s()` derives it from two measured ones, and the
-derivation is the authority:
+**The break-even is 1,289 validators a second over the 200 ms tick, and there is
+no single number for it.** It is not a constant of its own —
+`ProverModel::named_s()` derives it from two measured ones — and it is a curve
+rather than a rate, because a tail is priced as a set and `scattered_nodes` is
+concave, so a longer interval collects leaves that share more of the tree:
 
-| | per_validator_s | acc_node_s x 22 | per named leaf | break-even |
+| | per_validator_s | nodes a leaf | per named leaf | break-even, 200 ms tick |
 |---|---|---|---|---|
-| Zisk v1.0.0-alpha | 834.7 us | 43.5 us | 1.79 ms | 558/s |
-| **Zisk v1.1.0-alpha** | 834.7 us | **31.9 us** | **1.5365 ms** | **651/s** |
+| Zisk v1.0.0-alpha | 834.7 us | 22 x 43.5 us | 1.79 ms | 558/s |
+| v1.1.0-alpha, as modelled to 2026-08-19 | 834.7 us | 22 x **31.9 us** | 1.5365 ms | 651/s |
+| **v1.1.0-alpha, measured on the live run** | **325.8 us** | **6.9–15 x 31.9 us** | **0.60–1.03 ms** | **1,289/s** |
 
-`acc_node_s` was re-measured at 31.9 us on v1.1.0-alpha and the model carries
-that value; 1.79 ms and 558/s are the v1.0.0-alpha pair, left behind in prose
-that the re-measurement did not reach. Every "at 1.79 ms" in an older revision of
-this document is 14% too high. `waiting_pays_exactly_while_arrivals_outrun_the_per_leaf_price`
-asserts the derived figure, so the code has been right throughout.
+Two things were wrong with the middle row and they compounded. `per_validator_s`
+was the bincode-era figure and is 2.56x too big: regressing 31 final proofs from
+epochs 469595–469630 on their own `tail_named` gives 10.777 s + 595.5 us a leaf,
+and at 834.7 us the validator term alone exceeds the whole measured tail cost.
+And 22 nodes a leaf is what `scattered_nodes` says of a tail of *one*; its
+marginal is 13.4 nodes at 157 leaves and 6.9 at 14,473, because a deep tail
+shares most of its path. See `ProverModel::per_validator_s` for the fit.
 
 The measured arrival rate — 168 slots where the capture was complete, singles and
-aggregates together — crosses 651/s between **8,000 and 9,000 ms** into the slot:
+aggregates together — crosses 1,289/s inside **7,000 to 8,000 ms** into the slot,
+one bucket earlier than the superseded price put it:
 
-| ms into slot | 4–5 k | 5–6 k | 6–7 k | 7–8 k | **8–9 k** | 9–10 k | 10–11 k |
+| ms into slot | 4–5 k | 5–6 k | 6–7 k | **7–8 k** | 8–9 k | 9–10 k | 10–11 k |
 |---|---|---|---|---|---|---|---|
-| arrivals/s | 5,984 | 4,858 | 2,538 | 1,423 | **652** | 313 | 215 |
+| arrivals/s | 5,984 | 4,858 | 2,538 | **1,423** | 652 | 313 | 215 |
 
-Both constants land in that same bucket, so the correction does not move the cap.
+The bar moved by one bucket and the cap is far outside both, so the correction
+does not move the cap.
 The cap was wrong for its own reasons, and **it is now 10,000 ms**. The
 arithmetic:
 
@@ -1044,7 +1051,7 @@ two arrivals there is a silence that means nothing of the kind. **A longer windo
 or more hysteresis moves which silence it stops in; it does not stop it stopping
 in one.** Replayed against the same 23 epochs' arrivals, 20 tick phases apiece:
 
-| rule | median fire, ms into slot | mean `tail_named` | mean `wait + tail x 1.5365 ms` |
+| rule | median fire, ms into slot | mean `tail_named` | mean `wait + tail x 1.5365 ms` (superseded price) |
 |---|---|---|---|
 | **measured, as it ran** | 6,248 | 5,347 | **9.93 s** |
 | 200 ms window (the rule, replayed) | 6,132 | 5,427 | 9.80 s |
@@ -1063,6 +1070,14 @@ in one.** Replayed against the same 23 epochs' arrivals, 20 tick phases apiece:
 The replay reproduces the measured baseline to 1.5% on the mean tail and 1.3% on
 the objective, which is what makes the other rows worth reading.
 
+The objective column is priced at the superseded 1.5365 ms a leaf, and it is the
+one table here that could not be corrected by arithmetic: it is a mean of
+per-epoch `wait + tail x price`, so it needs the replay re-run rather than a
+multiplication. Every row shares the price, so the *ranking* stands and the
+conclusion below it is unaffected; the absolute seconds are 2 to 2.5x high, and
+the tail half of each row shrinks by more than the wait half, which if anything
+strengthens the rows that wait less.
+
 **Every rate-only rule is beaten by the same 2 s of silence.** It has to observe
 that silence to know the singles are done, and if it waits long enough to survive
 it, it also pays it again after the aggregates land. Hysteresis at 10 windows is
@@ -1079,7 +1094,7 @@ paid for itself, **or** the aggregate half of the slot's gossip has not yet been
 and gone — which it reads off the gossip, as "no aggregate for this slot yet, or
 one arrived in the last interval", and not off a clock. The hold is not free, so
 it is taken only while what is still in flight could pay for the silence so far
-at the same 1.5365 ms a leaf. A slot that has already converged fires instead of
+at the same measured leaf price. A slot that has already converged fires instead of
 waiting for aggregates that cannot be worth much, and a slot with nothing in
 flight fires on the instant.
 
@@ -1167,7 +1182,7 @@ is what three epochs can support.
   these are a baseline for the *trigger*, not for proving.
 - **`tail_named` is the number that will hurt on a GPU, and it is two orders of
   magnitude larger in steady state**: 4,999 / 6,822 / 8,159, against 75–111 on
-  every catch-up. At 1.5365 ms per named leaf that is **7.7 s, 10.5 s and 12.5 s
+  every catch-up. At the measured leaf price that is **3.2 s, 4.3 s and 5.0 s
   of proving** on the critical path, against a `T2 - T` of 1.2–7.0 s today. On a
   GPU it does not add to the critical path — it becomes it, dwarfing the 3.640 s
   stage floor and the ~0.87 s of BLS, and the modelled `T2 - T` of 5.5 s does not
@@ -1181,7 +1196,7 @@ is what three epochs can support.
   | `wait_millis` | 924 | 1,355 | 6,378 |
   |---|---|---|---|
   | `tail_named` | 8,159 | 6,822 | 4,999 |
-  | that costs, at 1.5365 ms | 12.5 s | 10.5 s | 7.7 s |
+  | that costs, measured | 5.0 s | 4.3 s | 3.2 s |
 
   Monotonic, and it is the mechanism the trigger exists to exploit. It is three
   points from three different epochs with different arrival patterns, so treat it
@@ -1211,7 +1226,7 @@ relationship is a distribution rather than a direction:
 | `wait_millis` | 1,192 | 1,715 | 239 | 4,761 |
 | fired, ms into slot | 6,248 | — | 3,908 | 8,684 |
 | `tail_named` | 6,563 | 5,347 | 603 | 14,538 |
-| that costs, at 1.5365 ms | 10.1 s | 8.2 s | 0.9 s | 22.3 s |
+| that costs, measured | 4.1 s | 3.4 s | 0.4 s | 8.6 s |
 
 The cap did not bind on any of the 23. What ended every one of them was the rate
 rule, and the trigger section above is what was wrong with it.
