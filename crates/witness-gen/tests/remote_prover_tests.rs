@@ -9,7 +9,7 @@ mod common;
 
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -582,6 +582,145 @@ fn read_frame<T: serde::de::DeserializeOwned>(r: &mut impl std::io::Read) -> std
     r.read_exact(&mut bytes)?;
     bincode::deserialize(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// A prover process can go sick without going away, and the second ask is what
+/// says so.
+///
+/// On 2026-08-19 production died on one refusal: a committee witness of an
+/// ordinary shape was refused with an assert in `VerifyFinalPol0`, and the same
+/// witness proved cleanly against the same card once the server process there
+/// had been restarted. The witness was never the variable. A run that is meant
+/// to hold unattended for a day must survive that, so the witness is offered
+/// once more before the refusal is believed.
+#[test]
+fn a_witness_refused_once_is_proved_on_the_second_ask() {
+    let spool = tempfile::tempdir().unwrap();
+    let server = FickleProver::bind(1);
+    let prover = RemoteProver::connect(client(&server.addr, Some(spool.path()))).expect("connect");
+
+    let witness = witness();
+    let (output, _miller, _proof) = prover
+        .prove_group(&witness)
+        .expect("one refusal must not end the run");
+    let (local, _, _) = NativeProver::new(chain()).prove_group(&witness).unwrap();
+    assert_eq!(output.public_bytes(), local.public_bytes());
+
+    assert_eq!(
+        server.asked(),
+        2,
+        "the witness must be offered exactly twice"
+    );
+    let counters = prover.counters();
+    assert_eq!(
+        counters.proved, 1,
+        "the second ask is a proof like any other"
+    );
+    assert_eq!(counters.spooled, 0, "a refusal is never spooled");
+    assert_eq!(spooled_files(spool.path()), 0);
+}
+
+/// Two identical refusals are a bad witness, and a bad witness still stops the
+/// run.
+///
+/// This is the property the retry is not allowed to cost. A witness the circuit
+/// will not take poisons every epoch that folds it, and asking a third time
+/// only turns a loud failure into a loop.
+#[test]
+fn a_witness_refused_twice_still_stops_the_run() {
+    let spool = tempfile::tempdir().unwrap();
+    let server = FickleProver::bind(usize::MAX);
+    let prover = RemoteProver::connect(client(&server.addr, Some(spool.path()))).expect("connect");
+
+    let error = format!(
+        "{:#}",
+        prover
+            .prove_group(&witness())
+            .expect_err("a witness the circuit refuses twice is a stop condition"),
+    );
+    assert!(error.contains("refused"), "unexpected error: {error}");
+    assert!(error.contains(&server.addr), "unexpected error: {error}");
+    assert!(error.contains(REFUSAL), "unexpected error: {error}");
+
+    assert_eq!(server.asked(), 2, "a third ask would be a retry loop");
+    let counters = prover.counters();
+    assert_eq!(counters.proved, 0, "nothing was proved");
+    assert_eq!(counters.spooled, 0, "a refusal is never spooled");
+    assert_eq!(spooled_files(spool.path()), 0);
+}
+
+/// What the fickle server says when it refuses.
+const REFUSAL: &str = "Error generating witness for instance id 0";
+
+/// A server that refuses the first `refusals` witnesses and proves the rest.
+///
+/// Hand-rolled for the same reason [`EmptyProver`] is: what is under test is
+/// the reply, and a [`NativeProver`] behind [`serve_client`] has no way to be
+/// told to say no. It reports no ELF, so its empty proof is the legitimate
+/// answer of a witness-only server rather than the fault `reject_empty` catches
+/// — which is what every other server in this file does too.
+struct FickleProver {
+    addr: String,
+    asked: Arc<AtomicUsize>,
+}
+
+impl FickleProver {
+    fn bind(refusals: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let native = NativeProver::new(chain());
+        let programs: Vec<ProgramInfo> = STAGES
+            .iter()
+            .map(|&stage| ProgramInfo {
+                stage,
+                vk: native.program_vk(stage),
+                elf_sha256: None,
+            })
+            .collect();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let programs = programs.clone();
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    let Ok(hello) = read_frame::<Hello>(&mut stream) else {
+                        return;
+                    };
+                    assert_eq!(hello.version, PROTOCOL_VERSION);
+                    let ready = HelloReply::Ready {
+                        prover: "a prover that is sick and then is not".to_string(),
+                        programs,
+                    };
+                    if write_frame(&mut stream, &ready).is_err() {
+                        return;
+                    }
+                    while read_frame::<Request>(&mut stream).is_ok() {
+                        let asked = counter.fetch_add(1, Ordering::Relaxed);
+                        let reply = if asked < refusals {
+                            Reply::Failed(format!(
+                                "Proof error: {REFUSAL} [0:0] of type Recursive2"
+                            ))
+                        } else {
+                            Reply::Proved {
+                                proof: Vec::new(),
+                                cost: Default::default(),
+                            }
+                        };
+                        if write_frame(&mut stream, &reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { addr, asked }
+    }
+
+    /// How many witnesses have reached the circuit.
+    fn asked(&self) -> usize {
+        self.asked.load(Ordering::Relaxed)
+    }
 }
 
 /// A witness too large to frame is not spooled, because a retry of it would

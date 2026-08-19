@@ -96,7 +96,13 @@
 //!
 //! A witness the server *reached and refused* is a different thing and is an
 //! error. The circuit rejected those bytes and will reject them again, so it is
-//! reported where it happened rather than queued.
+//! reported where it happened rather than queued -- once it has been refused
+//! twice. A prover process can go sick without going away: on 2026-08-19 a
+//! committee witness was refused with an assert deep in the circuit, and the
+//! same bytes proved cleanly against the same card after that server was
+//! restarted. One refusal ended a run that was meant to hold for a day. So a
+//! refusal is offered once more on the same connection, and the second one is
+//! the verdict.
 //!
 //! This mirrors `crate::publish`, with one deliberate difference. The publisher
 //! keeps strict order by spooling everything once anything is spooled, because a
@@ -1057,7 +1063,51 @@ impl Inner {
             .store(now_unix_millis(), Ordering::Relaxed);
         let started = Instant::now();
         let request = Request::Prove { stage, witness };
-        let result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+        let mut result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+        // A refused witness is offered once more, and once only.
+        //
+        // The circuit said no, which is usually the witness: the same bytes
+        // against the same program earn the same answer. But the circuit is not
+        // always the variable. On 2026-08-19 a committee witness of an ordinary
+        // shape -- 354 instances, 211 Poseidon -- was refused with an assert in
+        // `VerifyFinalPol0`, and the same witness proved cleanly against the
+        // same card minutes later, once the server process there had been
+        // restarted and nothing else had changed. One refusal cannot tell a bad
+        // witness from a sick prover, and a run that is meant to hold for a day
+        // died of the difference.
+        //
+        // Two can, and two still stop the run. The second ask is also the only
+        // evidence anyone will ever have of which fault this was, so it says on
+        // the log which one it met.
+        if let Ok(Reply::Failed(reason)) = &result {
+            warn!(
+                addr = %self.config.addr,
+                stage = stage.as_str(),
+                reason = %reason,
+                "the prover refused this witness; asking once more before stopping the run",
+            );
+            // On the same connection and the same card, deliberately. The
+            // server keeps one resident prover for the whole process, so a
+            // fresh socket is a fresh thread onto the same sick state -- and a
+            // link that has actually broken is `attempt`'s to redial, which it
+            // already does. Another card is no better: `--prover-route` sets
+            // each server up for exactly the stages it is routed, so the other
+            // one holds no program this witness could be proven against.
+            result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+            let outcome = match &result {
+                Ok(Reply::Proved { .. }) => "proved; the prover was the fault and not the witness",
+                Ok(Reply::Failed(_)) => {
+                    "refused again; the witness is what the circuit will not take"
+                }
+                Err(_) => "unanswered; the link went before the circuit could say",
+            };
+            warn!(
+                addr = %self.config.addr,
+                stage = stage.as_str(),
+                outcome,
+                "the refused witness was asked a second time",
+            );
+        }
         self.last_foreground
             .store(now_unix_millis(), Ordering::Relaxed);
 
@@ -1077,8 +1127,9 @@ impl Inner {
                 );
                 Ok(proof)
             }
-            // The witness reached the circuit and the circuit said no. Spooling
-            // it would only feed it back to the same circuit.
+            // Refused twice, on two separate asks. Whatever else is wrong the
+            // answer is stable, so it is the witness, and spooling it would
+            // only feed it back to the same circuit.
             Ok(Reply::Failed(reason)) => bail!(
                 "the prover at {} refused the {} witness: {reason}",
                 self.config.addr,
@@ -1094,6 +1145,10 @@ impl Inner {
             // for the next run but not worth carrying on for. The error goes up
             // the orchestrator's `?` chain and out of the process, which is the
             // only way the supervisor gets to say it is not restarting.
+            //
+            // A witness refused once and then unanswered lands here too: the
+            // link is what failed the second time, and a spooled witness the
+            // circuit refuses again is dropped by the backfill.
             Err(e) => {
                 let Request::Prove { witness, .. } = request;
                 self.spool(stage, witness, publics, &e);
