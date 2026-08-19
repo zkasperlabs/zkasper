@@ -17,7 +17,7 @@
 //! is open before its own threshold slot.
 //!
 //! The backlog used to become a group proof on the fire path and then a
-//! recursion child of the final proof — 53 s on a mainnet card. It goes inline
+//! recursion child of the final proof — 36 s on a mainnet card. It goes inline
 //! now, because that is what the plan's tail asks for and the fire path stopped
 //! overriding it: the same attestations, as complement work rather than as a
 //! child.

@@ -10,12 +10,11 @@
 //! epoch whose cost decides whether a run gets started at all.
 //!
 //! What it costs is the number of children on the critical path, not the number
-//! of slots behind them: recursion is
-//! [`ProverModel::recursion_verify_s`] a child, MEASURED, and linear. Twenty-two
-//! slots proven one at a time are twenty-two children and a justification that
-//! outruns the node's state window; the same slots in groups of
-//! [`DEFAULT_SLOT_GROUP_WIDTH`] are two. So every assertion here counts
-//! children.
+//! of slots behind them: recursion is [`JUSTIFICATION_RECURSION_S`] a child,
+//! MEASURED, and linear. Twenty-two slots proven one at a time are twenty-two
+//! children and a justification that outruns the node's state window; the same
+//! slots in groups of [`DEFAULT_SLOT_GROUP_WIDTH`] are two. So every assertion
+//! here counts children.
 
 mod common;
 
@@ -46,6 +45,15 @@ const CATCH_UP_CONFIG: ChainConfig = ChainConfig {
 const SPE: u64 = CATCH_UP_CONFIG.slots_per_epoch;
 const VALIDATORS: usize = 32;
 const EPOCH: u64 = 10;
+
+/// Seconds `justification-guest` spends verifying one child.
+///
+/// Not [`ProverModel::recursion_verify_s`], which is the price in the streaming
+/// guests. A child is not one price across guests: 35.629 s in
+/// `aggregation-guest` and `stream-final-guest`, 53.087 s here. MEASURED by
+/// `recursion_cost_curve` at two, three and four children, and by mainnet epoch
+/// 469424 verifying 23 in 1,224 s in production. `BENCHMARKS.md` has both.
+const JUSTIFICATION_RECURSION_S: f64 = 53.087;
 
 fn config(dir: &Path, pipeline: Pipeline) -> OrchestratorConfig {
     OrchestratorConfig {
@@ -151,9 +159,9 @@ async fn test_the_first_epoch_of_a_run_is_proven_in_groups() {
 ///
 /// The critical path of the first epoch is its justification, and a
 /// justification is a floor plus a recursion per child — MEASURED at
-/// [`ProverModel::recursion_verify_s`] and linear from 2 children to 23. So the
-/// child count above is the cost, and this states it as seconds rather than
-/// leaving a reader to multiply.
+/// [`JUSTIFICATION_RECURSION_S`] and linear from 2 children to 23. So the child
+/// count above is the cost, and this states it as seconds rather than leaving a
+/// reader to multiply.
 ///
 /// It has to fit inside the node's state window, not just inside an epoch. This
 /// node serves 3-4 epochs of state, and a first epoch that took ~25 minutes
@@ -168,14 +176,14 @@ async fn test_the_first_epoch_fits_inside_an_epoch() {
     // committee proof that opened it.
     let children = artifacts(&epoch_dir, "slot_proof_").len() + 1;
     let model = ProverModel::default();
-    let justification_s = model.stage_floor_s + children as f64 * model.recursion_verify_s;
+    let justification_s = model.stage_floor_s + children as f64 * JUSTIFICATION_RECURSION_S;
 
     assert_eq!(children, 3, "two groups and the committee proof");
     assert!(
         justification_s < 200.0,
         "the justification models at {justification_s:.0} s over {children} children; \
          one child per slot would be {:.0} s",
-        model.stage_floor_s + 23.0 * model.recursion_verify_s,
+        model.stage_floor_s + 23.0 * JUSTIFICATION_RECURSION_S,
     );
     // A mainnet epoch is 384 s. The justification is the largest single stage of
     // the first epoch and the one that grew with the epoch before it was
