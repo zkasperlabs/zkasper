@@ -104,10 +104,17 @@ fn streaming_pipeline_justifies_and_finalizes() {
 
     assert!(plan.threshold_reached);
     // 70% of 16 validators is 11.2, so the 6th committee — the 12th validator —
-    // is the one that crosses, and nothing after it is proven at all. All six go
-    // inline: an epoch this small has nothing a group would save.
-    assert_eq!(plan.tail, vec![0, 1, 2, 3, 4, 5]);
-    assert!(plan.groups.is_empty());
+    // is the one that crosses, and nothing after it is proven at all.
+    //
+    // **All six used to go inline, and that flipped in `9f10d05`.** While a
+    // child cost 35.629 s an epoch this small had nothing a group could save;
+    // at the measured 1.520 s plus 0.83 s for a proof's first child, grouping
+    // wins even here. Only the crossing unit stays inline, because a group
+    // containing it could not be proven before `T`.
+    assert_eq!(plan.groups, vec![vec![0, 1, 2], vec![3, 4]]);
+    assert_eq!(plan.folds, vec![vec![0], vec![1]]);
+    assert_eq!(plan.tail, vec![5]);
+    assert!(plan.absorbed.is_empty());
 
     let run = run(&fixture, &folded(&grouped(&plan)));
 
