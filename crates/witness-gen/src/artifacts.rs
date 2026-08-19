@@ -227,7 +227,8 @@ pub struct EpochLatency {
     /// never a count of late slots: a backlog of nine slots is one group.
     ///
     /// **0 is the schedule's own optimum, and 1 used to be.** A group the final
-    /// proof absorbs is one recursion — 35.629 s on the streaming guests — where
+    /// proof absorbs costs a stage floor and a recursion — 3.64 s plus 1.520 s
+    /// on the streaming guests, plus 0.83 s for the proof's first child — where
     /// the slots under it are
     /// complement work worth a few seconds, so the plan puts them inline and
     /// leaves nothing to absorb. It could not before: `StreamPlan::tail` was

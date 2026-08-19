@@ -10,8 +10,14 @@
 //! epoch whose cost decides whether a run gets started at all.
 //!
 //! What it costs is the number of children on the critical path, not the number
-//! of slots behind them: recursion is [`JUSTIFICATION_RECURSION_S`] a child,
-//! MEASURED, and linear. Twenty-two slots proven one at a time are twenty-two
+//! of slots behind them: recursion is [`ProverModel::recursion_verify_s`] a
+//! child, measured, and linear. This test held its own copy of that price at
+//! 53.087 s until `9f10d05`; it now reads the model, because a child is one
+//! price across guests — the work is a property of the proof format, identical
+//! to five decimal places whichever guest verifies it. The 53.087 s and the
+//! streaming model's 35.629 s were the same compressed child on two rented
+//! boxes, and the same card spans 1.25x on a CPU affinity change alone.
+//! Twenty-two slots proven one at a time are twenty-two
 //! children and a justification that outruns the node's state window; the same
 //! slots in groups of [`DEFAULT_SLOT_GROUP_WIDTH`] are two. So every assertion
 //! here counts children.
@@ -45,23 +51,6 @@ const CATCH_UP_CONFIG: ChainConfig = ChainConfig {
 const SPE: u64 = CATCH_UP_CONFIG.slots_per_epoch;
 const VALIDATORS: usize = 32;
 const EPOCH: u64 = 10;
-
-/// Seconds `justification-guest` spends verifying one child.
-///
-/// The same 1.520 s as [`ProverModel::recursion_verify_s`], and it is one price
-/// across guests. The work of a child is a property of the proof format — 10.9 M
-/// RISC-V steps, identical to five decimal places whichever guest verifies it
-/// and whichever guest produced it — so there is no per-guest price to carry
-/// here. The 53.087 s this constant held, and the 35.629 s the streaming model
-/// held, were the same compressed child on two different rented boxes; the same
-/// card spans 1.25x on a CPU affinity change alone. `BENCHMARKS.md` has the
-/// ladder that separated the floor, the per-proof Poseidon step and the child.
-///
-/// **Held at 53.087 until the schedule is re-derived**, for the reason
-/// [`ProverModel::recursion_verify_s`] gives: repricing a child changes which
-/// shape the daemon should plan, and that is a decision rather than a constant
-/// swap.
-const JUSTIFICATION_RECURSION_S: f64 = 53.087;
 
 fn config(dir: &Path, pipeline: Pipeline) -> OrchestratorConfig {
     OrchestratorConfig {
@@ -166,10 +155,15 @@ async fn test_the_first_epoch_of_a_run_is_proven_in_groups() {
 /// What that epoch costs, in the only unit the prover charges in.
 ///
 /// The critical path of the first epoch is its justification, and a
-/// justification is a floor plus a recursion per child — MEASURED at
-/// [`JUSTIFICATION_RECURSION_S`] and linear from 2 children to 23. So the child
-/// count above is the cost, and this states it as seconds rather than leaving a
-/// reader to multiply.
+/// justification is a floor, one Poseidon AIR instance, and a recursion per
+/// child — linear from 2 children to 23. So the child count above is the cost,
+/// and this states it as seconds rather than leaving a reader to multiply.
+///
+/// **The bound stopped binding when a child was repriced from 53.087 s to
+/// 1.520 s**: this models at ~9 s against a limit of 192. It is kept as a
+/// regression guard on the child *count*, which is what the grouping controls
+/// and what actually grew unbounded before, rather than deleted for passing
+/// easily.
 ///
 /// It has to fit inside the node's state window, not just inside an epoch. This
 /// node serves 3-4 epochs of state, and a first epoch that took ~25 minutes
@@ -184,14 +178,15 @@ async fn test_the_first_epoch_fits_inside_an_epoch() {
     // committee proof that opened it.
     let children = artifacts(&epoch_dir, "slot_proof_").len() + 1;
     let model = ProverModel::default();
-    let justification_s = model.stage_floor_s + children as f64 * JUSTIFICATION_RECURSION_S;
+    let justification_s =
+        model.stage_floor_s + model.first_child_s + children as f64 * model.recursion_verify_s;
 
     assert_eq!(children, 3, "two groups and the committee proof");
     assert!(
         justification_s < 200.0,
         "the justification models at {justification_s:.0} s over {children} children; \
          one child per slot would be {:.0} s",
-        model.stage_floor_s + 23.0 * JUSTIFICATION_RECURSION_S,
+        model.stage_floor_s + model.first_child_s + 23.0 * model.recursion_verify_s,
     );
     // A mainnet epoch is 384 s. The justification is the largest single stage of
     // the first epoch and the one that grew with the epoch before it was

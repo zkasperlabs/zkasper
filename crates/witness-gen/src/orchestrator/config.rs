@@ -12,13 +12,14 @@ use super::Pipeline;
 
 /// Attestation slots one slot proof covers, by default.
 ///
-/// **Eleven, and it is this large because a child is the expensive thing.**
-/// A recursive verification is
-/// [`crate::streaming::ProverModel::recursion_verify_s`] — 35.629 s, MEASURED —
-/// against 1.01 s for a mainnet slot inside a proof that is already running and
-/// 3.64 s for the proof itself. So a slot that shares a proof with ten others
-/// costs a hundredth of a slot that brings its own recursion, and grouping is
-/// the whole of the saving: a mainnet epoch's ~22 slots become two children
+/// **Eleven, because a slot that brings its own proof is the expensive thing.**
+/// A mainnet slot costs 1.01 s inside a proof that is already running. A slot
+/// that arrives alone pays the 3.64 s stage floor as well, and a recursion —
+/// [`crate::streaming::ProverModel::recursion_verify_s`], **1.520 s, measured
+/// directly on a card** — for the parent that verifies it, plus 0.83 s if it is
+/// that parent's first child. So a slot on its own costs about five times one
+/// that shares, not the hundredfold this said while a child was priced at
+/// 35.629 s under proof compression. Grouping is still most of the saving: a mainnet epoch's ~22 slots become two children
 /// rather than twenty-two.
 ///
 /// It is a bound and not a target. A group covers at most this many slots
