@@ -99,6 +99,34 @@ committee share. An unproven assignment lets a colluding prover place
 adversarial stake into a one-slot window. The default byzantine threshold is
 25%.
 
+**The attack this defends against, stated plainly.** The committee partition is
+prover-chosen -- disjoint, because leaves are consumed in strictly increasing
+validator-index order, but otherwise arbitrary. If a confirmation threshold were
+a fraction of *slot 1's committee weight*, the prover would be choosing its own
+denominator: concentrate the validators you control into bucket 1, have them all
+vote, and any percentage clears with a small fraction of total stake. Ordering,
+pairing and leaf binding all pass. **Finality is immune to this because its
+denominator is global** -- two thirds of total active balance, summed over every
+bucket, so moving stake between buckets changes nothing. A per-slot denominator
+is not, and that is why this design states its threshold over the total.
+
+**And that is the trilemma FCR has not yet escaped:**
+
+1. **Threshold over the total** -- sound without the shuffle, as above. But it
+   requires opening every attesting validator's leaf: 75% of 2.34M validators at
+   ~1.54 ms each is roughly **2,700 seconds** against a 12-second budget. It is
+   the shape the finality path had before complement proving.
+2. **Complement proving** fixes the cost -- open the ~90 absentees rather than
+   the ~30,000 attesters -- but it needs per-slot summed public keys and
+   balances, which is exactly what the committee proof produces.
+3. **Once the threshold is per-slot, the denominator is prover-chosen again**, so
+   the RANDAO shuffle must be bound in circuit: 90 rounds of swap-or-not over a
+   million validators, which the finality path deliberately avoids.
+
+So the affordable variant needs the shuffle and the variant that does not need
+the shuffle is not affordable. **This is the central open problem for FCR**, it
+is not inherited from finality, and no option above is costed yet.
+
 ---
 
 ## 5. What FCR inherits, and from where
