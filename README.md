@@ -19,9 +19,18 @@ init point — one beacon state root the operator chose. See
 
 `T` is the moment the chain publishes enough attestations to justify a
 checkpoint. `T2` is the moment a proof of it exists. `T2 - T` is the only
-latency a consumer sees, and the pipeline exists to make it small. The measured
-cost model puts `T2 - T` at **5.5 s on one GPU**, with one proof and one wrap
-between `T` and `T2`. See [BENCHMARKS.md](BENCHMARKS.md).
+latency a consumer sees, and the pipeline exists to make it small.
+
+**Measured on live mainnet: median 228.2 s, p90 269.0 s** over ten folded
+epochs, 2026-08-19. The pipeline's own contribution is about 123 s of that; the
+rest was the daemon not observing the crossing until the prover came free, which
+has since been fixed and models 189.5 s. The current schedule models **83.1 s**.
+
+An earlier README quoted **5.5 s**, which was computed with recursion priced at
+zero. Recursion is now measured -- 35.629 s per verified child on the streaming
+guests -- and `T2 - T` is dominated by it. That figure is withdrawn. See
+[BENCHMARKS.md](BENCHMARKS.md) and
+[docs/finality/assumptions.md](docs/finality/assumptions.md).
 
 ## Layout
 
@@ -164,8 +173,9 @@ Open:
 
 - No streaming epoch has a real end-to-end proof yet. `T2 - T` is a model over
   measured per-stage times.
-- Recursive verification is unmeasured. It is a model parameter that defaults to
-  zero.
+- Recursive verification is measured: **35.629 s** per child on the two guests on
+  the streaming critical path, **53.087 s** on `justification-guest`. The
+  mechanism behind that 1.49x is not established.
 - The Solidity verifier is not integrated with the Zisk proof format.
 - The init point is trusted, not proven. A consumer has to regenerate it, or
   hold the accumulator to the rule in
