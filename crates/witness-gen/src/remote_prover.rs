@@ -1061,6 +1061,13 @@ impl Inner {
         }
         self.last_foreground
             .store(now_unix_millis(), Ordering::Relaxed);
+        // Kept because `witness` moves into the request. Without it the log
+        // cannot separate the round trip's two halves, and the committee stage
+        // is 77-88 s of round trip that is not proving against a witness of
+        // 113 MB: whether that is the wire or the far end's own ingest decides
+        // between a faster link and a smaller witness, and nothing published
+        // today can tell them apart.
+        let witness_bytes = witness.len();
         let started = Instant::now();
         let request = Request::Prove { stage, witness };
         let mut result = self.attempt(&mut self.conn.lock().unwrap(), &request);
@@ -1120,6 +1127,7 @@ impl Inner {
                 info!(
                     stage = stage.as_str(),
                     words = proof.len(),
+                    witness_bytes,
                     prove_millis = cost.prove_millis,
                     wrap_millis = cost.wrap_millis,
                     round_trip_millis = started.elapsed().as_millis() as u64,
