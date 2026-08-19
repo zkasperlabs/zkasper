@@ -92,9 +92,12 @@ impl Reporter {
 
     /// Keep a streaming epoch's measured `T2 - T`.
     pub(super) fn record_latency(&mut self, latency: EpochLatency) {
+        // The final proof is due at `T` and starts once the wait is over *and*
+        // the late group is proven, so its slip is both terms. They used to be
+        // one number, and separating them must not quietly shorten this one.
         crate::metrics::observe_proof_start(
             Stage::StreamFinal,
-            latency.wait_millis as f64 / 1000.0,
+            (latency.wait_millis + latency.late_group_millis) as f64 / 1000.0,
         );
         crate::metrics::observe_latency(&latency);
         if self.latencies.len() == RECENT_LATENCIES {

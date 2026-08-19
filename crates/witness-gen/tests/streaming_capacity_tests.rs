@@ -26,14 +26,20 @@
 //! world. These two tests pin both halves of the relationship so that the
 //! difference between them stays visible.
 //!
-//! # `wait_millis` is not idle time
+//! # `wait_millis` is not idle time, and no longer claims to be
 //!
-//! The manifest's `wait_millis` is `fired - crossed`, and the late group proof
-//! runs between those two timestamps. So on the behind path it is not a window
-//! that could absorb a fold — it *is* the group proof, already on the critical
-//! path. [`test_a_daemon_behind_the_threshold_folds_nothing`] pins that with a
-//! prover that takes a known time to prove a group, and its twin pins that the
-//! same prover does not show up in `wait_millis` when the daemon is at the head.
+//! `wait_millis` is `fired - crossed`, and the late group proof used to run
+//! between those two timestamps: the fired stamp was taken at the top of
+//! `close`, which the fire path reaches only after proving the backlog. So the
+//! manifest reported a 141 s group proof as a 141 s trigger hold — against a cap
+//! of 10 s, into a histogram whose top bucket is 12 s — and three separate
+//! analyses read it as the trigger waiting.
+//!
+//! The stamp is now taken where the trigger actually fires, and the group proof
+//! is reported as `late_group_millis` beside it. The two tests below pin the
+//! split from both sides, and [`test_the_reported_wait_never_exceeds_what_the_tail_is_worth`]
+//! pins the bound that makes `wait_millis` readable at all: a wait can never be
+//! worth more than the tail it is waiting for.
 
 mod common;
 
@@ -55,6 +61,7 @@ use zkasper_common::ChainConfig;
 
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
 use zkasper_witness_gen::prover::{NativeProver, Proof, Prover, Stage};
+use zkasper_witness_gen::streaming::ProverModel;
 
 const TEST_CONFIG: ChainConfig = ChainConfig {
     slots_per_epoch: 8,
@@ -255,20 +262,36 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
         "nothing was folded, so there is no aggregate",
     );
 
-    // The group proof sits between `T` and `fired`, which is the whole of
-    // `wait_millis` here. This is the measurement that says the window cannot
-    // absorb a fold: it is already full.
-    let wait = latency["wait_millis"].as_u64().expect("wait_millis");
+    // The group proof sits between `T` and the final proof, and it is reported
+    // as itself. This is the measurement that says the window cannot absorb a
+    // fold: it is already full, of proving rather than of waiting.
+    let late_group = latency["late_group_millis"]
+        .as_u64()
+        .expect("late_group_millis");
     assert!(
-        wait >= GROUP_PROVE.as_millis() as u64,
-        "wait_millis ({wait} ms) should contain the late group proof \
-         ({} ms), because that proof runs between T and the fired timestamp",
+        late_group >= GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) should be the late group proof \
+         ({} ms), which runs between the trigger firing and the final proof",
         GROUP_PROVE.as_millis(),
     );
+
+    // And it is not charged to the trigger. This is the assertion that was
+    // inverted: the daemon never held back here at all — it fired on the first
+    // tick that evaluated the trigger — and the old stamp reported the whole
+    // group proof as a wait.
+    let wait = latency["wait_millis"].as_u64().expect("wait_millis");
+    assert!(
+        wait < GROUP_PROVE.as_millis() as u64,
+        "wait_millis ({wait} ms) contains the group proof ({} ms) again; the \
+         fired timestamp has drifted back into the fire path's work",
+        GROUP_PROVE.as_millis(),
+    );
+
     let t2_minus_t = latency["t2_minus_t_millis"].as_u64().expect("t2_minus_t");
     assert!(
-        t2_minus_t >= wait,
-        "T2 - T ({t2_minus_t} ms) covers the wait ({wait} ms) and the final proof",
+        t2_minus_t >= wait + late_group,
+        "T2 - T ({t2_minus_t} ms) covers the wait ({wait} ms), the late group \
+         ({late_group} ms) and the final proof",
     );
 }
 
@@ -322,15 +345,84 @@ async fn test_a_daemon_at_the_head_folds_every_group_before_the_threshold() {
         "both folds ran, and ran before the threshold",
     );
 
-    // The same prover that put 400 ms into `wait_millis` on the behind path puts
-    // none into it here, because no group proof runs after `T`. That difference
-    // is the entire value of folding: not that the group proof is cheaper, but
-    // that it is off the critical path.
-    let wait = latency["wait_millis"].as_u64().expect("wait_millis");
+    // The same prover that put 400 ms into `late_group_millis` on the behind
+    // path puts none into it here, because no group proof runs after `T`. That
+    // difference is the entire value of folding: not that the group proof is
+    // cheaper, but that it is off the critical path.
+    let late_group = latency["late_group_millis"]
+        .as_u64()
+        .expect("late_group_millis");
     assert!(
-        wait < GROUP_PROVE.as_millis() as u64,
-        "wait_millis ({wait} ms) must not contain a group proof ({} ms) — \
+        late_group < GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) contains a group proof ({} ms) — \
          every group was proven and folded before the threshold crossed",
         GROUP_PROVE.as_millis(),
     );
+
+    let wait = latency["wait_millis"].as_u64().expect("wait_millis");
+    assert!(
+        wait < GROUP_PROVE.as_millis() as u64,
+        "wait_millis ({wait} ms) must not contain a group proof ({} ms)",
+        GROUP_PROVE.as_millis(),
+    );
+}
+
+/// The bound that makes `wait_millis` mean something: the trigger can never
+/// hold longer than the tail it is holding for could possibly repay.
+///
+/// This is the invariant the live run violated by two orders of magnitude.
+/// Mainnet epoch 469483 reported a 141.6 s wait against a tail of 8,454 leaves —
+/// 13.0 s of proving at [`ProverModel::per_named_s`], so even emptying the tail
+/// entirely would have been a 10:1 loss. Nothing in the trigger could produce
+/// that: `--max-trigger-wait-millis` caps the hold at 10 s. The 141.6 s was the
+/// late group proof, charged to the wait by a timestamp taken in the wrong
+/// place, and the two are separate fields now.
+///
+/// Both paths are checked, because the point is that neither of them can hide a
+/// proof inside the wait. The behind path is the one that used to fail.
+#[tokio::test]
+async fn test_the_reported_wait_never_exceeds_what_the_tail_is_worth() {
+    let per_named_millis = ProverModel::default().per_named_s() * 1000.0;
+
+    for behind in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = chain();
+        let mut daemon = streaming_daemon(dir.path(), &chain).await;
+
+        let stream_epoch = FIRST_EPOCH + 1;
+        let boundary = stream_epoch * SPE;
+
+        if behind {
+            daemon
+                .api()
+                .set_head(chain.header_at(boundary + SLOTS_TO_THRESHOLD));
+            daemon.catch_up().await.unwrap();
+        } else {
+            for slot in boundary..=boundary + SLOTS_TO_THRESHOLD {
+                daemon.api().set_head(chain.header_at(slot));
+                daemon.catch_up().await.unwrap();
+            }
+        }
+
+        let latency = latency(dir.path());
+        assert_eq!(latency["epoch"], stream_epoch);
+        let wait = latency["wait_millis"].as_u64().expect("wait_millis") as f64;
+        let tail_named = latency["tail_named"].as_u64().expect("tail_named") as f64;
+
+        // What the whole tail is worth, plus one trigger interval: the daemon
+        // cannot fire between two evaluations, so it may overshoot by one.
+        let budget = tail_named * per_named_millis
+            + OrchestratorConfig::new(TEST_CONFIG, "test")
+                .trigger_interval
+                .as_millis() as f64;
+        assert!(
+            wait <= budget,
+            "behind={behind}: waited {wait} ms for a tail of {tail_named} leaves \
+             worth {:.1} ms of proving. A wait can only ever buy back the tail it \
+             is waiting for, so this is time lost on every outcome — and a wait \
+             this far past the budget is a proof charged to the trigger, not a \
+             trigger that held.",
+            tail_named * per_named_millis,
+        );
+    }
 }

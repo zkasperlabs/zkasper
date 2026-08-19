@@ -117,6 +117,18 @@
 //! thousands of attestations still to come. [`Filling`] is what the rule reads
 //! instead. [`Schedule::threshold_s`] is measured at 2/3 regardless, so any wait
 //! shows up in `T2 − T` rather than hiding in the choice of `T`.
+//!
+//! 651 a second is a rate, and a rate cannot bound a wait. It is break-even by
+//! construction — a second of waiting against a second of proving avoided — so
+//! an arrival stream that merely keeps clearing it justifies a wait of any
+//! length at all. The bound comes from the stock instead of the flow: the
+//! validators still in flight are worth `in_flight * per_named_s` and no more,
+//! because that is what the final proof would pay to open every one of them, so
+//! it is what the wait would save if all of them landed in the next instant.
+//! [`StreamPolicy::wait_budget_s`] is that quantity and the rule spends against
+//! it. A tail of 8,454 is worth 13.0 s; waiting 141 s for it loses 128 s on the
+//! best outcome available, and would need roughly 92,000 in flight to break
+//! even.
 
 use zkasper_common::acc::Digest;
 use zkasper_common::bls::Fp12;
@@ -571,38 +583,74 @@ impl StreamPolicy {
         removed as f64 * self.prover.per_named_s() > interval_s
     }
 
+    /// Every second of latency the attestations still in flight could buy back.
+    ///
+    /// [`Self::interval_paid`] prices one interval against the arrivals it saw,
+    /// which is a rate test and says nothing about how long the wait may run in
+    /// total. This is the other half, and it is a *stock* rather than a rate:
+    /// the final proof opens `in_flight` accumulator leaves if it fires now, at
+    /// [`ProverModel::per_named_s`] each, so that product is the entire prize —
+    /// what the wait would save if every one of them arrived in the next
+    /// instant and the tail went to zero.
+    ///
+    /// A second of waiting costs a second of `T2 - T` outright, so a wait longer
+    /// than the prize loses on every outcome, including the best one. That makes
+    /// this a budget and not a target: 8,454 leaves in flight are worth 13.0 s,
+    /// so no rate, however fast, makes a 141 s wait for them rational. 112
+    /// leaves are worth 0.17 s and the trigger should barely pause at all.
+    ///
+    /// `max_wait_s` bounds it from the other side, for the case the prize is
+    /// large but the arrivals never come.
+    pub fn wait_budget_s(&self, in_flight: usize) -> f64 {
+        (in_flight as f64 * self.prover.per_named_s()).min(self.max_wait_s)
+    }
+
     /// Whether the wait is still worth taking.
     ///
-    /// [`Self::interval_paid`] alone was the whole rule, and it is wrong on its
-    /// own for a reason that is not noise: a slot's gossip is **two arrivals,
-    /// not one**. The unaggregated attestations burst and drain, and then the
-    /// aggregates land in a piece, and between them is a silence that says
-    /// nothing at all about whether the slot is finished. A rule that reads only
-    /// the last interval's rate stops in the first silence it meets.
+    /// Two questions, and the rule needs both of them.
     ///
-    /// So the wait continues while either the last interval paid for itself, or
-    /// the aggregate half of the slot's gossip has not yet been and gone. The
-    /// second clause is not a licence to wait for ever: it holds only while what
-    /// is still in flight could pay for the silence so far, which is the same
-    /// per-leaf price the first clause is denominated in, and is why a slot that
-    /// has already converged fires rather than waiting for aggregates that
-    /// cannot be worth much. `waited_s`, the whole wait so far, is the guard
-    /// against a source that trickles for ever, and on mainnet it does not bind.
+    /// *Is the wait still collecting?* is a rate. [`Self::interval_paid`] reads
+    /// it off the last interval, widened by [`Filling::aggregates_pending`]
+    /// because a slot's gossip is **two arrivals, not one**: the unaggregated
+    /// attestations burst and drain, then the aggregates land in a piece, and
+    /// the silence between them says nothing at all about whether the slot is
+    /// finished. A rule that reads only the last interval's rate stops in the
+    /// first silence it meets.
     ///
-    /// Nothing here models *when* attestations arrive. Both halves are read off
+    /// *Is the wait still affordable?* is [`Self::wait_budget_s`], and it is the
+    /// half that was missing. The rate test is break-even by construction — one
+    /// second of waiting against one second of proving avoided — so on its own
+    /// it licenses a wait of any length whatever, provided each interval clears
+    /// the bar. It never asks what the wait has cost in total against what is
+    /// still left to win, and that second quantity is bounded: the tail in
+    /// flight is worth `in_flight * per_named_s` and not a millisecond more.
+    ///
+    /// So the budget is an `&&` over the whole rule rather than a clause inside
+    /// one arm of it. Both readings of "still collecting" spend from the same
+    /// budget, which is what puts the trade in the code: the wait continues
+    /// while it is collecting *and* while it has not already spent what the tail
+    /// is worth.
+    ///
+    /// Nothing here models *when* attestations arrive. Every input is read off
     /// the gossip itself — the rate off the last interval, the second arrival
     /// off whether the node has published an aggregate for this slot yet — so a
     /// chain that gossips earlier or later, or aggregates on a different
     /// schedule, moves the firing instant without moving this code.
     ///
+    /// Replaying the rule against 23 measured mainnet epochs fires at a median
+    /// 8.7 s into the filling slot, and the budget does not move that: a slot
+    /// that is still filling holds thousands of leaves, so its budget is
+    /// `max_wait_s` and the cap is what binds, exactly as before. What the
+    /// budget changes is the case the replay never contained — a tail too small
+    /// for waiting on it to repay the wait.
+    ///
     /// The rule can only ever cost latency. `T` is measured at the threshold the
     /// circuit itself enforces, so waiting past it changes what a proof costs
-    /// and never what it proves.
-    ///
-    /// `max_wait_s` is 10 s and is meant not to bind. Replaying the rule against
-    /// 23 measured mainnet epochs fires at a median 8.7 s into the filling slot;
-    /// caps of 6, 10 and 20 s give the identical result and only a cap of 4 s
-    /// changes it.
+    /// and never what it proves. It is also the only thing between `T` and the
+    /// final proof that is a *decision*: the late group proof on the fire path
+    /// is work rather than waiting, it is far larger than any wait this rule can
+    /// authorise, and it is measured on its own — see
+    /// `EpochLatency::late_group_millis`.
     pub fn worth_waiting(
         &self,
         filling: Filling,
@@ -610,10 +658,10 @@ impl StreamPolicy {
         stalled_s: f64,
         waited_s: f64,
     ) -> bool {
-        waited_s < self.max_wait_s
+        let budget_s = self.wait_budget_s(filling.in_flight);
+        waited_s < budget_s
             && (self.interval_paid(filling.removed, interval_s)
-                || (filling.aggregates_pending()
-                    && filling.in_flight as f64 * self.prover.per_named_s() > stalled_s))
+                || (filling.aggregates_pending() && stalled_s < budget_s))
     }
 
     /// Lanes each stage may run on, in the order it should prefer them.
@@ -1732,8 +1780,12 @@ mod tests {
     }
 
     /// The hold is not unconditional: it costs latency, so it is taken only
-    /// while what is in flight could pay for it at the same per-leaf price the
-    /// rest of the rule is denominated in.
+    /// while what is in flight is worth more than the wait has already cost.
+    ///
+    /// This clause used to price the tail against `stalled_s` — the silence
+    /// since the last interval that paid — rather than against the whole wait.
+    /// `T2 - T` is charged the whole wait, so that let a hold which kept being
+    /// refreshed run well past anything the tail could repay.
     #[test]
     fn a_converged_slot_does_not_wait_for_aggregates_it_cannot_use() {
         let policy = StreamPolicy::default();
@@ -1743,10 +1795,69 @@ mod tests {
             aggregates: 0,
             new_aggregates: 0,
         };
-        // 300 leaves are 0.46 s of proving, so half a second of silence is
-        // already more than they are worth.
-        assert!(policy.worth_waiting(converged, 0.2, 0.2, 1.0));
+        // 300 leaves are 0.46 s of proving, and that is the whole budget.
+        assert!(policy.worth_waiting(converged, 0.2, 0.2, 0.4));
+        // Still only 0.2 s of silence, but the wait as a whole has now cost more
+        // than these 300 could ever repay. The old rule held on here, because it
+        // was looking at the silence rather than at the bill.
+        assert!(!policy.worth_waiting(converged, 0.2, 0.2, 1.0));
         assert!(!policy.worth_waiting(converged, 0.2, 0.6, 1.4));
+    }
+
+    /// The bound the rule was missing: a rate test cannot cap a wait.
+    ///
+    /// [`StreamPolicy::interval_paid`] is break-even by construction — one
+    /// second of waiting against one second of proving avoided — so arrivals
+    /// that merely keep clearing 651 a second license a wait of any length, and
+    /// the only thing that ever ended one was `max_wait_s`. What actually bounds
+    /// it is the stock rather than the flow: a tail of `in_flight` leaves is
+    /// worth `in_flight * per_named_s` and no more, whatever rate delivers it.
+    #[test]
+    fn a_paying_rate_does_not_license_a_wait_past_what_the_tail_is_worth() {
+        let policy = StreamPolicy::default();
+
+        // 1,000 in flight: 1.54 s of proving, in total, for ever.
+        let worth_s = 1_000.0 * policy.prover.per_named_s();
+        assert!((worth_s - 1.5365).abs() < 1e-3, "{worth_s} s");
+
+        // Arriving at 2,500 a second — nearly four times break-even — so the
+        // rate test clears on every interval and never ends the wait itself.
+        let pouring = drained(1_000, 500);
+        assert!(policy.interval_paid(500, 0.2));
+
+        assert!(
+            policy.worth_waiting(pouring, 0.2, 0.0, 1.0),
+            "a second spent chasing 1.54 s of proving is still ahead",
+        );
+        assert!(
+            !policy.worth_waiting(pouring, 0.2, 0.0, 2.0),
+            "waited past what the whole tail could repay, because the arrivals \
+             were still clearing a break-even rate",
+        );
+    }
+
+    /// The budget, in the numbers from the epochs that exposed it.
+    #[test]
+    fn the_wait_budget_is_the_tail_priced_at_the_per_leaf_rate() {
+        let policy = StreamPolicy::default();
+
+        // Mainnet 469483 fired with 8,454 leaves still in its tail. That is
+        // 13.0 s of proving: the most any wait for them could ever have saved,
+        // against the 141.6 s that epoch was reported to have waited.
+        let worth_s = 8_454.0 * policy.prover.per_named_s();
+        assert!((worth_s - 12.99).abs() < 0.01, "{worth_s} s");
+        assert!(141.6 / policy.prover.per_named_s() > 90_000.0, "break-even");
+
+        // Above `max_wait_s`, so the cap is what binds for a filling slot — the
+        // budget changes nothing in the case the rule was tuned on.
+        assert_eq!(policy.wait_budget_s(8_454), policy.max_wait_s);
+
+        // 469480's tail was 112 leaves, worth 0.17 s, and the budget says so.
+        assert!((policy.wait_budget_s(112) - 0.172).abs() < 0.001);
+
+        // Nothing in flight is worth nothing, which is why an epoch that opens
+        // past its own threshold fires on the instant.
+        assert_eq!(policy.wait_budget_s(0), 0.0);
     }
 
     /// Nothing in flight is the catch-up case, and it must fire on the instant

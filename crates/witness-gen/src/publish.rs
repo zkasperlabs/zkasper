@@ -335,24 +335,17 @@ impl Publisher {
         );
     }
 
-    pub fn threshold_fired(
-        &self,
-        epoch: u64,
-        fired_unix_millis: u64,
-        wait_millis: u64,
-        tail: usize,
-        tail_named: usize,
-        late_groups: usize,
-    ) {
+    pub fn threshold_fired(&self, fired: &ThresholdFired) {
         self.event(
             "threshold.fired",
-            epoch,
+            fired.epoch,
             json!({
-                "fired_unix_millis": fired_unix_millis,
-                "wait_millis": wait_millis,
-                "tail": tail,
-                "tail_named": tail_named,
-                "late_groups": late_groups,
+                "fired_unix_millis": fired.fired_unix_millis,
+                "wait_millis": fired.wait_millis,
+                "late_group_millis": fired.late_group_millis,
+                "tail": fired.tail,
+                "tail_named": fired.tail_named,
+                "late_groups": fired.late_groups,
             }),
         );
     }
@@ -475,6 +468,23 @@ impl Publisher {
 }
 
 /// How far an epoch in flight has got.
+/// The trigger firing, and what `T2 - T` is about to be spent on.
+///
+/// `wait_millis` is the decision — how long the trigger held past the threshold
+/// — and `late_group_millis` is the work that follows it, proving the backlog
+/// the epoch opened with. They were one number until the fired timestamp moved
+/// out of the final proof's own span, and a reader could not tell a trigger that
+/// held from a prover that was behind.
+pub struct ThresholdFired {
+    pub epoch: u64,
+    pub fired_unix_millis: u64,
+    pub wait_millis: u64,
+    pub late_group_millis: u64,
+    pub tail: usize,
+    pub tail_named: usize,
+    pub late_groups: usize,
+}
+
 pub struct EpochProgress {
     pub epoch: u64,
     pub attesting_balance: u64,

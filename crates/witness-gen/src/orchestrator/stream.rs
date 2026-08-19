@@ -380,9 +380,17 @@ impl EpochPipeline for StreamPipeline {
             return Ok(());
         }
 
-        // Fire. Everything gossip has reached is closed, and the plan decides
-        // how much of it the final proof carries inline; slots past the crossing
-        // are simply never proven.
+        // Fire. `T2 - T` splits here, and the split is the whole reason this
+        // timestamp is taken now rather than when the final proof starts: the
+        // wait is over at this instant, and everything after it — the late group
+        // proof below, then the final proof — is the prover working. Stamping it
+        // in `close` instead charged the late group to the wait, which made a
+        // 141 s group proof read as a 141 s trigger hold against a cap of 10 s.
+        let fired_unix_millis = now_unix_millis();
+
+        // Everything gossip has reached is closed, and the plan decides how much
+        // of it the final proof carries inline; slots past the crossing are
+        // simply never proven.
         for unit in held.open {
             aggregator.stream.forget(unit.slot);
             aggregator.attesting_balance += unit.marginal_balance;
@@ -394,7 +402,8 @@ impl EpochPipeline for StreamPipeline {
         let late = (aggregator.proved < crossing)
             .then(|| Self::prove_group(engine, &aggregator, aggregator.proved..crossing, tick))
             .transpose()?;
-        self.close(engine, aggregator, late, crossing, tick).await
+        self.close(engine, aggregator, late, crossing, fired_unix_millis, tick)
+            .await
     }
 
     fn forget(&mut self) {
@@ -687,10 +696,14 @@ impl StreamPipeline {
         aggregator: StreamAggregator,
         late: Option<GroupProof>,
         crossing: usize,
+        fired_unix_millis: u64,
         tick: &mut Tick,
     ) -> Result<()> {
         let started = Instant::now();
-        let fired_unix_millis = now_unix_millis();
+        // The late group proof is the only thing the fire path does between the
+        // trigger firing and here, so this is exactly its cost — and on a daemon
+        // that opened its epoch late it is the largest term in `T2 - T`.
+        let late_group_millis = now_unix_millis().saturating_sub(fired_unix_millis);
         let target_epoch = aggregator.context.target_epoch;
         let tail: Vec<&SlotComplement> = vec![&aggregator.units[crossing]];
         let tail_named = tail.iter().map(|u| u.named_indices.len()).sum();
@@ -701,15 +714,16 @@ impl StreamPipeline {
         };
         let late_groups = groups.len();
         if let Some(publish) = engine.report.publisher() {
-            publish.threshold_fired(
-                target_epoch,
+            publish.threshold_fired(&publish::ThresholdFired {
+                epoch: target_epoch,
                 fired_unix_millis,
-                fired_unix_millis
+                wait_millis: fired_unix_millis
                     .saturating_sub(aggregator.crossed_unix_millis.unwrap_or_default()),
-                tail.len(),
+                late_group_millis,
+                tail: tail.len(),
                 tail_named,
                 late_groups,
-            );
+            });
             publish.stage_started(Stage::StreamFinal, target_epoch, None, None);
         }
 
@@ -804,6 +818,7 @@ impl StreamPipeline {
                 proof_unix_millis,
                 t2_minus_t_millis: proof_unix_millis.saturating_sub(threshold_unix_millis),
                 wait_millis: fired_unix_millis.saturating_sub(threshold_unix_millis),
+                late_group_millis,
                 tail_named,
                 folded_groups: aggregator.folded_groups,
                 late_groups,
@@ -812,6 +827,7 @@ impl StreamPipeline {
             info!(
                 t2_minus_t_millis = latency.t2_minus_t_millis,
                 wait_millis = latency.wait_millis,
+                late_group_millis = latency.late_group_millis,
                 tail_named = latency.tail_named,
                 folded_groups = latency.folded_groups,
                 late_groups = latency.late_groups,

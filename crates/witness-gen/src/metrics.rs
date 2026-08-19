@@ -126,9 +126,18 @@ const LATENCY_BUCKETS: &[f64] = &[
 ];
 
 /// How long the trigger held past the threshold. Capped by
-/// `--max-trigger-wait-millis`, which defaults to 10 s.
+/// `--max-trigger-wait-millis`, which defaults to 10 s, and by the tail's own
+/// worth — see `StreamPolicy::wait_budget_s`. A sample past the top of this
+/// ladder is a bug in the trigger, not a slow epoch; every live sample landed in
+/// `+Inf` while the late group proof was being charged to the wait.
 const WAIT_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0,
+];
+
+/// The late group proof, which is unbounded by anything the trigger controls: it
+/// is the backlog the epoch opened with, and it scales with the slots in it.
+const LATE_GROUP_BUCKETS: &[f64] = &[
+    0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 300.0,
 ];
 
 /// Absentees the final proof opened inline. A count, not a duration, but the
@@ -153,6 +162,7 @@ const BUCKETS: &[(&str, &[f64])] = &[
     ("zkasper_epoch_cost_usd", COST_BUCKETS),
     ("zkasper_t2_minus_t_seconds", LATENCY_BUCKETS),
     ("zkasper_trigger_wait_seconds", WAIT_BUCKETS),
+    ("zkasper_late_group_seconds", LATE_GROUP_BUCKETS),
     ("zkasper_tail_named", TAIL_BUCKETS),
 ];
 
@@ -394,6 +404,8 @@ pub fn observe_latency(latency: &EpochLatency) {
         .record(seconds(latency.t2_minus_t_millis));
     histogram!("zkasper_trigger_wait_seconds", "follow" => follow)
         .record(seconds(latency.wait_millis));
+    histogram!("zkasper_late_group_seconds", "follow" => follow)
+        .record(seconds(latency.late_group_millis));
     histogram!("zkasper_tail_named", "follow" => follow).record(latency.tail_named as f64);
     counter!("zkasper_groups_folded_total").increment(latency.folded_groups as u64);
 }
@@ -543,6 +555,12 @@ fn describe() {
         "zkasper_trigger_wait_seconds",
         Unit::Seconds,
         "The part of T2 - T that was the trigger holding back rather than the prover working."
+    );
+    describe_histogram!(
+        "zkasper_late_group_seconds",
+        Unit::Seconds,
+        "The part of T2 - T spent proving the backlog the epoch opened with, after the trigger \
+         fired and before the final proof. Zero for an epoch that folded everything before T."
     );
     describe_histogram!(
         "zkasper_tail_named",

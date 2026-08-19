@@ -100,6 +100,7 @@ the pipeline does happens before `T`.
   "proof_unix_millis": 1755525140400,
   "t2_minus_t_millis": 10400,
   "wait_millis": 1200,
+  "late_group_millis": 0,
   "tail": 1,
   "tail_named": 14,
   "folded_groups": 6,
@@ -107,9 +108,18 @@ the pipeline does happens before `T`.
 }
 ```
 
-`wait_millis` is the part of `t2_minus_t_millis` that was the trigger holding
-back rather than the prover working. `late_groups` above zero says the daemon was
-behind the chain.
+`t2_minus_t_millis` splits into three: `wait_millis`, the trigger holding back
+after the threshold; `late_group_millis`, proving the backlog the epoch opened
+with; and the final proof itself, which is the remainder.
+
+`wait_millis` is bounded twice over — by `--max-trigger-wait-millis` (10 s by
+default) and by what the tail is worth, since `tail_named` leaves cost
+`tail_named x 1.5365 ms` to open and a wait can never buy back more than that.
+A value far above either bound means a proof is being charged to the trigger.
+
+`late_group_millis` and `late_groups` above zero both say the same thing: the
+daemon reached the epoch after its threshold had already crossed, so its backlog
+was proven on the critical path instead of being folded before `T`.
 
 ### `proof`
 
@@ -432,7 +442,7 @@ Every `data` object carries `seq` and `unix_millis`.
 | `stage.started` | a proof starts | `{seq, unix_millis, epoch, stage, slot, index}` |
 | `stage.finished` | a proof lands | `{seq, unix_millis, epoch, stage, slot, index, millis, prove_millis, wrap_millis, witness, proof_bytes}` |
 | `threshold.crossed` | `T` | `{seq, unix_millis, epoch, threshold_unix_millis, attesting_balance, total_active_balance, attesting_pct}` |
-| `threshold.fired` | the trigger fires | `{seq, unix_millis, epoch, fired_unix_millis, wait_millis, tail, tail_named, late_groups}` |
+| `threshold.fired` | the trigger fires | `{seq, unix_millis, epoch, fired_unix_millis, wait_millis, late_group_millis, tail, tail_named, late_groups}` |
 | `proof.landed` | `T2` | `{seq, unix_millis, epoch, proof, public_inputs, latency}` |
 | `posting.landed` | a proof is verified on another chain | `{seq, unix_millis, epoch, posting}` |
 | `epoch.closed` | epoch finished | `{seq, unix_millis, epoch, summary}` — `summary` is the `/v1/epochs` entry |

@@ -129,16 +129,33 @@ impl StageTiming {
 pub struct EpochLatency {
     pub epoch: u64,
     pub threshold_unix_millis: u64,
-    /// When the trigger actually started the final proof. Never before
-    /// `threshold_unix_millis`, and later than it whenever waiting for in-flight
-    /// attestations was the cheaper way to a postable proof.
+    /// When the trigger fired: the end of the wait, not the start of the final
+    /// proof. Never before `threshold_unix_millis`, and later than it whenever
+    /// waiting for in-flight attestations was the cheaper way to a postable
+    /// proof.
     pub fired_unix_millis: u64,
     pub proof_unix_millis: u64,
     pub t2_minus_t_millis: u64,
     /// The part of `t2_minus_t_millis` that was the trigger holding back rather
     /// than the prover working. Reading it against `tail_named` is what says
-    /// whether the wait bought what the model says it should have.
+    /// whether the wait bought what the model says it should have, and
+    /// `StreamPolicy::wait_budget_s` is the bound: a tail of `tail_named` leaves
+    /// is worth `tail_named * per_named_s` of proving, so a wait longer than
+    /// that lost time on every outcome available to it.
+    ///
+    /// Bounded by `--max-trigger-wait-millis`, 10 s by default. It was not,
+    /// until the fired timestamp moved out of `close`: the late group proof ran
+    /// between `T` and the old stamp, so a 141 s group proof was reported as a
+    /// 141 s wait against a 10 s cap, and `late_group_millis` is where it went.
     pub wait_millis: u64,
+    /// The late group proof, which is the rest of `t2_minus_t_millis` before the
+    /// final proof itself.
+    ///
+    /// Zero on a daemon that folded everything before `T`. Above zero it is the
+    /// backlog the epoch opened with, proven on the critical path because the
+    /// fire path is the first tick that could prove it — so it is `late_groups`
+    /// priced in seconds, and on a catch-up epoch it is the largest term here.
+    pub late_group_millis: u64,
     /// Accumulator leaves the final proof opened for its inline tail — the
     /// absentees the wait did not remove. Every one of them is
     /// `ProverModel::per_named_s` on the critical path.

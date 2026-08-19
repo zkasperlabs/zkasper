@@ -458,6 +458,7 @@ export class IndexDO extends DurableObject {
         this.mergeLatency(epoch, {
           fired_unix_millis: num(d.fired_unix_millis) ?? num(d.unix_millis) ?? undefined,
           wait_millis: num(d.wait_millis) ?? undefined,
+          late_group_millis: num(d.late_group_millis) ?? undefined,
           tail: num(d.tail) ?? undefined,
           tail_named: num(d.tail_named) ?? undefined,
           late_groups: num(d.late_groups) ?? undefined,
