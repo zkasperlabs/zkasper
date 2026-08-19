@@ -233,6 +233,19 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
     let vk = prover.program_vk(Stage::Group);
     server.stop();
 
+    // What the four calls cannot avoid: every stage runs its circuit locally
+    // whether or not the prover answers, because the daemon advances on the
+    // outputs its own circuits computed and not on the server's. So the floor
+    // is four local runs, measured here rather than assumed -- it is 1.1 s a
+    // call on an idle box and 3.4 s on a loaded one, which no constant spans.
+    let floor = Instant::now();
+    for _ in 0..4 {
+        NativeProver::new(chain())
+            .prove_group(&witness)
+            .expect("the local circuit runs with or without a prover");
+    }
+    let floor = floor.elapsed();
+
     // Two epochs' worth of stages, against a prover that is not there. Each call
     // returns the outputs the local circuit computed and the empty proof of a
     // witness-only run, so the daemon keeps following the chain.
@@ -247,13 +260,30 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
         );
         assert_eq!(output.public_bytes(), proven.public_bytes());
     }
-    // Fast, because the backoff means an outage costs one connect attempt per
-    // interval rather than one per stage. The bound is loose enough for a loaded
-    // CI box and far under the 8 x 500 ms of connect timeouts it replaces.
+    // An outage adds the spool write and the failed connect, and nothing else.
+    // Measured 2026-08-19: the connect costs 16-137 us against a closed port and
+    // the spool write 16-39 ms, against 1.1-3.4 s of circuit per call -- about
+    // 3% on top of work that would have happened anyway.
+    //
+    // The bound is a multiple of the floor and not a constant over it, because
+    // the noise scales with the floor too: two adjacent four-call blocks drift
+    // 34% apart at load 38 on a 20-core box, which is 3.8 s when the floor is
+    // 11 s and 0.2 s when it is idle. Twice the floor clears the worst drift
+    // measured with half again to spare, and still fails long before an outage
+    // could cost the daemon what the epoch costs.
+    //
+    // An absolute bound cannot work at all: the floor alone is 4.7-9.5 s on
+    // this box. The 2 s that stood here was under the floor and could not pass
+    // on any box -- and the 8 x 500 ms of connect timeouts it claimed to beat
+    // were never paid either, because a closed port refuses at once and only a
+    // host that drops SYNs reaches `connect_timeout`. That the outage waits on
+    // nothing is asserted exactly, and load cannot move it, by `timed_out`.
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "four calls into an outage took {:?}",
+        started.elapsed() < floor * 2,
+        "four calls into an outage took {:?}, over twice the {:?} of local \
+         circuit work they cannot avoid",
         started.elapsed(),
+        floor,
     );
 
     // The witness builders bind the verification key on every stage, so it has
@@ -263,6 +293,8 @@ fn an_outage_costs_the_epoch_and_not_the_daemon() {
     let counters = prover.counters();
     assert_eq!(counters.spooled, 4, "every lost witness must be kept");
     assert_eq!(counters.unproven, 4);
+    // A server that is down refuses the connection; nothing here waits one out.
+    assert_eq!(counters.timed_out, 0, "an outage must not be waited out");
     assert_eq!(counters.pending, 4);
     assert_eq!(counters.dropped, 0);
     assert_eq!(spooled_files(spool.path()), 4);
