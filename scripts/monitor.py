@@ -200,13 +200,39 @@ def api_detail(body):
     return f"chain {d.get('chain')}, epoch {(d.get('accumulator') or {}).get('epoch')}"
 
 
+def published_gaps():
+    """Epochs the chain justified but no proof exists for.
+
+    Nothing watched this until 2026-08-19, which is how a collector bug that
+    discarded every network aggregate ran for a whole night: it abandoned four
+    epochs at 62-76% support while `gossip.dropped` stayed 0 and every other
+    check stayed green. A consumer cannot detect a missing epoch for themselves,
+    so the hole has to be found here.
+    """
+    try:
+        req = Request("https://api.zkasper.com/v1/epochs?limit=40",
+                      headers={"User-Agent": "zkasper-monitor"})
+        with urlopen(req, timeout=25) as r:
+            d = json.loads(r.read())
+    except Exception as e:
+        return check("chain", True, f"not checked: {e}")
+    nums = sorted(e["epoch"] for e in d.get("epochs", []) if e.get("status") == "proven")
+    if len(nums) < 2:
+        return check("chain", True, f"{len(nums)} proven, too few to judge")
+    missing = [n for n in range(nums[0], nums[-1]) if n not in set(nums)]
+    return check("chain", not missing,
+                 f"proven {nums[0]}-{nums[-1]}, "
+                 + (f"HOLES at {missing}" if missing else "contiguous"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="print only failures")
     a = ap.parse_args()
 
-    checks = daemon() + gpus() + [url("api", API, api_detail), url("site", SITE, None)]
+    checks = (daemon() + gpus()
+              + [url("api", API, api_detail), published_gaps(), url("site", SITE, None)])
     healthy = all(c["ok"] for c in checks)
 
     if a.json:
