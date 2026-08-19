@@ -448,6 +448,51 @@ and the modelled one is the blind tick.** Nothing about the prover, the recursio
 cost or the fold schedule is implicated by it, and none of it was visible while
 `T` was stamped where the gap was.
 
+### What sets the observation delay
+
+Not a late stamp. Over the 29 steady-state epochs of the run the prover was busy
+for **98.5%** of the window between the chain crossing and the daemon noticing,
+and the daemon looked within a median **0.30 s** of the prover coming free. It
+was never idle and blind; it was working and blind.
+
+The window splits in two, and only one half is forced:
+
+| | share of the window |
+| --- | --- |
+| a proof already running when the chain crossed | **56.0%** |
+| proofs *started after* it, while the daemon was not looking | **42.5%** |
+| prover idle | 1.5% |
+
+The first half cannot be recovered without preempting a proof in flight. **The
+second can**: those are proofs the daemon queued because it did not know the
+threshold had gone by, and 11 of them were started across 9 of the 29 epochs.
+The epochs that queued nothing blind observed the crossing a median **65.5 s**
+late; the epochs that queued work blind, **133.3 s**. That is where the next
+effort belongs — evaluating the trigger above the in-flight-proof early return in
+`StreamPipeline::drive`, so the daemon stops enqueueing work once the epoch is
+already justifiable. It is worth about 40 s of the ~99 s median, and it buys no
+prover time at all.
+
+**`001b250` did not change this, and could not have.** It moved proving off the
+drive loop so the tick returns while a proof runs, which is what it was for and
+what it did — the head stays fresh and the next epoch gets speculated. But the
+threshold check sits below the early return it introduced, and before it the same
+check sat above a *blocking* prove call. Either way the trigger is evaluated
+exactly once per proof, immediately after the previous one lands. The mechanism
+changed; the cadence did not. No steady-state epoch predates `001b250` in this
+run, so the archive cannot measure the difference — the code settles it instead.
+
+**`6eb1302` improved it, despite appearing not to.** Measured against each
+daemon's own crossing slot the median observation delay is 75.2 s under `001b250`
+and 98.1 s under `6eb1302`. The comparison is invalid: before `6eb1302` the
+collector discarded every network aggregate, so the daemon under-counted and
+needed a median of **25** slots to reach 2/3 where it now needs **21**. Its
+crossing slot was four slots — 48 s — too late, and every delay measured against
+it is that much too small. Corrected, `001b250` is 123.2 s against `6eb1302`'s
+98.1 s. For the same reason the corrected `T2 - T` of every pre-`6eb1302` epoch
+in this document is itself a lower bound; the ten published epochs are all after
+it and are unaffected.
+
 One conservatism is left in the anchor and it is small. A slot's attestations do
 not exist at its boundary; the crossing slot supplies only the last third of the
 quorum, and on 193 slots of mainnet gossip (`arrivals.tsv` from this run) a third
