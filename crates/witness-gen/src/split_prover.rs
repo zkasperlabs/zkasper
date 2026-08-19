@@ -21,14 +21,33 @@
 //! **The committee proof is what to move.** It is 179 s of the 399, it has a
 //! full epoch of lead time by construction — a RANDAO mix from the end of epoch
 //! E-2 fixes the committees of epoch E — and it is the one stage that never
-//! touches `T2`. Moving it to a second card leaves about 220 s on the first,
-//! which fits inside an epoch with room to spare.
+//! touches `T2`.
+//!
+//! # Routing alone changes nothing, and this is the trap
+//!
+//! Moving that stage to a second card takes its 179 s off the first card's
+//! **duty cycle**. It does not take it out of the epoch's **wall-clock chain**,
+//! because [`crate::orchestrator`] awaits the committee proof inline in
+//! `open_epoch` and proves everything else on the calling task. Nothing is ever
+//! in flight on two cards at once, so the cycle stays ~379 s whichever card
+//! answers, and the gain is about 5 s an epoch rather than 175.
+//!
+//! An earlier version of this comment said moving it "leaves about 220 s on the
+//! first card, which fits inside an epoch with room to spare". That is true of
+//! duty cycle and false of cycle time, and the difference is the whole point: a
+//! card was rented on the strength of it.
+//!
+//! **What makes the second card pay is starting epoch N+1's committee proof
+//! during epoch N** and merely awaiting it at `open_epoch`. The lead time is
+//! already there in the schedule; only the concurrency is missing. Until that
+//! exists this type is plumbing waiting for a caller.
 //!
 //! # What this does not do
 //!
 //! It does not make one proof faster, and it does not parallelise a stage across
 //! cards. It routes whole stages to whole provers. Two proofs of *different*
-//! stages can then be in flight at once; two of the same stage still queue.
+//! stages *could* then be in flight at once — once something issues them
+//! concurrently; two of the same stage still queue.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
