@@ -371,8 +371,63 @@ permutation — 13.8 kB of code in the shipped ELF against a 652-byte syscall
 stub — and only the transcript's 306 width-16 hashes stay precompiled.
 
 So the 35.629 s a child above is a compression artefact, not the price of
-recursion. The pipeline stopped paying it on 2026-08-19; the wall-clock number
-that replaces it is a GPU measurement and is not in this document yet.
+recursion. The pipeline stopped paying it on 2026-08-19.
+
+### The wall-clock number that replaces it: 1.52 s a child
+
+```sh
+./scripts/recursion_bench_build.sh
+./scripts/recursion_bench_emu.sh                      # cost units, 0..3 children
+./scripts/recursion_bench_gpu.sh                      # box setup and ELF setup
+./scripts/recursion_bench_gpu_prove.sh children 2     # compressed ladder
+./scripts/recursion_bench_gpu_prove.sh nm 2           # uncompressed ladder
+```
+
+MEASURED on a rented RTX 5090, driver 580.159.03, CUDA 12.9.1, cargo-zisk
+v1.1.0-alpha **[gpu]**, 2026-08-19. `Proof generated`, warm; the ladder is
+`crates/recursion-bench-guest` over real proofs, so `n + 1` minus `n` is one
+recursion and nothing else.
+
+| children | compressed | uncompressed |
+|---:|---:|---:|
+| 0 | 2.376 s | 2.349 s |
+| 1 | 43.245 s | 4.736 s |
+| 2 | 87.039 s | 6.175 s |
+| 3 | 142.129 s | 7.694 s |
+| 4 | | 9.297 s |
+
+**Three terms, separated.** Least squares over the uncompressed ladder at
+`n = 1..4` is `3.175 s + 1.520 s a child`, worst residual **0.042 s — 2.7% of
+one child**. The zero-child point is 2.349 s, which is the empty-guest floor this
+document already carries (2.367 s ± 0.049, measured in an unrelated campaign).
+
+| term | value |
+|---|---:|
+| empty-guest floor | 2.349 s |
+| **the step for having any child at all** | **+0.83 s** |
+| **per child** | **1.520 s** |
+
+The 0.83 s is a proof's first `Poseidon` AIR instance: 3,877 permutations is
+about 54,000 rows of a 131,072-row AIR, and a guest with no children builds no
+such instance. It is paid **once per proof, not once per child**, `ProverModel`
+has no term for it, and at 1.52 s a child it is worth more than half a child.
+**Splitting one proof's children across two proofs now costs a floor and a
+Poseidon instance and saves almost nothing** — the opposite of what the 35.629 s
+number implied.
+
+**The compressed ladder bends, and that is why the old curve read high.** Its
+marginals are 40.87, 43.79 and 55.09 s for three chunks of work the emulator says
+are identical to five decimal places — 610, 589 and 535 M cost units a second.
+A least-squares slope over it reports the bend as slope: 46.35 s a child against
+a first child of 40.87 s, worst residual 13% of a child.
+
+**And the seconds are a property of the rental.** One compressed child, warm,
+one process, one card, varying only the CPU affinity mask: **44.54 s on 256
+cores, 36.75 s on 64, 35.74 s on 32, 38.68 s on 16** — 1.25x, non-monotonic,
+widest mask slowest, because the prover sizes its thread pool from the node's
+core count and not from its affinity mask. The 1.49x between 35.629 s and
+53.087 s needs no mechanism beyond that: this box measured 40.9 s, between the
+two, and neither figure was a property of a guest.
 
 ## `T2 - T`
 

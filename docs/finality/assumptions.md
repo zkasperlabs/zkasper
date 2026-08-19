@@ -245,6 +245,68 @@ The same obligation applies to any consumer that reads a justification proof on
 its own rather than through a finalization — the API publishes them — since the
 circuit that would have made the comparison is not in the picture.
 
+### Which proving system a child proof was proved under: pinned
+
+**This was open until 2026-08-19, and while it was open the section above bought
+nothing.** Baking a child's program key checks a *public value* of the child's
+proof. Which circuit emitted that public value is a separate question, and it was
+answered out of the witness.
+
+`zisklib::verify_zisk_proof` splits the last four words off the buffer it is
+given and passes them to the STARK verifier as `rootC`:
+
+```rust
+let (proof, vk) = zisk_proof.split_at(zisk_proof.len() - VADCOP_VK_LEN_WORDS);
+zisk_verifier::verify_vadcop_final_proof(proof, vk, HASH)
+```
+
+`rootC` is the Merkle root of the *constant polynomials*, and for a circuit
+compiled through circom into `proofman`'s compressor form the constant
+polynomials are the gates and the wiring — the circuit itself. Nothing else names
+it. `proofman`'s generated `vadcop_final` verifier and its `recursive2` verifier
+are **byte for byte the same 7,196 lines**; they differ only in a domain size and
+in the root they are handed. The generated code is a verifier for *any* circuit of
+that shape, and the four words say which one.
+
+So a prover could compile a circuit of their own — one with 69 public signals and
+no constraints tying them to anything — prove it honestly, and write its root on
+the end. The parent's `verify_child` then read the program key out of a public
+value the attacker had chosen, matched it against the baked constant, and called
+a STARK verifier that agreed with the attacker's own circuit. Every baked key,
+every published `program_vk`, and the public bytes an aggregator binds were all
+public values of a circuit the prover wrote. The parent's own key was unchanged,
+so a verifier that pinned only the top-level program accepted the result. This
+was the same hole as the one above, one layer down, and it also reached the
+host-side verifier in `witness-gen/src/verify.rs` and the check the daemon runs on
+every proof a remote prover-server hands back.
+
+**The key is now a constant.** `zkasper_common::recursion::VADCOP_FINAL_VK` is
+`rootC` of the `vadcop_final` circuit in the Zisk **v1.1.0-alpha** proving key,
+and `verify_child` compares the trailing four words against it *before* it looks
+at the program key — because every check below it is a statement about the circuit
+those words name. One constant covers everything: every baked edge, the three
+edges that cannot be baked, the host-side verifier, and the prover's own check on
+what it just produced.
+
+**It is far easier to pin than the program keys, and for one reason.** The VADCOP
+final key is a constant of a Zisk release, not of any guest ELF. Changing it
+changes no key derived from it, so there is no dependency graph, no topological
+bake, and no edge that cannot be closed. One shared constant in `zkasper-common`
+is enough, and it is checked in the one place every recursive edge goes through.
+
+**Two obligations remain.** Rederive the constant on a Zisk bump — it is
+`provingKey/zisk/vadcop_final/vadcop_final.verkey.bin`, and the v1.0.0-alpha value
+is a different number. A stale constant refuses every proof, which is the safe
+direction, but it refuses it at the far end of a proving run. And an on-chain
+verifier must pin the same thing: the wrap's public-input preimage includes a
+`rootCVadcopFinal` field, but v1.1.0-alpha stamps the proof's own program key
+there rather than the VADCOP key, so a contract that reads that field is not
+pinning the proving system by reading it.
+
+Note that `zkasper_common` is code every guest compiles in, so changing this
+constant changes every guest ELF. `./scripts/bake_child_vks.sh` has to run with
+it, as it does for any other change a guest compiles.
+
 ### The FFG source checkpoint is not constrained
 
 The circuits assert that every attestation names the expected target epoch and

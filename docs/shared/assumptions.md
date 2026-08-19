@@ -172,6 +172,29 @@ can run in tests without a prover. Inside a guest an empty proof is rejected.
 is a witness-only mode. Only `--prover zisk` produces proofs that a consumer can
 verify.
 
+### The proving system a child was proved under is pinned, and must be rederived
+
+`zisklib::verify_zisk_proof` takes the key it checks a child's STARK against from
+the **last four words of the child's own buffer**. That key is `rootC`, the
+commitment to the constant polynomials, which for a circom-compiled circuit *are*
+the gates and the wiring -- `proofman`'s generated `vadcop_final` and `recursive2`
+verifiers are byte for byte the same code and differ only in that root. Left
+witness-supplied it is a soundness hole with no floor: a prover compiles a circuit
+with 69 unconstrained public signals, proves it, and every public value an honest
+parent then binds -- the program key included -- is one they wrote. It was
+witness-supplied until 2026-08-19.
+
+`zkasper_common::recursion::VADCOP_FINAL_VK` pins it, and `verify_child` checks it
+first. Both products inherit that from the shared crate; unlike the child program
+keys, there is nothing per-guest to do, because the key belongs to a Zisk release
+rather than to any ELF. The full account is in
+[../finality/assumptions.md](../finality/assumptions.md), "Which proving system a
+child proof was proved under".
+
+**What a Zisk bump costs:** rederive the constant from
+`provingKey/zisk/vadcop_final/vadcop_final.verkey.bin` of the new release. A stale
+value costs liveness, never soundness -- it refuses every proof.
+
 ### The on-chain wrap reintroduces a trusted setup
 
 The Zisk STARK is transparent. The PLONK wrap that puts a proof on chain is not.
