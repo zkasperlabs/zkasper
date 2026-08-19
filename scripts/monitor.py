@@ -170,18 +170,6 @@ def daemon():
         out.append(check("folds", worst_late < 2,
                          f"worst late_groups in last {min(len(lat),5)}: {worst_late}"))
 
-    # Say so rather than print nothing when there is no data. Time and cost are
-    # two of the three metrics that matter, and a check that disappears when it
-    # has nothing to report reads exactly like a check that passed.
-    done = [l for l in lat if l.get("t2_minus_t_millis")]
-    if len(done) >= 3:
-        v = sorted(l["t2_minus_t_millis"] / 1000 for l in done)
-        out.append(check("time", True,
-                         f"T2-T median {v[len(v) // 2]:.0f}s "
-                         f"p90 {v[int(0.9 * (len(v) - 1))]:.0f}s over {len(v)}"))
-    else:
-        out.append(check("time", True, f"{len(done)} epochs measured, too few"))
-
     # How far behind the chain the daemon closes an epoch, and which way it is
     # moving. This is the signal `T2 - T` mostly measures and the one an operator
     # can act on: an epoch closed 3.5 epochs late is a backlog, not a slow proof,
@@ -194,6 +182,7 @@ def daemon():
     # `threshold_unix_millis` is by construction `genesis + slot * slot_seconds`,
     # so two epochs of latency determine both, and the check cannot drift from
     # the chain the daemon is actually following.
+    done = [l for l in lat if l.get("t2_minus_t_millis")]
     if len(done) >= 2:
         a, b = done[-2], done[-1]
         span_slots = b["threshold_slot"] - a["threshold_slot"]
@@ -284,6 +273,63 @@ def api_detail(body):
     return f"chain {d.get('chain')}, epoch {(d.get('accumulator') or {}).get('epoch')}"
 
 
+def published_latency():
+    """The `T2 - T` distribution, from the API rather than the manifest.
+
+    The criterion asks for median and p90 over **at least 100 epochs**, and the
+    daemon's manifest keeps the last **ten** — so nothing could measure it until
+    this read the published feed instead. The API holds every epoch of the run
+    and is what a consumer sees, which makes it the right source anyway.
+
+    Two windows, because they answer different questions. A run starts behind
+    the chain and spends ~7 epochs closing the backlog, during which `T2 - T` is
+    the backlog and not the pipeline: 892 s falling to 60 s on 2026-08-19. The
+    all-time figure is what the criterion wants and stays dragged by that tail
+    for hours. The trailing figure is what tells an operator whether steady state
+    has degraded, and it is the one that moves first when something breaks.
+    """
+    try:
+        epochs, before = [], None
+        while len(epochs) < 400:
+            url = "https://api.zkasper.com/v1/epochs?limit=200"
+            if before is not None:
+                url += f"&before={before}"
+            req = Request(url, headers={"User-Agent": "zkasper-monitor"})
+            with urlopen(req, timeout=30) as r:
+                page = json.loads(r.read())
+            epochs.extend(page.get("epochs", []))
+            before = page.get("next_before")
+            if before is None:
+                break
+        req = Request("https://api.zkasper.com/v1/status",
+                      headers={"User-Agent": "zkasper-monitor"})
+        with urlopen(req, timeout=25) as r:
+            init = json.loads(r.read()).get("init_epoch")
+    except Exception as e:
+        return check("time", True, f"not checked: {e}")
+
+    # Since the current init point only: epochs below it belong to a chain that
+    # was abandoned, and their latency describes a run that no longer exists.
+    # Chronological first, then sorted for the percentiles. Slicing a sorted
+    # list for "the last ten" takes the ten slowest, which is exactly backwards
+    # for a check meant to notice steady state degrading.
+    series = sorted(((e["epoch"], e["latency"]["t2_minus_t_millis"] / 1000)
+                     for e in epochs
+                     if (e.get("latency") or {}).get("t2_minus_t_millis")
+                     and (init is None or e.get("epoch", 0) >= init)),
+                    key=lambda row: row[0])
+    v = sorted(t for _, t in series)
+    if len(v) < 3:
+        return check("time", True, f"{len(v)} epochs measured since init, too few")
+    recent = sorted(t for _, t in series[-10:])
+    return check("time", True,
+                 f"T2-T median {v[len(v) // 2]:.0f}s "
+                 f"p90 {v[int(0.9 * (len(v) - 1))]:.0f}s over {len(v)}"
+                 f" ({len(v)}/100 for the criterion)"
+                 + (f", last {len(recent)} median {recent[len(recent) // 2]:.0f}s"
+                    if len(v) > 10 else ""))
+
+
 def published_gaps():
     """Epochs the chain justified but no proof exists for.
 
@@ -352,7 +398,8 @@ def main():
     a = ap.parse_args()
 
     checks = (daemon() + gpus()
-              + [url("api", API, api_detail), published_gaps(), url("site", SITE, None)])
+              + [url("api", API, api_detail), published_latency(), published_gaps(),
+                 url("site", SITE, None)])
     healthy = all(c["ok"] for c in checks)
 
     if a.json:
