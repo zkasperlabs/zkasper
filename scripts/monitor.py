@@ -133,14 +133,17 @@ def daemon():
     lat = s.get("recent_latencies") or []
     if lat:
         last = lat[-1]
-        # late_groups marks a catch-up epoch, not a steady-state one, so it is
-        # reported rather than paged on. Sustained non-zero means the daemon is
-        # not keeping up with the chain.
-        recent_late = sum(1 for l in lat[-5:] if l.get("late_groups"))
-        out.append(check("latency", recent_late < 5,
+        # late_groups == 1 is the schedule's own optimum, not a shortfall: the
+        # planner prints "Final absorbs [1]" on mainnet, and folding that last
+        # group would cost a stage floor plus a recursion (56.7 s) more. This
+        # check paged on every healthy epoch until 2026-08-19. Only 2 or more is
+        # a real signal, since the fire path holds at most one group and a
+        # second means the pipeline is behind.
+        worst_late = max((l.get("late_groups") or 0) for l in lat[-5:])
+        out.append(check("latency", worst_late < 2,
                          f"T2-T {last.get('t2_minus_t_millis')}ms, "
                          f"tail {last.get('tail_named')}, "
-                         f"late in last {min(len(lat),5)}: {recent_late}"))
+                         f"worst late_groups in last {min(len(lat),5)}: {worst_late}"))
 
     pub = s.get("publish") or {}
     if pub:
