@@ -23,10 +23,16 @@ use super::engine::{write_proof, Engine};
 /// Whether `error` means the node has thrown away a state this run still needs.
 ///
 /// A checkpoint-synced node serves states from its finalized split forward, and
-/// the split moves every epoch — measured on 2026-08-18, the window was about
-/// the last 60 to 100 slots. An accumulator that falls behind therefore asks for
-/// a state that no longer exists, and no number of restarts brings it back: the
-/// window only moves further away.
+/// the split moves in batches, so retention sawtooths between about two epochs
+/// and `--epochs-per-migration`. An accumulator that falls into the trough asks
+/// for a state that no longer exists, and no number of restarts brings it back:
+/// the window only moves further away.
+///
+/// This is now the failure of last resort rather than the ordinary one. Every
+/// boundary a stage needs is taken while the epoch is still inside the window
+/// and held in [`crate::boundary_cache`], so reaching here means the run was
+/// pointed at an epoch it was never up to see — a stale init point, or a stall
+/// longer than the cache's reach.
 ///
 /// The daemon used to bootstrap forward on its own here, which silently broke
 /// the accumulator chain at the epoch it restarted on. It now stops and says
@@ -51,14 +57,31 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
         let started = Instant::now();
         self.report.begin(Stage::EpochDiff, to_epoch, None, None);
 
+        // Both registries come out of what this run took while the node still
+        // served them. The diff is the stage that used to ask for the older of
+        // the two at the latest possible moment, which is how a run died one
+        // epoch behind finalization.
+        let slot_1 = self.snapshot.epoch_state.slot;
+        let slot_2 = to_epoch * self.config.chain.slots_per_epoch;
+        let held_1 = self
+            .boundary_at(slot_1)
+            .await
+            .context("open the boundary state the accumulator sits on")?;
+        let held_2 = self
+            .boundary_at(slot_2)
+            .await
+            .context("open the boundary state the accumulator is moving to")?;
+
         let mut tree = self.snapshot.tree.clone();
         let (witness, epoch_state, total_active_balance, num_validators) =
-            witness_epoch_diff::build(
+            witness_epoch_diff::build_held(
                 &self.api,
                 &self.config.chain,
                 &mut tree,
                 &self.snapshot.epoch_state,
-                to_epoch * self.config.chain.slots_per_epoch,
+                &held_1.validators,
+                &held_2.validators,
+                slot_2,
                 self.snapshot.state.total_active_balance,
             )
             .await
@@ -112,6 +135,10 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
             epoch_state,
         };
         self.store.save(&self.snapshot)?;
+
+        // The boundary the accumulator just left is the oldest any later stage
+        // can name, so everything behind it is dead weight on disk.
+        self.boundaries.forget_before(slot_2);
 
         let millis = started.elapsed().as_millis() as u64;
         info!(

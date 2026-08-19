@@ -21,6 +21,7 @@ use common::{FakeGossip, MockBeaconApi, SyntheticChain, BALANCE_GWEI};
 
 use zkasper_common::ChainConfig;
 
+use zkasper_witness_gen::init_point::InitPoint;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline, Tick};
 use zkasper_witness_gen::prover::NativeProver;
 use zkasper_witness_gen::store::{Store, StoreState};
@@ -387,17 +388,92 @@ async fn test_a_reorged_checkpoint_is_retried_and_never_published() {
     );
 }
 
-/// The node throws the state away while the daemon is behind it.
+/// The node migrates the boundary between the daemon opening an epoch and
+/// diffing it.
 ///
-/// A checkpoint-synced node serves states from its finalized split forward and
-/// the split moves every epoch, so an accumulator that has fallen behind asks
-/// for a state that is gone. Restarting cannot bring it back — the window only
-/// moves further away.
+/// This is the run that died on 2026-08-19, in miniature. The daemon proved
+/// epoch E's justification off the registry at E's boundary, spent three
+/// minutes on the proof, and then asked for that same registry again to build
+/// the diff out of E — by which time the node's split had moved past it. The
+/// state was never unavailable; the daemon had nowhere to keep what it had
+/// already read.
+///
+/// Nothing here waits for the split. The node stops serving the boundary the
+/// instant the epoch is justified, which is the worst the trough can do, and
+/// the diff still has to run.
+#[tokio::test]
+async fn test_diffs_a_boundary_the_node_has_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let mut daemon = open(dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
+
+    let tick = daemon.tick().await.unwrap();
+    assert_eq!(tick.justified, Some(FIRST_EPOCH));
+
+    // The split moves past the epoch the accumulator sits on — one epoch behind
+    // what the node calls finalized, which is where the live run was.
+    daemon.api().prune_state(FIRST_EPOCH * SPE);
+
+    let tick = daemon
+        .tick()
+        .await
+        .expect("the diff runs off the boundary this run took, not off the node");
+    assert_eq!(tick.advanced_to, Some(FIRST_EPOCH + 1));
+    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
+    assert_eq!(
+        daemon.state().init_epoch,
+        FIRST_EPOCH,
+        "the accumulator chain is unbroken: nothing re-anchored",
+    );
+}
+
+/// A restart resumes onto boundaries the node has migrated in the meantime.
+///
+/// The cursor of a resumed run is already behind finalization, so a daemon that
+/// held its boundaries in memory alone would come back needing exactly what the
+/// node has just thrown away. They are kept beside the store for this.
+#[tokio::test]
+async fn test_resumes_onto_boundaries_the_node_has_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+
+    let mut daemon = open(dir.path(), chain.mock(LAST_EPOCH * SPE + 3)).await;
+    daemon.tick().await.unwrap();
+    drop(daemon);
+
+    // Both boundaries the next diff spans are gone from the node: the one the
+    // accumulator sits on and the one it is moving to.
+    let mock = chain.mock(LAST_EPOCH * SPE + 3);
+    mock.prune_state(FIRST_EPOCH * SPE);
+    mock.prune_state((FIRST_EPOCH + 1) * SPE);
+    let mut daemon = Orchestrator::open(
+        mock,
+        config(dir.path()),
+        Box::new(NativeProver::new(TEST_CONFIG)),
+    )
+    .await
+    .expect("the store is enough to resume from");
+
+    let tick = daemon
+        .tick()
+        .await
+        .expect("what the run held before the restart is still held after it");
+    assert_eq!(tick.advanced_to, Some(FIRST_EPOCH + 1));
+}
+
+/// The node throws away a state this run never held.
+///
+/// A checkpoint-synced node serves states from its finalized split forward, so
+/// an accumulator pointed at an epoch the daemon was not up to see asks for a
+/// state that is gone. Restarting cannot bring it back — the window only moves
+/// further away — and a cache cannot produce a boundary it never took.
 ///
 /// The daemon used to start again from a fresh bootstrap here, which kept it
 /// alive at the cost of silently breaking the accumulator chain at the epoch it
-/// restarted on. It now stops and names the remedy, because a break a consumer
-/// cannot see is worse than an outage an operator can.
+/// restarted on. It still stops and names the remedy, because a break a
+/// consumer cannot see is worse than an outage an operator can. The one place
+/// it does skip forward is a run that has chained nothing yet — see
+/// `test_anchors_itself_when_the_init_point_is_out_of_reach`.
 #[tokio::test]
 async fn test_stops_when_the_node_has_thrown_the_state_away() {
     let dir = tempfile::tempdir().unwrap();
@@ -408,13 +484,18 @@ async fn test_stops_when_the_node_has_thrown_the_state_away() {
     daemon.tick().await.unwrap();
     daemon.tick().await.unwrap();
     assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
+    drop(daemon);
+
+    // A store carried somewhere without the boundaries beside it, which is the
+    // only way a resumed run can need a state it never took.
+    std::fs::remove_dir_all(dir.path().join("zkasperd.db.boundaries")).unwrap();
 
     // Reopen against a node that has stopped serving epoch 11's boundary state,
     // which is what the diff onto epoch 12 needs. It still holds the epoch it
     // reports as finalized, as a node always does.
-    let mut mock = chain.mock(LAST_EPOCH * SPE + 3);
-    mock.unservable_states.insert((FIRST_EPOCH + 1) * SPE);
+    let mock = chain.mock(LAST_EPOCH * SPE + 3);
     let config = config_from(dir.path(), &mock).await;
+    mock.prune_state((FIRST_EPOCH + 1) * SPE);
     let mut daemon = Orchestrator::open(mock, config, Box::new(NativeProver::new(TEST_CONFIG)))
         .await
         .unwrap();
@@ -433,6 +514,50 @@ async fn test_stops_when_the_node_has_thrown_the_state_away() {
     // still unbroken.
     assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
     assert_eq!(daemon.state().init_epoch, FIRST_EPOCH);
+}
+
+/// The init point names an epoch the node has already migrated.
+///
+/// An init point is generated at the node's finalized checkpoint — the oldest
+/// state it serves — so one migration between generating it and walking its
+/// registry leaves a daemon that cannot start and cannot be retried into
+/// starting. Nothing is chained yet at that point, so there is nothing for a
+/// later starting epoch to break, and the run anchors itself on what the node
+/// does serve rather than dying at startup.
+#[tokio::test]
+async fn test_anchors_itself_when_the_init_point_is_out_of_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let mut mock = chain.mock(LAST_EPOCH * SPE + 3);
+    mock.set_finality(FIRST_EPOCH, chain.checkpoint_root(FIRST_EPOCH));
+
+    // A tuple for an epoch behind the node's window, which is what a freshly
+    // generated one becomes when the split moves while the daemon is starting.
+    let stale = InitPoint {
+        epoch: FIRST_EPOCH - 1,
+        ..zkasper_witness_gen::init_point::generate(&mock, &TEST_CONFIG, "test", FIRST_EPOCH * SPE)
+            .await
+            .unwrap()
+    };
+    mock.prune_state((FIRST_EPOCH - 1) * SPE);
+
+    let daemon = Orchestrator::open(
+        mock,
+        OrchestratorConfig {
+            init_point: Some(stale),
+            ..config(dir.path())
+        },
+        Box::new(NativeProver::new(TEST_CONFIG)),
+    )
+    .await
+    .expect("a run that has chained nothing starts where the node can serve it");
+
+    assert_eq!(daemon.state().init_epoch, FIRST_EPOCH);
+    assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH);
+    assert!(
+        dir.path().join("zkasperd.init-point.json").exists(),
+        "the tuple the run anchored on has to be somewhere an operator can publish it",
+    );
 }
 
 #[tokio::test]

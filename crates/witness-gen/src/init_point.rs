@@ -63,7 +63,7 @@ use zkasper_common::ChainConfig;
 
 use crate::acc_tree::AccTree;
 use crate::artifacts::{hex0x, hex_digest};
-use crate::beacon_api::BeaconApi;
+use crate::beacon_api::{BeaconApi, ValidatorResponse};
 use crate::epoch_state::EpochState;
 use crate::ssz_state;
 use crate::state_diff::{
@@ -165,20 +165,32 @@ struct Walk {
     total_active_balance: u64,
 }
 
+/// Read the validator registry at `slot`.
+///
+/// Split out so a caller that is already holding it — see
+/// [`crate::boundary_cache`] — does not ask the node twice for the one response
+/// the node stops serving.
+pub async fn fetch_registry(api: &impl BeaconApi, slot: u64) -> Result<Vec<ValidatorResponse>> {
+    api.get_validators(&slot.to_string())
+        .await
+        .with_context(|| format!("fetch the validator registry at slot {slot}"))
+}
+
 /// Build the accumulator and the SSZ view of the registry at `slot`.
 ///
 /// The one expensive thing the daemon still does at startup, and the reason it
 /// is honest to call the result checked rather than trusted: this is the same
 /// deterministic function of the validator list that produced the init point.
-async fn walk(api: &impl BeaconApi, config: &ChainConfig, slot: u64, epoch: u64) -> Result<Walk> {
-    let validators = api
-        .get_validators(&slot.to_string())
-        .await
-        .with_context(|| format!("fetch the validator registry at slot {slot}"))?;
+fn walk(
+    validators: &[ValidatorResponse],
+    config: &ChainConfig,
+    slot: u64,
+    epoch: u64,
+) -> Result<Walk> {
     let num_validators = validators.len() as u64;
     anyhow::ensure!(num_validators > 0, "the registry at slot {slot} is empty");
 
-    let validator_roots = build_validator_roots(&validators);
+    let validator_roots = build_validator_roots(validators);
     let (ssz_data_root, _) =
         build_validators_ssz_tree(&validator_roots, config.validators_tree_depth, &[]);
 
@@ -207,12 +219,24 @@ pub async fn take(
     chain: impl Into<String>,
     slot: u64,
 ) -> Result<(InitPoint, Snapshot)> {
+    let validators = fetch_registry(api, slot).await?;
+    take_held(api, config, chain, slot, &validators).await
+}
+
+/// The same, from a registry the caller is already holding.
+pub async fn take_held(
+    api: &impl BeaconApi,
+    config: &ChainConfig,
+    chain: impl Into<String>,
+    slot: u64,
+    validators: &[ValidatorResponse],
+) -> Result<(InitPoint, Snapshot)> {
     anyhow::ensure!(
         slot.is_multiple_of(config.slots_per_epoch),
         "slot {slot} is not an epoch boundary",
     );
     let epoch = slot / config.slots_per_epoch;
-    let walked = walk(api, config, slot, epoch).await?;
+    let walked = walk(validators, config, slot, epoch)?;
     let validators_htr = list_hash_tree_root(&walked.ssz_data_root, walked.num_validators);
 
     // A node that serves the debug state endpoint gives the real branch. The
@@ -310,6 +334,17 @@ pub async fn open(
     chain_name: &str,
     init: &InitPoint,
 ) -> Result<Snapshot> {
+    let validators = fetch_registry(api, init.slot(config)).await?;
+    open_held(config, chain_name, init, &validators)
+}
+
+/// The same, from a registry the caller is already holding.
+pub fn open_held(
+    config: &ChainConfig,
+    chain_name: &str,
+    init: &InitPoint,
+    validators: &[ValidatorResponse],
+) -> Result<Snapshot> {
     init.check()?;
     if init.chain != chain_name {
         bail!(
@@ -319,8 +354,7 @@ pub async fn open(
     }
 
     let slot = init.slot(config);
-    let walked = walk(api, config, slot, init.epoch)
-        .await
+    let walked = walk(validators, config, slot, init.epoch)
         .with_context(|| format!("walk the registry the init point names, at slot {slot}"))?;
 
     if walked.num_validators != init.num_validators {

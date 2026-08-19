@@ -47,8 +47,10 @@ pub struct MockBeaconApi {
     pub genesis_validators_root: [u8; 32],
     pub fork_version: [u8; 4],
     /// Slots whose state this node will not serve, as a checkpoint-synced node
-    /// stops serving what its split slot has moved past.
-    pub unservable_states: HashSet<u64>,
+    /// stops serving what its split slot has moved past. Behind a lock because
+    /// the split moves under a daemon that is already running, which is the
+    /// case that matters.
+    pub unservable_states: Mutex<HashSet<u64>>,
     /// Every block_id `get_block_attestations` was called with, in order.
     ///
     /// Continuous mode is supposed to stop fetching blocks the moment the 2/3
@@ -77,7 +79,7 @@ impl MockBeaconApi {
             finality: HashMap::new(),
             genesis_validators_root: [0xAA; 32],
             fork_version: [0x04, 0x00, 0x00, 0x00],
-            unservable_states: HashSet::new(),
+            unservable_states: Mutex::new(HashSet::new()),
             attestation_requests: Mutex::new(Vec::new()),
             head: Mutex::new(None),
             reorged_to: Mutex::new(None),
@@ -88,6 +90,25 @@ impl MockBeaconApi {
     /// Block ids `get_block_attestations` was called with.
     pub fn requested_blocks(&self) -> Vec<String> {
         self.attestation_requests.lock().unwrap().clone()
+    }
+
+    /// Stop serving the state at `slot`, the way a node does when its split
+    /// moves past it. Nothing else about the chain changes: blocks, headers and
+    /// attestations outlive the state they were produced with.
+    pub fn prune_state(&self, slot: u64) {
+        self.unservable_states.lock().unwrap().insert(slot);
+    }
+
+    /// The 404 a node gives for a state it has migrated, word for word, because
+    /// that is the string the daemon matches to tell it from a real fault.
+    fn refuse_if_migrated(&self, state_id: &str) -> Result<()> {
+        if let Ok(slot) = state_id.parse::<u64>() {
+            anyhow::ensure!(
+                !self.unservable_states.lock().unwrap().contains(&slot),
+                "404 Not Found: NOT_FOUND: beacon state at slot {slot}",
+            );
+        }
+        Ok(())
     }
 
     /// Move the head, the way a node does between polls.
@@ -153,14 +174,7 @@ impl ChainStatusApi for MockBeaconApi {
 #[async_trait::async_trait]
 impl BeaconApi for MockBeaconApi {
     async fn get_validators(&self, state_id: &str) -> Result<Vec<ValidatorResponse>> {
-        // Word for word what a beacon node says, because that is the string the
-        // daemon matches to tell a pruned state from a real fault.
-        if let Ok(slot) = state_id.parse::<u64>() {
-            anyhow::ensure!(
-                !self.unservable_states.contains(&slot),
-                "404 Not Found: NOT_FOUND: beacon state at slot {slot}",
-            );
-        }
+        self.refuse_if_migrated(state_id)?;
         self.validators
             .get(state_id)
             .cloned()
@@ -179,6 +193,7 @@ impl BeaconApi for MockBeaconApi {
     }
 
     async fn get_committees(&self, state_id: &str, epoch: u64) -> Result<Vec<CommitteeResponse>> {
+        self.refuse_if_migrated(state_id)?;
         self.committees
             .get(&(state_id.to_string(), epoch))
             .cloned()

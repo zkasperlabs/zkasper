@@ -9,7 +9,7 @@ use zkasper_common::types::{BlsPubkey, EpochDiffWitness, ValidatorData, Validato
 use zkasper_common::ChainConfig;
 
 use crate::acc_tree::AccTree;
-use crate::beacon_api::BeaconApi;
+use crate::beacon_api::{BeaconApi, ValidatorResponse};
 use crate::epoch_state::EpochState;
 use crate::ssz_state;
 use crate::state_diff::{
@@ -17,12 +17,14 @@ use crate::state_diff::{
     validator_response_to_field_leaves, validator_response_to_pubkey_chunks, SlotHistory,
 };
 
-/// Build an EpochDiffWitness and update the AccTree in place.
+/// Build an EpochDiffWitness and update the AccTree in place, reading both
+/// registries off the node.
 ///
-/// Uses `old_state` (from the init point or the previous epoch diff) to avoid recomputing
-/// O(n) validator roots and re-parsing the old SSZ state.
-///
-/// Returns `(witness, new_epoch_state, new_total_active_balance, new_num_validators)`.
+/// A daemon must not: by the time it proves an epoch, the node has usually
+/// migrated the state at `old_state.slot`, and asking for it is the failure
+/// this whole cache exists to remove. It holds both registries already and
+/// calls [`build_held`]. This is for the one-shot commands and the tests, where
+/// the operator picked the epoch and the node is known to serve it.
 #[tracing::instrument(name = "witness", skip_all, fields(stage = "epoch_diff", slot_2))]
 pub async fn build(
     api: &impl BeaconApi,
@@ -32,38 +34,63 @@ pub async fn build(
     slot_2: u64,
     total_active_balance_1: u64,
 ) -> Result<(EpochDiffWitness, EpochState, u64, u64)> {
+    let validators_2 = {
+        let _span = info_span!("fetch_validators").entered();
+        let v = api
+            .get_validators(&slot_2.to_string())
+            .await
+            .context("fetch validators at slot_2")?;
+        info!(count = v.len(), "fetched validators");
+        v
+    };
+    let validators_1 = {
+        let _span = info_span!("fetch_old_validators").entered();
+        api.get_validators(&old_state.slot.to_string())
+            .await
+            .context("fetch validators at slot_1")?
+    };
+    build_held(
+        api,
+        config,
+        acc_tree,
+        old_state,
+        &validators_1,
+        &validators_2,
+        slot_2,
+        total_active_balance_1,
+    )
+    .await
+}
+
+/// The same, from the two registries the caller is already holding.
+///
+/// Uses `old_state` (from the init point or the previous epoch diff) to avoid recomputing
+/// O(n) validator roots and re-parsing the old SSZ state.
+///
+/// Returns `(witness, new_epoch_state, new_total_active_balance, new_num_validators)`.
+#[tracing::instrument(name = "witness", skip_all, fields(stage = "epoch_diff", slot_2))]
+#[allow(clippy::too_many_arguments)]
+pub async fn build_held(
+    api: &impl BeaconApi,
+    config: &ChainConfig,
+    acc_tree: &mut AccTree,
+    old_state: &EpochState,
+    validators_1: &[ValidatorResponse],
+    validators_2: &[ValidatorResponse],
+    slot_2: u64,
+    total_active_balance_1: u64,
+) -> Result<(EpochDiffWitness, EpochState, u64, u64)> {
     let slot_1 = old_state.slot;
     let ssz_depth = config.validators_tree_depth;
     let slot_2_str = slot_2.to_string();
     let epoch_1 = slot_1 / config.slots_per_epoch;
     let epoch_2 = slot_2 / config.slots_per_epoch;
 
-    // Fetch only new validators (old are cached in old_state)
-    let validators_2 = {
-        let _span = info_span!("fetch_validators").entered();
-        let v = api
-            .get_validators(&slot_2_str)
-            .await
-            .context("fetch validators at slot_2")?;
-        info!(count = v.len(), "fetched validators");
-        v
-    };
-
-    // We also need old validators for mutation field data — fetch from API
-    // (these are lightweight to fetch from the file-backed API; the expensive
-    // part was computing validator_roots which we skip via old_state)
-    let validators_1 = {
-        let _span = info_span!("fetch_old_validators").entered();
-        api.get_validators(&slot_1.to_string())
-            .await
-            .context("fetch validators at slot_1")?
-    };
-
     let num_validators_1 = old_state.num_validators;
     let num_validators_2 = validators_2.len() as u64;
 
     // Find which validators changed (including epoch-boundary activations/exits)
-    let mutation_indices = find_mutations(&validators_1, &validators_2, epoch_1, epoch_2);
+    let mutation_indices = find_mutations(validators_1, validators_2, epoch_1, epoch_2);
     anyhow::ensure!(
         !mutation_indices.is_empty(),
         "no mutations found between states"
@@ -76,7 +103,7 @@ pub async fn build(
 
         let old_roots = if old_state.validator_roots.is_empty() {
             // No cache — compute from scratch (slow path)
-            crate::state_diff::build_validator_roots(&validators_1)
+            crate::state_diff::build_validator_roots(validators_1)
         } else {
             old_state.validator_roots.clone()
         };

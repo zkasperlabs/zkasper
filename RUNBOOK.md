@@ -145,6 +145,15 @@ states finalized *after* the node restarts; states already migrated stay
 migrated. A daemon whose chain depends on one of them can no longer skip forward
 on its own — it stops, and recovery is a fresh init point (§6).
 
+**The daemon no longer reads a boundary state at the moment it needs it.** The
+registry and the committee assignment at an epoch's first slot are the only two
+node responses that stop being servable, and both are now taken while the epoch
+is young and held in `zkasperd.db.boundaries/` beside the store until the
+accumulator has moved past them. What used to be two reads of the same state, up
+to twenty minutes apart, with the second one racing the migration, is one read at
+the earliest moment the boundary exists. Requirement 4 buys slack for the rest of
+the pipeline; it is no longer what keeps the epoch diff alive.
+
 **Subscribe to `single_attestation`, not `attestation`.** Since Electra,
 Lighthouse emits `EventKind::SingleAttestation` for unaggregated attestations and
 `EventKind::Attestation` only for aggregates. Mainnet is on Fulu
@@ -478,10 +487,18 @@ Startup is now a registry walk at the init point's epoch, with no proving and no
 minutes. Take the init point and start the daemon in the same breath and the race
 is not close.
 
-The window still matters *after* startup: every epoch diff reads the previous
-epoch's state, so a daemon that falls far enough behind asks for one that is
-gone. It stops and says so rather than starting a second accumulator over the
-top of the first — see §6.
+If it is lost anyway, the daemon takes an init point of its own at the node's
+finalized checkpoint and starts there, writing the tuple to
+`<db-path minus .db>.init-point.json` and saying so twice at ERROR. It only does
+this before anything has been chained — which is the whole of what this branch
+is, since there is no store yet — so nothing is broken by it. **Publish that
+file**: it is the tuple a consumer checks the run against, and it is not the one
+you generated.
+
+After startup the window no longer decides anything: every boundary a stage will
+need is taken while its epoch is young and held beside the store. A daemon asked
+for a boundary it never took still stops rather than starting a second
+accumulator over the top of the first — see §6.
 
 ### Step 8 — Run the daemon under a supervisor
 
@@ -715,7 +732,8 @@ voluntary.
 | Symptom | Cause | Action |
 |---|---|---|
 | `Error: fetch chain head` | Node unreachable | Restart node, then daemon. Nothing is damaged. |
-| `... returned 404 Not Found: NOT_FOUND: beacon state at slot N` | The node no longer holds that state | Wait one epoch: the daemon may simply be ahead of the node. If it repeats, the run has fallen out of the node's window and cannot be resumed — restart from a new init point (§ below). |
+| `could not take this epoch's boundary` (warning) | The node had already migrated a boundary the daemon tried to take ahead of time | None. It is a warning by design: the stage that needs one and has none is what fails, and it says so separately. Repeated for the *same* epoch every tick means the run is behind the node's window. |
+| `... returned 404 Not Found: NOT_FOUND: beacon state at slot N` | The node no longer holds a state the daemon never took | The daemon takes every boundary it needs while the epoch is inside the node's window and holds it in `zkasperd.db.boundaries/`, so this is a run pointed at an epoch it was never up to see — a store moved without that directory, or a stall longer than the cache reaches. Not resumable: restart from a new init point (§ below). |
 | `missing current_version` / `missing data array` | Old binary. Fixed: the client now reports the status and body. | Rebuild. |
 | `store at ... is damaged; delete it and start again from an init point` | Truncation or checksum failure | Not recoverable in place. Restart from a new init point (§ below); note that `acc_chain_digest` restarts and will not match a peer that never lost theirs. |
 | `store ... holds a X accumulator, but this run is configured for Y` | Wrong `--db-path` or `--chain` | Point at the right file. |
@@ -740,7 +758,7 @@ and the next began.
 ```sh
 pkill -f run_zkasperd.sh; pkill -f 'target/release/zkasperd'
 cd /mnt/ssd/zkasper-run
-rm -f zkasperd.db && rm -rf out
+rm -f zkasperd.db && rm -rf zkasperd.db.boundaries out
 # then step 7 to take a fresh init point, and step 8 to start again
 ```
 
@@ -767,6 +785,7 @@ the epoch redone with no `recent_latencies` entry for it.
 | lighthouse RSS | **5.9–7.0 GB** | With `--subscribe-all-subnets` and multiplier 2000. Flat over the same window. |
 | Node datadir | **947 MB** after 15 minutes | Checkpoint-synced, backfill running. Budget 450+ GB for a month with default `--hierarchy-exponents`. |
 | `zkasperd.db` | **343 MB** | Rewritten whole twice an epoch. |
+| `zkasperd.db.boundaries/` | **~300 MB per epoch held**, four at a time | The validator registry and committees at each epoch boundary the run is holding, one file per boundary. Written once per epoch and pruned as the accumulator passes them, so it does not grow. Delete it only with the store: without it a resumed run needs states the node may have migrated. |
 | `out/` | **110–120 MB per epoch** | Witness files, of which `committee.bin` is 113 MB. At 225 epochs a day that is **~26 GB/day, ~780 GB/month** — larger than the beacon database. Prune or ship them; nothing re-reads a closed epoch's directory. |
 | SSE ingest | 28,033 events/slot | ~1.47 MB/s sustained, 3.8 TB/month if it crosses a network. |
 

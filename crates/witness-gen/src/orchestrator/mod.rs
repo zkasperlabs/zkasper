@@ -54,16 +54,17 @@ pub use pipeline::Pipeline;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tracing::info;
+use tracing::{error, info};
 
 use zkasper_common::types::Checkpoint;
 
 use crate::acc_tree::AccTree;
 use crate::artifacts::{hex_digest, ArtifactSink};
 use crate::beacon_api::{BeaconApi, ChainStatusApi};
+use crate::boundary_cache::{self, BoundaryCache};
 use crate::epoch_state::EpochState;
 use crate::gossip::{AttestationSource, EventStreamSource};
-use crate::init_point;
+use crate::init_point::{self, InitPoint};
 use crate::prover::Prover;
 use crate::publish::Publisher;
 use crate::store::{Snapshot, Store, StoreState};
@@ -133,6 +134,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     ) -> Result<Self> {
         let store = Store::new(&config.db_path);
         let sink = ArtifactSink::new(&config.output_dir)?;
+        let mut boundaries = BoundaryCache::beside(&config.db_path);
 
         let mut this = match store.load()? {
             Some(snapshot) => {
@@ -149,17 +151,21 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                     chain_digest = %hex_digest(&snapshot.state.acc_chain_digest),
                     "resuming",
                 );
-                Self::assemble(api, config, store, sink, prover, snapshot, publish)
+                Self::assemble(
+                    api, config, store, sink, prover, snapshot, publish, boundaries,
+                )
             }
             None => {
                 let init = config.init_point.clone().context(
                     "no accumulator state file and no init point; \
                      generate one with `zkasper-init-point` and pass --init-point",
                 )?;
-                let snapshot = init_point::open(&api, &config.chain, &config.chain_name, &init)
+                let snapshot = Self::anchor(&api, &config, &init, &mut boundaries)
                     .await
                     .context("start from the configured init point")?;
-                let this = Self::assemble(api, config, store, sink, prover, snapshot, publish);
+                let this = Self::assemble(
+                    api, config, store, sink, prover, snapshot, publish, boundaries,
+                );
                 this.engine.store.save(&this.engine.snapshot)?;
                 this
             }
@@ -169,10 +175,86 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
             .chain
             .refresh(&this.engine.api, &this.engine.config)
             .await?;
+        // Before anything else asks for one. A resumed cursor is already behind
+        // the node's split, and every epoch spent not holding its boundary is an
+        // epoch the migration can take it in.
+        let cursor = this.engine.snapshot.state.cursor_epoch;
+        this.engine.hold_boundaries(cursor).await;
         this.publish_status()?;
         Ok(this)
     }
 
+    /// Open the accumulator on `init`, or on one this run takes for itself when
+    /// the node no longer serves the epoch `init` names.
+    ///
+    /// An init point is generated at the node's finalized checkpoint, which is
+    /// the oldest state it serves. One migration between generating it and
+    /// reading its registry is therefore enough to make it unopenable, and no
+    /// retry recovers a window that only moves away.
+    ///
+    /// Skipping forward is safe here and nowhere else: this is the branch with
+    /// no store, so there is no accumulator chain for a new starting epoch to
+    /// break. It is still said twice over — the run records the epoch it started
+    /// at, and the tuple it started from is written beside the store, because a
+    /// consumer checks the chain against that tuple and cannot check one nobody
+    /// published.
+    async fn anchor(
+        api: &A,
+        config: &OrchestratorConfig,
+        init: &InitPoint,
+        boundaries: &mut BoundaryCache,
+    ) -> Result<Snapshot> {
+        let slot = init.slot(&config.chain);
+        let taken = match boundary_cache::read(api, &config.chain, slot).await {
+            Ok(taken) => taken,
+            Err(e) if is_pruned_state(&e) => {
+                let epoch = api
+                    .get_finality_checkpoints("head")
+                    .await
+                    .context("ask the node where it is, to anchor this run somewhere it serves")?
+                    .finalized
+                    .epoch;
+                error!(
+                    configured_epoch = init.epoch,
+                    epoch,
+                    error = %format!("{e:#}"),
+                    "the node no longer serves the epoch the init point names; \
+                     anchoring this run on its finalized checkpoint instead",
+                );
+                let slot = epoch * config.chain.slots_per_epoch;
+                let taken = boundary_cache::read(api, &config.chain, slot)
+                    .await
+                    .context("read the boundary the node reports as finalized")?;
+                let (anchored, snapshot) = init_point::take_held(
+                    api,
+                    &config.chain,
+                    &config.chain_name,
+                    slot,
+                    &taken.validators,
+                )
+                .await?;
+                let path = config.db_path.with_extension("init-point.json");
+                anchored
+                    .write(&path)
+                    .context("write the init point this run anchored itself on")?;
+                error!(
+                    path = %path.display(),
+                    epoch = anchored.epoch,
+                    "publish this init point beside the run's proofs; \
+                     the accumulator chain starts here and not where it was configured to",
+                );
+                boundaries.put(taken);
+                return Ok(snapshot);
+            }
+            Err(e) => return Err(e),
+        };
+        let snapshot =
+            init_point::open_held(&config.chain, &config.chain_name, init, &taken.validators)?;
+        boundaries.put(taken);
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         api: A,
         config: OrchestratorConfig,
@@ -181,6 +263,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
         prover: Box<dyn Prover>,
         snapshot: Snapshot,
         publish: Option<Arc<Publisher>>,
+        boundaries: BoundaryCache,
     ) -> Self {
         Self {
             engine: Engine {
@@ -195,6 +278,7 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 sink,
                 prover,
                 snapshot,
+                boundaries,
             },
             batch: BatchPipeline::default(),
             stream: StreamPipeline::default(),
