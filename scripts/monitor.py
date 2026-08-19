@@ -182,6 +182,36 @@ def daemon():
     else:
         out.append(check("time", True, f"{len(done)} epochs measured, too few"))
 
+    # How far behind the chain the daemon closes an epoch, and which way it is
+    # moving. This is the signal `T2 - T` mostly measures and the one an operator
+    # can act on: an epoch closed 3.5 epochs late is a backlog, not a slow proof,
+    # and the only question that matters is whether the backlog is shrinking.
+    # Measured 2026-08-19: 3.89 epochs late, then 3.55, gaining 0.34 an epoch on
+    # one card at an 87% duty cycle -- an hour to catch up, and hours behind
+    # after any hiccup.
+    #
+    # `slot_seconds` and genesis come out of the data rather than a constant:
+    # `threshold_unix_millis` is by construction `genesis + slot * slot_seconds`,
+    # so two epochs of latency determine both, and the check cannot drift from
+    # the chain the daemon is actually following.
+    if len(done) >= 2:
+        a, b = done[-2], done[-1]
+        span_slots = b["threshold_slot"] - a["threshold_slot"]
+        slot_s = ((b["threshold_unix_millis"] - a["threshold_unix_millis"]) / 1000
+                  / span_slots) if span_slots else 0
+        if slot_s > 0:
+            spe = 32
+            genesis = b["threshold_unix_millis"] / 1000 - b["threshold_slot"] * slot_s
+            lag = [(l["proof_unix_millis"] / 1000
+                    - (genesis + l["epoch"] * spe * slot_s)) / (spe * slot_s)
+                   for l in done[-4:]]
+            trend = lag[-1] - lag[0]
+            out.append(check("lag", trend <= 0 or lag[-1] < 1.0,
+                             f"closes {lag[-1]:.2f} epochs behind the chain, "
+                             + (f"gaining {-trend / max(len(lag) - 1, 1):.2f} an epoch"
+                                if trend < 0 else
+                                f"LOSING {trend / max(len(lag) - 1, 1):.2f} an epoch")))
+
     # Cost per epoch: sum the prover time of a whole epoch's stages and price it.
     stages = s.get("recent_stages") or []
     rate = s.get("prover_usd_per_hour")
