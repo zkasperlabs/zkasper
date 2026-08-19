@@ -674,6 +674,10 @@ They are handled, they log a warning, and they resolve themselves:
   `/eth/v2/beacon/blocks/{id}/attestations`, whose errors are swallowed
   silently and produce no other symptom.
 - `no state to read the fork version from; taking head's`
+- `could not backfill a spooled witness` — the prover is away and the spool is
+  waiting for it. Logged on the doubling rather than on every pass, and bounded
+  at both ends: if the prover does not answer within
+  `--prover-unreachable-seconds` the daemon stops instead of repeating this.
 
 ### The health check
 
@@ -740,6 +744,7 @@ voluntary.
 | `store format version N, expected M` | Format bump, no migration exists | Restart from a new init point (§ below). |
 | `the ... circuit rejected the witness` | An unprovable witness | Real bug. Keep the epoch directory under `out/epoch-*` — it is the reproduction. |
 | `the ... proof does not verify against its own program key and outputs` | Prover, ELF or proving-key mismatch | Not a chain problem. Check the ELF against the proving key. |
+| `the prover at HOST:PORT has been unreachable for ... it is gone rather than restarting` | That prover server is not running any more: the card was reclaimed, the credit ran out, or the process died | Go to the machine the message names, not to the daemon. Start `zkasper-prover-server` there, then start the daemon. The witnesses of the epochs the outage spanned are still in the spool and drain behind the first reconnect. A short outage never produces this line — the prover has to fail continuously for `--prover-unreachable-seconds` (default 600) — so seeing it means the server was down for at least ten minutes. |
 | `fetch header at slot N` / `NOT_FOUND: beacon block at slot N`, repeating forever | **The epoch boundary slot was skipped.** Fixed — the epoch diff now reads the state root from `/eth/v1/beacon/states/{slot}/root`, which is defined for a skipped slot, instead of from a block header, which is not. On a build before that fix the daemon crash-loops permanently, because the slot will never gain a block. | Rebuild. To get moving without one, take a fresh init point past the skipped boundary. |
 | Wedged, repeating the same epoch | The node cannot serve that epoch's state | Restart from a new init point (§ below). |
 | `accumulator_commitment ... does not bind acc_root ... and total_active_balance ...` | The init point's three accumulator fields disagree | The file is wrong or was edited. Take it again with `zkasper-init-point`; do not patch it by hand. |

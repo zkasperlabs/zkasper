@@ -258,6 +258,24 @@ struct Cli {
     #[arg(long, default_value_t = 1800)]
     prover_timeout_seconds: u64,
 
+    /// How long a prover may be unreachable before the daemon stops.
+    ///
+    /// The spool covers a prover that is *away*: a server restarting on the far
+    /// card comes back in seconds and the witnesses it missed drain behind it.
+    /// It does not cover a prover that is *gone*. When the GPU credit ran out on
+    /// 2026-08-19 both cards vanished and the daemon spooled and retried into an
+    /// empty socket until it was stopped by hand — a live process, a stale
+    /// manifest, and a supervisor that only speaks when the daemon exits.
+    ///
+    /// Past this, the prover is called gone: the next proof fails with the
+    /// address and the duration, the daemon exits, and `run_zkasperd.sh` says it
+    /// is not restarting. Each `--prover-route` has its own clock, so the card
+    /// that failed is the card the message names.
+    ///
+    /// Zero never stops, for a run that would rather publish unproven epochs.
+    #[arg(long, default_value_t = 600)]
+    prover_unreachable_seconds: u64,
+
     /// What an hour of this deployment's proving hardware costs, in US dollars.
     ///
     /// The daemon measures prover milliseconds per epoch and publishes both,
@@ -324,6 +342,7 @@ impl Cli {
                     RemoteProver::connect(RemoteProverConfig {
                         spool_dir: Some(spool),
                         request_timeout: Duration::from_secs(self.prover_timeout_seconds),
+                        unreachable_deadline: Duration::from_secs(self.prover_unreachable_seconds),
                         ..RemoteProverConfig::new(chain.clone(), addr, token.clone(), stages)
                     })
                 };

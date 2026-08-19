@@ -213,6 +213,17 @@ binding them. The next call reconnects, and a background thread proves the
 backlog in the slack between epochs. `crates/witness-gen/src/remote_prover.rs`
 has the detail.
 
+**A server that does not come back stops the daemon.** That is a different
+fault wearing the same clothes, and it needs the opposite answer: a card whose
+credit ran out never answers again, so spooling and retrying into it forever
+turns a loud failure into a silent one — a live process, a stale manifest, and
+nothing on the log but the same warning. Once a prover has failed continuously
+for `--prover-unreachable-seconds` (10 minutes by default, a little over one and
+a half epochs) it is declared gone: the next proof fails with the address and
+the duration, the error leaves the process, and `run_zkasperd.sh` says it is not
+restarting. Each `--prover-route` keeps its own clock, so the card that failed
+is the card the message names.
+
 **The split is affordable because the critical-path witness is small.**
 Complement proving shrank the witness of the proof after `T` to **2,671 bytes**.
 The only large witness is the committee proof at about **115 MB**, and that
