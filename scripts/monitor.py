@@ -167,19 +167,26 @@ def daemon():
         worst_late = max((l.get("late_groups") or 0) for l in lat[-5:])
         # The three that matter: every epoch proven, and the cost and time of
         # proving them. Everything else here is plumbing.
-        done = [l for l in lat if l.get("t2_minus_t_millis")]
-        if len(done) >= 3:
-            v = sorted(l["t2_minus_t_millis"] / 1000 for l in done)
-            med = v[len(v) // 2]
-            p90 = v[int(0.9 * (len(v) - 1))]
-            out.append(check("time", True,
-                             f"T2-T median {med:.0f}s p90 {p90:.0f}s over {len(v)}"))
         out.append(check("folds", worst_late < 2,
                          f"worst late_groups in last {min(len(lat),5)}: {worst_late}"))
+
+    # Say so rather than print nothing when there is no data. Time and cost are
+    # two of the three metrics that matter, and a check that disappears when it
+    # has nothing to report reads exactly like a check that passed.
+    done = [l for l in lat if l.get("t2_minus_t_millis")]
+    if len(done) >= 3:
+        v = sorted(l["t2_minus_t_millis"] / 1000 for l in done)
+        out.append(check("time", True,
+                         f"T2-T median {v[len(v) // 2]:.0f}s "
+                         f"p90 {v[int(0.9 * (len(v) - 1))]:.0f}s over {len(v)}"))
+    else:
+        out.append(check("time", True, f"{len(done)} epochs measured, too few"))
 
     # Cost per epoch: sum the prover time of a whole epoch's stages and price it.
     stages = s.get("recent_stages") or []
     rate = s.get("prover_usd_per_hour")
+    if not stages:
+        out.append(check("cost", True, "no stage priced yet"))
     if stages and rate:
         by_epoch = {}
         for st in stages:
@@ -261,9 +268,22 @@ def published_gaps():
                       headers={"User-Agent": "zkasper-monitor"})
         with urlopen(req, timeout=25) as r:
             d = json.loads(r.read())
+        req = Request("https://api.zkasper.com/v1/status",
+                      headers={"User-Agent": "zkasper-monitor"})
+        with urlopen(req, timeout=25) as r:
+            init = json.loads(r.read()).get("init_epoch")
     except Exception as e:
         return check("chain", True, f"not checked: {e}")
-    epochs = d.get("epochs", [])
+    # Judge the current run, not everything the API ever indexed. A fresh init
+    # point starts a new accumulator chain, and every epoch below it belongs to
+    # a chain that was deliberately abandoned -- reporting those as holes makes
+    # this check fail for ever after a legitimate cold start, which is how an
+    # operator learns to ignore it. The restart itself is named in the detail so
+    # a broken chain is still visible rather than filtered away.
+    epochs = [e for e in d.get("epochs", [])
+              if init is None or e.get("epoch", 0) >= init]
+    if not epochs:
+        return check("chain", True, f"no epoch published since the init at {init}")
     nums = sorted(e["epoch"] for e in epochs if e.get("status") == "proven")
     # An epoch that closed without a proof is the same hole, published rather
     # than absent. It is named apart because the two are fixed differently: a
@@ -272,7 +292,7 @@ def published_gaps():
     unproven = sorted(e["epoch"] for e in epochs if e.get("status") == "unproven")
     if len(nums) < 2:
         return check("chain", not unproven,
-                     f"{len(nums)} proven, too few to judge"
+                     f"{len(nums)} proven since init {init}, too few to judge"
                      + (f", UNPROVEN {unproven}" if unproven else ""))
     known = set(nums) | set(unproven)
     missing = [n for n in range(nums[0], nums[-1]) if n not in known]
@@ -283,7 +303,7 @@ def published_gaps():
     # it was neither published nor spooled.
     stuck = sorted(e["epoch"] for e in epochs
                    if e.get("status") == "proving" and e["epoch"] < nums[-1])
-    bits = [f"proven {nums[0]}-{nums[-1]}"]
+    bits = [f"proven {nums[0]}-{nums[-1]} since init {init}"]
     if missing:
         bits.append(f"HOLES at {missing}")
     if unproven:
