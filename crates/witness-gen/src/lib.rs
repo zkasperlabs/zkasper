@@ -6,6 +6,7 @@ pub mod boundary;
 pub mod boundary_cache;
 pub mod child_vks;
 pub mod committee;
+pub mod committee_cache;
 pub mod db;
 pub mod epoch_state;
 pub mod fixture;
