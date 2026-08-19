@@ -108,3 +108,15 @@ test("stranded is settled and proving is not", () => {
 test("stranded is the api's word, so a daemon that sent it still passes through", () => {
   assert.equal(statusForProof("stranded", empty), "stranded");
 });
+
+test("a speculating daemon's live epoch is not stranded by the epoch it is opening", () => {
+  // The daemon proves epoch N+1's diff and committee during N and publishes
+  // their stage timings, so N+1 exists while N is still open. Observed on
+  // 2026-08-19 with no restart: 469657 had two stages, 469656 had three and was
+  // proving, and 469656 was reaped out from under a healthy daemon.
+  assert.equal(isStranded("proving", 469656, 469657, 469656), false);
+  // Everything below what it is working on is still stranded.
+  assert.equal(isStranded("proving", 469570, 469657, 469656), true);
+  // And with no daemon word available the old rule stands.
+  assert.equal(isStranded("proving", 469656, 469657, null), true);
+});

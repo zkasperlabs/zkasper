@@ -60,6 +60,22 @@ export function isSettled(status: unknown): boolean {
 //   tagged with epoch N+1 — the `epoch_diff` stage that moves the accumulator
 //   onto it — cannot be emitted until epoch N is settled.
 //
+// **That last sentence is false and cost a false positive.** When the daemon is
+// behind the head it speculates: it proves epoch N+1's `epoch_diff` and
+// `committee` during epoch N and publishes their stage timings, so N+1 exists in
+// this table while N is still open. Observed on 2026-08-19 with no restart
+// involved — 469657 carried two stages while 469656 was proving with three, and
+// 469656 was reaped while a healthy daemon was actively working on it. It is
+// sound at the head, where speculation cannot fire because the boundary state of
+// N+1 does not exist yet, and unsound during catch-up — which is exactly when an
+// operator needs to trust it.
+//
+// So the daemon's own word is the exemption: `currentEpoch` is what `/v1/status`
+// reports it is working on, and that epoch is never stranded however many later
+// ones exist. If the daemon dies its last epoch stops being reapable, which is
+// the boundary that already existed — nothing can outlive the newest epoch —
+// and `service.stale` on `/v1/status` is what says so.
+//
 // The tempting weaker rule is "below the highest *proven* epoch". It is weaker
 // twice over: it misses an epoch stranded under a newer one that is itself
 // still proving, and it goes on missing it for as long as the newer one takes.
@@ -70,6 +86,12 @@ export function isSettled(status: unknown): boolean {
 // enforces that within a run, and a fresh init point is always taken ahead of
 // where the last one stopped — that is what makes it a recovery. Rewinding an
 // index onto a lower epoch is `POST /v1/ingest/reset` and nothing else.
-export function isStranded(status: unknown, epoch: number, highestEpoch: number): boolean {
+export function isStranded(
+  status: unknown,
+  epoch: number,
+  highestEpoch: number,
+  currentEpoch?: number | null,
+): boolean {
+  if (typeof currentEpoch === "number" && epoch === currentEpoch) return false;
   return status === "proving" && epoch < highestEpoch;
 }

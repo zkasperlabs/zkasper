@@ -575,10 +575,16 @@ export class IndexDO extends DurableObject {
       "SELECT epoch, status FROM epochs WHERE status = 'proving' AND epoch < ? ORDER BY epoch ASC",
       highest,
     );
+    // What the daemon says it is working on. A speculating daemon publishes the
+    // next epoch's opening stages while this one is still open, so `highest`
+    // alone strands a live epoch; its own word is the exemption.
+    const current = jparse(this.getKv("status"))?.current_epoch;
     const out: Array<{ seq: number; type: string; data: any }> = [];
     for (const r of open) {
       const epoch = r.epoch as number;
-      if (!isStranded(r.status, epoch, highest)) continue;
+      if (!isStranded(r.status, epoch, highest, typeof current === "number" ? current : null)) {
+        continue;
+      }
       // Deliberately no `closed_unix_millis`. `abandoned` gets one because a
       // live daemon decided at a known instant; this epoch never closed, and
       // stamping the sweep's own clock on it would report `wall_millis_total`
