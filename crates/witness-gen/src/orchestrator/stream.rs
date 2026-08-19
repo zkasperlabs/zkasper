@@ -355,6 +355,12 @@ impl EpochPipeline for StreamPipeline {
                 )?;
                 Self::fold_group(engine, &mut aggregator, group)?;
             }
+            // Again here, and not only when the epoch opened. The boundary the
+            // next epoch's diff needs does not exist until the chain reaches
+            // it, so a daemon close to the head has none to start from at
+            // `open_epoch` and would otherwise wait a whole epoch to ask
+            // again. `covers` makes this free once one is running.
+            engine.speculate(target_epoch + 1).await;
             if aggregator.exhausted(engine.chain.head_slot()) {
                 warn!(
                     target_epoch,
