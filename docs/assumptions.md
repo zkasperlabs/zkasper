@@ -376,10 +376,14 @@ adversarial stake into a one-slot window. The default byzantine threshold is
 - the stage floor, the empty-guest floor, and the per-proof floor and slope
 - the accumulator node cost, the wrap, and the cold penalty
 - every precompile cost, and the VRAM behaviour
-- **recursive verification: 53.087 s per child**, linear from 2 children to 23,
-  with an intercept that lands on the stage floor. It was carried as zero for as
-  long as nothing could measure it, and it is larger than every other constant
-  in the model put together.
+- **recursive verification, and it is not one price across guests.**
+  `justification-guest` is **53.087 s per child**, linear from 2 children to 23,
+  with an intercept that lands on the stage floor. The two guests on the
+  streaming critical path are **35.629 s per child** — measured in production
+  over 24 epoch-opening folds, whose child count is fixed by the guest source,
+  sd 0.326 s. The model carried the justification figure for both until
+  2026-08-19. It was carried as zero before anything could measure it, and it is
+  larger than every other constant in the model put together.
 
 **Carried forward from Zisk v1.0.0-alpha**: the cost per opened validator and
 the cost per committee member. The attester sweep cannot be reproduced, because
@@ -389,15 +393,20 @@ look worse than it is.
 
 **Modelled, not measured**:
 
-- **`T2 - T` is 67.8 s in a model** over measured per-stage times, on two GPUs.
-  **No prover has run this shape.** It was 112.8 s while the final proof's inline
+- **`T2 - T` is 83.1 s in a model** over measured per-stage times, on two GPUs.
+  **No prover has run this shape.** It was 112.4 s while the final proof's inline
   tail was capped at four slots and the epoch's end had to be a group it then
-  verified as a child; uncapping it removes that child. Every measurement below
-  was taken against the capped shape: a production stream-final proof took 148.2 s
-  four times within ±1.1 s, and the folded path ran at 116.5 to 124.2 s against a
-  117.7 s model — an earlier revision of this model, which no longer reproduces.
-  **The 5.5 s this document used to quote was computed with recursion priced at
-  zero and is withdrawn.**
+  verified as a child; uncapping it removes that child but not the two the final
+  proof cannot avoid — the running aggregate and the previous epoch's
+  justification. Every measurement below was taken against the capped shape: a
+  production stream-final proof took 148.2 s four times within ±1.1 s, and the
+  folded path ran at 116.5 to 124.2 s. **The 67.8 s this document quoted until
+  2026-08-19 is withdrawn**: the model charged the final proof one child too few
+  and priced the rest at the justification guest's rate, and the two errors
+  cancel only at three children. The capped shape had three and was right by
+  accident; the uncapped shape has two and was 15.3 s optimistic. **The 5.5 s
+  quoted before that was computed with recursion priced at zero and is also
+  withdrawn.**
 - **The Fp2-tower rate is fitted**, with a bracket from 162M to 268M units per
   second. Nothing in the campaign runs BLS at mainnet scale.
 - **The committee proof cost at mainnet scale is an extrapolation** from
