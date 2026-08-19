@@ -102,6 +102,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (path === "/v1/ingest" && method === "POST") return ingest(request, env);
   if (path === "/v1/ingest/reset" && method === "POST") return reset(request, env);
+  if (path === "/v1/ingest/reap" && method === "POST") return reap(request, env);
   if (path === "/v1/ingest/cursor") {
     if (method !== "GET") return fail(405, "method_not_allowed", "GET only");
     if (!(await tokenOk(request.headers.get("authorization"), env.INGEST_TOKEN))) {
@@ -180,6 +181,17 @@ async function reset(request: Request, env: Env): Promise<Response> {
     await Promise.all(listed.objects.map((o: any) => env.PROOFS!.delete(o.key)));
   }
   return stub(env).fetch(doUrl("/do/reset"), { method: "POST" });
+}
+
+// Mark every epoch a dead daemon left open. The sweep runs on ingest too, so
+// this is only needed for an index that was already carrying stranded epochs
+// before ingest started sweeping — or to reap on demand rather than waiting for
+// the daemon to reach its next epoch. Idempotent; safe to call twice.
+async function reap(request: Request, env: Env): Promise<Response> {
+  if (!(await tokenOk(request.headers.get("authorization"), env.INGEST_TOKEN))) {
+    return fail(401, "unauthorized", "bearer token required");
+  }
+  return stub(env).fetch(doUrl("/do/reap"), { method: "POST" });
 }
 
 async function putProof(request: Request, env: Env, epoch: number): Promise<Response> {
