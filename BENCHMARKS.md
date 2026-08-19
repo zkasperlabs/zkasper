@@ -422,8 +422,10 @@ group covered. `T` is that slot's boundary.
 Recomputed and not re-measured: `proof_unix_millis` is unchanged, and only the
 origin moved. The five epochs of the paragraph above reproduce exactly from this
 procedure — 8.4, 15.7, 46.7, 93.0, 124.7 — which is what says the crossing slots
-are right. Across all 37 epochs of the run the observation delay ran a median
-**105.2 s**, minimum 8.4 s, maximum 742.8 s.
+are right. Across the 36 epochs of the run the rule resolves, the observation
+delay ran a median **99.1 s**, minimum 8.4 s, maximum 549.6 s. The thirty-seventh,
+469497, is dropped rather than guessed at: it took a gossip gap and was repaired
+from blocks, so one group closed the whole epoch and the crossing is inside it.
 
 **The old number was tight because of the error, not despite it.** Its spread was
 18.4 s against a corrected spread of 111.8 s, and its standard deviation 6.0 s

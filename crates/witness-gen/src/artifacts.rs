@@ -129,9 +129,9 @@ impl StageTiming {
 /// `T` was stamped when the daemon noticed instead, until 2026-08-19, and that
 /// made every published figure a lower bound. The threshold check sits below the
 /// in-flight-proof early return in [`super::orchestrator`], so the daemon is
-/// blind to the crossing for the length of every proof. Over the 37 measured
-/// mainnet epochs of the 2026-08-19 run the notice came a median **105 s** after
-/// the crossing slot began, and 743 s after it once. Every one of those seconds
+/// blind to the crossing for the length of every proof. Over the 36 measured
+/// mainnet epochs of the 2026-08-19 run the notice came a median **99 s** after
+/// the crossing slot began, and 550 s after it once. Every one of those seconds
 /// was a second a consumer waited and the metric did not report, and the error
 /// was largest exactly when the daemon was furthest behind — which is when the
 /// number matters. [`Self::observation_millis`] is that gap, kept rather than

@@ -123,8 +123,8 @@ mainnet the over-statement is about 3 s.
 the difference. **`T` was stamped there until 2026-08-19**, which made
 `t2_minus_t_millis` a lower bound: the trigger is only evaluated on a tick with
 no proof in flight, so the daemon is blind to the crossing for the length of
-every proof. Over 37 measured mainnet epochs the notice came a median 105 s after
-the crossing slot began. If you recorded figures from an older daemon, they are
+every proof. Over 36 measured mainnet epochs the notice came a median 99 s after
+the crossing slot began, and 550 s after it once. If you recorded figures from an older daemon, they are
 short by that much and are not comparable with these.
 
 `t2_minus_t_millis` splits into four, in order and without overlap:

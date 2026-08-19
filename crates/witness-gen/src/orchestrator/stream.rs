@@ -1186,7 +1186,7 @@ impl StreamPipeline {
         // a consumer is quoted no longer depends on when this process happened
         // to be free to look. It did until 2026-08-19, and that made every
         // published figure a lower bound by however long the prover had been
-        // holding the tick: a median 105 s over this epoch's run.
+        // holding the tick: a median 99 s over this epoch's run.
         //
         // `crossed_unix_millis` is kept beside it rather than discarded. It is
         // still the honest origin for the trigger's own wait, and the difference
