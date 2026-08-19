@@ -138,7 +138,9 @@ it belongs there.
 - **Child program keys are not baked, because no guest exists.** The discipline
   in finality's "Which program a child proof came from" is what an FCR build
   would have to follow before `fcr-confirm-guest` could trust an
-  `fcr-slot-proof-guest` child.
+  `fcr-slot-proof-guest` child. The VADCOP final key underneath it needs nothing:
+  it is one constant in `zkasper-common` and FCR gets it by calling
+  `verify_child`.
 
 ---
 

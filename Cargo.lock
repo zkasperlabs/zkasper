@@ -7965,7 +7965,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zkasper-shuffle-bench-guest"
+name = "zkasper-recursion-bench-guest"
 version = "0.1.0"
 dependencies = [
  "ziskos",

@@ -16,8 +16,29 @@
 //! one the guest was compiled with instead, and that is what every recursive
 //! edge in this pipeline uses except the two a program cannot bake — its own.
 //!
+//! There is a third key, and it is the one that decides whether any of the above
+//! is a check at all. `zisklib::verify_zisk_proof` splits the last four words off
+//! the buffer and passes them to the STARK verifier as `rootC` — the commitment
+//! to the *constant polynomials*, which for a circom-compiled circuit are the
+//! gates and the wiring. `proofman`'s generated `vadcop_final` verifier is byte
+//! for byte the same code as its `recursive2` verifier; the two differ only in
+//! that root. So the circuit being verified is named by those four words and by
+//! nothing else, and a prover who supplies their own supplies their own circuit,
+//! whose 69 public values — the program key at index 1 included — are then
+//! whatever they wrote. [`VADCOP_FINAL_VK`] pins them.
+//!
 //! Serialized proof layout, in u64 words:
-//! `[minimal][n_publics][program_vk(4)][publics(64)][proof..][vadcop_vk(4)]`
+//! `[minimal][n_publics][is_vadcop_final][program_vk(4)][publics(64)][proof..][vadcop_vk(4)]`
+//!
+//! The child is an uncompressed `vadcop_final` proof, and that is a performance
+//! decision as much as a format one. A compressed proof has Merkle arity 2, so
+//! `proofman`'s `arity * 4 == WIDTH` fixes the verifier's hash width at 8, and
+//! `syscall_poseidon1` only accepts width 16 — every Merkle and FRI hash inside
+//! the guest falls back to software Poseidon. Measured on a slot proof, that is
+//! 242.8 M RISC-V steps a child against 10.9 M, and 306 precompiled permutations
+//! against 3,877. The uncompressed proof is 369,224 bytes rather than 254,624,
+//! and it is the `is_vadcop_final_proof` flag at index 0 of its public vector
+//! that pushes the program key one word later than a compressed proof's.
 
 use alloc::vec::Vec;
 
@@ -30,9 +51,25 @@ pub const ZISK_PUBLICS: usize = 64;
 /// Public values are committed as u32 slots, so this many bytes fit.
 pub const MAX_PUBLIC_BYTES: usize = ZISK_PUBLICS * 4;
 
-const VK_OFFSET: usize = 2;
+/// Length of the VADCOP final verification key, in u64 words.
+pub const VADCOP_VK_LEN: usize = 4;
+
+const VK_OFFSET: usize = 3;
 const PUBLICS_OFFSET: usize = VK_OFFSET + PROGRAM_VK_LEN;
-const MIN_PROOF_WORDS: usize = PUBLICS_OFFSET + ZISK_PUBLICS;
+/// Header, publics, and the key the verifier splits off the end. A buffer
+/// shorter than this makes the two overlap, and the tail read below would
+/// return public values rather than a key.
+const MIN_PROOF_WORDS: usize = PUBLICS_OFFSET + ZISK_PUBLICS + VADCOP_VK_LEN;
+
+/// Whether a proof is laid out the way the offsets above read it.
+///
+/// A compressed proof carries no `is_vadcop_final` flag, so every field after
+/// the header sits one word earlier and the same offsets would read a key out
+/// of the child's own public values. Rejecting it here is what keeps the
+/// binding a parse of the format rather than of one word past it.
+fn is_uncompressed(proof: &[u64]) -> bool {
+    proof.len() >= MIN_PROOF_WORDS && proof[0] == 0
+}
 
 /// Identifies which guest program produced a proof.
 pub type ProgramVk = [u64; PROGRAM_VK_LEN];
@@ -41,9 +78,43 @@ pub type ProgramVk = [u64; PROGRAM_VK_LEN];
 /// one cannot verify anything; `scripts/bake_child_vks.sh` is what fills it in.
 pub const UNSET_VK: ProgramVk = [0; PROGRAM_VK_LEN];
 
+/// The proving system every proof in this pipeline is proved under.
+///
+/// `rootC` of the `vadcop_final` circuit, read from
+/// `provingKey/zisk/vadcop_final/vadcop_final.verkey.bin` of the Zisk
+/// **v1.1.0-alpha** proving key — the release `Cargo.toml` pins `ziskos` and
+/// `zisk-sdk` to. It is a constant of that release and of nothing in this
+/// repository, so unlike the child program keys it depends on no guest ELF,
+/// there is no dependency graph to walk, and one shared constant is enough.
+///
+/// **Rederive it on a Zisk bump, before anything else.** A stale value refuses
+/// every proof, which is the safe direction and an obvious one; the value for
+/// v1.0.0-alpha is `[16418290590932191654, 2682920145730279116,
+/// 9421690135668477588, 7053485478104629196]` and is not this. Compressed
+/// proofs are a different circuit with a different root again, and the layout
+/// check rejects them before this is consulted.
+pub const VADCOP_FINAL_VK: ProgramVk = [
+    11800534191493876478,
+    6047701255643179780,
+    11700752144183100736,
+    12226993988674551281,
+];
+
+/// The VADCOP final verification key a proof asks to be checked under.
+///
+/// This is a request, not a property: it is the tail of a buffer the prover
+/// wrote, and `zisklib::verify_zisk_proof` obeys it. See the module docs.
+pub fn child_vadcop_vk(proof: &[u64]) -> Option<ProgramVk> {
+    if !is_uncompressed(proof) {
+        return None;
+    }
+    let tail = &proof[proof.len() - VADCOP_VK_LEN..];
+    Some([tail[0], tail[1], tail[2], tail[3]])
+}
+
 /// The program verification key a proof commits to.
 pub fn child_program_vk(proof: &[u64]) -> Option<ProgramVk> {
-    if proof.len() < MIN_PROOF_WORDS {
+    if !is_uncompressed(proof) {
         return None;
     }
     Some([
@@ -56,7 +127,7 @@ pub fn child_program_vk(proof: &[u64]) -> Option<ProgramVk> {
 
 /// The byte stream the child committed with `ziskos::io::commit_slice`.
 pub fn child_public_bytes(proof: &[u64]) -> Option<[u8; MAX_PUBLIC_BYTES]> {
-    if proof.len() < MIN_PROOF_WORDS {
+    if !is_uncompressed(proof) {
         return None;
     }
     let mut out = [0u8; MAX_PUBLIC_BYTES];
@@ -82,6 +153,14 @@ pub fn verify_child(proof: &[u64], expected_vk: &ProgramVk, expected_publics: &[
         expected_publics.len() <= MAX_PUBLIC_BYTES,
         "public outputs exceed the {MAX_PUBLIC_BYTES}-byte proof capacity",
     );
+
+    // First, because every check under it is a statement about the circuit these
+    // four words name. Get this wrong and the program key below is a public
+    // value of a circuit the prover wrote, and agrees with whatever they wanted
+    // it to agree with.
+    if child_vadcop_vk(proof) != Some(VADCOP_FINAL_VK) {
+        return false;
+    }
 
     let Some(vk) = child_program_vk(proof) else {
         return false;
@@ -170,5 +249,114 @@ impl PublicWriter {
             "public outputs exceed the {MAX_PUBLIC_BYTES}-byte proof capacity",
         );
         self.bytes.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 1.0.0-alpha `vadcop_final` root, and the 1.1.0-alpha
+    /// `vadcop_final_compressed` one. Both are real circuits with real proofs
+    /// behind them, which is the point: they are what a prover would reach for
+    /// first, and they are not what this pipeline proves under.
+    const FOREIGN_VKS: [ProgramVk; 3] = [
+        [
+            16418290590932191654,
+            2682920145730279116,
+            9421690135668477588,
+            7053485478104629196,
+        ],
+        [
+            7077556885608687133,
+            1422085596864190689,
+            2297137918351717267,
+            14362995833492506538,
+        ],
+        UNSET_VK,
+    ];
+
+    /// A buffer shaped like a child proof: uncompressed, the flag set, the
+    /// program key and public words where the offsets read them, and the VADCOP
+    /// key on the end. Nothing between is a proof, so the STARK verifier refuses
+    /// it — every assertion below is about a refusal that happens before that.
+    fn shaped(program_vk: &ProgramVk, publics: &[u8], vadcop_vk: &ProgramVk) -> Vec<u64> {
+        let mut words = alloc::vec![0u64; MIN_PROOF_WORDS];
+        words[1] = 69;
+        words[2] = 1;
+        words[VK_OFFSET..PUBLICS_OFFSET].copy_from_slice(program_vk);
+        for (i, chunk) in publics.chunks(4).enumerate() {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            words[PUBLICS_OFFSET + i] = u32::from_le_bytes(word) as u64;
+        }
+        let end = words.len() - VADCOP_VK_LEN;
+        words[end..].copy_from_slice(vadcop_vk);
+        words
+    }
+
+    /// The whole of this module's claim, in one assertion.
+    ///
+    /// A child that names any VADCOP key but ours is refused, and it is refused
+    /// while everything else about it is right: the program key is the one the
+    /// parent expects and the public bytes are the ones it asked for. Only the
+    /// circuit differs, and the circuit is the thing that decides whether those
+    /// two agreements mean anything.
+    #[test]
+    fn a_child_under_a_foreign_vadcop_key_is_refused() {
+        let program_vk: ProgramVk = [1, 2, 3, 4];
+        let publics = [7u8, 8, 9];
+        for foreign in FOREIGN_VKS {
+            let proof = shaped(&program_vk, &publics, &foreign);
+            assert_eq!(child_program_vk(&proof), Some(program_vk));
+            assert_eq!(child_vadcop_vk(&proof), Some(foreign));
+            assert!(!verify_child(&proof, &program_vk, &publics));
+        }
+    }
+
+    /// The tail is read from the end of the buffer, so a buffer short enough for
+    /// the end to be inside the public values must not parse at all. Otherwise a
+    /// prover picks four public words, which they also write, and the pin above
+    /// checks a number against itself.
+    #[test]
+    fn the_vadcop_key_never_overlaps_the_public_values() {
+        let proof = shaped(&[1, 2, 3, 4], &[], &VADCOP_FINAL_VK);
+        assert_eq!(child_vadcop_vk(&proof), Some(VADCOP_FINAL_VK));
+        assert_eq!(child_vadcop_vk(&proof[..proof.len() - 1]), None);
+        assert_eq!(child_program_vk(&proof[..proof.len() - 1]), None);
+    }
+
+    /// Against a real proof, which is the only thing that can say the pinned
+    /// constant is the one honest proofs actually carry. A wrong constant is the
+    /// safe failure — it refuses everything — but it refuses everything at the
+    /// far end of a proving run, so pin it here where it costs nothing.
+    ///
+    /// ```text
+    /// ZKASPER_CHILD_PROOF=/path/to/child.words.bin cargo test -p zkasper-common
+    /// ```
+    #[test]
+    fn a_real_child_carries_the_pinned_vadcop_key() {
+        let Ok(path) = std::env::var("ZKASPER_CHILD_PROOF") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read the child proof");
+        assert_eq!(bytes.len() % 8, 0, "{path} is not a u64 word stream");
+        let proof: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(child_vadcop_vk(&proof), Some(VADCOP_FINAL_VK));
+
+        let program_vk = child_program_vk(&proof).expect("an uncompressed child proof");
+        let publics = child_public_bytes(&proof).expect("an uncompressed child proof");
+        assert!(verify_child(&proof, &program_vk, &publics));
+
+        // The same proof, asking to be checked under someone else's circuit.
+        for foreign in FOREIGN_VKS {
+            let mut forged = proof.clone();
+            let end = forged.len() - VADCOP_VK_LEN;
+            forged[end..].copy_from_slice(&foreign);
+            assert!(!verify_child(&forged, &program_vk, &publics));
+        }
     }
 }

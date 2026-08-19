@@ -410,6 +410,90 @@ fixtures carry stub child proofs, and a guest rejects an empty proof, so every
 earlier attempt to measure this had to remove the recursion first and measured
 the remainder.
 
+### Almost all of it was the compression
+
+MEASURED 2026-08-19 with `ziskemu -X` on a guest that calls `verify_zisk_proof`
+and does nothing else, fed 0, 1, 2 and 3 copies of one real slot proof. The
+slope is exact and has no timing noise in it: `TOTAL` is the trace area a prove
+has to cover, so the difference between `n` and `n + 1` children is one
+recursion in the currency the prover charges in.
+
+| per child | compressed (`VadcopFinalMinimal`) | uncompressed (`VadcopFinal`) | |
+|---|---:|---:|---:|
+| RISC-V steps | 242,778,258 | 10,902,201 | **22.3x** |
+| trace area (`TOTAL`) | 24,933,840,298 | 1,078,785,018 | **23.1x** |
+| `poseidon1` precompile calls | 306 | 3,877 | |
+| Goldilocks `mul`, one child | 8,675,665 | 227,511 | |
+| serialized bytes | 254,624 | 369,224 | |
+
+The precompile counts are the mechanism. `proofman`'s compressed verifier is
+`stark_verify::<Poseidon1_8, Poseidon1_8, Poseidon1_16, Poseidon1_8>` because
+its Merkle arity is 2 and `arity * 4 == WIDTH`; the uncompressed one is
+`Poseidon1_16` in the first three positions because its arity is 4.
+`poseidon1_hash` only reaches `syscall_poseidon1` when `W == 16`, so under a
+compressed child the whole Merkle and FRI path runs the software Hades
+permutation — 13.8 kB of code in the shipped ELF against a 652-byte syscall
+stub — and only the transcript's 306 width-16 hashes stay precompiled.
+
+So the 35.629 s a child above is a compression artefact, not the price of
+recursion. The pipeline stopped paying it on 2026-08-19.
+
+### The wall-clock number that replaces it: 1.52 s a child
+
+```sh
+./scripts/recursion_bench_build.sh
+./scripts/recursion_bench_emu.sh                      # cost units, 0..3 children
+./scripts/recursion_bench_gpu.sh                      # box setup and ELF setup
+./scripts/recursion_bench_gpu_prove.sh children 2     # compressed ladder
+./scripts/recursion_bench_gpu_prove.sh nm 2           # uncompressed ladder
+```
+
+MEASURED on a rented RTX 5090, driver 580.159.03, CUDA 12.9.1, cargo-zisk
+v1.1.0-alpha **[gpu]**, 2026-08-19. `Proof generated`, warm; the ladder is
+`crates/recursion-bench-guest` over real proofs, so `n + 1` minus `n` is one
+recursion and nothing else.
+
+| children | compressed | uncompressed |
+|---:|---:|---:|
+| 0 | 2.376 s | 2.349 s |
+| 1 | 43.245 s | 4.736 s |
+| 2 | 87.039 s | 6.175 s |
+| 3 | 142.129 s | 7.694 s |
+| 4 | | 9.297 s |
+
+**Three terms, separated.** Least squares over the uncompressed ladder at
+`n = 1..4` is `3.175 s + 1.520 s a child`, worst residual **0.042 s — 2.7% of
+one child**. The zero-child point is 2.349 s, which is the empty-guest floor this
+document already carries (2.367 s ± 0.049, measured in an unrelated campaign).
+
+| term | value |
+|---|---:|
+| empty-guest floor | 2.349 s |
+| **the step for having any child at all** | **+0.83 s** |
+| **per child** | **1.520 s** |
+
+The 0.83 s is a proof's first `Poseidon` AIR instance: 3,877 permutations is
+about 54,000 rows of a 131,072-row AIR, and a guest with no children builds no
+such instance. It is paid **once per proof, not once per child**, `ProverModel`
+has no term for it, and at 1.52 s a child it is worth more than half a child.
+**Splitting one proof's children across two proofs now costs a floor and a
+Poseidon instance and saves almost nothing** — the opposite of what the 35.629 s
+number implied.
+
+**The compressed ladder bends, and that is why the old curve read high.** Its
+marginals are 40.87, 43.79 and 55.09 s for three chunks of work the emulator says
+are identical to five decimal places — 610, 589 and 535 M cost units a second.
+A least-squares slope over it reports the bend as slope: 46.35 s a child against
+a first child of 40.87 s, worst residual 13% of a child.
+
+**And the seconds are a property of the rental.** One compressed child, warm,
+one process, one card, varying only the CPU affinity mask: **44.54 s on 256
+cores, 36.75 s on 64, 35.74 s on 32, 38.68 s on 16** — 1.25x, non-monotonic,
+widest mask slowest, because the prover sizes its thread pool from the node's
+core count and not from its affinity mask. The 1.49x between 35.629 s and
+53.087 s needs no mechanism beyond that: this box measured 40.9 s, between the
+two, and neither figure was a property of a guest.
+
 ## `T2 - T`
 
 `T` is the moment the chain has published enough attestations to justify a
@@ -718,7 +802,8 @@ against Zisk **v1.0.0-alpha**, which is the newest release whose SNARK proving
 key exists. The guest is a stub that commits its input verbatim, fed the real
 176 public bytes of `/v1/proofs/469426`. That substitution is faithful: the wrap
 circuits are fixed size and never read the guest, which is why every zkasper
-proof is 254,624 bytes whatever stage produced it.
+proof is one size whatever stage produced it — 369,224 bytes since the
+compression was dropped, 254,624 before it.
 
 | step | time | output |
 | --- | --- | --- |

@@ -43,8 +43,16 @@
 //!
 //! # And exactly two recursions do, which is now the whole of `T2 − T`
 //!
-//! A child costs [`ProverModel::recursion_verify_s`] — 35.629 s, MEASURED in
-//! production — against a 3.640 s floor, so the sentences above are true and no
+//! **Corrected 2026-08-19, and everything in this section is a before number.**
+//! A child costs [`ProverModel::recursion_verify_s`], which is **1.520 s**
+//! MEASURED on a card once `fd9764d` stopped compressing children — the wrap
+//! was forcing the in-guest verifier onto a software Poseidon, and it was 23x of
+//! the cost. The seconds quoted below were computed at 35.629 s a child and are
+//! kept as the record of what the pipeline used to pay; the shape they argue for
+//! wants re-deriving from a post-fix run, and so does every figure that was
+//! itself derived by subtracting a recursion. See `BENCHMARKS.md`.
+//!
+//! Against a 3.640 s floor the sentences above are true and no
 //! longer the point. `T2 − T` on mainnet 430529 is **83.1 s**, of which 71 is
 //! the two recursive verifications [`ProverModel::final_s`] charges a folded
 //! final proof: the running aggregate the epoch was folded into, and the
@@ -301,54 +309,53 @@ pub struct ProverModel {
     /// of wall around it is process startup, which a long-lived prover does not
     /// pay.
     pub wrap_s: f64,
-    /// Seconds to verify one child proof recursively, in the guests this model
-    /// prices — `aggregation-guest` and `stream-final-guest`.
+    /// Seconds to verify one child proof recursively.
     ///
-    /// MEASURED in production, mainnet epochs 469,468-469,537, 2026-08-19: the
-    /// fold that opens an epoch is the cleanest estimator the pipeline has. It
-    /// verifies the epoch diff, the committee proof and its groups — a child
-    /// count fixed by `verify_aggregate`'s `previous == None` branch, which also
-    /// refuses an empty group list — and its own non-recursion work is the floor
-    /// plus 4 ms. Twenty-four of them, each verifying three children, price a
-    /// child at **35.629 s, sd 0.326, range 34.65 to 36.08**. Forty-four
-    /// stream-final proofs at three and four children reproduce it to a mean
-    /// error of +0.3 s.
+    /// MEASURED on a rented RTX 5090, driver 580.159.03, CUDA 12.9.1,
+    /// cargo-zisk v1.1.0-alpha [gpu], 2026-08-19, on a guest that verifies `n`
+    /// children and does nothing else (`crates/recursion-bench-guest`) over
+    /// real proofs at `n = 0, 1, 2, 3, 4`. Warm `Proof generated` seconds. Least
+    /// squares over `n = 1..4` is `3.175 s + 1.520 s a child`, worst residual
+    /// 0.042 s — 2.7% of one child. The zero-child point is 2.349 s, which
+    /// reproduces the empty-guest floor measured in an unrelated campaign.
     ///
-    /// **It is not one price across guests, and 53.087 s was the wrong one.**
-    /// `justification-guest` costs 53.087 s a child — `recursion_cost_curve` on
-    /// an RTX 5090 at two, three and four children, and the batch justification
-    /// of mainnet epoch 469424 verifying 23 in 1,224 s on the production fleet
-    /// itself. Both guests are measured on the same class of card, so the 1.49x
-    /// between them is the guest and not the hardware; the mechanism is not
-    /// established. What is established is that 53.087 s cannot describe the
-    /// streaming guests: at that price the opening fold's measured 110.9 s is
-    /// 2.00 children, where the source requires at least three.
+    /// **It was 35.629 s until `fd9764d`, and that was the compression.** Every
+    /// child was wrapped to `VadcopFinalMinimal` before being verified. A
+    /// compressed proof has Merkle arity 2, `proofman` fixes the verifier's hash
+    /// width at `arity * 4`, and `syscall_poseidon1` only accepts width 16 — so
+    /// every Merkle and FRI hash ran as software Hades inside the guest. 242.8 M
+    /// RISC-V steps a child against 10.9 M. See BENCHMARKS.md.
     ///
-    /// **It hid a bug for exactly as long as the pipeline ran at three
-    /// children.** `final_s` charged one child too few and this field was 1.49x
-    /// too high, and `(n - 1) x 53.087 = n x 35.629` at `n = 3.04`. The folded
-    /// path had three children, so the model reproduced it to 0.5 s while being
-    /// wrong twice. The `MAX_TAIL` shape has two, where the errors stop
-    /// cancelling.
+    /// **This model is missing a term, and it now matters.** A proof pays about
+    /// **0.83 s once** for having any child at all: its first `Poseidon` AIR
+    /// instance, whose floor a childless guest never builds. That is more than
+    /// half a child, it is per proof rather than per child, and nothing here
+    /// charges it. Anything this model says about splitting work across proofs
+    /// is optimistic by 0.83 s a proof until it does.
     ///
-    /// **The floor is held, not fitted.** Only two distinct child counts appear
-    /// in production — three and four — so a free intercept is not identified by
-    /// this data and comes out negative. The figure above holds the floor at its
-    /// own measured 3.640 s and fits the price alone, which is why it is quoted
-    /// with a spread rather than a confidence interval.
+    /// **Seconds here are a property of the rental, not of the guest.** The same
+    /// child, warm, one process, one card, spans 35.7 to 44.5 s under the old
+    /// compression when only the CPU affinity mask changes — non-monotonically,
+    /// widest mask slowest. The 1.49x that once separated this figure from
+    /// `justification-guest`'s 53.087 s was that, and not a difference between
+    /// guests: the work per child is identical to five decimal places whoever
+    /// verifies it.
     ///
-    /// **A recursion costs ten proofs.** Against a 3.640 s stage floor, one
-    /// recursive verification is worth about ten whole proofs of anything else
-    /// this pipeline does, and it dwarfs every other term in this struct put
-    /// together. Two consequences follow and both invert what the zero implied:
+    /// **A recursion no longer costs ten proofs.** Against a 3.640 s stage floor
+    /// a child is now under half a proof, which inverts what the 35.629 s
+    /// implied: grouping slots to reduce child counts is close to free either
+    /// way, and a fold that exists only to take children off another proof
+    /// mostly buys latency at the cost of a floor.
     ///
-    /// - **Children, not proofs, are the cost.** Splitting work across more
-    ///   proofs to keep each one small *adds* recursions and therefore adds
-    ///   work. What saves work is carrying more slots per child.
-    /// - **A fold buys latency, never throughput.** Absorbing `k` children into
-    ///   a fold pays `k + 1` recursions to take `k` off whoever would have
-    ///   verified them, so it is worth doing only for the ones that would
-    ///   otherwise land between `T` and `T2`.
+    /// **The default below is deliberately still 35.629, and that is a hold, not
+    /// an oversight.** Setting it to the measured 1.520 flips four schedule
+    /// tests — `inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group`,
+    /// `lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529`,
+    /// `nothing_is_left_for_the_final_proof_to_absorb` and
+    /// `a_bigger_floor_pushes_another_slot_into_the_tail` — because at 1.520 s
+    /// the schedule's optimum is a different shape and the published `T2 - T`
+    /// figures move with it. That is a re-derivation for whoever owns the
+    /// scheduler, against a post-fix production run, and not a constant swap.
     pub recursion_verify_s: f64,
     pub acc_depth: u32,
 }
@@ -845,7 +852,13 @@ pub fn schedule(
     total_active_balance: u64,
     policy: &StreamPolicy,
 ) -> Schedule {
-    schedule_capped(units, total_active_balance, policy, usize::MAX)
+    // 24, not unbounded, from 2026-08-19: an uncapped tail ran the stream_final
+    // guest past DEFAULT_MAX_STEPS (~68.7e9) on epoch 469569 and killed the run.
+    // That is a runaway rather than a budget overrun -- the whole fused shuffle
+    // proof is ~841e6 steps -- so the cap is a guard, not the fix. 24 is the
+    // value the win was modelled at (112.4 -> 83.1 s) and bounds the blast
+    // radius while the interaction with the held-group tail range is diagnosed.
+    schedule_capped(units, total_active_balance, policy, 24)
 }
 
 /// The same, with the inline tail capped at `max_tail` units.
