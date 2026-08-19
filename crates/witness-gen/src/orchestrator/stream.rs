@@ -515,6 +515,34 @@ impl StreamPipeline {
             Self::repair_from_blocks(engine, &mut aggregator).await?;
         }
 
+        let policy = engine.config.stream_policy.clone();
+        let total = aggregator.context.total_active_balance;
+
+        // Observe the crossing here, before anything can return. `held` reads
+        // the stream this tick has just ingested, so the answer is available at
+        // this point — and the in-flight branch below returns without ever
+        // reaching the arm that used to ask. That return is why
+        // `observation_millis` charged the daemon's own blindness to the chain:
+        // over 29 steady-state mainnet epochs on 2026-08-19 the median gap
+        // between the chain crossing two thirds and this process noticing was
+        // 99 s, worst 549.6 s, and none of it was the chain being slow.
+        // Stamping it here leaves `observation_millis` measuring gossip arrival
+        // and moves the daemon's blocking into `wait_millis`, which is the term
+        // the schedule owns and can shorten.
+        //
+        // Only while it has not crossed. `held` walks the epoch's units, and a
+        // tick that already knows the answer must not pay to learn it again.
+        if aggregator.crossed_unix_millis.is_none() {
+            let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
+            if held.balance as u128 >= policy.quorum_balance(total) {
+                let crossed = now_unix_millis();
+                aggregator.crossed_unix_millis = Some(crossed);
+                if let Some(publish) = engine.report.publisher() {
+                    publish.threshold_crossed(target_epoch, crossed, held.balance, total);
+                }
+            }
+        }
+
         // A proof started on an earlier tick. Until it lands the pipeline must
         // not start another — one prover proves one thing at a time — so a tick
         // that finds one still running does the work that does not need the
@@ -573,23 +601,7 @@ impl StreamPipeline {
             return Ok(());
         }
 
-        let policy = engine.config.stream_policy.clone();
-        let total = aggregator.context.total_active_balance;
         let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
-
-        // The first moment the daemon *sees* it holds what the circuit would
-        // accept. This is where `T` was stamped until 2026-08-19, and the early
-        // return above is why it could not be: the chain crossed while a proof
-        // was running and this line did not execute until it finished.
-        if held.balance as u128 >= policy.quorum_balance(total)
-            && aggregator.crossed_unix_millis.is_none()
-        {
-            let crossed = now_unix_millis();
-            aggregator.crossed_unix_millis = Some(crossed);
-            if let Some(publish) = engine.report.publisher() {
-                publish.threshold_crossed(target_epoch, crossed, held.balance, total);
-            }
-        }
 
         let enough = held.balance as u128 >= policy.target_balance(total);
         let fire = enough && !aggregator.worth_waiting(&policy, held.filling);
