@@ -39,7 +39,14 @@ use crate::epoch_state::EpochState;
 use crate::prover::Proof;
 
 const MAGIC: &[u8; 8] = b"ZKASPRD\x01";
-const FORMAT_VERSION: u32 = 4;
+/// Bump this whenever a persisted *proof* changes shape as well as when a struct
+/// does. Version 5 is the uncompressed child: the stored stream-final and
+/// justification proofs are fed straight back in as children of the next epoch,
+/// so a version-4 store resumed under a version-5 guest reads a program key one
+/// word short and fails inside the circuit minutes into an epoch. Refusing the
+/// store at startup turns that into `restart from a new init point`, which is
+/// what the recovery table already says to do.
+const FORMAT_VERSION: u32 = 5;
 
 /// Everything the daemon needs to pick up exactly where it stopped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
