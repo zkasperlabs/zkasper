@@ -325,10 +325,12 @@ impl StreamAggregator {
     /// [`streaming::ProverModel::recursion_verify_s`], where inlining the same
     /// slots is complement work and no child at all.
     ///
-    /// Clamped below by `proved`, because the plan is cut for a prover that kept
-    /// up and `proved` is what this one actually folded. A daemon ahead of the
-    /// plan inlines only what the plan asked for; one behind it still needs a
-    /// group for the difference.
+    /// It starts at `proved`, not at the plan's cut, because the plan is cut for
+    /// a prover that kept up and `proved` is what this one actually folded. A
+    /// group for the difference is the same complement work plus a stage floor,
+    /// a second Miller batch, a recursion in the final proof and a round trip to
+    /// the card, and it runs entirely after `T` — so a daemon behind the plan
+    /// inlines the difference for the same reason a daemon ahead of it does.
     ///
     /// An `unfolded` group displaces both. It is the group the final proof will
     /// absorb, and the fire path has no second group to bridge with, so the tail
@@ -347,12 +349,7 @@ impl StreamAggregator {
             .max()?;
         let start = match &self.unfolded {
             Some((proved, _)) => *proved,
-            None => plan
-                .tail
-                .first()
-                .copied()
-                .unwrap_or(crossing + 1)
-                .max(self.proved),
+            None => self.proved,
         };
         Some(start.min(crossing + 1)..crossing + 1)
     }
