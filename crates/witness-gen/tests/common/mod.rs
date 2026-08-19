@@ -67,6 +67,14 @@ pub struct MockBeaconApi {
     /// happening now, which is what makes the daemon's schedule comparisons
     /// exercise the live path instead of looking like a fifty-year catch-up.
     pub genesis_time: u64,
+    /// Something to run while the daemon is inside `get_block_attestations`.
+    ///
+    /// The block walk is the longest thing a tick does, and gossip that lands
+    /// while it runs is the case the trigger has to be able to see. This is the
+    /// gossip equivalent of [`MockBeaconApi::head_handle`]: it moves the world
+    /// under the daemon *within* a call rather than between two of them.
+    #[allow(clippy::type_complexity)]
+    pub during_block_fetch: Mutex<Option<Box<dyn Fn(&str) + Send>>>,
 }
 
 impl MockBeaconApi {
@@ -85,7 +93,14 @@ impl MockBeaconApi {
             head: Arc::new(Mutex::new(None)),
             reorged_to: Mutex::new(None),
             genesis_time: 0,
+            during_block_fetch: Mutex::new(None),
         }
+    }
+
+    /// Run `hook` every time the daemon asks for a block's attestations, with
+    /// the block id it asked for.
+    pub fn during_block_fetch(&self, hook: impl Fn(&str) + Send + 'static) {
+        *self.during_block_fetch.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Block ids `get_block_attestations` was called with.
@@ -198,6 +213,9 @@ impl BeaconApi for MockBeaconApi {
             .lock()
             .unwrap()
             .push(block_id.to_string());
+        if let Some(hook) = self.during_block_fetch.lock().unwrap().as_ref() {
+            hook(block_id);
+        }
         self.attestations
             .get(block_id)
             .cloned()
@@ -727,18 +745,28 @@ fn compute_state_root_from_validators(
 /// orchestrator sees of either is the same drain, so a test can drive gossip
 /// arrival exactly and without a beacon node.
 #[derive(Clone, Default)]
-pub struct FakeGossip(std::sync::Arc<Mutex<Vec<AttestationResponse>>>);
+pub struct FakeGossip {
+    inbox: std::sync::Arc<Mutex<Vec<AttestationResponse>>>,
+    gapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl FakeGossip {
     /// Gossip these, as if the node had just validated them.
     pub fn publish(&self, attestations: Vec<AttestationResponse>) {
-        self.0.lock().unwrap().extend(attestations);
+        self.inbox.lock().unwrap().extend(attestations);
+    }
+
+    /// Report an outage on the next drain, the way the real source does after
+    /// it has reconnected. What the stream missed is only in blocks now, so the
+    /// orchestrator has to walk them.
+    pub fn gap(&self) {
+        self.gapped.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl AttestationSource for FakeGossip {
     fn drain(&self) -> Vec<AttestationResponse> {
-        std::mem::take(&mut self.0.lock().unwrap())
+        std::mem::take(&mut self.inbox.lock().unwrap())
     }
 
     fn took_reorg(&self) -> bool {
@@ -746,7 +774,7 @@ impl AttestationSource for FakeGossip {
     }
 
     fn took_gap(&self) -> bool {
-        false
+        self.gapped.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     fn counters(&self) -> zkasper_witness_gen::gossip::Counters {
