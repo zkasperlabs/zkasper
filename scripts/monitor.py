@@ -52,7 +52,15 @@ def status_path():
             argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             for i, a in enumerate(argv):
                 if a == b"--output-dir" and i + 1 < len(argv):
-                    return str(Path(argv[i + 1].decode()) / "status.json")
+                    out = Path(argv[i + 1].decode())
+                    # Only the production daemon counts. A test or dry-run
+                    # zkasperd matches `pgrep -x` just as well, and on
+                    # 2026-08-19 one was reporting `epoch 10, head 426` --
+                    # fixture values -- as production health while production
+                    # was down for a deploy. Anchor on where it writes.
+                    if PRODUCTION_OUT not in (str(out), str(out.resolve())):
+                        continue
+                    return str(out / "status.json")
     except Exception:
         pass
     return None
@@ -60,6 +68,7 @@ def status_path():
 
 def daemon_running():
     return status_path() is not None
+PRODUCTION_OUT = "/mnt/ssd/zkasper-run/out-remote"
 VAST_KEY_FILE = "/root/.openclaw/workspace/.vast-api"
 API = "https://api.zkasper.com/v1/status"
 METRICS = "http://127.0.0.1:9464/metrics"
