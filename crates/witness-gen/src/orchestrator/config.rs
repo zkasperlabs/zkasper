@@ -14,7 +14,7 @@ use super::Pipeline;
 ///
 /// **Eleven, and it is this large because a child is the expensive thing.**
 /// A recursive verification is
-/// [`crate::streaming::ProverModel::recursion_verify_s`] — 55.56 s, MEASURED —
+/// [`crate::streaming::ProverModel::recursion_verify_s`] — 35.629 s, MEASURED —
 /// against 1.01 s for a mainnet slot inside a proof that is already running and
 /// 3.64 s for the proof itself. So a slot that shares a proof with ten others
 /// costs a hundredth of a slot that brings its own recursion, and grouping is

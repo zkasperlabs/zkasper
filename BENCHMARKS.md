@@ -279,9 +279,49 @@ question — 1,224/22 divides to 55.6 whether the cost is per child or per proof
 and three points between 2 and 4 settle it: the second child costs the same as
 the twenty-third.
 
-**A recursion costs fifteen proofs.** Against the 3.640 s stage floor, one
-recursive verification is worth more than fifteen whole proofs of anything else
-here: a slot proof is 4.2 s, a committee proof over 64 members is 3.3 s, a
+### It is `justification-guest`'s price, and the streaming guests charge less
+
+**53.087 s is a per-guest number, and the model spent a day applying it to the
+wrong guests.** Every row above is `justification-guest`. The two guests on the
+streaming critical path — `aggregation-guest` and `stream-final-guest` — charge
+**35.629 s a child**, and the production run measures it directly.
+
+The estimator is the fold that opens an epoch. Its child count is fixed by
+construction: `verify_aggregate` takes the `previous == None` branch, which
+verifies the epoch diff and the committee proof, and it refuses an empty group
+list — so an opening fold that absorbs one group verifies exactly three
+children. Its own non-recursion work is the stage floor plus one Fp12 multiply,
+4 ms. Twenty-four of them across mainnet epochs 469,486-469,537:
+
+| | value |
+|---|---:|
+| opening folds measured | 24 |
+| children each, by construction | 3 |
+| prove time | 107.60 to 111.87 s |
+| **per child, floor held at 3.640 s** | **35.629 s, sd 0.326** |
+| range | 34.65 to 36.08 s |
+
+**53.087 s is refuted by that table on its own.** At 53.087 s a child, an
+opening fold measured at 110.9 s verified 2.00 children. The source requires at
+least three. No integer child count reproduces the streaming stages at that
+price; at 35.629 s the three- and four-child stages come out at 2.98 and 4.12.
+
+Forty-four stream-final proofs over the same epochs cross-check it: priced at
+the folds' 35.629 s a child, and charged the child count the guest source says
+they verify, the mean error is **+0.3 s** and the rms 3.8 s.
+
+**The mechanism is not established.** Both guests were measured on the same
+class of card — the `recursion_cost_curve` box and the production prover box are
+both vast.ai RTX 5090s — so the 1.49x is the guest and not the hardware, and the
+production fleet reproduces `justification-guest`'s 53 s itself at epoch 469424.
+A child is genuinely not one price, and this document no longer pretends
+otherwise. `ProverModel::recursion_verify_s` carries the streaming figure
+because that is the pipeline it prices; `catch_up_test` carries the
+justification figure because that is the pipeline it prices.
+
+**A recursion costs ten proofs.** Against the 3.640 s stage floor, one recursive
+verification in the streaming guests is worth about ten whole proofs of anything
+else here: a slot proof is 4.2 s, a committee proof over 64 members is 3.3 s, a
 mainnet slot inside a proof already running is about 1 s. Every other constant
 in `ProverModel` put together is noise beside it.
 
@@ -314,21 +354,37 @@ cargo test --release --test ssz_file_tests test_ssz_file_streaming_schedule -- -
 ```
 
 On mainnet epoch 430529, 2,212,730 validators, the schedule needs **two GPUs**
-and puts `T2 - T` at **67.8 s**, with the final proof verifying no child at all.
+and puts `T2 - T` at **83.1 s**, with the final proof verifying the running
+aggregate and the previous epoch's justification and no group at all.
 
-It was **112.8 s** until the inline tail stopped being capped at four slots; see
-*the largest remaining win* below, which is now spent. **The 117.7 s quoted
-throughout the rest of this section is an earlier revision of this model and no
-longer reproduces** — the same command printed 112.8 s at `903f3e6`, before any
-of this change. 117.7 s is the number the live run validated, so the paragraphs
-that compare it against measurement are left as they were written; every figure
-below the sensitivity table's rewrite is today's model.
+It was **112.4 s** until the inline tail stopped being capped at four slots; see
+*the largest remaining win* below, which is now spent.
+
+**Every figure in this section was rewritten on 2026-08-19, and the two errors
+that made the old ones look right are worth stating.** The model charged the
+final proof one child too few — `final_s` charged `absorbed + 1` on the folded
+path where `stream-final-guest` verifies `absorbed + 2`, the third being the
+previous epoch's justification, which its own module doc has always called
+irreducible — and `recursion_verify_s` carried `justification-guest`'s 53.087 s,
+which is 1.49x what the streaming guests charge. The two cancel exactly at three
+children:
+
+```
+(n - 1) x 53.087  =  n x 35.629      at  n = 3.04
+```
+
+The folded path the live run measured has three, so the old model reproduced it
+to half a second while being wrong twice. **The shape the `MAX_TAIL` change
+moved the pipeline to has two**, where the errors stop cancelling in the
+optimistic direction: the old model charged one child, 53.087 s, where the guest
+verifies two, 71.3 s. That is the whole of the difference between the withdrawn
+67.8 s and today's 83.1 s.
 
 **It was 5.5 s on one GPU until recursion was measured, and that number is
-withdrawn.** The model carried `recursion_verify_s` as zero; it is 53.087 s, and
-the final proof of an epoch verifies two children it cannot avoid — the running
-aggregate and the previous epoch's justification. Those two are 106 s of the
-117.7, and everything the schedule can actually choose is the remaining 12.
+withdrawn.** The model carried `recursion_verify_s` as zero. The final proof of
+an epoch verifies two children it cannot avoid — the running aggregate and the
+previous epoch's justification — and at 35.629 s those two are 71 s of the
+83.1 s. Everything the schedule can actually choose is the remaining 12.
 
 The production run confirms that the cost is **per child**, from the other
 direction: a real stream-final proof took **148.2 s over four epochs, within
@@ -336,23 +392,24 @@ direction: a real stream-final proof took **148.2 s over four epochs, within
 54 to 1,319 attesters for the same 148 s. A cost that ignores the work in front
 of it is a cost per child.
 
-**It does not corroborate the 117.7 s figure, and this document previously
-claimed it did.** Those 148.2 s were measured on the *unfolded* path, where the
-stream-final proof verifies the epoch diff and the committee proof inline
-because no opening fold has done it — four children. The 117.7 s model describes
-the folded path, which has two. The two numbers describe different circuits, so
-one cannot anchor the other. Note also that 53.087 s per child reproduces
-neither: 2 children gives 110 s, 3 gives 163 s, 4 gives 216 s, and none of those
-is 148.2 s.
-
-**The folded path has now run, and the model holds.** Mainnet epochs
+**The folded path has run, and it is what found the bug.** Mainnet epochs
 469,501-469,509, 2026-08-19, are the first with `folded_groups > 0`. Six of them
 verify an aggregate, one absorbed group and the previous justification, and their
 stream-final proofs are **116.5, 117.2, 118.5, 119.8, 121.2 and 124.2 s** — mean
-119.6 s, spread 7.7 s, against a model of 123.2 s at their measured tails. One
-folded nothing and took 168.0 s against a modelled 183.2 s. The model is
-**conservative by 3 to 8% on both paths**, so 117.7 s is no longer anchored at
-one end only.
+119.6 s, spread 7.7 s. One folded nothing and took 168.0 s.
+
+Those two shapes differ by exactly one child, and that is what settles it. At
+53.087 s and the child count the model charged, the three-child proofs come out
++1.8 s and the four-child proof +13.1 s — an error that grows with the child
+count, which is the signature of counting one too few at a price that is too
+high. At 35.629 s and the count the guest source states, the same proofs come
+out at +0.3 s mean over 44 of them.
+
+The opening folds beside them are the cleaner arbiter, because their child count
+is not a matter of reading `late_groups`: `verify_aggregate` verifies the epoch
+diff, the committee proof and at least one group, so an opening fold is at least
+three children by construction. Twenty-four of them measured 107.6 to 111.9 s.
+At 53.087 s that is two children, which the source forbids.
 
 **What did not hold is the daemon's schedule, and `late_groups` is not where it
 failed.** The published schedule's own optimum left one group unfolded for the
@@ -360,9 +417,9 @@ final proof to absorb — `Final absorbs [1]` in the report as it read then — 
 `late_groups = 1` was the plan, and the recursion it costs was already inside the
 117.7 s. It is `Final absorbs []` and `late_groups = 0` now; the paragraph is
 kept because it is the reasoning the measurement was read against. Absorbing that group is right rather than merely tolerable: folding it
-instead costs `stage_floor_s + recursion_verify_s` — 56.7 s — more, and cannot
-finish before `T` anyway, because a fold is 109.8 s and the group's last slot
-arrives one slot before the crossing. `folding_the_last_group_costs_a_floor_and_a_recursion_more`
+instead costs `stage_floor_s + recursion_verify_s` — 39.3 s — more, and cannot
+finish before `T` anyway, because a continuation fold is 74.9 s and the group's
+last slot arrives one slot before the crossing. `folding_the_last_group_costs_a_floor_and_a_recursion_more`
 pins the arithmetic.
 
 The gap between the model and the measurement is a single term, and it is exact:
@@ -442,8 +499,8 @@ either.** `schedule` puts `threshold_s` at `arrival` of the crossing unit, and
 boundary, the same origin `T` now uses. The two are finally the same quantity.
 Against the 117.7 s model this run was compared with, the corrected median is
 **1.94x**, not the 1.045x the run claimed, and the gap is 110.5 s against an
-observation delay of 107.7 s over the same ten epochs. Against today's 67.8 s it
-is 3.4x, but no daemon has run under that schedule yet. **The whole of the discrepancy between the measured `T2 - T`
+observation delay of 107.7 s over the same ten epochs. Against today's 83.1 s it
+is 2.7x, but no daemon has run under that schedule yet. **The whole of the discrepancy between the measured `T2 - T`
 and the modelled one is the blind tick.** Nothing about the prover, the recursion
 cost or the fold schedule is implicated by it, and none of it was visible while
 `T` was stamped where the gap was.
@@ -505,13 +562,20 @@ showing the problem rather than hiding it.
 
 **The largest remaining win was inlining, not folding, and it has been taken.**
 The slots no fold can reach are cheaper carried inline by the final proof than
-proven as a group at all: one group is one recursion, 53.087 s, where eleven
-mainnet slots of complement work is under ten. The inline tail was capped at four
-slots on the pre-recursion reasoning that "a group is one floor either way".
-Lifting that cap takes the modelled `T2 - T` on epoch 430529 from **112.8 s to
-67.8 s** on the same two cards, with the final proof absorbing nothing —
+proven as a group at all: one group is one recursion, 35.629 s, where eight
+mainnet slots of complement work is about seven. The inline tail was capped at
+four slots on the pre-recursion reasoning that "a group is one floor either way".
+Lifting that cap takes the modelled `T2 - T` on epoch 430529 from **112.4 s to
+83.1 s** on the same two cards, with the final proof absorbing nothing —
 `lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529` prices both shapes
 against each other on the real epoch's per-slot numbers, offline.
+
+**The A/B this replaces claimed 112.8 s to 67.8 s, a 45.0 s win.** It is 29.3 s.
+The capped shape barely moved — 112.8 to 112.4 — because it leaves a group for
+the final proof to absorb, which is the three-child shape where the missing child
+and the inflated price cancelled. The uncapped shape has two children and gained
+15.3 s when both were fixed. Lifting the cap is still the largest single win
+available; it is two thirds of what was published.
 
 The daemon had to change with it: `stream.rs` hardcoded the final proof's tail to
 the crossing slot and threw `StreamPlan::tail` away, so the plan's choice never
@@ -521,26 +585,26 @@ aggregate already covers.
 **This is a model, and no prover has run it.** The last GPU exited before the
 change was written. What is measured about it is that the schedule reproduces on
 real fixture data and that the daemon executes the shape end to end against a
-mock node; what is not measured is a stream-final proof over eleven inline slots
+mock node; what is not measured is a stream-final proof over eight inline slots
 on a card.
 
 What it is sensitive to — today's model, all at the 4-card budget:
 
 | | `T2 - T` | GPUs |
 |---|---:|---:|
-| **recursion 53.087 s per child (measured)** | **67.8 s** | **2** |
-| recursion 5 s per child | 11.8 s | 2 |
-| recursion 1 s per child | 6.5 s | 2 |
+| **recursion 35.629 s per child (measured)** | **83.1 s** | **2** |
+| recursion 5 s per child | 16.8 s | 2 |
+| recursion 1 s per child | 7.5 s | 2 |
 | recursion 0 s per child (what the model used to assume) | 5.5 s | 1 |
-| stage floor 2.43 s (an empty guest) | 65.6 s | 2 |
-| **stage floor 3.64 s (measured)** | **67.8 s** | **2** |
-| stage floor 20.00 s | 86.3 s | 2 |
-| Fp2-tower rate 162M units/s (the slow bracket) | 70.0 s | 2 |
-| Fp2-tower rate 400M units/s (the fast end) | 62.6 s | 1 |
+| stage floor 2.43 s (an empty guest) | 81.9 s | 2 |
+| **stage floor 3.64 s (measured)** | **83.1 s** | **2** |
+| stage floor 20.00 s | 102.3 s | 2 |
+| Fp2-tower rate 162M units/s (the slow bracket) | 84.8 s | 2 |
+| Fp2-tower rate 400M units/s (the fast end) | 79.2 s | 2 |
 
 The inline tail is now the largest term the schedule chooses, and the floor moves
-it: a 20 s floor puts thirteen slots inline and costs 18.5 s over the measured
-one, where before the cap it moved `T2 - T` by 17.7 s over the same range without
+it: a 20 s floor puts eleven slots inline and costs 19.2 s over the measured one,
+where before the cap it moved `T2 - T` by 17.7 s over the same range without
 being able to change the shape.
 
 **Recursion is the whole answer and everything else is rounding.** The stage
@@ -553,12 +617,12 @@ final proof has to verify the running aggregate — that is what an aggregate is
 for. It also verifies the previous epoch's justification, and that proof exists
 an epoch early, exactly like the epoch diff and the committee proof, both of
 which were already moved into the fold that opens the epoch for this reason.
-Moving the third one there would take 53 s off `T2 - T` and is the largest
+Moving the third one there would take 36 s off `T2 - T` and is the largest
 single latency win available.
 
 **The trigger threshold dominates every prover term.** At 66 to 68% of the stake
-the epoch closes on 22 slots and `T2 - T` is 67.8 s. At 69 to 70% it waits for a
-23rd slot and pays 83.7 s. The default is 2/3 exactly, which is the rule the
+the epoch closes on 22 slots and `T2 - T` is 83.1 s. At 69 to 70% it waits for a
+23rd slot and pays 99.1 s. The default is 2/3 exactly, which is the rule the
 circuit enforces.
 
 **Warm and cold are different products.** The cold penalty is 5.80 s of process
