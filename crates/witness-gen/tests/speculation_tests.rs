@@ -362,6 +362,102 @@ async fn test_an_epoch_opens_on_proofs_made_while_the_epoch_before_it_ran() {
     }
 }
 
+/// An epoch that fires on the tick it opens still starts the next epoch's
+/// opening proofs, because the loop keeps running while its own proofs do.
+///
+/// This is mainnet epoch 469482 -> 469483, which cost 137 s of `T2 - T`.
+///
+/// The daemon opened 469482 at 02:11:30 and its threshold had already crossed,
+/// so it fired on the tick it opened and the `!fire` branch — the only other
+/// place [`Engine::speculate`] is called — never ran. `open_epoch`'s own call
+/// had bailed: epoch 469483's first slot did not exist for another five
+/// seconds. The loop then sat inside a blocking prover until 02:16:53, so the
+/// retry that would have started 469483's opening proofs never happened and
+/// nothing refreshed the head it would have been made against. 469483 proved
+/// its own diff and committee — 153 s — before it could open, and opened with
+/// 16.6 s of slack against a group proof of 105 s. Nothing could be folded, and
+/// its whole backlog landed on the critical path: 299.7 s, against 162.3 s for
+/// the epoch beside it that had 236 s of slack.
+///
+/// Both halves of that are pinned here. The head moves during the final proof,
+/// which is the only thing a daemon proving on its loop cannot see, and the
+/// assertion is that the next epoch's opening proofs ran beside that proof
+/// rather than after it.
+// Multi-threaded, because the point is that the chain moves on whether or not
+// the daemon is in a position to look. A current-thread runtime would let a
+// daemon blocking inside its prover hold the timer as well, which is a stronger
+// claim than reality makes and not the one under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_the_next_epoch_starts_while_this_one_proves_even_if_it_never_waited() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let log = ProofLog::default();
+    let stream_epoch = FIRST_EPOCH + 1;
+    let next_epoch = stream_epoch + 1;
+
+    // The head stops on the streaming epoch's first slot, so the run justifies
+    // the epoch before it and opens this one against a chain that holds none of
+    // its attestations yet — and, crucially, none of the next epoch's boundary
+    // either, so nothing can be proved ahead at the moment the epoch opens.
+    let mut daemon = daemon(dir.path(), &chain, stream_epoch * SPE, log.clone()).await;
+    let head = daemon.api().head_handle();
+    daemon.catch_up().await.unwrap();
+    assert_eq!(daemon.state().cursor_epoch, stream_epoch);
+    assert!(
+        log.all()
+            .iter()
+            .all(|w| !(w.stage == Stage::Committee && w.epoch == next_epoch)),
+        "the next epoch cannot have been proved ahead yet: its boundary does \
+         not exist on a chain that has not reached it",
+    );
+
+    // Now the whole epoch arrives at once, which is what being behind looks
+    // like from the pipeline's side: the very first evaluation of the trigger
+    // already holds enough stake, so it fires on the tick it sees it and never
+    // takes the branch that folds.
+    daemon
+        .api()
+        .set_head(chain.header_at(stream_epoch * SPE + SLOTS_TO_THRESHOLD));
+
+    // And the next epoch begins while this one's final proof runs. On mainnet
+    // this was five seconds after the epoch opened and five minutes before the
+    // loop executed again.
+    let arrived = chain.header_at(next_epoch * SPE + SLOTS_TO_THRESHOLD);
+    tokio::spawn(async move {
+        tokio::time::sleep(FINAL_PROVE / 4).await;
+        *head.lock().unwrap() = Some(arrived);
+    });
+
+    daemon.catch_up().await.unwrap();
+    assert_eq!(
+        daemon.state().justified_through,
+        Some(next_epoch),
+        "both epochs still close, which is what proving off the loop must not \
+         change",
+    );
+
+    let closing = log.one(Stage::StreamFinal, stream_epoch);
+    let diff = log.one(Stage::EpochDiff, next_epoch);
+    let committee = log.one(Stage::Committee, next_epoch);
+    assert!(
+        diff.overlaps(&closing),
+        "epoch {next_epoch}'s diff must run beside epoch {stream_epoch}'s final \
+         proof. It can only start once the loop has seen a head it did not have \
+         when the epoch opened, so a loop that is inside the prover never sees \
+         it and the diff lands on the next epoch's opening path instead",
+    );
+    assert!(
+        committee.overlaps(&closing),
+        "and so must its committee proof, which is the expensive half: \
+         {COMMITTEE_PROVE:?} of the {SERIAL_CYCLE:?} an epoch has",
+    );
+    assert!(
+        diff.end <= committee.start,
+        "the committee witness binds the root the diff produces, so proving \
+         them off the loop must not have reordered them",
+    );
+}
+
 /// A daemon that cannot prove the next epoch ahead still proves it inline.
 ///
 /// The head never leaves the epoch being streamed, so the boundary the next

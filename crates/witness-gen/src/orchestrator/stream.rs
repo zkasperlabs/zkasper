@@ -23,20 +23,25 @@
 //! threshold — see [`crate::streaming`]. That last proof is the only thing on
 //! `T2 - T`, and the manifest publishes the measured value.
 //!
-//! What is not here yet is parallelism: groups are proved one at a time, in
-//! order, on the calling task. The aggregator does not depend on that — it takes
-//! outputs and proofs and does not care which order they were produced in — so
-//! handing the prover to a pool of GPUs is a change to this file only.
+//! # Proving does not happen on the drive loop
+//!
+//! Groups are still proved one at a time and in order — one prover, one GPU —
+//! but each proof runs on a thread of its own and the tick that started it
+//! returns. See [`Proving`] for what that is worth and what it cost not to have.
+//! The aggregator does not depend on the order proofs are produced in, so
+//! handing the prover to a pool of GPUs is still a change to this file only.
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tokio::task::JoinHandle;
 use tracing::{info, info_span, instrument, warn};
 
 use zkasper_common::bls::{fp12_mul, Fp12, FP12_ONE};
 use zkasper_common::types::{
-    AggregateOutput, BoundaryAnchor, Checkpoint, GroupProofOutput, PreviousJustification,
+    AggregateOutput, AggregateWitness, BoundaryAnchor, Checkpoint, GroupProofOutput,
+    PreviousJustification, SlotProofWitness, StreamFinalOutput, StreamFinalWitness,
 };
 
 use crate::artifacts::{
@@ -45,7 +50,7 @@ use crate::artifacts::{
 use crate::attestation_collector::{SlotComplement, SlotStream};
 use crate::beacon_api::{BeaconApi, ChainStatusApi};
 use crate::committee::EpochCommittees;
-use crate::prover::{Proof, Stage};
+use crate::prover::{Proof, ProveCost, Prover, Stage};
 use crate::publish::{self, ClosedEpoch, EpochProgress};
 use crate::store::{StoreState, StreamFinalRecord};
 use crate::streaming::{self, Filling, StreamContext, StreamPolicy};
@@ -109,6 +114,158 @@ struct GroupProof {
     output: GroupProofOutput,
     miller: Fp12,
     proof: Proof,
+}
+
+/// A [`Prover`] call running off the drive loop.
+///
+/// [`Prover`] is synchronous and one call holds a GPU for minutes. Proving on
+/// the calling task therefore stopped the whole loop for the length of every
+/// proof — and the loop is where the head is refreshed and where the next
+/// epoch's opening proofs are asked for.
+///
+/// Measured on mainnet, 2026-08-19. The tick that closed epoch 469482 ran from
+/// 02:11:31 to 02:16:53 and carried throughout it a head taken before epoch
+/// 469483's first slot existed, five seconds later. So
+/// [`super::engine::Engine::speculate`] bailed on `head_slot < slot_2` and was
+/// never asked again, and 469483 proved its own epoch diff and committee — 153 s
+/// — on its own opening path. A threshold is a wall clock and does not move, so
+/// that 153 s came straight out of the epoch's open-to-threshold slack: 16.6 s,
+/// where the epoch beside it had 236 s. An epoch with less slack than a group
+/// proof has no tick on which to fold, so its whole backlog lands on `T2 - T`
+/// as a late group. 469483 measured 299.7 s against 469486's 162.3 s.
+///
+/// One prover still proves one thing at a time — the pipeline holds at most one
+/// of these — so nothing here is about proving in parallel. It is about the loop
+/// continuing to run while the prover works.
+struct Proving<T> {
+    /// When the stage began, witness build included, so that what the manifest
+    /// records does not change with where the proof runs.
+    started: Instant,
+    handle: JoinHandle<Proved<T>>,
+    /// The answer, once a wait has had it. A [`JoinHandle`] must not be polled
+    /// after it completes, so a wait that lands parks its result here for
+    /// [`Self::take`] rather than dropping it.
+    landed: Option<Proved<T>>,
+}
+
+/// What a proving task answers with: the stage's output, and what it cost.
+type Proved<T> = Result<(T, Option<ProveCost>)>;
+
+impl<T: Send + 'static> Proving<T> {
+    fn spawn(
+        started: Instant,
+        prover: Arc<dyn Prover>,
+        prove: impl FnOnce(&dyn Prover) -> Result<T> + Send + 'static,
+    ) -> Self {
+        Self {
+            started,
+            // The cost is read on the proving thread rather than after the fact:
+            // by the time the loop collects this, the same prover has answered
+            // the speculation's calls. Same reason as [`super::speculation`].
+            handle: tokio::task::spawn_blocking(move || {
+                let output = prove(prover.as_ref())?;
+                Ok((output, prover.last_cost()))
+            }),
+            landed: None,
+        }
+    }
+
+    /// Wait for the proof, but never past `within`.
+    ///
+    /// Both halves matter. Returning at the interval is what lets the loop
+    /// refresh its head and ask again for the next epoch's opening proofs, which
+    /// is the whole point of not proving here. Waking the instant the proof
+    /// lands is what keeps that interval off the epoch's own clock, so a
+    /// pipeline of short ticks costs the same as one long one.
+    async fn settle(&mut self, within: Duration) -> bool {
+        if self.landed.is_some() {
+            return true;
+        }
+        let Ok(joined) = tokio::time::timeout(within, &mut self.handle).await else {
+            return false;
+        };
+        self.landed = Some(match joined {
+            Ok(proved) => proved,
+            Err(e) => Err(e).context("the proving task did not finish"),
+        });
+        true
+    }
+
+    async fn take(mut self) -> Proved<T> {
+        match self.landed.take() {
+            Some(landed) => landed,
+            None => self
+                .handle
+                .await
+                .context("the proving task did not finish")?,
+        }
+    }
+}
+
+/// A proof this pipeline started and has not collected, and what the tick that
+/// collects it will do with the result.
+///
+/// At most one exists at a time, so the ordering the circuits require is kept by
+/// construction: a group is folded only once it has landed, and the final proof
+/// binds an aggregate that is already finished.
+enum Pending {
+    /// A group off the critical path, folded when it lands.
+    Group(GroupInFlight),
+    /// The fold of a group that has landed.
+    Fold {
+        index: usize,
+        /// What `proved` becomes once this lands. Captured at the start rather
+        /// than read off `units` at the end, because the loop keeps running.
+        proved: usize,
+        witness: Arc<AggregateWitness>,
+        proving: Proving<(AggregateOutput, Proof)>,
+    },
+    /// The backlog the trigger fired on top of. The final proof follows it.
+    Late { group: GroupInFlight, fired: Fired },
+    /// The one proof on `T2 - T`.
+    Final {
+        closing: Closing,
+        witness: Arc<StreamFinalWitness>,
+        proving: Proving<(StreamFinalOutput, Proof, u64)>,
+    },
+}
+
+/// A group proof in flight, and what the tick that collects it will need.
+struct GroupInFlight {
+    range: Range<usize>,
+    witness: Arc<SlotProofWitness>,
+    proving: Proving<(GroupProofOutput, Fp12, Proof)>,
+}
+
+impl Pending {
+    async fn settle(&mut self, within: Duration) -> bool {
+        match self {
+            Pending::Group(group) | Pending::Late { group, .. } => {
+                group.proving.settle(within).await
+            }
+            Pending::Fold { proving, .. } => proving.settle(within).await,
+            Pending::Final { proving, .. } => proving.settle(within).await,
+        }
+    }
+}
+
+/// What the trigger decided, carried from the instant it fired to the proof that
+/// closes the epoch.
+struct Fired {
+    unix_millis: u64,
+    /// Index of the unit that carried the epoch over the threshold.
+    crossing: usize,
+}
+
+/// What the tick that collects the final proof needs in order to report the
+/// epoch that produced it.
+struct Closing {
+    started: Instant,
+    fired_unix_millis: u64,
+    late_group_millis: u64,
+    late_groups: usize,
+    tail: usize,
+    tail_named: usize,
 }
 
 /// What one evaluation of the trigger sees.
@@ -240,6 +397,8 @@ impl StreamAggregator {
 #[derive(Default)]
 pub(super) struct StreamPipeline {
     aggregator: Option<StreamAggregator>,
+    /// The proof this epoch is waiting on, if any. See [`Proving`].
+    pending: Option<Pending>,
 }
 
 impl EpochPipeline for StreamPipeline {
@@ -252,7 +411,12 @@ impl EpochPipeline for StreamPipeline {
 
         let mut aggregator = match self.aggregator.take() {
             Some(aggregator) if aggregator.context.target_epoch == target_epoch => aggregator,
-            _ => Self::open(engine, target_epoch).await?,
+            _ => {
+                // Every proof in flight was bound to the epoch being replaced,
+                // so none of it is worth collecting.
+                self.pending = None;
+                Self::open(engine, target_epoch).await?
+            }
         };
 
         let _span = info_span!("stream", target_epoch).entered();
@@ -276,6 +440,23 @@ impl EpochPipeline for StreamPipeline {
         }
         if aggregator.gap {
             Self::repair_from_blocks(engine, &mut aggregator).await?;
+        }
+
+        // A proof started on an earlier tick. Until it lands the pipeline must
+        // not start another — one prover proves one thing at a time — so a tick
+        // that finds one still running does the work that does not need the
+        // prover and returns. Asking again for the next epoch's opening proofs
+        // is the whole point of returning: this tick is short, so the head it
+        // asks against is current, and a boundary that did not exist when the
+        // epoch opened exists by now.
+        if let Some(mut pending) = self.pending.take() {
+            if !pending.settle(engine.config.trigger_interval).await {
+                engine.speculate(target_epoch + 1).await;
+                self.pending = Some(pending);
+                self.aggregator = Some(aggregator);
+                return Ok(());
+            }
+            return self.collect(engine, aggregator, pending, tick).await;
         }
 
         // A reorg can take the checkpoint out from under an epoch that is
@@ -347,13 +528,11 @@ impl EpochPipeline for StreamPipeline {
                 aggregator.units.push(unit);
             }
             if aggregator.proved < aggregator.units.len() {
-                let group = Self::prove_group(
+                self.pending = Some(Pending::Group(Self::start_group(
                     engine,
                     &aggregator,
                     aggregator.proved..aggregator.units.len(),
-                    tick,
-                )?;
-                Self::fold_group(engine, &mut aggregator, group)?;
+                )));
             }
             // Again here, and not only when the epoch opened. The boundary the
             // next epoch's diff needs does not exist until the chain reaches
@@ -373,6 +552,10 @@ impl EpochPipeline for StreamPipeline {
                 }
                 engine.snapshot.state.attempted_epoch = Some(target_epoch);
                 engine.store.save(&engine.snapshot)?;
+                // Including whatever was being proved for it. An abandoned
+                // epoch has nobody left to collect that proof, and a loop that
+                // waits for one nothing will collect never returns.
+                self.pending = None;
                 tick.gave_up_on = Some(target_epoch);
             } else {
                 self.aggregator = Some(aggregator);
@@ -384,7 +567,7 @@ impl EpochPipeline for StreamPipeline {
         // timestamp is taken now rather than when the final proof starts: the
         // wait is over at this instant, and everything after it — the late group
         // proof below, then the final proof — is the prover working. Stamping it
-        // in `close` instead charged the late group to the wait, which made a
+        // in the closing proof instead charged the late group to the wait, which made a
         // 141 s group proof read as a 141 s trigger hold against a cap of 10 s.
         let fired_unix_millis = now_unix_millis();
 
@@ -399,15 +582,28 @@ impl EpochPipeline for StreamPipeline {
         let crossing = aggregator
             .crossing(&policy)
             .context("the threshold moved out from under the trigger")?;
-        let late = (aggregator.proved < crossing)
-            .then(|| Self::prove_group(engine, &aggregator, aggregator.proved..crossing, tick))
-            .transpose()?;
-        self.close(engine, aggregator, late, crossing, fired_unix_millis, tick)
-            .await
+        let fired = Fired {
+            unix_millis: fired_unix_millis,
+            crossing,
+        };
+        self.pending = Some(if aggregator.proved < crossing {
+            Pending::Late {
+                group: Self::start_group(engine, &aggregator, aggregator.proved..crossing),
+                fired,
+            }
+        } else {
+            Self::start_final(engine, &aggregator, None, fired)?
+        });
+        self.aggregator = Some(aggregator);
+        Ok(())
     }
 
     fn forget(&mut self) {
         self.aggregator = None;
+        // Dropping the handle detaches the task rather than stopping it —
+        // nothing interrupts a proof already on a blocking thread — but the
+        // task writes nothing, so what it leaves behind is prover time.
+        self.pending = None;
     }
 }
 
@@ -542,45 +738,80 @@ impl StreamPipeline {
         })
     }
 
-    /// Prove one group of units. Nothing about the epoch changes until it is
-    /// either folded or handed to the final proof.
+    /// Build one group's witness and hand the proof to a thread of its own.
+    ///
+    /// Nothing about the epoch changes until [`Self::finish_group`] collects it,
+    /// and nothing but the witness build happens on the loop.
     #[instrument(
         name = "stage",
         skip_all,
         fields(stage = "group", epoch = aggregator.context.target_epoch, index = range.start),
     )]
-    fn prove_group<A: BeaconApi + ChainStatusApi>(
+    fn start_group<A: BeaconApi + ChainStatusApi>(
         engine: &mut Engine<A>,
         aggregator: &StreamAggregator,
         range: Range<usize>,
-        tick: &mut Tick,
-    ) -> Result<GroupProof> {
+    ) -> GroupInFlight {
         let started = Instant::now();
         let target_epoch = aggregator.context.target_epoch;
         engine
             .report
             .begin(Stage::Group, target_epoch, None, Some(range.start));
         let units: Vec<&SlotComplement> = aggregator.units[range.clone()].iter().collect();
-        let slots: Vec<u64> = units.iter().map(|u| u.slot).collect();
-        if let Some(&last) = slots.last() {
+        if let Some(last) = units.last() {
             engine
                 .chain
-                .observe_start_delay(&engine.config, Stage::Group, target_epoch, last);
+                .observe_start_delay(&engine.config, Stage::Group, target_epoch, last.slot);
         }
 
-        let witness = streaming::group_witness(
+        let witness = Arc::new(streaming::group_witness(
             &aggregator.context,
             &engine.snapshot.tree,
             &aggregator.committees,
             &units,
-        );
-        let (output, miller, proof) = engine
-            .prover
-            .prove_group(&witness)
+        ));
+        let proving = Proving::spawn(started, engine.prover.clone(), {
+            let witness = witness.clone();
+            move |prover| prover.prove_group(&witness)
+        });
+        GroupInFlight {
+            range,
+            witness,
+            proving,
+        }
+    }
+
+    /// Collect a finished group proof: write it, time it, and hand it on to be
+    /// folded or given to the final proof.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "group", epoch = aggregator.context.target_epoch, index = group.range.start),
+    )]
+    async fn finish_group<A: BeaconApi + ChainStatusApi>(
+        engine: &mut Engine<A>,
+        aggregator: &StreamAggregator,
+        group: GroupInFlight,
+        tick: &mut Tick,
+    ) -> Result<GroupProof> {
+        let GroupInFlight {
+            range,
+            witness,
+            proving,
+        } = group;
+        let started = proving.started;
+        let target_epoch = aggregator.context.target_epoch;
+        let slots: Vec<u64> = aggregator.units[range.clone()]
+            .iter()
+            .map(|u| u.slot)
+            .collect();
+        let ((output, miller, proof), cost) = proving
+            .take()
+            .await
             .with_context(|| format!("group proof over slots {slots:?}"))?;
 
         let name = format!("group_{}", range.start);
-        let artifact = engine.sink.write_witness(target_epoch, &name, &witness)?;
+        let artifact = engine.sink.write_witness(target_epoch, &name, &*witness)?;
         write_proof(&engine.sink, target_epoch, &name, &proof)?;
 
         info!(
@@ -590,15 +821,9 @@ impl StreamPipeline {
             "group proof",
         );
         engine.report.record(
-            StageTiming::new(
-                Stage::Group,
-                target_epoch,
-                started,
-                engine.prover.last_cost(),
-                artifact,
-            )
-            .at_index(range.start)
-            .with_proof(&proof),
+            StageTiming::new(Stage::Group, target_epoch, started, cost, artifact)
+                .at_index(range.start)
+                .with_proof(&proof),
         );
         tick.slots_proved.extend(slots);
 
@@ -609,17 +834,18 @@ impl StreamPipeline {
         })
     }
 
-    /// Fold a finished group into the running aggregate.
+    /// Start folding a finished group into the running aggregate.
     #[instrument(
         name = "stage",
         skip_all,
         fields(stage = "aggregate", epoch = aggregator.context.target_epoch),
     )]
-    fn fold_group<A: BeaconApi + ChainStatusApi>(
+    fn start_fold<A: BeaconApi + ChainStatusApi>(
         engine: &mut Engine<A>,
         aggregator: &mut StreamAggregator,
+        proved: usize,
         group: GroupProof,
-    ) -> Result<()> {
+    ) -> Pending {
         let started = Instant::now();
         let target_epoch = aggregator.context.target_epoch;
         if let Some(last) = aggregator.units.last() {
@@ -637,7 +863,7 @@ impl StreamPipeline {
             Some(aggregator.folded_groups),
         );
 
-        let witness = streaming::aggregate_witness(
+        let witness = Arc::new(streaming::aggregate_witness(
             &aggregator.context,
             aggregator.aggregate.clone(),
             std::mem::take(&mut aggregator.aggregate_proof),
@@ -645,19 +871,51 @@ impl StreamPipeline {
             vec![group.output],
             vec![group.proof],
             vec![group.miller],
-        );
-        let (output, proof) = engine.prover.prove_aggregate(&witness)?;
+        ));
+        let proving = Proving::spawn(started, engine.prover.clone(), {
+            let witness = witness.clone();
+            move |prover| prover.prove_aggregate(&witness)
+        });
+        Pending::Fold {
+            index: aggregator.folded_groups,
+            proved,
+            witness,
+            proving,
+        }
+    }
 
-        let name = format!("aggregate_{}", aggregator.folded_groups);
-        let artifact = engine.sink.write_witness(target_epoch, &name, &witness)?;
+    /// Adopt a finished fold: from here the aggregate covers `proved` units.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "aggregate", epoch = aggregator.context.target_epoch),
+    )]
+    async fn finish_fold<A: BeaconApi + ChainStatusApi>(
+        engine: &mut Engine<A>,
+        aggregator: &mut StreamAggregator,
+        index: usize,
+        proved: usize,
+        witness: Arc<AggregateWitness>,
+        proving: Proving<(AggregateOutput, Proof)>,
+    ) -> Result<()> {
+        let started = proving.started;
+        let target_epoch = aggregator.context.target_epoch;
+        let ((output, proof), cost) = proving.take().await?;
+
+        let name = format!("aggregate_{index}");
+        let artifact = engine.sink.write_witness(target_epoch, &name, &*witness)?;
         write_proof(&engine.sink, target_epoch, &name, &proof)?;
 
-        aggregator.aggregate_miller = fp12_mul(&aggregator.aggregate_miller, &group.miller);
+        // The groups' own Miller accumulators, read back off the witness this
+        // fold was built against rather than carried a second time beside it.
+        for miller in &witness.group_millers {
+            aggregator.aggregate_miller = fp12_mul(&aggregator.aggregate_miller, &miller.0);
+        }
         aggregator.attesting_balance = output.attesting_balance;
         aggregator.aggregate = Some(output);
         aggregator.aggregate_proof = proof;
         aggregator.folded_groups += 1;
-        aggregator.proved = aggregator.units.len();
+        aggregator.proved = proved;
 
         info!(
             folded = aggregator.folded_groups,
@@ -670,64 +928,110 @@ impl StreamPipeline {
             "aggregate",
         );
         engine.report.record(
-            StageTiming::new(
-                Stage::Aggregate,
-                target_epoch,
-                started,
-                engine.prover.last_cost(),
-                artifact,
-            )
-            .at_index(aggregator.folded_groups - 1)
-            .with_proof(&aggregator.aggregate_proof),
+            StageTiming::new(Stage::Aggregate, target_epoch, started, cost, artifact)
+                .at_index(index)
+                .with_proof(&aggregator.aggregate_proof),
         );
         Ok(())
     }
 
-    /// The only proof on the critical path: the marginal attestation, the one
-    /// final exponentiation, and the previous epoch's justification, at once.
+    /// Take a finished proof and do the next thing the epoch needs.
+    ///
+    /// This is the only place a proof result enters the epoch, and it runs on
+    /// the loop, so the ordering the circuits require is the ordering of these
+    /// arms: a group is folded once it has landed, the backlog the trigger fired
+    /// on top of is folded into the final witness once it has landed, and the
+    /// final proof binds an aggregate that is already finished.
+    async fn collect<A: BeaconApi + ChainStatusApi>(
+        &mut self,
+        engine: &mut Engine<A>,
+        mut aggregator: StreamAggregator,
+        pending: Pending,
+        tick: &mut Tick,
+    ) -> Result<()> {
+        match pending {
+            Pending::Group(group) => {
+                let proved = group.range.end;
+                let group = Self::finish_group(engine, &aggregator, group, tick).await?;
+                self.pending = Some(Self::start_fold(engine, &mut aggregator, proved, group));
+            }
+            Pending::Fold {
+                index,
+                proved,
+                witness,
+                proving,
+            } => {
+                Self::finish_fold(engine, &mut aggregator, index, proved, witness, proving).await?;
+            }
+            Pending::Late { group, fired } => {
+                let group = Self::finish_group(engine, &aggregator, group, tick).await?;
+                self.pending = Some(Self::start_final(engine, &aggregator, Some(group), fired)?);
+            }
+            Pending::Final {
+                closing,
+                witness,
+                proving,
+            } => {
+                return self
+                    .finish_final(engine, aggregator, closing, witness, proving, tick)
+                    .await;
+            }
+        }
+        self.aggregator = Some(aggregator);
+        Ok(())
+    }
+
+    /// Start the only proof on the critical path: the marginal attestation, the
+    /// one final exponentiation, and the previous epoch's justification, at
+    /// once.
     #[instrument(
         name = "stage",
         skip_all,
         fields(stage = "stream_final", epoch = aggregator.context.target_epoch),
     )]
-    async fn close<A: BeaconApi + ChainStatusApi>(
-        &mut self,
+    fn start_final<A: BeaconApi + ChainStatusApi>(
         engine: &mut Engine<A>,
-        aggregator: StreamAggregator,
+        aggregator: &StreamAggregator,
         late: Option<GroupProof>,
-        crossing: usize,
-        fired_unix_millis: u64,
-        tick: &mut Tick,
-    ) -> Result<()> {
+        fired: Fired,
+    ) -> Result<Pending> {
         let started = Instant::now();
         // The late group proof is the only thing the fire path does between the
         // trigger firing and here, so this is exactly its cost — and on a daemon
         // that opened its epoch late it is the largest term in `T2 - T`.
-        let late_group_millis = now_unix_millis().saturating_sub(fired_unix_millis);
+        let late_group_millis = now_unix_millis().saturating_sub(fired.unix_millis);
         let target_epoch = aggregator.context.target_epoch;
-        let tail: Vec<&SlotComplement> = vec![&aggregator.units[crossing]];
+        let tail: Vec<&SlotComplement> = vec![&aggregator.units[fired.crossing]];
         let tail_named = tail.iter().map(|u| u.named_indices.len()).sum();
 
         let (groups, group_proofs, group_millers) = match late {
             Some(g) => (vec![g.output], vec![g.proof], vec![g.miller]),
             None => (Vec::new(), Vec::new(), Vec::new()),
         };
-        let late_groups = groups.len();
+        let closing = Closing {
+            started,
+            fired_unix_millis: fired.unix_millis,
+            late_group_millis,
+            late_groups: groups.len(),
+            tail: tail.len(),
+            tail_named,
+        };
         if let Some(publish) = engine.report.publisher() {
             publish.threshold_fired(&publish::ThresholdFired {
                 epoch: target_epoch,
-                fired_unix_millis,
-                wait_millis: fired_unix_millis
+                fired_unix_millis: closing.fired_unix_millis,
+                wait_millis: closing
+                    .fired_unix_millis
                     .saturating_sub(aggregator.crossed_unix_millis.unwrap_or_default()),
                 late_group_millis,
-                tail: tail.len(),
+                tail: closing.tail,
                 tail_named,
-                late_groups,
+                late_groups: closing.late_groups,
             });
             publish.stage_started(Stage::StreamFinal, target_epoch, None, None);
         }
 
-        let witness = streaming::final_witness(
+        let witness = Arc::new(streaming::final_witness(
             &aggregator.context,
             &engine.snapshot.tree,
             &aggregator.committees,
@@ -741,10 +1045,49 @@ impl StreamPipeline {
             aggregator.previous.clone(),
             aggregator.previous_proof.clone(),
             aggregator.boundary.clone(),
-        );
+        ));
+        let proving = Proving::spawn(started, engine.prover.clone(), {
+            let witness = witness.clone();
+            // `T2` is stamped here rather than where the loop collects this, so
+            // that the number the project exists to minimise is the instant the
+            // proof existed and not the instant a poll noticed.
+            move |prover| {
+                let (output, proof) = prover.prove_stream_final(&witness)?;
+                Ok((output, proof, now_unix_millis()))
+            }
+        });
+        Ok(Pending::Final {
+            closing,
+            witness,
+            proving,
+        })
+    }
 
-        let (output, proof) = engine.prover.prove_stream_final(&witness)?;
-        let proof_unix_millis = now_unix_millis();
+    /// Adopt the final proof: verify it, publish it, and move the epoch on.
+    #[instrument(
+        name = "stage",
+        skip_all,
+        fields(stage = "stream_final", epoch = aggregator.context.target_epoch),
+    )]
+    async fn finish_final<A: BeaconApi + ChainStatusApi>(
+        &mut self,
+        engine: &mut Engine<A>,
+        aggregator: StreamAggregator,
+        closing: Closing,
+        witness: Arc<StreamFinalWitness>,
+        proving: Proving<(StreamFinalOutput, Proof, u64)>,
+        tick: &mut Tick,
+    ) -> Result<()> {
+        let Closing {
+            started,
+            fired_unix_millis,
+            late_group_millis,
+            late_groups,
+            tail,
+            tail_named,
+        } = closing;
+        let target_epoch = aggregator.context.target_epoch;
+        let ((output, proof, proof_unix_millis), cost) = proving.take().await?;
 
         // Everything from here is after `T2`, so none of it can inflate the
         // latency this pipeline exists to minimise — including checking that
@@ -759,7 +1102,7 @@ impl StreamPipeline {
 
         let artifact = engine
             .sink
-            .write_witness(target_epoch, "stream_final", &witness)?;
+            .write_witness(target_epoch, "stream_final", &*witness)?;
         write_proof(&engine.sink, target_epoch, "stream_final", &proof)?;
 
         info!(
@@ -775,14 +1118,8 @@ impl StreamPipeline {
         let (epochs, bytes) = engine.sink.prune_old_epochs();
         crate::metrics::observe_output(epochs, bytes);
         engine.report.record(
-            StageTiming::new(
-                Stage::StreamFinal,
-                target_epoch,
-                started,
-                engine.prover.last_cost(),
-                artifact,
-            )
-            .with_proof(&proof),
+            StageTiming::new(Stage::StreamFinal, target_epoch, started, cost, artifact)
+                .with_proof(&proof),
         );
 
         // A proof of a checkpoint the chain no longer has is worse than no proof
@@ -822,7 +1159,7 @@ impl StreamPipeline {
                 tail_named,
                 folded_groups: aggregator.folded_groups,
                 late_groups,
-                tail: tail.len(),
+                tail,
             };
             info!(
                 t2_minus_t_millis = latency.t2_minus_t_millis,
@@ -910,6 +1247,13 @@ impl StreamPipeline {
     /// is on the trigger's clock or the poll's.
     pub(super) fn in_flight(&self) -> bool {
         self.aggregator.is_some()
+    }
+
+    /// Whether a proof this pipeline started is still running. The loop watches
+    /// this so that [`super::Orchestrator::catch_up`] waits for work it asked
+    /// for rather than returning half-done.
+    pub(super) fn proving(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// The epoch in flight, as the manifest reports it.

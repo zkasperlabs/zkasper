@@ -336,13 +336,20 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
     }
 
     /// Do everything the node's current head makes possible, then return.
+    ///
+    /// A proof the streaming pipeline started is work this call asked for, so it
+    /// is waited for rather than left running — but waited for one short tick at
+    /// a time, because each of those ticks refreshes the head and asks again for
+    /// the next epoch's opening proofs. That is the whole difference between
+    /// this and blocking inside the prover. The tick itself does the waiting,
+    /// bounded by the trigger interval, so there is nothing to sleep for here.
     pub async fn catch_up(&mut self) -> Result<Vec<Tick>> {
         let mut ticks = Vec::new();
         loop {
             let tick = self.tick().await?;
             let progressed = tick.made_progress();
             ticks.push(tick);
-            if !progressed {
+            if !progressed && !self.stream.proving() {
                 return Ok(ticks);
             }
         }

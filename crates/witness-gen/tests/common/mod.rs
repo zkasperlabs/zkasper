@@ -7,7 +7,7 @@ pub mod mock_node;
 pub mod stub_api;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -57,8 +57,9 @@ pub struct MockBeaconApi {
     /// threshold is crossed, which is only observable by what it asked for.
     pub attestation_requests: Mutex<Vec<String>>,
     /// Head header, when a test moves it between ticks. Takes precedence over
-    /// `headers["head"]`.
-    pub head: Mutex<Option<HeaderResponse>>,
+    /// `headers["head"]`. Shared so that a test can also move it *within* a
+    /// tick — see [`MockBeaconApi::head_handle`].
+    pub head: Arc<Mutex<Option<HeaderResponse>>>,
     /// Block root every `block_id` resolves to, when a test reorgs the chain
     /// under a daemon that is already collecting against the old one.
     pub reorged_to: Mutex<Option<[u8; 32]>>,
@@ -81,7 +82,7 @@ impl MockBeaconApi {
             fork_version: [0x04, 0x00, 0x00, 0x00],
             unservable_states: Mutex::new(HashSet::new()),
             attestation_requests: Mutex::new(Vec::new()),
-            head: Mutex::new(None),
+            head: Arc::new(Mutex::new(None)),
             reorged_to: Mutex::new(None),
             genesis_time: 0,
         }
@@ -118,6 +119,17 @@ impl MockBeaconApi {
     /// head is testing catch-up rather than streaming.
     pub fn set_head(&self, header: HeaderResponse) {
         *self.head.lock().unwrap() = Some(header);
+    }
+
+    /// A handle on the head, kept after the node has been handed to a daemon.
+    ///
+    /// [`Self::set_head`] moves the chain on between calls into the daemon,
+    /// which is enough for anything that only reads the head at the top of a
+    /// tick. A chain that arrives *during* a call — the case a daemon proving
+    /// off its loop exists to notice — needs the head to be movable while the
+    /// daemon holds the node, and that is what this is for.
+    pub fn head_handle(&self) -> Arc<Mutex<Option<HeaderResponse>>> {
+        self.head.clone()
     }
 
     /// Reorg every checkpoint onto `root`, or back onto the real chain.
