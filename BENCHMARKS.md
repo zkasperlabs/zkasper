@@ -766,7 +766,7 @@ mainnet slots of complement work is about seven. The inline tail was capped at
 four slots on the pre-recursion reasoning that "a group is one floor either way".
 Lifting that cap takes the modelled `T2 - T` on epoch 430529 from **112.4 s to
 83.1 s** on the same two cards, with the final proof absorbing nothing —
-`lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529` prices both shapes
+`the_tail_cap_no_longer_binds_on_mainnet_430529` prices both shapes
 against each other on the real epoch's per-slot numbers, offline.
 
 **The A/B this replaces claimed 112.8 s to 67.8 s, a 45.0 s win.** It is 29.3 s.
