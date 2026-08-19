@@ -139,6 +139,15 @@ def daemon():
         # check paged on every healthy epoch until 2026-08-19. Only 2 or more is
         # a real signal, since the fire path holds at most one group and a
         # second means the pipeline is behind.
+        # folded_groups is a readout of prover latency, not of attestation volume:
+        # a group is however many slots piled up while the previous proof ran, so
+        # 1 is the healthy shape and a large number means the cycle time collapsed.
+        # Epoch 469539 folded 19 against dead provers and still published as
+        # "proven" -- the fold count said so before anything else did.
+        worst_folded = max((l.get("folded_groups") or 0) for l in lat[-5:])
+        out.append(check("cycle", worst_folded <= 5,
+                         f"worst folded_groups in last {min(len(lat),5)}: {worst_folded}"
+                         + ("" if worst_folded <= 5 else " -- the prover is answering too fast to be proving")))
         worst_late = max((l.get("late_groups") or 0) for l in lat[-5:])
         out.append(check("latency", worst_late < 2,
                          f"T2-T {last.get('t2_minus_t_millis')}ms, "
@@ -216,13 +225,23 @@ def published_gaps():
             d = json.loads(r.read())
     except Exception as e:
         return check("chain", True, f"not checked: {e}")
-    nums = sorted(e["epoch"] for e in d.get("epochs", []) if e.get("status") == "proven")
+    epochs = d.get("epochs", [])
+    nums = sorted(e["epoch"] for e in epochs if e.get("status") == "proven")
+    # An epoch that closed without a proof is the same hole, published rather
+    # than absent. It is named apart because the two are fixed differently: a
+    # gap is an epoch the daemon never finished, and `unproven` is one it
+    # finished with no prover behind it.
+    unproven = sorted(e["epoch"] for e in epochs if e.get("status") == "unproven")
     if len(nums) < 2:
-        return check("chain", True, f"{len(nums)} proven, too few to judge")
-    missing = [n for n in range(nums[0], nums[-1]) if n not in set(nums)]
-    return check("chain", not missing,
+        return check("chain", not unproven,
+                     f"{len(nums)} proven, too few to judge"
+                     + (f", UNPROVEN {unproven}" if unproven else ""))
+    known = set(nums) | set(unproven)
+    missing = [n for n in range(nums[0], nums[-1]) if n not in known]
+    return check("chain", not missing and not unproven,
                  f"proven {nums[0]}-{nums[-1]}, "
-                 + (f"HOLES at {missing}" if missing else "contiguous"))
+                 + (f"HOLES at {missing}" if missing else "contiguous")
+                 + (f", UNPROVEN {unproven}" if unproven else ""))
 
 
 def main():

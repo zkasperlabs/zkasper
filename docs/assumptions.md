@@ -106,6 +106,59 @@ attested to.
 
 ## 2. What the circuits trust
 
+### Is the shuffle necessary? Yes to compute, no to prove
+
+**Settled. Do not reopen without new evidence** -- this gets asked repeatedly
+because the two halves are easy to confuse for each other.
+
+**Computing it: necessary.** The host must use the real swap-or-not shuffle. A
+validator's signature is over AttestationData, which contains the **slot**, so a
+bucket can only pair against a message its members actually signed. Feed the
+circuit a made-up assignment and the multi-pairing fails and **no proof comes
+out**. The shuffle is not optional anywhere in this system.
+
+**Proving it: not necessary.** The circuit does not recompute the shuffle and
+does not bind the RANDAO seed, and this costs nothing in soundness.
+
+#### The objection, stated plainly
+
+*"Without checking the shuffle, a validator can fake attestations into whatever
+slot they like."*
+
+They can sign for a slot they were not assigned -- nothing prevents producing
+that signature, and Ethereum would reject the attestation where this circuit
+accepts it. **It gains them nothing**, because the quantity proved is a sum over
+*validators*, not over slots:
+
+- **Counting one validator twice is blocked by disjointness.** Leaves are
+  consumed in strictly increasing index order, so each validator lands in exactly
+  one bucket whatever the witness claims. Moving someone from bucket 5 to bucket
+  7 adds no balance; it is the same validator, counted once either way.
+- **Counting a validator who did not sign is blocked by the pairing.** It forces
+  the bucket minus its absentees to be exactly the signers of that slot's
+  message. Pad a bucket with a non-signer and the aggregate key comes out wrong;
+  name them as an absentee and their balance is subtracted anyway.
+- **Moving balance away from a key is blocked by the leaf.** One Poseidon2 hash
+  over pubkey and active effective balance, summed in the same pass, so a
+  validator cannot lend its key to one total and a different balance to the other.
+
+The adversary's own stake counts once whichever bucket it sits in, and honest
+stake is untouched. No arrangement of buckets inflates the total.
+
+#### What it means precisely
+
+The proof establishes **"validators holding at least two thirds of active stake
+signed this target"**. It does **not** establish "Ethereum's fork choice
+justified this epoch under its own committee rule". Those coincide whenever
+validators attest in their assigned slots, which honest validators always do. An
+adversary attesting off-slot produces something Ethereum discards and this
+circuit counts -- and still cannot inflate the total.
+
+A consumer needing the second statement rather than the first would require the
+shuffle bound in circuit, and this section would stop applying. **Nobody has
+asked for that**, and it would put 90 rounds of swap-or-not over a million
+validators on the prover.
+
 ### Committee assignment is unproven witness
 
 **This is the subtlest assumption in the system, and it is deliberate.** The
@@ -376,10 +429,14 @@ adversarial stake into a one-slot window. The default byzantine threshold is
 - the stage floor, the empty-guest floor, and the per-proof floor and slope
 - the accumulator node cost, the wrap, and the cold penalty
 - every precompile cost, and the VRAM behaviour
-- **recursive verification: 53.087 s per child**, linear from 2 children to 23,
-  with an intercept that lands on the stage floor. It was carried as zero for as
-  long as nothing could measure it, and it is larger than every other constant
-  in the model put together.
+- **recursive verification, and it is not one price across guests.**
+  `justification-guest` is **53.087 s per child**, linear from 2 children to 23,
+  with an intercept that lands on the stage floor. The two guests on the
+  streaming critical path are **35.629 s per child** — measured in production
+  over 24 epoch-opening folds, whose child count is fixed by the guest source,
+  sd 0.326 s. The model carried the justification figure for both until
+  2026-08-19. It was carried as zero before anything could measure it, and it is
+  larger than every other constant in the model put together.
 
 **Carried forward from Zisk v1.0.0-alpha**: the cost per opened validator and
 the cost per committee member. The attester sweep cannot be reproduced, because
@@ -389,15 +446,20 @@ look worse than it is.
 
 **Modelled, not measured**:
 
-- **`T2 - T` is 67.8 s in a model** over measured per-stage times, on two GPUs.
-  **No prover has run this shape.** It was 112.8 s while the final proof's inline
+- **`T2 - T` is 83.1 s in a model** over measured per-stage times, on two GPUs.
+  **No prover has run this shape.** It was 112.4 s while the final proof's inline
   tail was capped at four slots and the epoch's end had to be a group it then
-  verified as a child; uncapping it removes that child. Every measurement below
-  was taken against the capped shape: a production stream-final proof took 148.2 s
-  four times within ±1.1 s, and the folded path ran at 116.5 to 124.2 s against a
-  117.7 s model — an earlier revision of this model, which no longer reproduces.
-  **The 5.5 s this document used to quote was computed with recursion priced at
-  zero and is withdrawn.**
+  verified as a child; uncapping it removes that child but not the two the final
+  proof cannot avoid — the running aggregate and the previous epoch's
+  justification. Every measurement below was taken against the capped shape: a
+  production stream-final proof took 148.2 s four times within ±1.1 s, and the
+  folded path ran at 116.5 to 124.2 s. **The 67.8 s this document quoted until
+  2026-08-19 is withdrawn**: the model charged the final proof one child too few
+  and priced the rest at the justification guest's rate, and the two errors
+  cancel only at three children. The capped shape had three and was right by
+  accident; the uncapped shape has two and was 15.3 s optimistic. **The 5.5 s
+  quoted before that was computed with recursion priced at zero and is also
+  withdrawn.**
 - **The Fp2-tower rate is fitted**, with a bracket from 162M to 268M units per
   second. Nothing in the campaign runs BLS at mainnet scale.
 - **The committee proof cost at mainnet scale is an extrapolation** from

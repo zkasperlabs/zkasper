@@ -17,7 +17,7 @@
 //! is open before its own threshold slot.
 //!
 //! The backlog used to become a group proof on the fire path and then a
-//! recursion child of the final proof — 53 s on a mainnet card. It goes inline
+//! recursion child of the final proof — 36 s on a mainnet card. It goes inline
 //! now, because that is what the plan's tail asks for and the fire path stopped
 //! overriding it: the same attestations, as complement work rather than as a
 //! child.
@@ -365,15 +365,13 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
     // Which is what empties the window between `T` and the final proof. It used
     // to hold a whole group proof — the measurement that said the window could
     // not absorb a fold because it was already full of proving.
-    // A millisecond, not zero: the fire path still builds the final witness
-    // between the two stamps, and a wall clock rounds that up sometimes.
     let late_group = latency["late_group_millis"]
         .as_u64()
         .expect("late_group_millis");
     assert!(
         late_group < GROUP_PROVE.as_millis() as u64,
-        "late_group_millis ({late_group} ms) contains a group proof ({} ms); \
-         there is none left to charge to the critical path",
+        "late_group_millis ({late_group} ms) holds a group proof ({} ms); there \
+         is supposed to be no late group left to charge to the critical path",
         GROUP_PROVE.as_millis(),
     );
 

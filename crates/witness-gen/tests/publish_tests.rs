@@ -12,8 +12,9 @@ mod common;
 
 use common::stub_api::StubApi;
 
+use zkasper_witness_gen::artifacts::EpochCost;
 use zkasper_witness_gen::prover::Stage;
-use zkasper_witness_gen::publish::{DaemonInfo, PublishConfig, Publisher};
+use zkasper_witness_gen::publish::{ClosedEpoch, DaemonInfo, PublishConfig, Publisher};
 
 fn publisher(url: &str, spool: &std::path::Path) -> Arc<Publisher> {
     Publisher::spawn(
@@ -157,5 +158,76 @@ async fn an_unreachable_api_costs_nothing_and_loses_nothing() {
             .is_none()
             || publisher.counters().pending == 0,
         "a drained spool should be empty",
+    );
+}
+
+/// An epoch whose prover returned nothing must not be published as `proven`.
+///
+/// This is the fault the whole doctrine is about. A missing epoch is a hole and
+/// a hole can be seen; an epoch that says `proven` over no bytes cannot be
+/// checked by the consumer it lies to — they ask for the proof, get nothing,
+/// and cannot tell a broken service from a mistake of their own. Mainnet 469538
+/// and 469539 shipped exactly that on 2026-08-19, against provers that had
+/// already exited: `status: "proven"`, `available: false`, `bytes: 0`.
+///
+/// Both directions are pinned, because a status hardcoded the other way would
+/// pass half of this.
+#[tokio::test]
+async fn an_epoch_with_no_proof_is_not_published_as_proven() {
+    let stub = StubApi::start().await;
+    let spool = tempfile::tempdir().expect("tempdir");
+    let publisher = publisher(&stub.url(), spool.path());
+
+    for (epoch, words) in [(300u64, &[][..]), (301, &[1u64, 2, 3, 4][..])] {
+        let proof = zkasper_witness_gen::publish::proof_ref(
+            epoch,
+            Stage::StreamFinal,
+            words,
+            &[9; 4],
+            &[0xAB; 8],
+            Some("0xelf"),
+        );
+        publisher.epoch_closed(&ClosedEpoch {
+            epoch,
+            cost: EpochCost::default(),
+            target_root: "0x00".into(),
+            finalizes_epoch: epoch - 1,
+            justified: serde_json::Value::Null,
+            finalized: serde_json::Value::Null,
+            accumulator: serde_json::Value::Null,
+            latency: None,
+            proof,
+            public_inputs: serde_json::Value::Null,
+        });
+    }
+
+    assert!(
+        stub.wait_for(|s| s.events().len() >= 2).await,
+        "the stub never saw both epochs close",
+    );
+    let events = stub.events();
+    let closed = |epoch: u64| {
+        events
+            .iter()
+            .find(|e| e["type"] == "epoch.closed" && e["epoch"] == epoch)
+            .unwrap_or_else(|| panic!("epoch {epoch} never closed"))
+    };
+
+    let unproven = closed(300);
+    assert_eq!(
+        unproven["summary"]["proof"]["bytes"], 0,
+        "the fixture has to be the case under test: {unproven}",
+    );
+    assert_ne!(
+        unproven["summary"]["status"], "proven",
+        "an epoch with no proof bytes must never claim to be proven: {unproven}",
+    );
+    assert_eq!(unproven["summary"]["status"], "unproven");
+
+    let proven = closed(301);
+    assert_eq!(proven["summary"]["proof"]["bytes"], 32);
+    assert_eq!(
+        proven["summary"]["status"], "proven",
+        "an epoch with proof bytes still has to say so: {proven}",
     );
 }

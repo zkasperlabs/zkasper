@@ -20,7 +20,8 @@ use zkasper_common::ChainConfig;
 use zkasper_witness_gen::attestation_collector::SlotComplement;
 use zkasper_witness_gen::prover::{NativeProver, Prover, Stage};
 use zkasper_witness_gen::remote_prover::{
-    serve_client, RemoteProver, RemoteProverConfig, ServerConfig, PROTOCOL_VERSION,
+    serve_client, Hello, HelloReply, ProgramInfo, RemoteProver, RemoteProverConfig, Reply, Request,
+    ServerConfig, PROTOCOL_VERSION,
 };
 use zkasper_witness_gen::split_prover::SplitProver;
 use zkasper_witness_gen::streaming;
@@ -477,6 +478,110 @@ fn routes_each_stage_to_its_own_prover() {
     let health = split.health().expect("a network prover reports health");
     assert_eq!(health.proved, 2);
     assert_eq!(health.unproven, 0);
+}
+
+/// A server that holds the ELF and answers with nothing is a fault, not a
+/// witness-only run.
+///
+/// An empty proof is a legitimate value everywhere else here — it is what a
+/// witness-only build produces and what an outage hands back — and `check` will
+/// not separate the cases, because off-target `verify_child` accepts an empty
+/// proof so circuit logic can be exercised without a prover. What separates
+/// them is the handshake: a server with no ELF digest has no prover, and one
+/// that reported a digest for this stage said it could prove it. Taking its
+/// empty answer for a proof is how an epoch reaches a consumer as `proven` with
+/// nothing behind it, so it is refused where it arrives.
+#[test]
+fn an_empty_proof_from_a_real_prover_is_refused() {
+    let spool = tempfile::tempdir().unwrap();
+    let server = EmptyProver::bind();
+    let prover = RemoteProver::connect(client(&server.addr, Some(spool.path()))).expect("connect");
+
+    let error = format!(
+        "{:#}",
+        prover
+            .prove_group(&witness())
+            .expect_err("an empty proof from a prover that has an ELF is not a proof"),
+    );
+    assert!(error.contains("empty proof"), "unexpected error: {error}");
+    assert!(error.contains(&server.addr), "unexpected error: {error}");
+
+    // Not spooled: the same server would answer a retry the same way, which is
+    // why a refusal is not spooled either.
+    let counters = prover.counters();
+    assert_eq!(counters.proved, 0, "nothing was proved");
+    assert_eq!(counters.spooled, 0);
+    assert_eq!(spooled_files(spool.path()), 0);
+}
+
+/// A server that speaks the protocol, reports an ELF for every stage, and
+/// answers every witness with no proof at all.
+///
+/// Hand-rolled rather than a [`Prover`] behind [`serve_client`], because what
+/// is under test is the claim the handshake makes and not any circuit: the
+/// frames are a length and a bincode value, and there are three of them.
+struct EmptyProver {
+    addr: String,
+}
+
+impl EmptyProver {
+    fn bind() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let native = NativeProver::new(chain());
+        let programs: Vec<ProgramInfo> = STAGES
+            .iter()
+            .map(|&stage| ProgramInfo {
+                stage,
+                vk: native.program_vk(stage),
+                elf_sha256: Some(format!("0x{}", "ab".repeat(32))),
+            })
+            .collect();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let programs = programs.clone();
+                std::thread::spawn(move || {
+                    let Ok(hello) = read_frame::<Hello>(&mut stream) else {
+                        return;
+                    };
+                    assert_eq!(hello.version, PROTOCOL_VERSION);
+                    let ready = HelloReply::Ready {
+                        prover: "a prover that answers with nothing".to_string(),
+                        programs,
+                    };
+                    if write_frame(&mut stream, &ready).is_err() {
+                        return;
+                    }
+                    while read_frame::<Request>(&mut stream).is_ok() {
+                        let reply = Reply::Proved {
+                            proof: Vec::new(),
+                            cost: Default::default(),
+                        };
+                        if write_frame(&mut stream, &reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { addr }
+    }
+}
+
+fn write_frame<T: serde::Serialize>(w: &mut impl std::io::Write, value: &T) -> std::io::Result<()> {
+    let bytes = bincode::serialize(value).expect("serialize a frame");
+    w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    w.write_all(&bytes)?;
+    w.flush()
+}
+
+fn read_frame<T: serde::de::DeserializeOwned>(r: &mut impl std::io::Read) -> std::io::Result<T> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let mut bytes = vec![0u8; u32::from_le_bytes(len) as usize];
+    r.read_exact(&mut bytes)?;
+    bincode::deserialize(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// A witness too large to frame is not spooled, because a retry of it would
