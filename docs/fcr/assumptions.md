@@ -110,22 +110,17 @@ denominator is global** -- two thirds of total active balance, summed over every
 bucket, so moving stake between buckets changes nothing. A per-slot denominator
 is not, and that is why this design states its threshold over the total.
 
-**And that is the trilemma FCR has not yet escaped:**
+**This is resolved, and the resolution is written down**: the shuffle is proven
+once per epoch, inside the committee proof, an epoch ahead. RANDAO fixes epoch
+E's assignment at the end of E-2, so it has a full epoch of lead time and never
+touches the critical path, and the committee proof already reads every leaf once
+per epoch. With the assignment proven the denominator is no longer prover-chosen,
+so FCR can state a per-slot committee threshold and confirm inside a minute.
+Complement proving then works for both products off the same sums. See
+[../shared/committee-and-shuffle.md](../shared/committee-and-shuffle.md).
 
-1. **Threshold over the total** -- sound without the shuffle, as above. But it
-   requires opening every attesting validator's leaf: 75% of 2.34M validators at
-   ~1.54 ms each is roughly **2,700 seconds** against a 12-second budget. It is
-   the shape the finality path had before complement proving.
-2. **Complement proving** fixes the cost -- open the ~90 absentees rather than
-   the ~30,000 attesters -- but it needs per-slot summed public keys and
-   balances, which is exactly what the committee proof produces.
-3. **Once the threshold is per-slot, the denominator is prover-chosen again**, so
-   the RANDAO shuffle must be bound in circuit: 90 rounds of swap-or-not over a
-   million validators, which the finality path deliberately avoids.
-
-So the affordable variant needs the shuffle and the variant that does not need
-the shuffle is not affordable. **This is the central open problem for FCR**, it
-is not inherited from finality, and no option above is costed yet.
+What remains open is the **cost** of the shuffle inside that proof, not whether
+it belongs there.
 
 ---
 

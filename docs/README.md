@@ -50,3 +50,5 @@ which.
 | [../RUNBOOK.md](../RUNBOOK.md) | how to provision, run, monitor and recover a mainnet deployment |
 | [../BENCHMARKS.md](../BENCHMARKS.md) | every cost constant, and what measured it |
 | [../monitoring/README.md](../monitoring/README.md) | the metrics the daemon serves, and what pages on them |
+
+- [shared/committee-and-shuffle.md](shared/committee-and-shuffle.md) - one proof per epoch establishes the committee assignment and the per-slot sums, an epoch ahead. Settled design.

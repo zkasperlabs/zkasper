@@ -20,6 +20,12 @@ soundness (a false proof).
 
 ---
 
+**The committee proof and the shuffle**: the assignment is proven once per
+epoch, an epoch ahead, inside the committee proof -- see
+[../shared/committee-and-shuffle.md](../shared/committee-and-shuffle.md).
+Finality does not require it proven, for the reason in section 1; FCR does,
+because its denominator is a bucket rather than the total. One proof serves both.
+
 ## 1. Is the shuffle necessary? Yes to compute, no to prove
 
 **Settled. Do not reopen without new evidence** -- this gets asked repeatedly
