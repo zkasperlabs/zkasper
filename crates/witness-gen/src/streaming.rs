@@ -37,29 +37,31 @@
 //! inline into the final proof rather than into a group of its own — and so does
 //! every slot behind it that a group could not have finished in a slot's time,
 //! which is what [`StreamPlan::tail`] is for. How far back that reaches is a
-//! recursion question rather than a slack one — see below — and the schedule
+//! floor question rather than a recursion one — see below — and the schedule
 //! finds the boundary rather than assuming it: on mainnet 430529 at the measured
-//! floor it inlines the last eleven slots.
+//! floor it inlines the last two slots.
 //!
-//! # And exactly two recursions do, which is now the whole of `T2 − T`
+//! # And exactly two recursions do, which is now a third of `T2 − T`
 //!
-//! **Corrected 2026-08-19, and everything in this section is a before number.**
-//! A child costs [`ProverModel::recursion_verify_s`], which is **1.520 s**
-//! MEASURED on a card once `fd9764d` stopped compressing children — the wrap
-//! was forcing the in-guest verifier onto a software Poseidon, and it was 23x of
-//! the cost. The seconds quoted below were computed at 35.629 s a child and are
-//! kept as the record of what the pipeline used to pay; the shape they argue for
-//! wants re-deriving from a post-fix run, and so does every figure that was
-//! itself derived by subtracting a recursion. See `BENCHMARKS.md`.
+//! A child costs [`ProverModel::recursion_verify_s`] — **1.520 s** MEASURED on a
+//! card once `fd9764d` stopped compressing children, the wrap having forced the
+//! in-guest verifier onto a software Poseidon at 23x the cost — and any proof
+//! with a child at all pays [`ProverModel::first_child_s`] once on top, 0.83 s,
+//! for the Poseidon AIR instance that verifier builds. It was 35.629 s a child
+//! and no step at all until 2026-08-19. **Everything below is re-derived at the
+//! measured pair rather than rescaled**, because what moved is the shape of the
+//! optimum and not only its price; `BENCHMARKS.md` has the before numbers.
 //!
-//! Against a 3.640 s floor the sentences above are true and no
-//! longer the point. `T2 − T` on mainnet 430529 is **83.1 s**, of which 71 is
-//! the two recursive verifications [`ProverModel::final_s`] charges a folded
-//! final proof: the running aggregate the epoch was folded into, and the
-//! previous epoch's justification. It was 112.4 s while the epoch's end had to
-//! be a third child on top of those. How to cut the groups and how many cards
-//! to use is the rest, and it is small. Where the tail begins is not: it decides
-//! whether there is a group left for the final proof to absorb at all.
+//! Against a 3.640 s floor, `T2 − T` on mainnet 430529 is **10.6 s** and it is
+//! the final proof and nothing else: 3.64 s of floor, 3.87 s of recursion — the
+//! running aggregate the epoch was folded into, the previous epoch's
+//! justification, and the one Poseidon instance they share — 2.40 s for the two
+//! slots it takes inline, and the epoch's one 0.66 s final exponentiation. It
+//! was 83.1 s at 35.629 s a child, and 112.4 s before the inline tail was
+//! uncapped. The epoch's own work is one card: two groups, two folds and the
+//! final proof, with the last fold landing 1.6 s before `T`. How to cut the
+//! groups and how many cards to use is the rest, and it is small. Where the
+//! tail begins is not: it decides whether a second floor lands after `T`.
 //!
 //! **Both of those numbers were right by accident until 2026-08-19, and one of
 //! them still is.** `final_s` charged `absorbed + 1` on the folded path where
@@ -69,32 +71,39 @@
 //! `recursion_verify_s` carried `justification-guest`'s 53.087 s, which is 1.49x
 //! what these guests charge. `(n − 1) × 53.087 = n × 35.629` at `n = 3.04`, so
 //! the capped shape's three children came out right to half a second and the
-//! two-child shape the tail cap was lifted for did not: 67.8 s was 83.1 s. See
-//! `BENCHMARKS.md` for the live run that separated them.
+//! two-child shape the tail cap was lifted for did not: 67.8 s was 83.1 s —
+//! both of them before numbers now. See `BENCHMARKS.md` for the live run that
+//! separated them.
 //!
-//! Three things follow, and they are the opposite of what a free recursion
-//! implied.
+//! Three things follow, and the first two are the opposite of what they were at
+//! 35.629 s a child.
 //!
-//! **A slot is cheaper inline than in a group the final proof absorbs.** Eight
-//! mainnet slots of complement work is about seven seconds against 36 s for the
-//! child. [`StreamPlan::tail`] used to stop at four slots on the pre-recursion
-//! reasoning that a group is one floor either way; lifting that takes modelled
-//! `T2 − T` on 430529 from 112.4 s to 83.1 s, with nothing left to absorb.
+//! **A slot is cheaper in a group than inline, and the tail is no longer about
+//! the child.** A mainnet slot inline costs the final proof 0.93 s of
+//! complement work and a child costs 1.520 s, so a child buys a slot and a
+//! half: anything that can be *grouped* is the cheap side, and inlining eleven
+//! slots to save one child now loses 7.8 s. What the tail still buys is the
+//! floor it does not pay — a group covering the epoch's end can only run after
+//! the last attestation, in series in front of the final proof — and that is
+//! worth 5.2 s on 430529 against the 1.52 s child it saves. [`StreamPlan::tail`]
+//! is two slots there rather than eight, and the 24-unit cap in [`schedule`]
+//! never binds.
 //!
-//! **A fold is worth its floor now.** It used to buy nothing: absorbing a group
-//! into the final proof was free, so a fold was a wasted floor and the schedule
-//! only emitted one when it had time to spare. A group absorbed after `T` is
-//! 36 s on the critical path and the same group folded before it is 36 s off
-//! it, so folding is worth a floor and a half of its own several times over —
-//! but only for groups that would otherwise land after `T`. Folding anything
-//! else adds a recursion for the fold's own predecessor and buys nothing.
+//! **A fold is worth its floor, and only just.** A group absorbed after `T` is
+//! 1.52 s on the critical path and the same group folded before it is 1.52 s
+//! off it, for a floor and a Poseidon instance — 4.47 s — of prover time. That
+//! is a latency-for-throughput trade rather than a saving, and the schedule
+//! takes it because latency is the objective; at 35.629 s it was not a trade at
+//! all. Folding a group that would have landed before `T` anyway still buys
+//! nothing and costs a recursion for the fold's own predecessor.
 //!
-//! **The second irreducible recursion is not irreducible.** The previous
-//! epoch's justification exists a full epoch before this epoch's last
-//! attestation, exactly like the epoch diff and the committee proof — both of
-//! which are already verified by the fold that opens the epoch for precisely
-//! this reason. Verifying it there too would take 36 s off `T2 − T`, which is
-//! more than every other term in this model put together.
+//! **The second irreducible recursion is not irreducible, and is no longer
+//! worth moving.** The previous epoch's justification exists a full epoch before
+//! this epoch's last attestation, exactly like the epoch diff and the committee
+//! proof — both of which the fold that opens the epoch already verifies for
+//! precisely this reason. Verifying it there too would take 1.52 s off `T2 − T`
+//! rather than the 36 s that made it the largest term in this model, and 1.52 s
+//! does not pay for a new obligation on the consumer.
 //!
 //! # What the schedule is up against is arrival time, not throughput
 //!
@@ -326,12 +335,9 @@ pub struct ProverModel {
     /// every Merkle and FRI hash ran as software Hades inside the guest. 242.8 M
     /// RISC-V steps a child against 10.9 M. See BENCHMARKS.md.
     ///
-    /// **This model is missing a term, and it now matters.** A proof pays about
-    /// **0.83 s once** for having any child at all: its first `Poseidon` AIR
-    /// instance, whose floor a childless guest never builds. That is more than
-    /// half a child, it is per proof rather than per child, and nothing here
-    /// charges it. Anything this model says about splitting work across proofs
-    /// is optimistic by 0.83 s a proof until it does.
+    /// **A child is not the whole of what a recursion costs.** A proof also
+    /// pays [`ProverModel::first_child_s`] once for having any child at all,
+    /// which is more than half a child and is per proof rather than per child.
     ///
     /// **Seconds here are a property of the rental, not of the guest.** The same
     /// child, warm, one process, one card, spans 35.7 to 44.5 s under the old
@@ -347,16 +353,42 @@ pub struct ProverModel {
     /// way, and a fold that exists only to take children off another proof
     /// mostly buys latency at the cost of a floor.
     ///
-    /// **The default below is deliberately still 35.629, and that is a hold, not
-    /// an oversight.** Setting it to the measured 1.520 flips four schedule
-    /// tests — `inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group`,
-    /// `lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529`,
+    /// **The default was held at 35.629 until 2026-08-19**, because the measured
+    /// value moves the schedule's optimum rather than only its price: four
+    /// schedule tests assert a shape and all four assert a different one now —
+    /// `inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group`,
+    /// `the_tail_cap_no_longer_binds_on_mainnet_430529`,
     /// `nothing_is_left_for_the_final_proof_to_absorb` and
-    /// `a_bigger_floor_pushes_another_slot_into_the_tail` — because at 1.520 s
-    /// the schedule's optimum is a different shape and the published `T2 - T`
-    /// figures move with it. That is a re-derivation for whoever owns the
-    /// scheduler, against a post-fix production run, and not a constant swap.
+    /// `a_bigger_floor_pushes_another_slot_into_the_tail`. They were re-derived
+    /// against this constant rather than rescaled, and `T2 - T` on mainnet
+    /// 430529 went from 83.1 s to 10.6 s with them.
     pub recursion_verify_s: f64,
+    /// Seconds a proof pays once for having any child at all.
+    ///
+    /// MEASURED in the same ladder as [`ProverModel::recursion_verify_s`]: the
+    /// `n = 1..4` fit's intercept is 3.175 s and the zero-child point is
+    /// 2.349 s, so a guest that verifies one child pays **0.83 s** a guest that
+    /// verifies none does not. It is the first `Poseidon` AIR instance the
+    /// in-guest verifier builds: 3,877 permutations land in about 54,000 rows
+    /// of a 131,072-row AIR, and the instance costs its floor whether it is
+    /// filled or not. So the second child adds no more of it, and a second
+    /// *proof* pays it again.
+    ///
+    /// **It does not overlap `stage_floor_s`, because the two floors are
+    /// measured on childless guests.** 3.640 s is the committee guest, which
+    /// verifies nothing; 2.349 s is the bench guest with `n = 0`. Neither
+    /// contains a Poseidon instance, and the ladder's own intercept splits as
+    /// `2.349 + 0.826` — the childless floor plus the step. The zkasper
+    /// equivalent is therefore `3.640 + 0.83`: the floor unchanged, the step
+    /// charged on top of it, and neither term counted twice. Charging any part
+    /// of the 3.175 s to `stage_floor_s` would be charging the bench guest's
+    /// floor to a guest that has its own.
+    ///
+    /// At 35.629 s a child this was noise. At 1.520 s it prices what the old
+    /// constant made obvious and this one does not: splitting one proof's
+    /// children across two proofs now buys a second floor and a second Poseidon
+    /// instance — 4.47 s — to save 1.520 s a child moved.
+    pub first_child_s: f64,
     pub acc_depth: u32,
 }
 
@@ -369,7 +401,8 @@ impl Default for ProverModel {
             acc_node_s: 31.9e-6,
             bls_units_per_second: 200_000_000.0,
             wrap_s: 0.048,
-            recursion_verify_s: 35.629,
+            recursion_verify_s: 1.520,
+            first_child_s: 0.83,
             acc_depth: zkasper_common::constants::ACC_TREE_DEPTH,
         }
     }
@@ -445,9 +478,11 @@ impl ProverModel {
     /// `opening` is the fold that starts an epoch. `aggregation-guest` takes the
     /// `previous == None` branch there, which verifies the epoch diff and the
     /// committee proof rather than one predecessor — two children where every
-    /// later fold has one.
+    /// later fold has one. Either branch has a child, so `first_child_s` is
+    /// unconditional here.
     pub fn fold_s(&self, groups: f64, opening: bool) -> f64 {
         self.stage_floor_s
+            + self.first_child_s
             + (groups + if opening { 2.0 } else { 1.0 }) * self.recursion_verify_s
             + groups * self.bls_s(cost::FP12_MUL + cost::COMMIT_FP12)
     }
@@ -474,7 +509,9 @@ impl ProverModel {
             // one recursion the guest's own module doc calls irreducible. On
             // top of it the folded path verifies the running aggregate; the
             // unfolded path has no fold to inherit from, so it verifies the
-            // epoch diff and the committee proof itself instead.
+            // epoch diff and the committee proof itself instead. So there is
+            // always a child, and always one `first_child_s`.
+            + self.first_child_s
             + (absorbed + if folded { 2.0 } else { 3.0 }) * self.recursion_verify_s
             + (absorbed + 1.0) * self.bls_s(cost::FP12_MUL + cost::COMMIT_FP12)
     }
@@ -507,7 +544,10 @@ impl ProverModel {
 
     /// The fold that adds committee chunks together and builds the tree.
     pub fn committee_fold_s(&self, chunks: f64) -> f64 {
-        self.stage_floor_s + (chunks + 1.0) * self.recursion_verify_s + self.committee_tree_s()
+        self.stage_floor_s
+            + self.first_child_s
+            + (chunks + 1.0) * self.recursion_verify_s
+            + self.committee_tree_s()
     }
 }
 
@@ -855,9 +895,10 @@ pub fn schedule(
     // 24, not unbounded, from 2026-08-19: an uncapped tail ran the stream_final
     // guest past DEFAULT_MAX_STEPS (~68.7e9) on epoch 469569 and killed the run.
     // That is a runaway rather than a budget overrun -- the whole fused shuffle
-    // proof is ~841e6 steps -- so the cap is a guard, not the fix. 24 is the
-    // value the win was modelled at (112.4 -> 83.1 s) and bounds the blast
-    // radius while the interaction with the held-group tail range is diagnosed.
+    // proof is ~841e6 steps -- so the cap is a guard, not the fix. It is a long
+    // way above the optimum now: at 1.520 s a child the schedule wants two
+    // inline slots on 430529 and one on a mainnet-shaped epoch, so nothing
+    // between 2 and 24 changes a schedule and the cap only bounds the runaway.
     schedule_capped(units, total_active_balance, policy, 24)
 }
 
@@ -961,10 +1002,11 @@ fn with_lanes(
 
     // How much of the epoch's end the final proof swallows whole. This stopped
     // at four slots, on the pre-recursion reasoning that a group has slack the
-    // tail does not and a group is one floor either way. A group the final proof
-    // absorbs is a recursion — 35.629 s — where eight mainnet slots of
-    // complement work is under ten, so that bound was buying a child nothing
-    // needed. Every split is priced now, up to the whole epoch inline.
+    // tail does not and a group is one floor either way. Both bounds were
+    // guesses at where the boundary is, and it moves with every constant in the
+    // model — a child is 1.520 s against 0.93 s for a mainnet slot inline, so
+    // the trade is now the group's own floor rather than its child. Every split
+    // is priced instead, up to the whole epoch inline.
     let best = (0..=max_tail.min(last + 1))
         .flat_map(|inline| {
             let head: Vec<usize> = (0..last + 1 - inline).collect();
@@ -1791,14 +1833,21 @@ mod tests {
     /// deadline instead — a dearer floor is a dearer group *and* a dearer fold,
     /// so the group has to cover less of the epoch to land before `T`, and what
     /// it gives up goes inline.
+    ///
+    /// Two slots and three, where it was eleven and twelve at 35.629 s a child.
+    /// The sensitivity is the same and the mechanism is the same; what changed
+    /// is where it starts, because inlining a slot no longer buys its way out of
+    /// a child worth ten floors. The tail is now only what the fold chain cannot
+    /// reach before `T`, which is why doubling the floor — the one constant the
+    /// chain's deadline is made of — still moves it by exactly one slot.
     #[test]
     fn a_bigger_floor_pushes_another_slot_into_the_tail() {
         let units = even_epoch();
         let measured = schedule(&units, 100, &with_floor(MEASURED_FLOOR_S));
         let doubled = schedule(&units, 100, &with_floor(2.0 * MEASURED_FLOOR_S));
 
-        assert_eq!(measured.plan.tail.len(), 11);
-        assert_eq!(doubled.plan.tail.len(), 12);
+        assert_eq!(measured.plan.tail.len(), 2);
+        assert_eq!(doubled.plan.tail.len(), 3);
         assert!(doubled.latency_s() > measured.latency_s());
     }
 
@@ -2030,11 +2079,19 @@ mod tests {
         (0..32).map(|s| unit(s, 1_000_000, 130)).collect()
     }
 
-    /// **`late_groups = 0` is the plan, and it used to be 1.** The optimum left
-    /// the last group unfolded for the final proof to absorb, because the tail
-    /// was capped at four slots and the rest of the epoch's end had to go
-    /// somewhere. Uncapped, the same slots go inline and there is no group left
-    /// to absorb — the same work without the 36 s child.
+    /// **`late_groups = 0` is the plan, and it used to be 1.** The optimum
+    /// leaves the final proof nothing to absorb: every group is finished in time
+    /// for the fold chain to take it, and the epoch's last slot goes inline
+    /// instead of becoming a group of its own.
+    ///
+    /// The conclusion survived the repricing and its reason did not. At 35.629 s
+    /// the tail was long — the whole end of the epoch went inline rather than be
+    /// a child — and this test read the capped shape against it. At 1.520 s a
+    /// child is the cheap side of that trade and the tail is one slot, so the
+    /// four-slot cap is inert and the shape it used to force has to be asked for
+    /// with a cap of zero. What the tail avoids is the group's own *floor*: the
+    /// epoch's end can only be proven after the last attestation, in series in
+    /// front of the final proof, and that is 5.2 s for a child worth 1.5.
     ///
     /// This is worth pinning from both sides because the field is named for the
     /// failure mode rather than for the design, and the reading of it has
@@ -2049,25 +2106,26 @@ mod tests {
             "the optimum absorbs nothing: {:?}",
             schedule.plan,
         );
+        assert_eq!(schedule.plan.tail.len(), 1);
         assert_eq!(
             schedule.plan.folds.len(),
-            2,
+            3,
             "and folds everything below the tail"
         );
 
-        let capped = schedule_capped(&units, 32_000_000, &StreamPolicy::default(), 4);
-        assert_eq!(capped.plan.absorbed.len(), 1);
+        let no_tail = schedule_capped(&units, 32_000_000, &StreamPolicy::default(), 0);
+        assert_eq!(no_tail.plan.absorbed.len(), 1);
         assert!(
-            capped.latency_s() - schedule.latency_s() > 25.0,
-            "capped at four slots {:.1}s against uncapped {:.1}s",
-            capped.latency_s(),
+            no_tail.latency_s() - schedule.latency_s() > 5.0,
+            "no inline tail {:.1}s against one inline slot {:.1}s",
+            no_tail.latency_s(),
             schedule.latency_s(),
         );
     }
 
-    /// Why it is absorbed rather than folded: a fold is a floor and a recursion
-    /// more expensive than the absorption it replaces, and it is serial in front
-    /// of the final proof rather than inside it.
+    /// Why it is absorbed rather than folded: a fold is a floor, a Poseidon
+    /// instance and a recursion more expensive than the absorption it replaces,
+    /// and it is serial in front of the final proof rather than inside it.
     ///
     /// A group whose last slot arrives within `fold_s(1)` of `T` therefore
     /// cannot be folded in time *and* would cost more if it could. Which is why
@@ -2079,46 +2137,67 @@ mod tests {
         let absorbed = m.final_s(130.0, 1.0, 3.0, 1.0, true);
         let folded = m.fold_s(1.0, false) + m.final_s(130.0, 1.0, 3.0, 0.0, true);
         assert!(
-            ((folded - absorbed) - (m.stage_floor_s + m.recursion_verify_s)).abs() < 0.01,
+            ((folded - absorbed) - (m.stage_floor_s + m.first_child_s + m.recursion_verify_s))
+                .abs()
+                < 0.01,
             "folding costs {:.2}s against absorbing's {absorbed:.2}s",
             folded,
         );
     }
 
-    /// And what beats both: the slots no fold can reach are cheaper *inline*
-    /// than as a group at all. A group is one recursion — 35.629 s — where
-    /// eight mainnet slots of complement work is under ten.
+    /// And what beats both, for the slots no fold can reach: they are cheaper
+    /// *inline* than as a group of their own — because a group is a floor, not
+    /// because it is a child.
     ///
-    /// The inline tail used to stop at four slots, on the pre-recursion
-    /// reasoning that "a group is one floor either way". A child is ten floors,
-    /// so that bound was the binding constraint on `T2 - T` rather than a safe
-    /// simplification, and it is gone.
+    /// The margin inverted with the constant, so the statement had to narrow. At
+    /// 35.629 s the child settled it outright: eleven slots inline were 26 s
+    /// cheaper than the same slots as a group the final proof absorbed, and the
+    /// group's own proof never needed pricing. At 1.520 s that comparison runs
+    /// the other way by 7.8 s — a child buys about a slot and a half of mainnet
+    /// complement work — and the assertion below says so. What survives is the
+    /// marginal statement about a slot at the *end* of the epoch, whose group
+    /// could only be proven after `T`: 0.93 s inline against a whole floor and a
+    /// child, which is why the tail exists and why it is short.
     #[test]
     fn inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group() {
         let m = ProverModel::default();
+        let alone = m.final_s(130.0, 1.0, 3.0, 0.0, true);
+        let one_more_inline = m.final_s(260.0, 2.0, 6.0, 0.0, true) - alone;
+        let as_its_own_group =
+            m.group_s(130.0, 1.0, 3.0) + m.final_s(130.0, 1.0, 3.0, 1.0, true) - alone;
+        assert!(
+            as_its_own_group - one_more_inline > 5.0,
+            "inline {one_more_inline:.2}s against {as_its_own_group:.2}s as a group",
+        );
+
+        // And the half that inverted: once a group exists and is finished, its
+        // child is cheaper than the slots it covers.
         let absorbed = m.final_s(130.0, 1.0, 3.0, 1.0, true);
         let inline = m.final_s(1430.0, 11.0, 33.0, 0.0, true);
         assert!(
-            absorbed - inline > 25.0,
+            inline - absorbed > 7.0,
             "inline {inline:.2}s against absorbed {absorbed:.2}s",
         );
     }
 
-    /// The same thing on the real epoch rather than a shape like it, priced both
-    /// ways so the win is measured and not asserted.
+    /// The same thing on the real epoch rather than a shape like it, and the
+    /// test that flipped hardest. Lifting the four-slot cap on the inline tail
+    /// was worth 29.3 s at 35.629 s a child — 112.4 s capped against 83.1 s
+    /// uncapped, eight slots inline and no group left to absorb. At 1.520 s it
+    /// is worth nothing at all: the optimum tail is *two* slots, so a cap of
+    /// four — or the 24 [`schedule`] carries as a runaway guard — never binds,
+    /// and the two searches return the same plan.
     ///
-    /// Both schedules come out of `schedule_capped` on the same units and the
-    /// same policy — the 4-card budget, the measured 3.640 s floor, the active
-    /// set as the committee proof's size — and the only difference is the bound
-    /// on the inline tail. Capped at four, the epoch's end is a group the final
-    /// proof has to absorb: 112.4 s. Uncapped, eight slots go inline and there
-    /// is no group left: 83.1 s.
+    /// What the tail is still worth is the floor it keeps off the critical path,
+    /// which is what a cap of zero prices: the epoch's end becomes a group no
+    /// fold can reach, the final proof absorbs it, and `T2 - T` goes from 10.6 s
+    /// to 15.8 s. Two slots is the whole of the win — a cap of one gives back
+    /// 0.3 s of it — so the bound that mattered is the model's, not a policy's.
     ///
-    /// `test_ssz_file_streaming_schedule` prints exactly these two numbers off
-    /// the 320 MB state download that [`EPOCH_430529`] was taken from; this runs
-    /// offline.
+    /// `test_ssz_file_streaming_schedule` prints these numbers off the 320 MB
+    /// state download that [`EPOCH_430529`] was taken from; this runs offline.
     #[test]
-    fn lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529() {
+    fn the_tail_cap_no_longer_binds_on_mainnet_430529() {
         let units = epoch_430529();
         let policy = StreamPolicy {
             lanes: 4,
@@ -2128,23 +2207,27 @@ mod tests {
         let capped = schedule_capped(&units, TOTAL_ACTIVE_BALANCE_430529, &policy, 4);
         let uncapped = schedule(&units, TOTAL_ACTIVE_BALANCE_430529, &policy);
 
-        assert_eq!(capped.plan.tail.len(), 1);
-        assert_eq!(capped.plan.absorbed.len(), 1);
-        assert_eq!(uncapped.plan.tail.len(), 8);
+        assert_eq!(uncapped.plan.tail.len(), 2);
         assert!(
             uncapped.plan.absorbed.is_empty(),
-            "still a group to absorb: {:?}",
+            "a group left to absorb: {:?}",
             uncapped.plan,
         );
+        assert_eq!(capped.plan, uncapped.plan, "the cap changed the plan");
 
         // In tenths, because that is the precision the constants underneath
         // carry and the precision `better` compares at.
-        assert_eq!((capped.latency_s() * 10.0).round(), 1124.0);
-        assert_eq!((uncapped.latency_s() * 10.0).round(), 831.0);
+        assert_eq!((uncapped.latency_s() * 10.0).round(), 106.0);
+
+        // The tail priced from the other side: forbid it and the epoch's end is
+        // a proof of its own, in series after the last attestation.
+        let no_tail = schedule_capped(&units, TOTAL_ACTIVE_BALANCE_430529, &policy, 0);
+        assert_eq!(no_tail.plan.absorbed.len(), 1);
+        assert_eq!((no_tail.latency_s() * 10.0).round(), 158.0);
 
         // And it is cheaper, not a latency-for-throughput trade: a group's floor
         // and its complement work both leave the epoch with the group.
-        assert!(uncapped.total_prover_s < capped.total_prover_s);
+        assert!(uncapped.total_prover_s < no_tail.total_prover_s);
     }
 
     /// A quarter of the validators offline: the threshold is never reached, and

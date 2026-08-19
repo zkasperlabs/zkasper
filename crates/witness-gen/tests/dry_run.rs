@@ -157,20 +157,25 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     );
     let latency = &status["recent_latencies"][0];
     assert_eq!(latency["epoch"], FIRST_EPOCH + 1);
-    // The whole of the epoch the aggregate has not already swallowed goes
-    // inline, because a group the final proof has to absorb is a recursion and
-    // the slots are complement work. On this chain the threshold crosses in nine
-    // slots and the daemon never gets a group folded before it, so all nine are
-    // on the critical path and nothing is absorbed. It used to be one attestation
-    // inline and the other eight as a child.
+    // What the plan asks the final proof to swallow, and it is one slot again: a
+    // child is 1.520 s against about 0.93 s of complement work a mainnet slot,
+    // so the tail is only what no group could have been proven for in time and
+    // everything behind it is worth grouping. It was the whole crossing — nine
+    // slots — while a child was 35.629 s and inlining was how to avoid one.
     assert_eq!(
-        latency["tail"],
-        chain.slots_to_threshold(FIRST_EPOCH + 1),
-        "the final proof did not carry the plan's tail",
+        latency["tail"], 1,
+        "the final proof did not carry the plan's tail: {latency}",
     );
+    // And on this fixture that group is late. The mock node serves the epoch as
+    // fast as the daemon can read it, while the plan cuts groups against a 12 s
+    // slot, so there is no wall-clock here for a group to be proven and folded
+    // before the trigger fires. `late_groups = 1` is the fixture's compressed
+    // clock rather than the plan's shape — the model lands the last fold 1.6 s
+    // before `T` on mainnet 430529 — and it is worth pinning because it is the
+    // path where the fire path has to bridge what the tail no longer covers.
     assert_eq!(
-        latency["late_groups"], 0,
-        "a group proof on the critical path",
+        latency["late_groups"], 1,
+        "the late group a compressed clock forces: {latency}",
     );
     assert!(
         latency["t2_minus_t_millis"].is_number(),
