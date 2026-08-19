@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::task::JoinHandle;
-use tracing::{info, info_span, instrument, warn};
+use tracing::{info, info_span, instrument, warn, Instrument};
 
 use zkasper_common::bls::{fp12_mul, Fp12, FP12_ONE};
 use zkasper_common::types::{
@@ -456,7 +456,7 @@ impl EpochPipeline for StreamPipeline {
     ) -> Result<()> {
         let target_epoch = engine.snapshot.state.cursor_epoch;
 
-        let mut aggregator = match self.aggregator.take() {
+        let aggregator = match self.aggregator.take() {
             Some(aggregator) if aggregator.context.target_epoch == target_epoch => aggregator,
             _ => {
                 // Every proof in flight was bound to the epoch being replaced,
@@ -466,7 +466,33 @@ impl EpochPipeline for StreamPipeline {
             }
         };
 
-        let _span = info_span!("stream", target_epoch).entered();
+        // Instrumented rather than entered. Nearly all of a tick is the await
+        // inside `settle`, and a guard held across an await is never exited, so
+        // the wait was counted as `time.busy`: a sleeping loop logged 201 ms of
+        // work five times a second, and read as a daemon burning a core.
+        self.drive_epoch(engine, tick, aggregator)
+            .instrument(info_span!("stream", target_epoch))
+            .await
+    }
+
+    fn forget(&mut self) {
+        self.aggregator = None;
+        // Dropping the handle detaches the task rather than stopping it —
+        // nothing interrupts a proof already on a blocking thread — but the
+        // task writes nothing, so what it leaves behind is prover time.
+        self.pending = None;
+    }
+}
+
+impl StreamPipeline {
+    /// One tick of the epoch in flight, under the span that names it.
+    async fn drive_epoch<A: BeaconApi + ChainStatusApi>(
+        &mut self,
+        engine: &mut Engine<A>,
+        tick: &mut Tick,
+        mut aggregator: StreamAggregator,
+    ) -> Result<()> {
+        let target_epoch = aggregator.context.target_epoch;
         let spe = engine.config.chain.slots_per_epoch;
 
         // Gossip is the source. Blocks repair what an outage swallowed, and are
@@ -677,16 +703,6 @@ impl EpochPipeline for StreamPipeline {
         Ok(())
     }
 
-    fn forget(&mut self) {
-        self.aggregator = None;
-        // Dropping the handle detaches the task rather than stopping it —
-        // nothing interrupts a proof already on a blocking thread — but the
-        // task writes nothing, so what it leaves behind is prover time.
-        self.pending = None;
-    }
-}
-
-impl StreamPipeline {
     /// Fill in from blocks what gossip did not deliver.
     ///
     /// Only two things need it: an epoch that opened after its own attestations
