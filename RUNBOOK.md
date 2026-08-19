@@ -656,7 +656,7 @@ output directory on local disk, not on network storage.
 
 | Signal | Condition | Meaning |
 |---|---|---|
-| `recent_latencies[].late_groups` | `> 0` | The daemon fell behind: attestations arrived that had not been folded when the trigger fired. It is a throughput symptom, not a correctness one. Currently 0 or 1 by construction. **Expected on the first streaming epoch of a run, or after a restart**, which opens mid-epoch and so folds nothing before the trigger — read it together with `folded_groups`, and only treat it as real when `folded_groups` is also non-zero. |
+| `recent_latencies[].late_groups` | `> 1` | 0 or 1 by construction: the final proof absorbs at most one group, so this is a flag rather than a count. **1 is the planned shape on a real prover, not a symptom** — the schedule's own optimum leaves the last group unfolded, because folding it costs a floor and a recursion more and cannot finish before `T` anyway. The `late_groups = 0` runs in §8 were `--prover native`, where a fold is milliseconds. What to watch on a GPU is `late_group_millis`, which is the same group proven *after* `T` instead of before it, and is the whole of the gap to the modelled `T2 - T`. |
 | `gossip.reconnects` | rising | The node or the network is unstable. Epochs around each reconnect were sourced from blocks, so their `T2 - T` is not representative — exclude them from any latency claim. |
 | `gossip` | **absent** | The daemon is reading blocks instead of gossip and is a slot behind by construction. Either `--no-gossip` is set or the pipeline is `batch`. |
 | `recent_latencies[].t2_minus_t_millis` | drifting up | Compare against the baseline in §8. |
@@ -1139,8 +1139,11 @@ steady-state result.** Three epochs are not a distribution either; what follows
 is what three epochs can support.
 
 - **`late_groups = 0` on all three steady-state epochs, and 1 on every catch-up.**
-  The alert is meaningful and the daemon keeps up with the chain once it is on
-  it.
+  The daemon keeps up with the chain once it is on it — *under `--prover
+  native`*, where a group proof is 4.8 s and a fold is milliseconds. On a real
+  prover a fold is 109.8 s and folding the last group is neither possible nor
+  wanted, so `late_groups = 1` is the steady state there and 0 is not the target.
+  See BENCHMARKS.md.
 - **`wait_millis` is 82–92% of `T2 - T`.** Under `--prover native` the prover is
   not on the critical path; the trigger holding for in-flight attestations is. A
   GPU run will report a similar `T2 - T` for an entirely different reason, so

@@ -449,6 +449,14 @@ impl EpochPipeline for StreamPipeline {
         // is the whole point of returning: this tick is short, so the head it
         // asks against is current, and a boundary that did not exist when the
         // epoch opened exists by now.
+        //
+        // The trigger is below this return, so it is blind for the length of
+        // every proof. Measured on mainnet, epochs 469501-469505: `T` was
+        // stamped 0.22 to 0.33 s after a proof landed on all five, and 8 to
+        // 125 s after the crossing slot began. That costs twice — the reported
+        // `T` is late, which flatters `T2 - T`, and every slot that arrived
+        // during the proof is unfolded when the trigger finally fires, which is
+        // `late_group_millis`.
         if let Some(mut pending) = self.pending.take() {
             if !pending.settle(engine.config.trigger_interval).await {
                 engine.speculate(target_epoch + 1).await;

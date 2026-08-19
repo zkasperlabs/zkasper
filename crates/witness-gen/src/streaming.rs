@@ -1877,6 +1877,76 @@ mod tests {
         assert!(!policy.worth_waiting(drained(1_000_000, 1_000_000), 0.2, 0.0, policy.max_wait_s));
     }
 
+    /// Mainnet's shape: 32 slots, each a thirty-second of the stake, 130
+    /// accumulator leaves apiece. 2/3 crosses on the 22nd, exactly as epoch
+    /// 430529 does in `test_ssz_file_streaming_schedule`.
+    fn mainnet_shaped() -> Vec<SlotComplement> {
+        (0..32).map(|s| unit(s, 1_000_000, 130)).collect()
+    }
+
+    /// **`late_groups = 1` is the plan, not a shortfall.** The schedule's own
+    /// optimum leaves the last group unfolded for the final proof to absorb,
+    /// and the published `T2 - T` is the latency of doing exactly that.
+    ///
+    /// This is worth pinning because the field is named for the failure mode
+    /// rather than for the design: a daemon reporting `late_groups = 1` is
+    /// running the shape the model chose, and one reporting 0 has either folded
+    /// a group it should have absorbed or inlined it instead.
+    #[test]
+    fn the_last_group_is_absorbed_by_design() {
+        let schedule = schedule(&mainnet_shaped(), 32_000_000, &StreamPolicy::default());
+        assert_eq!(
+            schedule.plan.absorbed.len(),
+            1,
+            "the optimum absorbs exactly one group: {:?}",
+            schedule.plan,
+        );
+        assert_eq!(
+            schedule.plan.folds.len(),
+            1,
+            "and folds everything below it"
+        );
+    }
+
+    /// Why it is absorbed rather than folded: a fold is a floor and a recursion
+    /// more expensive than the absorption it replaces, and it is serial in front
+    /// of the final proof rather than inside it.
+    ///
+    /// A group whose last slot arrives within `fold_s(1)` of `T` therefore
+    /// cannot be folded in time *and* would cost more if it could — so there is
+    /// always a last group in this position, and `late_groups >= 1` is the right
+    /// answer rather than a throughput symptom.
+    #[test]
+    fn folding_the_last_group_costs_a_floor_and_a_recursion_more() {
+        let m = ProverModel::default();
+        let absorbed = m.final_s(130.0, 1.0, 3.0, 1.0, true);
+        let folded = m.fold_s(1.0) + m.final_s(130.0, 1.0, 3.0, 0.0, true);
+        assert!(
+            ((folded - absorbed) - (m.stage_floor_s + m.recursion_verify_s)).abs() < 0.01,
+            "folding costs {:.2}s against absorbing's {absorbed:.2}s",
+            folded,
+        );
+    }
+
+    /// And what beats both: the slots no fold can reach are cheaper *inline*
+    /// than as a group at all. A group is one recursion — 53.087 s — where
+    /// eleven mainnet slots of complement work is under ten.
+    ///
+    /// `MAX_TAIL` caps the inline tail at four slots, on the pre-recursion
+    /// reasoning that "a group is one floor either way". A child is fifteen
+    /// floors now, so that bound is the binding constraint on `T2 - T` rather
+    /// than a safe simplification.
+    #[test]
+    fn inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group() {
+        let m = ProverModel::default();
+        let absorbed = m.final_s(130.0, 1.0, 3.0, 1.0, true);
+        let inline = m.final_s(1430.0, 11.0, 33.0, 0.0, true);
+        assert!(
+            absorbed - inline > 40.0,
+            "inline {inline:.2}s against absorbed {absorbed:.2}s",
+        );
+    }
+
     /// A quarter of the validators offline: the threshold is never reached, and
     /// the plan says so rather than pretending.
     #[test]

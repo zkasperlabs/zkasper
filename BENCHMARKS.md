@@ -337,10 +337,65 @@ one cannot anchor the other. Note also that 53.087 s per child reproduces
 neither: 2 children gives 110 s, 3 gives 163 s, 4 gives 216 s, and none of those
 is 148.2 s.
 
-**So this is a model over measured per-stage times, anchored at one end only.**
-No production epoch has yet run the folded path — every epoch this pipeline has
-ever proved reports `folded_groups=0`, because the daemon has never had the spare
-capacity to fold. Until one does, 117.7 s is unvalidated.
+**The folded path has now run, and the model holds.** Mainnet epochs
+469,501-469,509, 2026-08-19, are the first with `folded_groups > 0`. Six of them
+verify an aggregate, one absorbed group and the previous justification, and their
+stream-final proofs are **116.5, 117.2, 118.5, 119.8, 121.2 and 124.2 s** — mean
+119.6 s, spread 7.7 s, against a model of 123.2 s at their measured tails. One
+folded nothing and took 168.0 s against a modelled 183.2 s. The model is
+**conservative by 3 to 8% on both paths**, so 117.7 s is no longer anchored at
+one end only.
+
+**What did not hold is the daemon's schedule, and `late_groups` is not where it
+failed.** The published schedule's own optimum leaves one group unfolded for the
+final proof to absorb — `Final absorbs [1]` in the report above — so
+`late_groups = 1` is the plan, and the recursion it costs is already inside the
+117.7 s. Absorbing that group is right rather than merely tolerable: folding it
+instead costs `stage_floor_s + recursion_verify_s` — 56.7 s — more, and cannot
+finish before `T` anyway, because a fold is 109.8 s and the group's last slot
+arrives one slot before the crossing. `folding_the_last_group_costs_a_floor_and_a_recursion_more`
+pins the arithmetic.
+
+The gap between the model and the measurement is a single term, and it is exact:
+
+```
+T2 - T  =  late_group_millis  +  stream_final
+162.540 =  41.379             +  121.215
+196.299 =  76.574             +  119.776
+161.406 =  44.988             +  116.459
+179.736 =  61.253             +  118.529
+197.534 =  29.538             +  168.048
+218.376 =  94.168             +  124.208
+162.990 =  45.813             +  117.177
+```
+
+The schedule places the absorbed group so that it *finishes* at `T` — `Group(1)`
+runs 240.0 s to 253.0 s against a threshold at 252.0 s, one second of overhang.
+The daemon *starts* it at `T`, because the trigger is only evaluated on a tick
+with no proof in flight, and the tick that fires is therefore the first one after
+a 110 s fold. Every slot that arrived during that fold is still unproven when the
+trigger fires. **The whole 62 s of median gap is that displacement**, not the
+absorption.
+
+**`T` is stamped when the daemon looks, not when the chain crosses.** Same five
+epochs, same cause: the threshold check sits below the in-flight-proof early
+return, so `threshold_unix_millis` landed 0.22-0.33 s after a proof finished on
+all five, and 8.4, 15.7, 46.7, 93.0 and 124.7 s after the crossing slot began.
+`t2_minus_t_millis` is therefore a lower bound on what a consumer waits, and on a
+saturated daemon it understates it by up to two minutes.
+
+**The largest remaining win is inlining, not folding.** The slots no fold can
+reach are cheaper carried inline by the final proof than proven as a group at
+all: one group is one recursion, 53.087 s, where eleven mainnet slots of
+complement work is under ten. `MAX_TAIL` caps the inline tail at four slots on
+the pre-recursion reasoning that "a group is one floor either way"; lifting it to
+24 takes the modelled `T2 - T` on epoch 430529 from **112.8 s to 67.8 s** on the
+same two cards, with the final proof absorbing nothing —
+`inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group` pins the
+comparison. It is not free: the synthetic epoch in the unit tests then needs a
+card of its own for the committee proof, and `stream.rs` hardcodes the tail to
+the crossing slot rather than reading `StreamPlan::tail`, so the daemon cannot
+take it without a change on both sides.
 
 What it is sensitive to:
 

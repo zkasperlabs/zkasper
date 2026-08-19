@@ -151,10 +151,13 @@ pub struct EpochLatency {
     /// The late group proof, which is the rest of `t2_minus_t_millis` before the
     /// final proof itself.
     ///
-    /// Zero on a daemon that folded everything before `T`. Above zero it is the
-    /// backlog the epoch opened with, proven on the critical path because the
-    /// fire path is the first tick that could prove it — so it is `late_groups`
-    /// priced in seconds, and on a catch-up epoch it is the largest term here.
+    /// Zero on a daemon that had proven `late_groups` before `T`, which is
+    /// where the schedule puts it: the absorbed group *finishes* at the
+    /// threshold, and only its recursion is meant to land after it. Above zero
+    /// it is that same group started at `T` instead, because the trigger is
+    /// evaluated only on a tick with no proof in flight and the tick that fires
+    /// is therefore the first one after a fold. It is the whole of the gap
+    /// between the measured `T2 - T` and the modelled one.
     pub late_group_millis: u64,
     /// Accumulator leaves the final proof opened for its inline tail — the
     /// absentees the wait did not remove. Every one of them is
@@ -162,9 +165,18 @@ pub struct EpochLatency {
     pub tail_named: usize,
     /// Group proofs folded into the running aggregate before `T`.
     pub folded_groups: usize,
-    /// Groups the final proof had to verify itself, because they arrived too
-    /// late to fold. Zero is the shape the design aims at, and anything else
-    /// says the daemon was behind the chain.
+    /// Groups the final proof verified itself instead of taking them off a
+    /// fold — [`crate::streaming::StreamPlan::absorbed`], as the pipeline
+    /// realised it. The fire path holds at most one, so this is 0 or 1 and
+    /// never a count of late slots: a backlog of nine slots is one group.
+    ///
+    /// **1 is the schedule's own optimum on a real prover, not a shortfall.**
+    /// A fold is `ProverModel::fold_s(1)` — 109.8 s — and the last group's
+    /// slots arrive one slot before the crossing, so it can neither be folded
+    /// in time nor be worth folding: absorbing it costs one recursion where
+    /// folding it costs a floor and a recursion, in series in front of the
+    /// final proof rather than inside it. What says the daemon was behind is
+    /// `late_group_millis`, not this.
     pub late_groups: usize,
     /// Attestations the final proof verified inline.
     pub tail: usize,
