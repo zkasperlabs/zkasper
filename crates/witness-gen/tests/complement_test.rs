@@ -553,16 +553,15 @@ fn a_validator_gossiped_twice_is_summed_once() {
     );
 }
 
-/// Overlapping covers are a choice between them, and the choice is size.
+/// An aggregate that overlaps the singles is taken alongside them, not instead.
 ///
-/// An aggregate that overlaps the singles cannot be added to them — summing a
-/// validator's signature twice verifies, so the cover has to stay disjoint —
-/// but that is an argument for taking one of the two, not for always taking the
-/// singles. Here the aggregate carries the whole committee and the singles all
-/// but one member, so the aggregate wins; a disjoint aggregate is still taken
-/// alongside them.
+/// Summing a validator's signature twice verifies, so a cover has to stay
+/// disjoint — but a single names one validator, so ours can be cut down to
+/// whatever the aggregate did not carry. Here the aggregate carries the whole
+/// committee and the singles all but one member; a disjoint aggregate is taken
+/// alongside them just the same.
 #[test]
-fn the_larger_of_two_overlapping_covers_is_the_one_taken() {
+fn an_overlapping_aggregate_is_taken_alongside_the_singles() {
     let epoch = fixture();
     let head = [0x44u8; 32];
     let members = epoch.committees.members[0].clone();
@@ -856,4 +855,85 @@ fn the_aggregate_wave_carries_an_epoch_the_singles_alone_would_abandon() {
         verify_at(&witness_for(&epoch, &slots), WAVE_ACC_DEPTH).attesting_balance,
         held,
     );
+}
+
+/// The cover is the union of the two waves, not the larger of them.
+///
+/// Mainnet gossip arrives twice and the waves are not nested: a committee's
+/// aggregate carries 99.74% of it and the unaggregated feed 64.5% to 76.6%, and
+/// each holds members the other does not. A rule that weighed them against each
+/// other left that difference named whichever way it went — the aggregate lost
+/// and a slot stalled at what the subnets happened to deliver, or the singles
+/// lost and every member they alone carried became an absentee.
+///
+/// The discriminating case is the second one, and it is the smaller aggregate
+/// below: under a rule that picks a winner by size the singles take it and the
+/// three members only the aggregate carried are named.
+#[test]
+fn a_cover_is_the_union_of_the_waves_not_the_larger_of_them() {
+    let epoch = wave_epoch();
+    let head = [0u8; 32];
+    let committee = epoch
+        .committees
+        .committee(epoch.slot(0), 0)
+        .expect("committee")
+        .to_vec();
+
+    let close = |gossip: Vec<AttestationResponse>| {
+        let mut stream = SlotStream::new(
+            &epoch.config,
+            epoch.committees.clone(),
+            epoch.epoch,
+            epoch.target_root,
+        );
+        stream.ingest(&gossip).unwrap();
+        stream.close(epoch.slot(0)).expect("close the slot")
+    };
+    let singles = |members: &[u64]| -> Vec<AttestationResponse> {
+        members
+            .iter()
+            .map(|&index| committee_single(&epoch, 0, 0, head, index))
+            .collect()
+    };
+    // Everything outside committee 0 is absent, so only its members move.
+    let elsewhere = epoch.committees.members[0].len() - committee.len();
+
+    // The aggregate is the larger cover and misses the committee's first
+    // member, whom the singles delivered.
+    let mut gossip = singles(&committee[..WAVE_SINGLES]);
+    gossip.push(committee_aggregate(&epoch, 0, 0, head, &committee[1..]));
+    let larger = close(gossip);
+    assert_eq!(
+        larger.witness.absentees.len(),
+        elsewhere,
+        "the member only the singles carried was named",
+    );
+
+    // And the other way round: an aggregate carrying three members the singles
+    // never delivered, against singles that carry more than it does.
+    let mut gossip = singles(&committee[..WAVE_SINGLES]);
+    gossip.push(committee_aggregate(
+        &epoch,
+        0,
+        0,
+        head,
+        &committee[WAVE_SINGLES - 1..WAVE_SINGLES + 3],
+    ));
+    let smaller = close(gossip);
+    assert_eq!(
+        smaller.witness.absentees.len(),
+        elsewhere + committee.len() - WAVE_SINGLES - 3,
+        "the members only the smaller aggregate carried were named",
+    );
+
+    // Both covers are ones the circuit accepts, which is the whole of what a
+    // packing is allowed to be: the pairing closes or it does not.
+    for complement in [larger, smaller] {
+        let balance = complement.marginal_balance;
+        assert_eq!(
+            verify_at(&witness_for(&epoch, &[complement.witness]), WAVE_ACC_DEPTH,)
+                .attesting_balance,
+            balance,
+        );
+    }
 }
