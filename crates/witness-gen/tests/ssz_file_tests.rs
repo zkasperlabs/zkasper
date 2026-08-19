@@ -1039,6 +1039,22 @@ async fn test_ssz_file_streaming_finality() {
         run.group_outputs.len(),
         run.aggregate_outputs.len(),
     );
+
+    // What the inline tail costs off the critical path. Every slot the final
+    // proof swallows is one more complement witness and its share of two
+    // multi-proofs, and a remote prover is handed the lot in a single frame.
+    let final_bytes = bincode::serialize(&run.final_witness).unwrap().len();
+    eprintln!(
+        "final witness: {} inline slots, {:.2} MB, {:.0} kB a slot",
+        run.final_witness.tail.len(),
+        final_bytes as f64 / 1e6,
+        final_bytes as f64 / run.final_witness.tail.len().max(1) as f64 / 1e3,
+    );
+    assert!(
+        final_bytes < zkasper_witness_gen::remote_prover::MAX_FRAME_BYTES,
+        "the final witness is {final_bytes} bytes, over the {} byte frame cap",
+        zkasper_witness_gen::remote_prover::MAX_FRAME_BYTES,
+    );
 }
 
 // ---------------------------------------------------------------------------

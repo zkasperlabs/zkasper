@@ -314,7 +314,15 @@ cargo test --release --test ssz_file_tests test_ssz_file_streaming_schedule -- -
 ```
 
 On mainnet epoch 430529, 2,212,730 validators, the schedule needs **two GPUs**
-and puts `T2 - T` at **117.7 s**.
+and puts `T2 - T` at **67.8 s**, with the final proof verifying no child at all.
+
+It was **112.8 s** until the inline tail stopped being capped at four slots; see
+*the largest remaining win* below, which is now spent. **The 117.7 s quoted
+throughout the rest of this section is an earlier revision of this model and no
+longer reproduces** — the same command printed 112.8 s at `903f3e6`, before any
+of this change. 117.7 s is the number the live run validated, so the paragraphs
+that compare it against measurement are left as they were written; every figure
+below the sensitivity table's rewrite is today's model.
 
 **It was 5.5 s on one GPU until recursion was measured, and that number is
 withdrawn.** The model carried `recursion_verify_s` as zero; it is 53.087 s, and
@@ -347,10 +355,11 @@ folded nothing and took 168.0 s against a modelled 183.2 s. The model is
 one end only.
 
 **What did not hold is the daemon's schedule, and `late_groups` is not where it
-failed.** The published schedule's own optimum leaves one group unfolded for the
-final proof to absorb — `Final absorbs [1]` in the report above — so
-`late_groups = 1` is the plan, and the recursion it costs is already inside the
-117.7 s. Absorbing that group is right rather than merely tolerable: folding it
+failed.** The published schedule's own optimum left one group unfolded for the
+final proof to absorb — `Final absorbs [1]` in the report as it read then — so
+`late_groups = 1` was the plan, and the recursion it costs was already inside the
+117.7 s. It is `Final absorbs []` and `late_groups = 0` now; the paragraph is
+kept because it is the reasoning the measurement was read against. Absorbing that group is right rather than merely tolerable: folding it
 instead costs `stage_floor_s + recursion_verify_s` — 56.7 s — more, and cannot
 finish before `T` anyway, because a fold is 109.8 s and the group's last slot
 arrives one slot before the crossing. `folding_the_last_group_costs_a_floor_and_a_recursion_more`
@@ -384,32 +393,45 @@ all five, and 8.4, 15.7, 46.7, 93.0 and 124.7 s after the crossing slot began.
 `t2_minus_t_millis` is therefore a lower bound on what a consumer waits, and on a
 saturated daemon it understates it by up to two minutes.
 
-**The largest remaining win is inlining, not folding.** The slots no fold can
-reach are cheaper carried inline by the final proof than proven as a group at
-all: one group is one recursion, 53.087 s, where eleven mainnet slots of
-complement work is under ten. `MAX_TAIL` caps the inline tail at four slots on
-the pre-recursion reasoning that "a group is one floor either way"; lifting it to
-24 takes the modelled `T2 - T` on epoch 430529 from **112.8 s to 67.8 s** on the
-same two cards, with the final proof absorbing nothing —
-`inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group` pins the
-comparison. It is not free: the synthetic epoch in the unit tests then needs a
-card of its own for the committee proof, and `stream.rs` hardcodes the tail to
-the crossing slot rather than reading `StreamPlan::tail`, so the daemon cannot
-take it without a change on both sides.
+**The largest remaining win was inlining, not folding, and it has been taken.**
+The slots no fold can reach are cheaper carried inline by the final proof than
+proven as a group at all: one group is one recursion, 53.087 s, where eleven
+mainnet slots of complement work is under ten. The inline tail was capped at four
+slots on the pre-recursion reasoning that "a group is one floor either way".
+Lifting that cap takes the modelled `T2 - T` on epoch 430529 from **112.8 s to
+67.8 s** on the same two cards, with the final proof absorbing nothing —
+`lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529` prices both shapes
+against each other on the real epoch's per-slot numbers, offline.
 
-What it is sensitive to:
+The daemon had to change with it: `stream.rs` hardcoded the final proof's tail to
+the crossing slot and threw `StreamPlan::tail` away, so the plan's choice never
+reached the prover. It reads the plan now, clamped below by what the running
+aggregate already covers.
+
+**This is a model, and no prover has run it.** The last GPU exited before the
+change was written. What is measured about it is that the schedule reproduces on
+real fixture data and that the daemon executes the shape end to end against a
+mock node; what is not measured is a stream-final proof over eleven inline slots
+on a card.
+
+What it is sensitive to — today's model, all at the 4-card budget:
 
 | | `T2 - T` | GPUs |
 |---|---:|---:|
-| **recursion 53.087 s per child (measured)** | **117.7 s** | **2** |
+| **recursion 53.087 s per child (measured)** | **67.8 s** | **2** |
 | recursion 5 s per child | 11.8 s | 2 |
 | recursion 1 s per child | 6.5 s | 2 |
 | recursion 0 s per child (what the model used to assume) | 5.5 s | 1 |
-| stage floor 2.43 s (an empty guest) | 115.0 s | 2 |
-| **stage floor 3.64 s (measured)** | **117.7 s** | **2** |
-| stage floor 20.00 s | 135.4 s | 2 |
-| Fp2-tower rate 162M units/s (the slow bracket) | 118.5 s | 2 |
-| Fp2-tower rate 400M units/s (the fast end) | 115.8 s | 2 |
+| stage floor 2.43 s (an empty guest) | 65.6 s | 2 |
+| **stage floor 3.64 s (measured)** | **67.8 s** | **2** |
+| stage floor 20.00 s | 86.3 s | 2 |
+| Fp2-tower rate 162M units/s (the slow bracket) | 70.0 s | 2 |
+| Fp2-tower rate 400M units/s (the fast end) | 62.6 s | 1 |
+
+The inline tail is now the largest term the schedule chooses, and the floor moves
+it: a 20 s floor puts thirteen slots inline and costs 18.5 s over the measured
+one, where before the cap it moved `T2 - T` by 17.7 s over the same range without
+being able to change the shape.
 
 **Recursion is the whole answer and everything else is rounding.** The stage
 floor moves `T2 - T` by 20 s across a ten-fold range; the Fp2-tower rate, which
@@ -425,8 +447,8 @@ Moving the third one there would take 53 s off `T2 - T` and is the largest
 single latency win available.
 
 **The trigger threshold dominates every prover term.** At 66 to 68% of the stake
-the epoch closes on 22 slots and `T2 - T` is 117.7 s. At 69 to 70% it waits for
-a 23rd slot and pays 133.7 s. The default is 2/3 exactly, which is the rule the
+the epoch closes on 22 slots and `T2 - T` is 67.8 s. At 69 to 70% it waits for a
+23rd slot and pays 83.7 s. The default is 2/3 exactly, which is the rule the
 circuit enforces.
 
 **Warm and cold are different products.** The cold penalty is 5.80 s of process

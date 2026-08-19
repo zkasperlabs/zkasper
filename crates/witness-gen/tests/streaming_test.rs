@@ -57,6 +57,26 @@ fn folded(plan: &streaming::StreamPlan) -> streaming::StreamPlan {
     }
 }
 
+/// The same plan cut into a group proof plus the crossing slot inline.
+///
+/// The schedule stopped choosing this shape: a group the final proof has to
+/// absorb is a recursion, and the slots under it are complement work, so on an
+/// epoch this small it inlines the lot and emits no group at all. The tests that
+/// are about what a *group* proves, or what a fold binds, need one anyway.
+fn grouped(plan: &streaming::StreamPlan) -> streaming::StreamPlan {
+    let mut units: Vec<usize> = plan.groups.concat();
+    units.extend(plan.tail.iter().copied());
+    units.sort_unstable();
+    let last = units.pop().expect("a planned epoch");
+    streaming::StreamPlan {
+        groups: vec![units],
+        folds: Vec::new(),
+        absorbed: vec![0],
+        tail: vec![last],
+        ..plan.clone()
+    }
+}
+
 fn run(fixture: &Fixture, plan: &streaming::StreamPlan) -> streaming::StreamRun {
     streaming::run_native(
         &fixture.context,
@@ -84,11 +104,12 @@ fn streaming_pipeline_justifies_and_finalizes() {
 
     assert!(plan.threshold_reached);
     // 70% of 16 validators is 11.2, so the 6th committee — the 12th validator —
-    // is the one that crosses, and nothing after it is proven at all.
-    assert_eq!(plan.tail, vec![5]);
-    assert!(plan.groups.concat().iter().all(|&i| i < 5));
+    // is the one that crosses, and nothing after it is proven at all. All six go
+    // inline: an epoch this small has nothing a group would save.
+    assert_eq!(plan.tail, vec![0, 1, 2, 3, 4, 5]);
+    assert!(plan.groups.is_empty());
 
-    let run = run(&fixture, &folded(&plan));
+    let run = run(&fixture, &folded(&grouped(&plan)));
 
     assert_eq!(run.final_output.justified_epoch, EPOCH);
     assert_eq!(run.final_output.justified_root, fixture.context.target_root);
@@ -131,7 +152,7 @@ fn an_empty_first_slot_still_finalizes() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &folded(&plan));
+    let run = run(&fixture, &folded(&grouped(&plan)));
 
     assert_eq!(run.final_output.finalized_epoch, EPOCH - 1);
     assert_eq!(run.final_output.finalized_root, fixture.epoch.previous_root);
@@ -165,7 +186,7 @@ fn an_accumulator_built_off_another_state_is_rejected() {
     forged.context.epoch_diff.state_root_1 = [0xAB; 32];
 
     let message = rejection("an accumulator off another state was accepted", || {
-        run(&forged, &folded(&plan));
+        run(&forged, &folded(&grouped(&plan)));
     });
     assert!(
         message.contains("built from a different state than the boundary"),
@@ -196,6 +217,7 @@ fn a_bad_signature_survives_its_group_proof_and_fails_the_final_one() {
 
     // The group proof accepts it. It only ever claimed committee membership and
     // balances.
+    let plan = grouped(&plan);
     let members: Vec<&SlotComplement> = plan.groups[0].iter().map(|&i| &fixture.units[i]).collect();
     let witness = streaming::group_witness(
         &fixture.context,
@@ -226,7 +248,7 @@ fn a_groups_balance_cannot_be_counted_without_its_pairings() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &folded(&plan));
+    let run = run(&fixture, &folded(&grouped(&plan)));
 
     // Swap in the identity for the aggregate's Miller accumulator — the value a
     // prover would want if it hoped to count balances whose signatures it does
@@ -297,14 +319,19 @@ fn a_slot_cannot_be_counted_by_two_groups() {
     );
 }
 
-/// The critical path is one proof deep, and it holds one slot.
+/// The critical path is one proof deep, and it verifies no child.
 ///
 /// This is the claim the whole design rests on, so it is asserted rather than
 /// left to the benchmark script: whatever the epoch's size, what runs after the
-/// last attestation is a single proof over a single committee's complement, and
-/// the schedule puts nothing else there.
+/// last attestation is a single proof, and the schedule puts nothing else there.
+///
+/// How many slots that proof carries inline is the schedule's business and is
+/// not asserted — it is one when a fold got most of the epoch away first and the
+/// whole epoch when nothing did. What must not appear is a group proof the final
+/// one has to verify, which is a recursion where the slots under it are
+/// complement work.
 #[test]
-fn only_one_proof_and_one_slot_sit_after_the_last_attestation() {
+fn only_one_proof_sits_after_the_last_attestation() {
     let fixture = fixture();
     let schedule = streaming::schedule(
         &fixture.units,
@@ -313,7 +340,8 @@ fn only_one_proof_and_one_slot_sit_after_the_last_attestation() {
     );
     let run = run(&fixture, &schedule.plan);
 
-    assert_eq!(run.final_witness.tail.len(), 1);
+    assert_eq!(run.final_witness.tail.len(), schedule.plan.tail.len());
+    assert!(run.final_witness.groups.is_empty());
 
     let last = fixture.units[*schedule.plan.tail.last().unwrap()].slot;
     let arrival = (last - fixture.units[0].slot) as f64 * 12.0;
@@ -336,7 +364,7 @@ fn an_aggregate_from_another_checkpoint_is_rejected() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &folded(&plan));
+    let run = run(&fixture, &folded(&grouped(&plan)));
 
     let mut forged = run.final_witness.clone();
     forged.aggregate.as_mut().unwrap().target_root = [0xEE; 32];
@@ -358,7 +386,7 @@ fn a_partial_batch_justification_is_rejected() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &folded(&plan));
+    let run = run(&fixture, &folded(&grouped(&plan)));
 
     let mut forged = run.final_witness.clone();
     match &mut forged.previous_justification {
@@ -396,8 +424,12 @@ fn group_proofs_do_not_depend_on_each_other() {
         )
     };
 
-    let outputs: Vec<GroupProofOutput> = plan.groups.iter().map(prove).collect();
-    let reversed: Vec<GroupProofOutput> = plan.groups.iter().rev().map(prove).collect();
+    // A group a slot. The schedule cuts nothing this way any more — it inlines
+    // an epoch this small — but what the test is about is that a group proof
+    // reads nothing outside its own members, which needs more than one group.
+    let groups: Vec<Vec<usize>> = grouped(&plan).groups[0].iter().map(|&i| vec![i]).collect();
+    let outputs: Vec<GroupProofOutput> = groups.iter().map(prove).collect();
+    let reversed: Vec<GroupProofOutput> = groups.iter().rev().map(prove).collect();
 
     assert_eq!(
         outputs,
@@ -430,7 +462,7 @@ fn an_aggregate_pinned_to_another_program_is_refused() {
         fixture.context.total_active_balance,
         &StreamPolicy::default(),
     );
-    let run = run(&fixture, &folded(&plan));
+    let run = run(&fixture, &folded(&grouped(&plan)));
 
     let mut forged = run.final_witness.clone();
     forged

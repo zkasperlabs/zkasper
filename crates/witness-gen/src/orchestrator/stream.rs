@@ -253,8 +253,10 @@ impl Pending {
 /// closes the epoch.
 struct Fired {
     unix_millis: u64,
-    /// Index of the unit that carried the epoch over the threshold.
-    crossing: usize,
+    /// Units the final proof carries inline, as [`streaming::plan`] cut them,
+    /// clamped to what the running aggregate does not already cover. Always ends
+    /// at the unit that carried the epoch over the threshold.
+    tail: Range<usize>,
 }
 
 /// What the tick that collects the final proof needs in order to report the
@@ -286,16 +288,36 @@ impl StreamAggregator {
         head_slot >= self.scan_end
     }
 
-    /// Index of the unit that carries the epoch over the scheduling threshold.
+    /// The units the final proof carries inline, ending at the one that carries
+    /// the epoch over the scheduling threshold.
     ///
     /// Goes through [`streaming::plan`] rather than recomputing the crossing, so
     /// the daemon and the schedule the tests pin can never disagree on where an
-    /// epoch ends.
-    fn crossing(&self, policy: &StreamPolicy) -> Option<usize> {
+    /// epoch ends — nor on how much of it the final proof swallows whole, which
+    /// this used to decide for itself by taking the crossing slot alone and
+    /// throwing [`streaming::StreamPlan::tail`] away. That cost a recursion:
+    /// everything between the aggregate and the crossing became a group the
+    /// final proof had to absorb, at
+    /// [`streaming::ProverModel::recursion_verify_s`], where inlining the same
+    /// slots is complement work and no child at all.
+    ///
+    /// Clamped below by `proved`, because the plan is cut for a prover that kept
+    /// up and `proved` is what this one actually folded. A daemon ahead of the
+    /// plan inlines only what the plan asked for; one behind it still needs a
+    /// group for the difference.
+    fn tail(&self, policy: &StreamPolicy) -> Option<Range<usize>> {
         let plan = streaming::plan(&self.units, self.context.total_active_balance, policy);
-        plan.threshold_reached
-            .then(|| plan.groups.concat().into_iter().chain(plan.tail).max())
-            .flatten()
+        if !plan.threshold_reached {
+            return None;
+        }
+        let crossing = plan
+            .groups
+            .concat()
+            .into_iter()
+            .chain(plan.tail.iter().copied())
+            .max()?;
+        let start = plan.tail.first().copied().unwrap_or(crossing + 1);
+        Some(start.max(self.proved).min(crossing + 1)..crossing + 1)
     }
 
     /// Price every slot gossip has reached as if it closed this instant.
@@ -587,16 +609,16 @@ impl EpochPipeline for StreamPipeline {
             aggregator.attesting_balance += unit.marginal_balance;
             aggregator.units.push(unit);
         }
-        let crossing = aggregator
-            .crossing(&policy)
+        let tail = aggregator
+            .tail(&policy)
             .context("the threshold moved out from under the trigger")?;
         let fired = Fired {
             unix_millis: fired_unix_millis,
-            crossing,
+            tail: tail.clone(),
         };
-        self.pending = Some(if aggregator.proved < crossing {
+        self.pending = Some(if aggregator.proved < tail.start {
             Pending::Late {
-                group: Self::start_group(engine, &aggregator, aggregator.proved..crossing),
+                group: Self::start_group(engine, &aggregator, aggregator.proved..tail.start),
                 fired,
             }
         } else {
@@ -1005,11 +1027,13 @@ impl StreamPipeline {
     ) -> Result<Pending> {
         let started = Instant::now();
         // The late group proof is the only thing the fire path does between the
-        // trigger firing and here, so this is exactly its cost — and on a daemon
-        // that opened its epoch late it is the largest term in `T2 - T`.
+        // trigger firing and here, so this is exactly its cost. Zero whenever
+        // the plan's tail covers everything the aggregate does not, which is the
+        // shape the schedule picks; a daemon that fell behind its own plan is
+        // what puts a group here, and then this is the largest term in `T2 - T`.
         let late_group_millis = now_unix_millis().saturating_sub(fired.unix_millis);
         let target_epoch = aggregator.context.target_epoch;
-        let tail: Vec<&SlotComplement> = vec![&aggregator.units[fired.crossing]];
+        let tail: Vec<&SlotComplement> = aggregator.units[fired.tail.clone()].iter().collect();
         let tail_named = tail.iter().map(|u| u.named_indices.len()).sum();
 
         let (groups, group_proofs, group_millers) = match late {

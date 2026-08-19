@@ -36,23 +36,31 @@
 //! after `T` is a second floor in series with it. So the crossing slot goes
 //! inline into the final proof rather than into a group of its own — and so does
 //! every slot behind it that a group could not have finished in a slot's time,
-//! which is what [`StreamPlan::tail`] is for. At the measured 7.18 s floor a
-//! one-slot group fits inside a 12 s slot and the tail is one slot; a floor
-//! above about 11 s makes it two, and the schedule finds the boundary rather
-//! than assuming it.
+//! which is what [`StreamPlan::tail`] is for. How far back that reaches is a
+//! recursion question rather than a slack one — see below — and the schedule
+//! finds the boundary rather than assuming it: on mainnet 430529 at the measured
+//! floor it inlines the last eleven slots.
 //!
 //! # And exactly two recursions do, which is now the whole of `T2 − T`
 //!
 //! A child costs [`ProverModel::recursion_verify_s`] — 53.087 s, MEASURED —
 //! against a 3.640 s floor, so the sentences above are true and no longer the
-//! point. `T2 − T` on a mainnet epoch is **117.7 s**, of which 106 is two
-//! recursive verifications the final proof cannot skip: the running aggregate,
-//! and the previous epoch's justification. Everything the schedule chooses —
-//! how to cut the groups, how many cards, where the tail begins — is the
-//! remaining twelve.
+//! point. `T2 − T` on mainnet 430529 is **67.8 s**, of which 53 is the one
+//! recursive verification [`ProverModel::final_s`] charges a folded final proof:
+//! the running aggregate the epoch was folded into. It was 112.8 s while the
+//! epoch's end had to be a second child on top of that, and the two together
+//! were 106 of it. How to cut the groups and how many cards to use is the rest,
+//! and it is small. Where the tail begins is not: it decides whether there is a
+//! group left for the final proof to absorb at all.
 //!
-//! Two things follow, and they are the opposite of what a free recursion
+//! Three things follow, and they are the opposite of what a free recursion
 //! implied.
+//!
+//! **A slot is cheaper inline than in a group the final proof absorbs.** Eleven
+//! mainnet slots of complement work is under ten seconds against 53 s for the
+//! child. [`StreamPlan::tail`] used to stop at four slots on the pre-recursion
+//! reasoning that a group is one floor either way; lifting that takes modelled
+//! `T2 − T` on 430529 from 112.8 s to 67.8 s, with nothing left to absorb.
 //!
 //! **A fold is worth its floor now.** It used to buy nothing: absorbing a group
 //! into the final proof was free, so a fold was a wasted floor and the schedule
@@ -797,6 +805,21 @@ pub fn schedule(
     total_active_balance: u64,
     policy: &StreamPolicy,
 ) -> Schedule {
+    schedule_capped(units, total_active_balance, policy, usize::MAX)
+}
+
+/// The same, with the inline tail capped at `max_tail` units.
+///
+/// The cap is not a policy: nothing outside the tests sets one, because a group
+/// the final proof has to absorb costs a recursion and inlining its slots does
+/// not. It is here so the tests can price the shape the old bound forced against
+/// the shape the search picks without one, on the same units.
+fn schedule_capped(
+    units: &[SlotComplement],
+    total_active_balance: u64,
+    policy: &StreamPolicy,
+    max_tail: usize,
+) -> Schedule {
     (1..=policy.lanes.max(1))
         .map(|lanes| {
             with_lanes(
@@ -806,6 +829,7 @@ pub fn schedule(
                     lanes,
                     ..policy.clone()
                 },
+                max_tail,
             )
         })
         .min_by(better)
@@ -833,6 +857,7 @@ fn with_lanes(
     units: &[SlotComplement],
     total_active_balance: u64,
     policy: &StreamPolicy,
+    max_tail: usize,
 ) -> Schedule {
     if units.is_empty() {
         return Schedule {
@@ -881,14 +906,15 @@ fn with_lanes(
     let last = crossing.unwrap_or(units.len() - 1);
     let attesting_balance = units[..=last].iter().map(|u| u.marginal_balance).sum();
 
-    // How much of the epoch's end the final proof swallows whole. Past four
-    // slots the tail is always worse than a group: the group has slack the tail
-    // does not, and a group is one floor either way.
-    const MAX_TAIL: usize = 4;
-
-    let best = (0..=MAX_TAIL.min(last))
+    // How much of the epoch's end the final proof swallows whole. This stopped
+    // at four slots, on the pre-recursion reasoning that a group has slack the
+    // tail does not and a group is one floor either way. A group the final proof
+    // absorbs is a recursion — 53.087 s — where eleven mainnet slots of
+    // complement work is under ten, so that bound was buying a child nothing
+    // needed. Every split is priced now, up to the whole epoch inline.
+    let best = (0..=max_tail.min(last + 1))
         .flat_map(|inline| {
-            let head: Vec<usize> = (0..=last - inline).collect();
+            let head: Vec<usize> = (0..last + 1 - inline).collect();
             let tail: Vec<usize> = (last + 1 - inline..=last).collect();
             search(units, &head, &arrival, policy)
                 .into_iter()
@@ -1593,6 +1619,67 @@ mod tests {
         (0..32).map(|s| unit(s, 4, 200)).collect()
     }
 
+    /// Mainnet epoch 430529, as `test_ssz_file_streaming_schedule` collects it
+    /// off the real state: per slot in order, the balance the slot adds, the
+    /// accumulator leaves its complement opens, and the distinct messages its
+    /// aggregates carry. Those three are everything the schedule reads.
+    ///
+    /// Slot 22 names 3,217 rather than the usual 130 because it is the slot
+    /// after the crossing: its attestations were still arriving when the epoch
+    /// had already reached 2/3, so almost the whole committee is an absentee.
+    /// Nothing past the crossing is planned, so it never costs anything — it is
+    /// here because the table is the epoch, not a selection from it.
+    const EPOCH_430529: [(u64, usize, usize); 32] = [
+        (1_158_202_000_000_000, 334, 1),
+        (1_159_671_000_000_000, 164, 2),
+        (1_153_285_000_000_000, 156, 3),
+        (1_139_019_000_000_000, 163, 2),
+        (1_133_502_000_000_000, 307, 2),
+        (1_167_186_000_000_000, 148, 2),
+        (1_169_663_000_000_000, 100, 3),
+        (1_145_431_000_000_000, 131, 2),
+        (1_159_051_000_000_000, 125, 2),
+        (1_171_215_000_000_000, 137, 2),
+        (1_168_928_000_000_000, 160, 5),
+        (1_121_872_000_000_000, 156, 3),
+        (1_171_665_000_000_000, 142, 5),
+        (1_182_402_000_000_000, 121, 1),
+        (1_167_144_000_000_000, 126, 3),
+        (1_146_052_000_000_000, 106, 3),
+        (1_152_138_000_000_000, 123, 2),
+        (1_194_602_000_000_000, 150, 2),
+        (1_152_297_000_000_000, 159, 2),
+        (1_172_182_000_000_000, 133, 4),
+        (1_114_103_000_000_000, 147, 4),
+        (1_170_813_000_000_000, 124, 3),
+        (1_156_845_000_000_000, 3217, 5),
+        (1_131_775_000_000_000, 121, 6),
+        (1_155_226_000_000_000, 112, 3),
+        (1_180_905_000_000_000, 120, 4),
+        (1_156_402_000_000_000, 108, 3),
+        (1_176_109_000_000_000, 99, 3),
+        (1_145_475_000_000_000, 95, 3),
+        (1_178_040_000_000_000, 186, 2),
+        (1_143_521_000_000_000, 102, 2),
+        (1_151_313_000_000_000, 136, 2),
+    ];
+
+    /// Total active balance at epoch 430529: 37.17M ETH over 960,974 validators.
+    const TOTAL_ACTIVE_BALANCE_430529: u64 = 37_172_277_000_000_000;
+
+    fn epoch_430529() -> Vec<SlotComplement> {
+        EPOCH_430529
+            .iter()
+            .enumerate()
+            .map(|(slot, &(balance, named, messages))| {
+                let mut unit = unit(slot as u64, balance, named);
+                let primary = unit.witness.primary[0].clone();
+                unit.witness.secondary = vec![primary; messages - 1];
+                unit
+            })
+            .collect()
+    }
+
     fn with_floor(stage_floor_s: f64) -> StreamPolicy {
         StreamPolicy {
             prover: ProverModel {
@@ -1645,18 +1732,20 @@ mod tests {
         assert_eq!(after, vec![Stage::Final, Stage::Wrap]);
     }
 
-    /// A slot goes inline when no group could have finished it in the slot's
-    /// worth of slack, so where the tail ends is a function of the floor. At the
-    /// measured 7.18 s a one-slot group still fits inside a 12 s slot; the old
-    /// model's 789M cost units were 12.2 s of prover time and did not.
+    /// Where the tail ends is still a function of the floor, for a different
+    /// reason than it used to be. It was the slack a one-slot group needs; with
+    /// nothing left for the final proof to absorb it is the fold chain's
+    /// deadline instead — a dearer floor is a dearer group *and* a dearer fold,
+    /// so the group has to cover less of the epoch to land before `T`, and what
+    /// it gives up goes inline.
     #[test]
     fn a_bigger_floor_pushes_another_slot_into_the_tail() {
         let units = even_epoch();
         let measured = schedule(&units, 100, &with_floor(MEASURED_FLOOR_S));
         let doubled = schedule(&units, 100, &with_floor(2.0 * MEASURED_FLOOR_S));
 
-        assert_eq!(measured.plan.tail.len(), 1);
-        assert_eq!(doubled.plan.tail.len(), 2);
+        assert_eq!(measured.plan.tail.len(), 11);
+        assert_eq!(doubled.plan.tail.len(), 12);
         assert!(doubled.latency_s() > measured.latency_s());
     }
 
@@ -1703,10 +1792,14 @@ mod tests {
             0.0,
             "the committee proof is late"
         );
-        assert_eq!(
-            with.lanes, without.lanes,
-            "the committee proof took a card of its own",
-        );
+        // It does take a card of its own here, and that is the change rather
+        // than a regression: the epoch's own work is one group, one fold and one
+        // final proof in series on a single card now, so there is no idle card
+        // left to fill and no gap in the busy one wide enough for 140 s. What it
+        // costs is that card's idle time, not `T2` — which is what the equality
+        // above says.
+        assert_eq!(without.lanes, 1);
+        assert_eq!(with.lanes, 2);
     }
 
     #[test]
@@ -1884,27 +1977,38 @@ mod tests {
         (0..32).map(|s| unit(s, 1_000_000, 130)).collect()
     }
 
-    /// **`late_groups = 1` is the plan, not a shortfall.** The schedule's own
-    /// optimum leaves the last group unfolded for the final proof to absorb,
-    /// and the published `T2 - T` is the latency of doing exactly that.
+    /// **`late_groups = 0` is the plan, and it used to be 1.** The optimum left
+    /// the last group unfolded for the final proof to absorb, because the tail
+    /// was capped at four slots and the rest of the epoch's end had to go
+    /// somewhere. Uncapped, the same slots go inline and there is no group left
+    /// to absorb — the same work without the 53 s child.
     ///
-    /// This is worth pinning because the field is named for the failure mode
-    /// rather than for the design: a daemon reporting `late_groups = 1` is
-    /// running the shape the model chose, and one reporting 0 has either folded
-    /// a group it should have absorbed or inlined it instead.
+    /// This is worth pinning from both sides because the field is named for the
+    /// failure mode rather than for the design, and the reading of it has
+    /// inverted: a daemon reporting `late_groups = 1` is now a daemon that fell
+    /// behind the plan, not one running the shape the model chose.
     #[test]
-    fn the_last_group_is_absorbed_by_design() {
-        let schedule = schedule(&mainnet_shaped(), 32_000_000, &StreamPolicy::default());
-        assert_eq!(
-            schedule.plan.absorbed.len(),
-            1,
-            "the optimum absorbs exactly one group: {:?}",
+    fn nothing_is_left_for_the_final_proof_to_absorb() {
+        let units = mainnet_shaped();
+        let schedule = schedule(&units, 32_000_000, &StreamPolicy::default());
+        assert!(
+            schedule.plan.absorbed.is_empty(),
+            "the optimum absorbs nothing: {:?}",
             schedule.plan,
         );
         assert_eq!(
             schedule.plan.folds.len(),
             1,
-            "and folds everything below it"
+            "and folds everything below the tail"
+        );
+
+        let capped = schedule_capped(&units, 32_000_000, &StreamPolicy::default(), 4);
+        assert_eq!(capped.plan.absorbed.len(), 1);
+        assert!(
+            capped.latency_s() - schedule.latency_s() > 40.0,
+            "capped at four slots {:.1}s against uncapped {:.1}s",
+            capped.latency_s(),
+            schedule.latency_s(),
         );
     }
 
@@ -1913,9 +2017,9 @@ mod tests {
     /// of the final proof rather than inside it.
     ///
     /// A group whose last slot arrives within `fold_s(1)` of `T` therefore
-    /// cannot be folded in time *and* would cost more if it could — so there is
-    /// always a last group in this position, and `late_groups >= 1` is the right
-    /// answer rather than a throughput symptom.
+    /// cannot be folded in time *and* would cost more if it could. Which is why
+    /// the answer is neither: the slots go inline instead, and the test below is
+    /// the one that decides the shape.
     #[test]
     fn folding_the_last_group_costs_a_floor_and_a_recursion_more() {
         let m = ProverModel::default();
@@ -1932,10 +2036,10 @@ mod tests {
     /// than as a group at all. A group is one recursion — 53.087 s — where
     /// eleven mainnet slots of complement work is under ten.
     ///
-    /// `MAX_TAIL` caps the inline tail at four slots, on the pre-recursion
+    /// The inline tail used to stop at four slots, on the pre-recursion
     /// reasoning that "a group is one floor either way". A child is fifteen
-    /// floors now, so that bound is the binding constraint on `T2 - T` rather
-    /// than a safe simplification.
+    /// floors, so that bound was the binding constraint on `T2 - T` rather than
+    /// a safe simplification, and it is gone.
     #[test]
     fn inlining_the_unfoldable_slots_beats_absorbing_them_as_a_group() {
         let m = ProverModel::default();
@@ -1945,6 +2049,49 @@ mod tests {
             absorbed - inline > 40.0,
             "inline {inline:.2}s against absorbed {absorbed:.2}s",
         );
+    }
+
+    /// The same thing on the real epoch rather than a shape like it, priced both
+    /// ways so the win is measured and not asserted.
+    ///
+    /// Both schedules come out of `schedule_capped` on the same units and the
+    /// same policy — the 4-card budget, the measured 3.640 s floor, the active
+    /// set as the committee proof's size — and the only difference is the bound
+    /// on the inline tail. Capped at four, the epoch's end is a group the final
+    /// proof has to absorb: 112.8 s. Uncapped, the same eleven slots go inline
+    /// and there is no child at all: 67.8 s.
+    ///
+    /// `test_ssz_file_streaming_schedule` prints exactly these two numbers off
+    /// the 320 MB state download that [`EPOCH_430529`] was taken from; this runs
+    /// offline.
+    #[test]
+    fn lifting_the_tail_cap_is_worth_a_recursion_on_mainnet_430529() {
+        let units = epoch_430529();
+        let policy = StreamPolicy {
+            lanes: 4,
+            validators: 960_974.0,
+            ..StreamPolicy::default()
+        };
+        let capped = schedule_capped(&units, TOTAL_ACTIVE_BALANCE_430529, &policy, 4);
+        let uncapped = schedule(&units, TOTAL_ACTIVE_BALANCE_430529, &policy);
+
+        assert_eq!(capped.plan.tail.len(), 1);
+        assert_eq!(capped.plan.absorbed.len(), 1);
+        assert_eq!(uncapped.plan.tail.len(), 11);
+        assert!(
+            uncapped.plan.absorbed.is_empty(),
+            "still a group to absorb: {:?}",
+            uncapped.plan,
+        );
+
+        // In tenths, because that is the precision the constants underneath
+        // carry and the precision `better` compares at.
+        assert_eq!((capped.latency_s() * 10.0).round(), 1128.0);
+        assert_eq!((uncapped.latency_s() * 10.0).round(), 678.0);
+
+        // And it is cheaper, not a latency-for-throughput trade: a group's floor
+        // and its complement work both leave the epoch with the group.
+        assert!(uncapped.total_prover_s < capped.total_prover_s);
     }
 
     /// A quarter of the validators offline: the threshold is never reached, and
