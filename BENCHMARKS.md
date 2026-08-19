@@ -21,6 +21,7 @@ ZISK_BIN=/path/to/other/zisk/bin python3 scripts/bench.py
 python3 scripts/fit_gpu_bench.py          # floor and slope, from a proving sweep
 python3 scripts/time_model.py             # the seconds model
 python3 scripts/committee_bench.py        # one committee strategy, in a minute
+python3 scripts/shuffle_bench.py          # the validator shuffle, every way
 ```
 
 The toolchain and `ziskos` must match. v1.1.0-alpha changed the guest linker
@@ -183,6 +184,70 @@ re-basing multiplies the cost units of this guest by exactly 2.669 at every one
 of the 29 sizes. Only 1.26x of it is throughput. What is unambiguous is the
 wall clock on identical work: `n = 10,000` proves in 2.92 s against 5.29 s, and
 `n = 1,000,000` in 32.29 s against 107.38 s.
+
+### The integer-and-memory rate, and one step is not one step
+
+`scripts/shuffle_bench.py` proves four guests of different mixes at sizes from
+1.2M to 587M executed steps, 18 points, 3 warm proves each, one RTX 5090. It
+gives the rate the model has never had: what a plain RISC-V instruction costs
+when nothing else is happening.
+
+| work class | ns per executed step | M cost units/s |
+|---|---:|---:|
+| integer/memory — bit-sliced shuffle, 5 sizes | **196–206** | 544–589 |
+| integer/memory — whole-set `u32` shuffle, 3 sizes | 196–205 | 600–629 |
+| poseidon2-bound — committee proof over 65,536 members | 595 | 256 |
+| sha256-bound — `compute_shuffled_index` per validator | 1,407–1,446 | 227–234 |
+
+OLS over the bit-sliced family: **seconds = 2.158 + 206.11 ns × executed
+steps**, equivalently 2.238 s + units / 543.9M.
+
+**A step that drives a precompile is worth thirty of a step that does not**, so
+executed steps are no more a portable currency than cost units are. Within one
+work class either predicts well; across classes neither does. The 5.23x spread
+in this table is the same phenomenon as the 18M-to-246M spread above, read on
+the other axis.
+
+**The card matches production.** The committee-bench guest over 65,536 members
+proves in 11.14–11.75 s here; scaled to 901,001 members with `STAGE_FLOOR_S`
+held out that is **115.1 s against the production committee proof's 115.2 s**.
+
+### The validator shuffle, if it is ever proven in circuit
+
+`crates/shuffle-bench-guest` computes each validator's assigned slot every way
+worth computing it, and `V_SELFTEST` holds them all to a transcription of
+`compute_shuffled_index`. Marginal cost per active validator, `ziskemu -X`:
+
+| | steps | cost units | sha256 |
+|---|---:|---:|---:|
+| `compute_shuffled_index`, per validator, as the spec writes it | 7,626.1 | 2,504,734 | 180 |
+| whole-set swap-or-not over a `u32` index array | 593.9 | 73,090 | 0.176 |
+| the same permutation over 5-bit slot labels | 560.9 | 55,759 | 0.176 |
+| the same, bit-sliced into five bitplanes | **225.7** | **24,879** | 0.176 |
+
+Proved at the 901,001-validator mainnet active set: **115.3 s** for the
+client-standard form, **91.7 s** for the labels, **44.2 s** bit-sliced, against
+**10,207 s** for the spec's own per-validator formulation. It is 6.1% hashing
+and 60% `Main`, so instruction count is the only lever on it.
+
+`zkasper-pm/technical/shuffle-proof-cost.md` carries the campaign and what it
+decides.
+
+### A 587M-step proof fits on one card
+
+The largest single proof in the earlier campaign was 357M executed steps. The
+shuffle guest was pushed past it deliberately, because the fused
+committee-plus-shuffle proof was believed not to fit:
+
+| executed steps | `Proof generated` | VRAM allocated |
+|---:|---:|---:|
+| 203,707,056 | 44.2 s | 29.35 GB |
+| 316,298,922 | 70.4 s | 29.35 GB |
+| 406,510,329 | 92.8 s | 29.35 GB |
+| **586,901,161** | **138.7 s** | 29.35 GB |
+
+Allocation is flat because the prover reads free VRAM and fills it. Step count
+does not decide whether a proof fits, at least up to 587M on a 31.36 GB card.
 
 ## The warm prover, on a card
 

@@ -13,6 +13,7 @@ members = [
     "crates/bench-guest",
     "crates/committee-bench-guest",
     "crates/recursion-bench-guest",
+    "crates/shuffle-bench-guest",
 ]
 resolver = "2"
 

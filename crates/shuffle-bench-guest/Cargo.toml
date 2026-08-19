@@ -1,0 +1,11 @@
+[package]
+name = "zkasper-shuffle-bench-guest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkasper-shuffle-bench-guest"
+path = "src/main.rs"
+
+[dependencies]
+ziskos = { workspace = true }
