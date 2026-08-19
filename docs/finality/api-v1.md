@@ -105,11 +105,13 @@ happens before `T`.
   "threshold_unix_millis": 1755525130000,
   "observed_unix_millis": 1755525130800,
   "observation_millis": 800,
+  "blocked_millis": 1100,
   "fired_unix_millis": 1755525132000,
   "proof_unix_millis": 1755525140400,
   "t2_minus_t_millis": 10400,
-  "wait_millis": 1200,
+  "wait_millis": 100,
   "late_group_millis": 0,
+  "final_proof_millis": 8400,
   "tail": 1,
   "tail_named": 14,
   "folded_groups": 6,
@@ -133,15 +135,36 @@ every proof. Over 36 measured mainnet epochs the notice came a median 99 s after
 the crossing slot began, and 550 s after it once. If you recorded figures from an older daemon, they are
 short by that much and are not comparable with these.
 
-`t2_minus_t_millis` splits into four, in order and without overlap:
-`observation_millis`, the daemon not looking; `wait_millis`, the trigger holding
-back once it has; `late_group_millis`, proving the backlog the epoch opened with;
-and the final proof itself, which is the remainder.
+`t2_minus_t_millis` splits into **five**, in order and without overlap, and they
+sum to it exactly:
+
+| term | what the daemon was doing |
+|---|---|
+| `observation_millis` | not looking: the chain had crossed and the gossip had not arrived, or the tick had not come round |
+| `blocked_millis` | looking, and unable to act — the prover was finishing a proof it started before the crossing |
+| `wait_millis` | free to fire and choosing not to, for attestations still in flight |
+| `late_group_millis` | proving a backlog group the fire path could not skip |
+| `final_proof_millis` | proving the epoch |
+
+**`blocked_millis` and `final_proof_millis` are new on 2026-08-19, and
+`wait_millis` changed meaning.** It was `fired - observed`, which contained the
+prover's whole backlog: on the live run it read 27-30 s, matched the epoch's
+group proof to within 0.6 s over 13 consecutive epochs, and once read 55 s
+against a 10 s cap. That interval is `blocked_millis` now. Figures recorded from
+an older daemon have the two added together under the name `wait_millis`, and
+are not comparable with these.
 
 `wait_millis` is bounded twice over — by `--max-trigger-wait-millis` (10 s by
 default) and by what the tail is worth, since `tail_named` leaves cost
 `tail_named x 1.5365 ms` to open and a wait can never buy back more than that.
 A value far above either bound means a proof is being charged to the trigger.
+It is a **79 ms median** on the live run.
+
+`blocked_millis` and `late_group_millis` are the same backlog on the two sides
+of the fire: a group already running when the chain crossed lands in the first,
+a group the fire path has to start lands in the second, and a few hundred
+milliseconds decide which. Read them together — their sum is what the backlog
+cost, and neither is a wait.
 
 `late_group_millis` and `late_groups` above zero both say the same thing: the
 daemon fell behind the plan it fired on, far enough that the final proof could
@@ -484,7 +507,7 @@ Every `data` object carries `seq` and `unix_millis`.
 | `stage.started` | a proof starts | `{seq, unix_millis, epoch, stage, slot, index}` |
 | `stage.finished` | a proof lands | `{seq, unix_millis, epoch, stage, slot, index, millis, prove_millis, wrap_millis, witness, proof_bytes}` |
 | `threshold.crossed` | the daemon notices the crossing, which is not `T` | `{seq, unix_millis, epoch, observed_unix_millis, attesting_balance, total_active_balance, attesting_pct}` |
-| `threshold.fired` | the trigger fires | `{seq, unix_millis, epoch, fired_unix_millis, wait_millis, late_group_millis, tail, tail_named, late_groups}` |
+| `threshold.fired` | the trigger fires | `{seq, unix_millis, epoch, fired_unix_millis, blocked_millis, wait_millis, late_group_millis, tail, tail_named, late_groups}` |
 | `proof.landed` | `T2` | `{seq, unix_millis, epoch, proof, public_inputs, latency}` |
 | `posting.landed` | a proof is verified on another chain | `{seq, unix_millis, epoch, posting}` |
 | `epoch.closed` | epoch finished | `{seq, unix_millis, epoch, summary}` — `summary` is the `/v1/epochs` entry |
