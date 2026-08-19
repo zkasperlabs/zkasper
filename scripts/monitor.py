@@ -108,12 +108,19 @@ def daemon():
 
     out, age = [], time.time() - s.get("updated_unix", 0)
     beat = heartbeat_age()
-    alive = beat is not None and beat <= HEARTBEAT_STALE_S
-    out.append(check("daemon", alive if beat is not None else age <= STALE_S,
+    # No endpoint is a failure, not a reading to be taken another way. A process
+    # in /proc is not liveness: a run that has already ended stays there, threads
+    # and all, until the runtime finishes waiting on the blocking work it
+    # started, and for the whole of that it serves no metrics. Falling back to
+    # the manifest here is what reported a dead run as
+    # "ok daemon ... no heartbeat endpoint" on 2026-08-19, three crashes in a
+    # row. If the daemon is not answering, that is the finding.
+    out.append(check("daemon", beat is not None and beat <= HEARTBEAT_STALE_S,
                      f"epoch {(s.get('accumulator') or {}).get('epoch')}, "
                      f"head {s.get('head_slot')}, "
                      + (f"heartbeat {beat:.0f}s ago" if beat is not None
-                        else "no heartbeat endpoint")))
+                        else "no heartbeat endpoint: the process is not serving metrics, "
+                             "which is what a shutting-down or wedged daemon looks like")))
     out.append(check("pipeline", age <= STALE_S,
                      f"last stage finished {age:.0f}s ago"))
 

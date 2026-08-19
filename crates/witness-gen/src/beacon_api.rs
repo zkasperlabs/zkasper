@@ -16,6 +16,16 @@
 use anyhow::{bail, Context, Result};
 use zkasper_common::types::{BlockHeaderFields, Checkpoint};
 
+/// How a beacon node says it has thrown a state away, and what a caller says on
+/// its behalf when [`BeaconApi::get_state_ssz`] folded that 404 into `None`.
+///
+/// The orchestrator tells a dropped state from a real fault by this string —
+/// see `orchestrator::accumulator::is_pruned_state` — because a node gives
+/// nothing else to match on. A caller that turns the 404 into an `Option` has to
+/// put it back, or the one condition an operator can actually act on arrives
+/// looking like a consensus failure.
+pub const STATE_NOT_SERVED: &str = "NOT_FOUND: beacon state at slot";
+
 /// Trait abstracting beacon API access. Implement this for mock-based testing.
 #[async_trait::async_trait]
 pub trait BeaconApi {

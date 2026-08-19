@@ -278,6 +278,59 @@ fn vector_root_and_proof(data: &[u8], count: usize, index: usize) -> ([u8; 32], 
 }
 
 /// Read the slot (field 2) directly from raw SSZ — always at offset 40 (8 + 32).
+/// A structurally valid BeaconState holding nothing but its slot and the two
+/// entries a boundary is opened from.
+///
+/// For tests that need the parser to actually run. Every variable-length field
+/// is empty and every other fixed field is zero, so the root it hashes to is a
+/// real root of a real — if empty — state: which is exactly the point, because
+/// it is not a root any block header carries.
+#[cfg(test)]
+pub(crate) fn empty_state_ssz(
+    config: &ChainConfig,
+    slot: u64,
+    history: &crate::state_diff::SlotHistory,
+) -> Vec<u8> {
+    let sizes = field_fixed_sizes(config.fork_at_slot(slot));
+    let count = field_count(config.fork_at_slot(slot));
+    let fixed: usize = sizes.iter().take(count).sum();
+
+    // Every variable field is an offset. All of them are empty except the
+    // execution payload header, which has a fixed portion of its own that its
+    // hash tree root reads unconditionally — an empty one panics rather than
+    // hashing to the empty root. So the offsets run in two steps: everything
+    // before it is empty at the end of the fixed portion, it takes the 584
+    // bytes after that, and everything after it is empty beyond those.
+    const PAYLOAD_HEADER_FIELD: usize = 24;
+    const PAYLOAD_HEADER_FIXED: usize = 584;
+    const PAYLOAD_EXTRA_DATA_OFFSET: usize = 436;
+
+    let mut raw = vec![0u8; fixed + PAYLOAD_HEADER_FIXED];
+    let mut cursor = 0usize;
+    for (i, &size) in sizes.iter().enumerate().take(count) {
+        if VARIABLE_FIELD_INDICES.contains(&i) {
+            let offset = match i > PAYLOAD_HEADER_FIELD {
+                true => fixed + PAYLOAD_HEADER_FIXED,
+                false => fixed,
+            };
+            raw[cursor..cursor + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+        cursor += size;
+    }
+    // The payload header's own extra_data is empty, which its offset says by
+    // pointing past the end of its fixed portion.
+    raw[fixed + PAYLOAD_EXTRA_DATA_OFFSET..fixed + PAYLOAD_EXTRA_DATA_OFFSET + 4]
+        .copy_from_slice(&(PAYLOAD_HEADER_FIXED as u32).to_le_bytes());
+    raw[40..48].copy_from_slice(&slot.to_le_bytes());
+
+    let ring = (history.slot % SLOTS_PER_HISTORICAL_ROOT) as usize;
+    let block_roots: usize = sizes.iter().take(BLOCK_ROOTS_FIELD).sum();
+    let state_roots: usize = sizes.iter().take(STATE_ROOTS_FIELD).sum();
+    raw[block_roots + ring * 32..block_roots + ring * 32 + 32].copy_from_slice(&history.block_root);
+    raw[state_roots + ring * 32..state_roots + ring * 32 + 32].copy_from_slice(&history.state_root);
+    raw
+}
+
 fn extract_slot(raw_ssz: &[u8]) -> u64 {
     u64::from_le_bytes(raw_ssz[40..48].try_into().unwrap())
 }

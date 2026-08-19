@@ -161,10 +161,22 @@ const BUCKETS: &[(&str, &[f64])] = &[
 /// Must be called from inside the Tokio runtime: the listener, the heartbeat
 /// and the process collector are all tasks on it.
 pub fn install(addr: SocketAddr) -> Result<()> {
+    // Failing to take the address is not a metrics problem, and saying so has
+    // cost an operator an hour. It is how a second daemon finds out that it is
+    // second: nothing else stops two of them running against one database and
+    // one output directory, so this bind is the mutex. On 2026-08-19 it held
+    // five restarts off a daemon that was alive and proving, and the message
+    // sent the reader to the exporter instead of to the process already up.
     configured()?
         .with_http_listener(addr)
         .install()
-        .context("install the Prometheus exporter")?;
+        .with_context(|| {
+            format!(
+                "serve Prometheus metrics on {addr}. A daemon that cannot take this address \
+                 is usually a second daemon: look for a zkasperd already running against \
+                 this output directory before suspecting the exporter"
+            )
+        })?;
     describe();
 
     // Liveness, kept apart from progress. A stage can legitimately hold the

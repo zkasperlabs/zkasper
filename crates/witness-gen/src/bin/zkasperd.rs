@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -524,6 +524,18 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // Said here rather than left to the runtime's own report, which does not
+    // print until the process is actually leaving. A speculative proof runs on a
+    // blocking task, nothing cancels one, and the runtime's shutdown waits for
+    // it — so a run that ended can stay up for the two minutes a committee
+    // proof takes, alive in /proc with every async task already dropped and the
+    // metrics endpoint with them. On 2026-08-19 that window was read three times
+    // as a healthy daemon with a broken exporter. The daemon says it here, at
+    // the instant it knows, and the silence afterwards means shutdown.
+    if let Err(error) = &result {
+        error!(error = %format!("{error:#}"), "the run is over");
+    }
 
     // The last epoch of a run is the one most worth publishing, and it is the
     // one a dropped runtime would take with it.

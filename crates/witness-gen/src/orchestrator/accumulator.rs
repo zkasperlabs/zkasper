@@ -43,7 +43,7 @@ use super::speculation::AheadDiff;
 /// Matched on the message because that is what a beacon node gives. The daemon
 /// leans on the same string being distinctive that an operator does.
 pub(super) fn is_pruned_state(error: &anyhow::Error) -> bool {
-    format!("{error:#}").contains("NOT_FOUND: beacon state at slot")
+    format!("{error:#}").contains(crate::beacon_api::STATE_NOT_SERVED)
 }
 
 impl<A: BeaconApi + ChainStatusApi> Engine<A> {
