@@ -50,7 +50,8 @@
 mod common;
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use common::{MockBeaconApi, SyntheticChain};
@@ -65,6 +66,7 @@ use zkasper_common::types::{
 };
 use zkasper_common::ChainConfig;
 
+use zkasper_witness_gen::beacon_api::HeaderResponse;
 use zkasper_witness_gen::orchestrator::{Orchestrator, OrchestratorConfig, Pipeline};
 use zkasper_witness_gen::prover::{NativeProver, Proof, Prover, Stage};
 use zkasper_witness_gen::streaming::ProverModel;
@@ -92,17 +94,89 @@ const SLOTS_TO_THRESHOLD: u64 = 3;
 /// sleeps, so any `wait_millis` at or above this can only be a group proof.
 const GROUP_PROVE: Duration = Duration::from_millis(400);
 
-/// A prover that takes measurable time to prove a group, and no time to do
-/// anything else.
+/// How long the test prover takes to fold one group into the aggregate.
+///
+/// Longer than [`GROUP_PROVE`] on purpose. A fold started after the chain has
+/// crossed is the whole of what
+/// [`test_a_group_that_lands_on_a_justifiable_epoch_is_not_folded_first`]
+/// measures, so it has to be separable from the group proof that preceded it by
+/// more than a scheduling jitter.
+const FOLD_PROVE: Duration = Duration::from_millis(1200);
+
+/// What the chain does while a group proof is running.
+///
+/// The daemon can only be blind to a crossing while it is proving, so a test
+/// about that blindness needs the head to move *inside* a proof. The prover
+/// moves it itself rather than a second task racing the loop, which makes the
+/// ordering exact: the head is up one full trigger interval before the proof it
+/// moved during can land.
+#[derive(Clone, Default)]
+struct CrossDuringGroup(Arc<Mutex<Option<Crossing>>>);
+
+struct Crossing {
+    head: Arc<Mutex<Option<HeaderResponse>>>,
+    header: HeaderResponse,
+    /// Unix ms at which the head moved: the earliest the daemon could have seen
+    /// the chain cross, and so what its observation is measured against.
+    crossed_unix_millis: Option<u64>,
+}
+
+impl CrossDuringGroup {
+    /// Move the head the next time a group is proven, and not again.
+    fn arm(&self, head: Arc<Mutex<Option<HeaderResponse>>>, header: HeaderResponse) {
+        *self.0.lock().unwrap() = Some(Crossing {
+            head,
+            header,
+            crossed_unix_millis: None,
+        });
+    }
+
+    fn take(&self) {
+        let mut armed = self.0.lock().unwrap();
+        let Some(crossing) = armed.as_mut() else {
+            return;
+        };
+        if crossing.crossed_unix_millis.is_some() {
+            return;
+        }
+        *crossing.head.lock().unwrap() = Some(crossing.header.clone());
+        crossing.crossed_unix_millis = Some(now_unix_millis());
+    }
+
+    fn crossed_unix_millis(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|crossing| crossing.crossed_unix_millis)
+            .expect("the chain crossed while a group was being proven")
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// A prover that takes measurable time to prove a group and to fold one, and no
+/// time to do anything else.
 ///
 /// Everything else delegates to [`NativeProver`], so the epoch still composes
 /// exactly as it does in the other tests — the only thing added is a cost on
-/// the one stage whose placement relative to `T` is what these tests are about.
-struct SlowGroupProver(NativeProver);
+/// the two stages whose placement relative to `T` is what these tests are about.
+struct SlowGroupProver {
+    inner: NativeProver,
+    crossing: CrossDuringGroup,
+}
 
 impl SlowGroupProver {
-    fn new(config: ChainConfig) -> Self {
-        Self(NativeProver::new(config))
+    fn new(config: ChainConfig, crossing: CrossDuringGroup) -> Self {
+        Self {
+            inner: NativeProver::new(config),
+            crossing,
+        }
     }
 }
 
@@ -112,49 +186,54 @@ impl Prover for SlowGroupProver {
     }
 
     fn program_vk(&self, stage: Stage) -> ProgramVk {
-        self.0.program_vk(stage)
+        self.inner.program_vk(stage)
     }
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)> {
-        self.0.prove_epoch_diff(witness)
+        self.inner.prove_epoch_diff(witness)
     }
 
     fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)> {
-        self.0.prove_committee(witness)
+        self.inner.prove_committee(witness)
     }
 
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)> {
-        self.0.prove_slot(witness)
+        self.inner.prove_slot(witness)
     }
 
     fn prove_justification(
         &self,
         witness: &JustificationWitness,
     ) -> Result<(JustificationOutput, Proof)> {
-        self.0.prove_justification(witness)
+        self.inner.prove_justification(witness)
     }
 
     fn prove_finalization(
         &self,
         witness: &FinalizationWitness,
     ) -> Result<(FinalizationOutput, Proof)> {
-        self.0.prove_finalization(witness)
+        self.inner.prove_finalization(witness)
     }
 
     fn prove_group(&self, witness: &SlotProofWitness) -> Result<(GroupProofOutput, Fp12, Proof)> {
+        // Before the sleep, so the tick that collects this proof has already
+        // ingested the crossing — which is what a daemon on gossip has too, its
+        // loop still running while the prover works.
+        self.crossing.take();
         std::thread::sleep(GROUP_PROVE);
-        self.0.prove_group(witness)
+        self.inner.prove_group(witness)
     }
 
     fn prove_aggregate(&self, witness: &AggregateWitness) -> Result<(AggregateOutput, Proof)> {
-        self.0.prove_aggregate(witness)
+        std::thread::sleep(FOLD_PROVE);
+        self.inner.prove_aggregate(witness)
     }
 
     fn prove_stream_final(
         &self,
         witness: &StreamFinalWitness,
     ) -> Result<(StreamFinalOutput, Proof)> {
-        self.0.prove_stream_final(witness)
+        self.inner.prove_stream_final(witness)
     }
 }
 
@@ -165,6 +244,15 @@ fn chain() -> SyntheticChain {
 /// A daemon that has justified epoch 10 the batch way and is sitting on 11,
 /// which it will stream.
 async fn streaming_daemon(dir: &Path, chain: &SyntheticChain) -> Orchestrator<MockBeaconApi> {
+    streaming_daemon_with(dir, chain, CrossDuringGroup::default()).await
+}
+
+/// The same, with a prover that moves the head while it proves a group.
+async fn streaming_daemon_with(
+    dir: &Path,
+    chain: &SyntheticChain,
+    crossing: CrossDuringGroup,
+) -> Orchestrator<MockBeaconApi> {
     let mock = chain.mock((FIRST_EPOCH + 1) * SPE);
     let config = OrchestratorConfig {
         pipeline: Pipeline::Streaming,
@@ -183,9 +271,13 @@ async fn streaming_daemon(dir: &Path, chain: &SyntheticChain) -> Orchestrator<Mo
         ),
         ..OrchestratorConfig::new(TEST_CONFIG, "test")
     };
-    let mut daemon = Orchestrator::open(mock, config, Box::new(SlowGroupProver::new(TEST_CONFIG)))
-        .await
-        .expect("orchestrator opens");
+    let mut daemon = Orchestrator::open(
+        mock,
+        config,
+        Box::new(SlowGroupProver::new(TEST_CONFIG, crossing)),
+    )
+    .await
+    .expect("orchestrator opens");
 
     daemon.catch_up().await.unwrap();
     assert_eq!(daemon.state().cursor_epoch, FIRST_EPOCH + 1);
@@ -273,12 +365,16 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
     // Which is what empties the window between `T` and the final proof. It used
     // to hold a whole group proof — the measurement that said the window could
     // not absorb a fold because it was already full of proving.
+    // A millisecond, not zero: the fire path still builds the final witness
+    // between the two stamps, and a wall clock rounds that up sometimes.
     let late_group = latency["late_group_millis"]
         .as_u64()
         .expect("late_group_millis");
-    assert_eq!(
-        late_group, 0,
-        "there is no late group left to charge to the critical path",
+    assert!(
+        late_group < GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) contains a group proof ({} ms); \
+         there is none left to charge to the critical path",
+        GROUP_PROVE.as_millis(),
     );
 
     // And it is not charged to the trigger either. This is the assertion that
@@ -463,6 +559,129 @@ async fn test_a_daemon_at_the_head_folds_every_group_before_the_threshold() {
     assert!(
         wait < GROUP_PROVE.as_millis() as u64,
         "wait_millis ({wait} ms) must not contain a group proof ({} ms)",
+        GROUP_PROVE.as_millis(),
+    );
+}
+
+/// The third case, which is neither of the two above: the chain crosses while a
+/// group is being proven, and the group lands on an epoch that is already
+/// justifiable.
+///
+/// The daemon has to do something with that group, and until 2026-08-19 it did
+/// the one thing that cannot pay — it folded it. The fold was started by
+/// `collect`, an arm below the in-flight-proof early return and so above any
+/// evaluation of the trigger, which meant a whole aggregate proof was queued
+/// against an epoch the chain had already carried over two thirds, and the
+/// daemon did not look again until that proof finished. Measured over 29
+/// steady-state mainnet epochs on the 2026-08-19 run, **42% of the 2,500 s
+/// between the chain crossing and the daemon noticing was proofs started after
+/// the crossing**, and nine of the ten were exactly this fold.
+///
+/// Folding here cannot pay, whatever the numbers: with no aggregate the final
+/// proof verifies the group directly, so the fold buys back nothing on the
+/// critical path and adds its own length to it. So the group is held instead,
+/// the trigger runs on the same tick that collected it, and the final proof
+/// takes the group whole.
+///
+/// The pipeline is not starved by that. The group still ran, the final proof
+/// still absorbs it, and the slots that closed since go inline — what stops is
+/// only the *adding* of work to an epoch that no longer needs any.
+#[tokio::test]
+async fn test_a_group_that_lands_on_a_justifiable_epoch_is_not_folded_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let crossing = CrossDuringGroup::default();
+    let mut daemon = streaming_daemon_with(dir.path(), &chain, crossing.clone()).await;
+
+    let stream_epoch = FIRST_EPOCH + 1;
+    let boundary = stream_epoch * SPE;
+    let crossing_slot = boundary + SLOTS_TO_THRESHOLD - 1;
+
+    // One slot of the epoch is on the chain, which is one attester and a quarter
+    // of the stake: not enough, so the daemon closes it and starts a group.
+    daemon.api().set_head(chain.header_at(boundary + 1));
+
+    // And the rest of the epoch arrives while that group is being proven. This
+    // is the production shape — a mainnet fold is 110 s and a slot is 12 — and
+    // the only shape in which the daemon can be holding enough to justify and
+    // not know it.
+    crossing.arm(
+        daemon.api().head_handle(),
+        chain.header_at(boundary + SLOTS_TO_THRESHOLD),
+    );
+
+    // Driven until the epoch closes rather than in one call, because a tick that
+    // collects a fold reports no progress and leaves nothing proving, so
+    // `catch_up` returns on it. One call is enough once the fold is gone; the
+    // loop is what lets the assertions below be the ones that fail.
+    let mut ticks = Vec::new();
+    for _ in 0..4 {
+        ticks.extend(daemon.catch_up().await.unwrap());
+        if ticks.iter().any(|tick| tick.justified.is_some()) {
+            break;
+        }
+    }
+    assert_eq!(
+        ticks.iter().filter_map(|t| t.justified).collect::<Vec<_>>(),
+        vec![stream_epoch],
+    );
+
+    let latency = latency(dir.path());
+    assert_eq!(latency["epoch"], stream_epoch);
+    assert_eq!(
+        latency["threshold_slot"], crossing_slot,
+        "the chain crossed on the slot that arrived while the group was proving",
+    );
+
+    // The assertion the fix exists for. Without it the daemon queued a fold on
+    // this tick and did not evaluate the trigger again until it finished.
+    assert_eq!(
+        latency["folded_groups"], 0,
+        "an epoch that is already justifiable must not have work added to it: \
+         a fold here is a whole aggregate proof between the crossing and the \
+         daemon seeing it, and takes nothing off the critical path",
+    );
+    let epoch_dir = epoch_dir(dir.path(), stream_epoch);
+    assert!(
+        !epoch_dir.join("aggregate_0.bin").exists(),
+        "an aggregate was proven for an epoch that no longer needed one",
+    );
+
+    // Which is the same thing said in time: the daemon observed the crossing
+    // without an aggregate proof in the way.
+    let observed = latency["observed_unix_millis"].as_u64().expect("observed");
+    let blind = observed - crossing.crossed_unix_millis();
+    assert!(
+        blind < FOLD_PROVE.as_millis() as u64,
+        "the daemon took {blind} ms to see a crossing it was holding, which is \
+         a fold ({} ms) it queued while it was not looking",
+        FOLD_PROVE.as_millis(),
+    );
+
+    // And the pipeline was not starved to get it. The group ran, the final proof
+    // absorbed it whole, and the two slots that closed after it went inline.
+    assert!(
+        epoch_dir.join("group_0.bin").exists(),
+        "the group the epoch opened with was never proven",
+    );
+    assert_eq!(
+        latency["late_groups"], 1,
+        "the group that landed on the fire tick is the one the final proof \
+         verifies; nothing else was proven for it",
+    );
+    assert_eq!(
+        latency["tail"],
+        SLOTS_TO_THRESHOLD - 1,
+        "every slot the held group does not cover goes inline, up to the \
+         crossing and no further",
+    );
+    let late_group = latency["late_group_millis"]
+        .as_u64()
+        .expect("late_group_millis");
+    assert!(
+        late_group < GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) contains a group proof ({} ms); the \
+         fire path had a landed group to absorb and should have proven nothing",
         GROUP_PROVE.as_millis(),
     );
 }

@@ -99,6 +99,15 @@ struct StreamAggregator {
     /// public output, so the host carries it and the circuit checks the digest.
     aggregate_miller: Fp12,
     folded_groups: usize,
+    /// A group proof that has landed and has not been folded, with the unit
+    /// count it carries the epoch to.
+    ///
+    /// A group is collected on a tick that has not evaluated the trigger yet, so
+    /// what to do with it is decided below rather than where it lands: folded in
+    /// the `!fire` branch, and handed whole to the final proof in the other. See
+    /// [`StreamPipeline::drive`] for why the fold has to be the branch's and not
+    /// the collection's.
+    unfolded: Option<(usize, GroupProof)>,
     /// The epoch this one finalizes, captured when the epoch opened so that
     /// neither it nor the boundary below is opened on the critical path.
     previous: PreviousJustification,
@@ -308,6 +317,11 @@ impl StreamAggregator {
     /// up and `proved` is what this one actually folded. A daemon ahead of the
     /// plan inlines only what the plan asked for; one behind it still needs a
     /// group for the difference.
+    ///
+    /// An `unfolded` group displaces both. It is the group the final proof will
+    /// absorb, and the fire path has no second group to bridge with, so the tail
+    /// starts exactly where it ends rather than at the plan's cut — anything
+    /// else leaves units under no child at all.
     fn tail(&self, policy: &StreamPolicy) -> Option<Range<usize>> {
         let plan = streaming::plan(&self.units, self.context.total_active_balance, policy);
         if !plan.threshold_reached {
@@ -319,8 +333,16 @@ impl StreamAggregator {
             .into_iter()
             .chain(plan.tail.iter().copied())
             .max()?;
-        let start = plan.tail.first().copied().unwrap_or(crossing + 1);
-        Some(start.max(self.proved).min(crossing + 1)..crossing + 1)
+        let start = match &self.unfolded {
+            Some((proved, _)) => *proved,
+            None => plan
+                .tail
+                .first()
+                .copied()
+                .unwrap_or(crossing + 1)
+                .max(self.proved),
+        };
+        Some(start.min(crossing + 1)..crossing + 1)
     }
 
     /// Price every slot gossip has reached as if it closed this instant.
@@ -475,13 +497,19 @@ impl EpochPipeline for StreamPipeline {
         // asks against is current, and a boundary that did not exist when the
         // epoch opened exists by now.
         //
-        // The trigger is below this return, so it is blind for the length of
-        // every proof. Measured on mainnet, epochs 469501-469505: `T` was
-        // stamped 0.22 to 0.33 s after a proof landed on all five, and 8 to
-        // 125 s after the crossing slot began. That costs twice — the reported
-        // `T` is late, which flatters `T2 - T`, and every slot that arrived
-        // during the proof is unfolded when the trigger finally fires, which is
-        // `late_group_millis`.
+        // A tick that *collects* a group carries on past this point instead of
+        // returning, and that is what keeps the trigger from being consulted
+        // only after the next proof has already been queued. `collect` used to
+        // start the fold itself, one arm below the settle, so a group landing
+        // on an epoch the chain had already carried over two thirds bought
+        // another whole aggregate proof of blindness before anything looked.
+        // Measured over 29 steady-state mainnet epochs on 2026-08-19: 42% of
+        // the 2,500 s between the chain crossing and the daemon seeing it was
+        // proofs *started* after the crossing, and nine of the ten were that
+        // fold. The fold is worth running before `T` and never after it — the
+        // final proof verifies the group directly if it is not folded — so the
+        // decision belongs to the branch that knows whether the epoch is
+        // justifiable, which is below.
         if let Some(mut pending) = self.pending.take() {
             if !pending.settle(engine.config.trigger_interval).await {
                 engine.speculate(target_epoch + 1).await;
@@ -489,7 +517,10 @@ impl EpochPipeline for StreamPipeline {
                 self.aggregator = Some(aggregator);
                 return Ok(());
             }
-            return self.collect(engine, aggregator, pending, tick).await;
+            let Some(collected) = self.collect(engine, aggregator, pending, tick).await? else {
+                return Ok(());
+            };
+            aggregator = collected;
         }
 
         // A reorg can take the checkpoint out from under an epoch that is
@@ -534,8 +565,8 @@ impl EpochPipeline for StreamPipeline {
             }
         }
 
-        let fire = held.balance as u128 >= policy.target_balance(total)
-            && !aggregator.worth_waiting(&policy, held.filling);
+        let enough = held.balance as u128 >= policy.target_balance(total);
+        let fire = enough && !aggregator.worth_waiting(&policy, held.filling);
         aggregator.last_filling = held
             .filling
             .map(|(slot, named, aggregates)| (Instant::now(), slot, named, aggregates));
@@ -561,12 +592,22 @@ impl EpochPipeline for StreamPipeline {
                 aggregator.attesting_balance += unit.marginal_balance;
                 aggregator.units.push(unit);
             }
-            if aggregator.proved < aggregator.units.len() {
-                self.pending = Some(Pending::Group(Self::start_group(
-                    engine,
-                    &aggregator,
-                    aggregator.proved..aggregator.units.len(),
-                )));
+            // Nothing new goes to the prover once the epoch holds enough to
+            // justify; only the wait for in-flight attestations is left, and it
+            // is bounded by [`StreamPolicy::wait_budget_s`]. A fold started here
+            // would sit between the chain crossing and the daemon seeing it and
+            // take nothing off the critical path in exchange, and a group would
+            // become a recursion child of slots the tail carries inline.
+            if !enough {
+                if let Some((proved, group)) = aggregator.unfolded.take() {
+                    self.pending = Some(Self::start_fold(engine, &mut aggregator, proved, group));
+                } else if aggregator.proved < aggregator.units.len() {
+                    self.pending = Some(Pending::Group(Self::start_group(
+                        engine,
+                        &aggregator,
+                        aggregator.proved..aggregator.units.len(),
+                    )));
+                }
             }
             // Again here, and not only when the epoch opened. The boundary the
             // next epoch's diff needs does not exist until the chain reaches
@@ -620,13 +661,17 @@ impl EpochPipeline for StreamPipeline {
             unix_millis: fired_unix_millis,
             tail: tail.clone(),
         };
-        self.pending = Some(if aggregator.proved < tail.start {
-            Pending::Late {
+        // A group held from this tick's collection is already the backlog the
+        // final proof absorbs, so the fire path has nothing left to prove before
+        // the one proof on `T2 - T`.
+        let unfolded = aggregator.unfolded.take();
+        self.pending = Some(match unfolded {
+            Some((_, group)) => Self::start_final(engine, &aggregator, Some(group), fired)?,
+            None if aggregator.proved < tail.start => Pending::Late {
                 group: Self::start_group(engine, &aggregator, aggregator.proved..tail.start),
                 fired,
-            }
-        } else {
-            Self::start_final(engine, &aggregator, None, fired)?
+            },
+            None => Self::start_final(engine, &aggregator, None, fired)?,
         });
         self.aggregator = Some(aggregator);
         Ok(())
@@ -764,6 +809,7 @@ impl StreamPipeline {
             aggregate_proof: Proof::new(),
             aggregate_miller: FP12_ONE,
             folded_groups: 0,
+            unfolded: None,
             previous,
             previous_proof,
             boundary,
@@ -973,21 +1019,28 @@ impl StreamPipeline {
     ///
     /// This is the only place a proof result enters the epoch, and it runs on
     /// the loop, so the ordering the circuits require is the ordering of these
-    /// arms: a group is folded once it has landed, the backlog the trigger fired
+    /// arms: a group is held once it has landed, the backlog the trigger fired
     /// on top of is folded into the final witness once it has landed, and the
     /// final proof binds an aggregate that is already finished.
+    ///
+    /// A landed group is the one result this does not act on. Whether it is
+    /// folded or given to the final proof depends on the trigger, which the tick
+    /// has not evaluated yet, so the aggregator is handed back to
+    /// [`Self::drive`] instead of costing an aggregate proof to find out.
+    /// Returning `None` means the tick is over.
     async fn collect<A: BeaconApi + ChainStatusApi>(
         &mut self,
         engine: &mut Engine<A>,
         mut aggregator: StreamAggregator,
         pending: Pending,
         tick: &mut Tick,
-    ) -> Result<()> {
+    ) -> Result<Option<StreamAggregator>> {
         match pending {
             Pending::Group(group) => {
                 let proved = group.range.end;
                 let group = Self::finish_group(engine, &aggregator, group, tick).await?;
-                self.pending = Some(Self::start_fold(engine, &mut aggregator, proved, group));
+                aggregator.unfolded = Some((proved, group));
+                return Ok(Some(aggregator));
             }
             Pending::Fold {
                 index,
@@ -1006,13 +1059,13 @@ impl StreamPipeline {
                 witness,
                 proving,
             } => {
-                return self
-                    .finish_final(engine, aggregator, closing, witness, proving, tick)
-                    .await;
+                self.finish_final(engine, aggregator, closing, witness, proving, tick)
+                    .await?;
+                return Ok(None);
             }
         }
         self.aggregator = Some(aggregator);
-        Ok(())
+        Ok(None)
     }
 
     /// Start the only proof on the critical path: the marginal attestation, the
