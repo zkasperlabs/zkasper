@@ -16,7 +16,7 @@
 
 use zkasper_common::types::*;
 use zkasper_common::{committee, ChainConfig};
-use zkasper_witness_gen::attestation_collector::SlotStream;
+use zkasper_witness_gen::attestation_collector::{SlotComplement, SlotStream};
 use zkasper_witness_gen::beacon_api::{AttestationResponse, SingleAttester};
 use zkasper_witness_gen::fixture::Epoch;
 
@@ -71,7 +71,11 @@ fn witness_for(epoch: &Epoch, slots: &[SlotComplementWitness]) -> SlotProofWitne
 }
 
 fn verify(witness: &SlotProofWitness) -> SlotProofOutput {
-    zkasper_slot_proof_guest::verify_slot_proof_with_depth(witness, ACC_DEPTH)
+    verify_at(witness, ACC_DEPTH)
+}
+
+fn verify_at(witness: &SlotProofWitness, acc_depth: u32) -> SlotProofOutput {
+    zkasper_slot_proof_guest::verify_slot_proof_with_depth(witness, acc_depth)
 }
 
 /// Run `f` and return the message it panicked with.
@@ -549,14 +553,16 @@ fn a_validator_gossiped_twice_is_summed_once() {
     );
 }
 
-/// A network aggregate is a backstop, and only for what the singles missed.
+/// Overlapping covers are a choice between them, and the choice is size.
 ///
-/// The singles cover every member but one; an aggregate covering the whole
-/// committee overlaps them, so taking it would count everyone twice. It is
-/// refused, and the one uncovered member stays an absentee — while an aggregate
-/// over exactly that member is disjoint, and is taken.
+/// An aggregate that overlaps the singles cannot be added to them — summing a
+/// validator's signature twice verifies, so the cover has to stay disjoint —
+/// but that is an argument for taking one of the two, not for always taking the
+/// singles. Here the aggregate carries the whole committee and the singles all
+/// but one member, so the aggregate wins; a disjoint aggregate is still taken
+/// alongside them.
 #[test]
-fn an_overlapping_network_aggregate_is_refused_and_a_disjoint_one_is_taken() {
+fn the_larger_of_two_overlapping_covers_is_the_one_taken() {
     let epoch = fixture();
     let head = [0x44u8; 32];
     let members = epoch.committees.members[0].clone();
@@ -585,14 +591,13 @@ fn an_overlapping_network_aggregate_is_refused_and_a_disjoint_one_is_taken() {
             .chain([aggregate(&epoch, 0, head, &members)])
             .collect(),
     );
-    assert_eq!(
-        overlapping.witness.absentees.len(),
-        1,
-        "an aggregate overlapping the singles was folded in anyway",
+    assert!(
+        overlapping.witness.absentees.is_empty(),
+        "the singles blocked an aggregate that covered more than they did",
     );
     assert_eq!(
         verify(&witness_for(&epoch, &[overlapping.witness])).attesting_balance,
-        covered.len() as u64 * BALANCE_GWEI,
+        members.len() as u64 * BALANCE_GWEI,
     );
 
     let disjoint = close(
@@ -608,5 +613,247 @@ fn an_overlapping_network_aggregate_is_refused_and_a_disjoint_one_is_taken() {
     assert_eq!(
         verify(&witness_for(&epoch, &[disjoint.witness])).attesting_balance,
         members.len() as u64 * BALANCE_GWEI,
+    );
+}
+
+/// A few late singles must not cost a slot the committee it already had.
+///
+/// The daemon repairs an epoch it opened late from blocks, and a block's
+/// aggregates carry 99.7% of a mainnet committee. Gossip then delivers a
+/// handful of stragglers for the same slot. Measured on the run of 2026-08-19,
+/// epoch 469511: slots repaired from blocks and left alone kept 58 to 342
+/// absentees out of 28,157, and slots 3, 5, 6 and 10 — the ones a few late
+/// singles also landed on — recorded 27,810 to 28,152. The singles were seeded
+/// into the cover first, so four of them displaced twenty-eight thousand.
+#[test]
+fn late_singles_do_not_displace_the_aggregate_a_slot_was_repaired_with() {
+    let epoch = fixture();
+    let head = [0x44u8; 32];
+    let members = epoch.committees.members[0].clone();
+
+    let mut stream = SlotStream::new(
+        &epoch.config,
+        epoch.committees.clone(),
+        epoch.epoch,
+        epoch.target_root,
+    );
+    stream
+        .ingest(&[aggregate(&epoch, 0, head, &members)])
+        .unwrap();
+    stream
+        .ingest(&[single(&epoch, 0, head, members[0])])
+        .unwrap();
+
+    let complement = stream.close(epoch.slot(0)).expect("close the slot");
+    assert!(
+        complement.witness.absentees.is_empty(),
+        "one late single cost the slot {} of {} members",
+        complement.witness.absentees.len(),
+        members.len(),
+    );
+    assert_eq!(
+        verify(&witness_for(&epoch, &[complement.witness])).attesting_balance,
+        members.len() as u64 * BALANCE_GWEI,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two waves mainnet gossip actually arrives in
+// ---------------------------------------------------------------------------
+
+/// Eight slots of four committees, sized so the unaggregated wave alone sits
+/// under 2/3 of the active balance and the aggregate wave carries it over.
+const WAVE_SLOTS: u64 = 8;
+const WAVE_COMMITTEES: u64 = 4;
+const WAVE_PER_COMMITTEE: usize = 16;
+/// 512 validators need a deeper accumulator than [`ACC_DEPTH`] holds.
+const WAVE_ACC_DEPTH: u32 = 10;
+/// Members of a committee the unaggregated feed delivers. A live mainnet node
+/// subscribed to every subnet delivered 18,164 to 21,562 of a 28,157-member
+/// slot over the slots captured on 2026-08-18 — 64.5% to 76.6%.
+const WAVE_SINGLES: usize = 10;
+/// Members the committee's aggregate covers, one short of the whole committee
+/// so that neither wave is a superset of the other. On chain, epoch 469506's
+/// aggregates covered 898,634 of 901,001 committee places — 99.74%.
+const WAVE_AGGREGATED: usize = 15;
+
+fn wave_epoch() -> Epoch {
+    Epoch::with_committees(
+        ChainConfig {
+            acc_tree_depth: WAVE_ACC_DEPTH,
+            slots_per_epoch: WAVE_SLOTS,
+            ..ChainConfig::MAINNET
+        },
+        EPOCH,
+        WAVE_SLOTS,
+        WAVE_COMMITTEES,
+        WAVE_PER_COMMITTEE,
+    )
+}
+
+/// One committee's aggregate, as a node publishes it on
+/// `beacon_aggregate_and_proof`: exactly one bit set in `committee_bits`, and
+/// `aggregation_bits` indexed within that one committee.
+fn committee_aggregate(
+    epoch: &Epoch,
+    slot_in_epoch: u64,
+    committee_index: u64,
+    head: [u8; 32],
+    signers: &[u64],
+) -> AttestationResponse {
+    let committee = epoch
+        .committees
+        .committee(epoch.slot(slot_in_epoch), committee_index)
+        .expect("committee");
+    let mut aggregation_bits = vec![0u8; committee.len().div_ceil(8)];
+    for &index in signers {
+        let bit = committee
+            .iter()
+            .position(|&m| m == index)
+            .expect("committee member");
+        aggregation_bits[bit / 8] |= 1 << (bit % 8);
+    }
+    AttestationResponse {
+        aggregation_bits,
+        committee_bits: vec![1u8 << committee_index],
+        ..aggregate(epoch, slot_in_epoch, head, signers)
+    }
+}
+
+/// One `SingleAttestation` out of a named committee.
+fn committee_single(
+    epoch: &Epoch,
+    slot_in_epoch: u64,
+    committee_index: u64,
+    head: [u8; 32],
+    attester: u64,
+) -> AttestationResponse {
+    AttestationResponse {
+        aggregation_bits: Vec::new(),
+        single_attester: Some(SingleAttester {
+            committee_index,
+            attester_index: attester,
+        }),
+        ..aggregate(epoch, slot_in_epoch, head, &[attester])
+    }
+}
+
+/// Drive a whole epoch through the collector in arrival order, with or without
+/// the aggregate wave, and return what it held at the end.
+///
+/// The order is the daemon's: a slot's unaggregated burst, then the slot before
+/// it closing because gossip has moved past it, then this slot's aggregates.
+fn collect_two_waves(epoch: &Epoch, aggregated: bool) -> Vec<SlotComplement> {
+    let head = [0u8; 32];
+    let mut stream = SlotStream::new(
+        &epoch.config,
+        epoch.committees.clone(),
+        epoch.epoch,
+        epoch.target_root,
+    );
+    let mut units = Vec::new();
+
+    let committee = |slot_in_epoch: u64, committee_index: u64| {
+        epoch
+            .committees
+            .committee(epoch.slot(slot_in_epoch), committee_index)
+            .expect("committee")
+            .to_vec()
+    };
+
+    for slot_in_epoch in 0..WAVE_SLOTS {
+        for committee_index in 0..WAVE_COMMITTEES {
+            let members = committee(slot_in_epoch, committee_index);
+            let singles: Vec<AttestationResponse> = members[..WAVE_SINGLES]
+                .iter()
+                .map(|&index| committee_single(epoch, slot_in_epoch, committee_index, head, index))
+                .collect();
+            stream.ingest(&singles).expect("ingest the singles");
+        }
+
+        if let Some(previous) = slot_in_epoch.checked_sub(1) {
+            units.push(stream.close(epoch.slot(previous)).expect("close a slot"));
+        }
+
+        if !aggregated {
+            continue;
+        }
+        for committee_index in 0..WAVE_COMMITTEES {
+            let members = committee(slot_in_epoch, committee_index);
+            // The aggregator missed the committee's first member, whom the
+            // singles did deliver.
+            let signed = members[members.len() - WAVE_AGGREGATED..].to_vec();
+            stream
+                .ingest(&[committee_aggregate(
+                    epoch,
+                    slot_in_epoch,
+                    committee_index,
+                    head,
+                    &signed,
+                )])
+                .expect("ingest the aggregates");
+        }
+    }
+    units.push(
+        stream
+            .close(epoch.slot(WAVE_SLOTS - 1))
+            .expect("close the last slot"),
+    );
+    units
+}
+
+/// The epoch the daemon abandoned four times in thirty-nine, proved.
+///
+/// Mainnet gossip is two arrivals: unaggregated attestations burst and drain,
+/// and the aggregates land two thirds of the way into the slot carrying the
+/// committee members the singles never delivered. The collector seeded its
+/// cover with the singles and refused every aggregate that overlapped them, so
+/// the second wave contributed nothing and the epoch plateaued at whatever the
+/// first had — 63.6% to 65.7% of the active balance on the epochs it gave up
+/// on, against a chain that justified every one of them.
+///
+/// Both halves are asserted, because only the pair is the bug: the unaggregated
+/// wave alone is genuinely under the threshold, and the epoch has to be provable
+/// once the aggregates land.
+#[test]
+fn the_aggregate_wave_carries_an_epoch_the_singles_alone_would_abandon() {
+    let epoch = wave_epoch();
+    let policy = zkasper_witness_gen::streaming::StreamPolicy {
+        slots_per_epoch: WAVE_SLOTS,
+        ..Default::default()
+    };
+    let quorum = 2 * epoch.total_active_balance / 3;
+
+    let singles_only = collect_two_waves(&epoch, false);
+    let alone: u64 = singles_only.iter().map(|u| u.marginal_balance).sum();
+    assert!(
+        alone < quorum,
+        "the unaggregated wave alone already reaches the threshold, so this \
+         fixture cannot show what the second one carries",
+    );
+    assert!(
+        !zkasper_witness_gen::streaming::plan(&singles_only, epoch.total_active_balance, &policy)
+            .threshold_reached
+    );
+
+    let both = collect_two_waves(&epoch, true);
+    let held: u64 = both.iter().map(|u| u.marginal_balance).sum();
+    assert!(
+        held >= quorum,
+        "the aggregate wave was dropped: {held} of {} against {quorum}",
+        epoch.total_active_balance,
+    );
+    assert!(
+        zkasper_witness_gen::streaming::plan(&both, epoch.total_active_balance, &policy)
+            .threshold_reached,
+        "the epoch was abandoned with the aggregates in hand",
+    );
+
+    // And the cover the collector chose is one the circuit accepts: every slot
+    // of the epoch, verified together, for the balance it claimed.
+    let slots: Vec<SlotComplementWitness> = both.iter().map(|u| u.witness.clone()).collect();
+    assert_eq!(
+        verify_at(&witness_for(&epoch, &slots), WAVE_ACC_DEPTH).attesting_balance,
+        held,
     );
 }

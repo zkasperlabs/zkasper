@@ -44,18 +44,28 @@ pub struct SlotComplement {
 /// One aggregate as the node published it, with its signers resolved.
 struct Aggregate {
     attestation: AttestationWitness,
+    /// The same signature, decompressed once, so that a chosen cover can be
+    /// summed into the single aggregate the guest is cheapest at.
+    signature: Signature,
     signers: BTreeSet<u64>,
 }
 
-/// One message's unaggregated attestations, summed as they arrive.
+/// One committee's unaggregated attestations over one message, summed as they
+/// arrive.
 ///
 /// This is the primary path. A `SingleAttestation` names one validator, so a
 /// running total over them is disjoint by construction — there is no cover to
-/// choose and no overlap to resolve, and the circuit is handed exactly one
-/// aggregate per distinct message. Summing here rather than at
+/// choose and no overlap to resolve. Summing here rather than at
 /// [`SlotStream::close`] is what keeps a slot's thirty thousand G2
 /// decompressions off the critical path: they are paid as gossip arrives, and
 /// only the last few land after the threshold.
+///
+/// The bucket is a committee and not a message, because a network aggregate is
+/// a committee's worth of signers and the two have to be comparable. Post-
+/// Electra `AttestationData.index` is pinned to 0, so every committee of a slot
+/// voting the same head shares one message; a running total over all of them
+/// would be a 28,000-signer block that no 440-signer aggregate can ever be
+/// disjoint from. See [`SlotStream::peek`].
 struct Summed {
     /// The message, with `signature` left empty until it is read out.
     attestation: AttestationWitness,
@@ -67,14 +77,34 @@ impl Summed {
     /// The running total, as an aggregate the rest of the collector can treat
     /// like any other.
     fn aggregate(&self) -> Aggregate {
+        let signature = self.signature.to_signature();
         Aggregate {
             attestation: AttestationWitness {
-                signature: BlsSignature(self.signature.to_signature().to_bytes()),
+                signature: BlsSignature(signature.to_bytes()),
                 ..self.attestation.clone()
             },
+            signature,
             signers: self.signers.clone(),
         }
     }
+}
+
+/// Sum a message's chosen aggregates into the one the circuit derives a key for.
+///
+/// They are pairwise disjoint by construction, so their signatures add exactly
+/// as the guest's derived key adds their public keys — and one aggregate is
+/// what the guest is cheapest at, because every extra one is another G2
+/// decompression inside the proof.
+fn merge(aggregates: &[&Aggregate]) -> Option<AttestationWitness> {
+    let (first, rest) = aggregates.split_first()?;
+    let mut sum = AggregateSignature::from_signature(&first.signature);
+    for aggregate in rest {
+        sum.add_signature(&aggregate.signature, false).ok()?;
+    }
+    Some(AttestationWitness {
+        signature: BlsSignature(sum.to_signature().to_bytes()),
+        ..first.attestation.clone()
+    })
 }
 
 /// `AttestationData`, as the key that decides which aggregates share a message.
@@ -105,12 +135,12 @@ pub struct SlotStream {
     target_root: [u8; 32],
     slots_per_epoch: u64,
     committees: Arc<EpochCommittees>,
-    /// Network aggregates seen so far, keyed by the slot they attest to. The
-    /// backstop path: used only where the singles feed has a hole.
+    /// Network aggregates seen so far, keyed by the slot they attest to. They
+    /// compete with the summed singles rather than backstopping them.
     pending: BTreeMap<u64, Vec<Aggregate>>,
-    /// Unaggregated attestations, summed per message as they arrive, keyed by
-    /// the slot they attest to. The primary path.
-    summed: BTreeMap<u64, BTreeMap<DataKey, Summed>>,
+    /// Unaggregated attestations, summed per message and committee as they
+    /// arrive, keyed by the slot they attest to. The primary path.
+    summed: BTreeMap<u64, BTreeMap<(DataKey, u64), Summed>>,
     /// Slots [`Self::forget`] has been called for.
     ///
     /// Dropping the maps is not enough to forget a slot: attestations for it
@@ -149,9 +179,9 @@ impl SlotStream {
     /// Only attestations targeting this checkpoint are kept, and they are filed
     /// under the slot they attest to rather than whatever carried them.
     ///
-    /// An unaggregated attestation goes straight into its message's running
-    /// signature; an aggregate is held aside until [`Self::close`] decides
-    /// whether the singles already cover it. A validator seen twice — the same
+    /// An unaggregated attestation goes straight into its committee's running
+    /// signature; an aggregate is held aside until [`Self::close`] chooses
+    /// between it and whatever else covers the same members. A validator seen twice — the same
     /// attestation re-gossiped, or a single a later block also carried — is
     /// added once, because summing a signature twice still verifies and would
     /// quietly count the validator twice.
@@ -191,25 +221,33 @@ impl SlotStream {
                 attesting_validators: Vec::new(),
             };
 
-            if att.single_attester.is_some() {
-                self.sum_single(attestation, signers)?;
-            } else {
-                self.pending
-                    .entry(att.data_slot)
-                    .or_default()
-                    .push(Aggregate {
-                        attestation,
-                        signers,
-                    });
+            match att.single_attester {
+                Some(single) => self.sum_single(attestation, single.committee_index, signers)?,
+                None => {
+                    // A backstop the node published and we cannot read is one
+                    // less cover to choose from, not a reason to fail the tick.
+                    let Ok(signature) = Signature::from_bytes(&attestation.signature.0) else {
+                        continue;
+                    };
+                    self.pending
+                        .entry(att.data_slot)
+                        .or_default()
+                        .push(Aggregate {
+                            attestation,
+                            signature,
+                            signers,
+                        });
+                }
             }
         }
         Ok(())
     }
 
-    /// Add one unaggregated attestation to its message's running signature.
+    /// Add one unaggregated attestation to its committee's running signature.
     fn sum_single(
         &mut self,
         attestation: AttestationWitness,
+        committee_index: u64,
         signers: BTreeSet<u64>,
     ) -> Result<()> {
         let signature = Signature::from_bytes(&attestation.signature.0)
@@ -219,7 +257,7 @@ impl SlotStream {
             .summed
             .entry(attestation.data_slot)
             .or_default()
-            .entry(data_key(&attestation))
+            .entry((data_key(&attestation), committee_index))
         {
             Entry::Vacant(message) => {
                 message.insert(Summed {
@@ -266,17 +304,22 @@ impl SlotStream {
         let committee = self.committees.aggregate(slot_in_epoch)?.clone();
         let members = &self.committees.members[slot_in_epoch as usize];
 
-        // Our own aggregates go in first, one per message, each already the sum
-        // of every unaggregated attestation seen for it. Then the network's, in
-        // decreasing size, and only where they are disjoint from what is already
-        // counted.
+        // Every cover the slot has — our own per-committee sums of the
+        // unaggregated feed, and the network's aggregates — taken largest
+        // first, and only where disjoint from what is already counted.
         //
         // Disjointness is proved here rather than assumed, because summing a
         // validator's signature twice *verifies*: `sig + sig_v` checks out
         // against `2·pk_v + rest`, so a double count is not caught downstream by
-        // anything. Seeding with the singles is what makes the rule bite in the
-        // right direction — a network aggregate is taken only for a committee
-        // the singles feed missed entirely, which is what "backstop" means.
+        // anything. What cannot be assumed either is that ours is the better
+        // cover. It used to be seeded first unconditionally, and that is what
+        // made the daemon skip epochs the chain had justified: an overlapping
+        // aggregate was refused however much more of the committee it carried,
+        // so a slot repaired from blocks at 99.7% collapsed to 0.02% the moment
+        // four late singles arrived for it, and a slot on gossip alone stalled
+        // at whatever the unaggregated feed happened to deliver — 62% to 76% on
+        // mainnet, against 99.7% on chain. Size is the rule instead, and a tie
+        // still goes to ours because a sum we built is one we can account for.
         let ours: Vec<Aggregate> = self
             .summed
             .get(&slot)
@@ -289,10 +332,8 @@ impl SlotStream {
         }
 
         let mut by_message: BTreeMap<DataKey, (Vec<&Aggregate>, BTreeSet<u64>)> = BTreeMap::new();
-        let mut order: Vec<&Aggregate> = ours.iter().collect();
-        let mut network: Vec<&Aggregate> = theirs.into_iter().flatten().collect();
-        network.sort_by_key(|a| std::cmp::Reverse(a.signers.len()));
-        order.extend(network);
+        let mut order: Vec<&Aggregate> = ours.iter().chain(theirs.into_iter().flatten()).collect();
+        order.sort_by_key(|a| std::cmp::Reverse(a.signers.len()));
         for aggregate in order {
             let entry = by_message
                 .entry(data_key(&aggregate.attestation))
@@ -356,10 +397,7 @@ impl SlotStream {
             witness: SlotComplementWitness {
                 slot_in_epoch,
                 committee,
-                primary: primary_aggregates
-                    .into_iter()
-                    .map(|a| a.attestation.clone())
-                    .collect(),
+                primary: vec![merge(&primary_aggregates)?],
                 secondary,
                 absentees,
             },

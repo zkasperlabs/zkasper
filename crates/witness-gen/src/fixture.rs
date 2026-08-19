@@ -62,7 +62,25 @@ impl Epoch {
     /// committee proof needs it to be.
     pub fn new(config: ChainConfig, epoch: u64, slots: u64, per_slot: usize) -> Self {
         let boundary = (epoch - 1) * config.slots_per_epoch;
-        Self::build(config, epoch, slots, per_slot, boundary)
+        Self::build(config, epoch, slots, 1, per_slot, boundary)
+    }
+
+    /// The same, cut into `committees` committees a slot.
+    ///
+    /// Mainnet's shape, and the one thing a single committee cannot reproduce:
+    /// post-Electra every committee of a slot votes the same `AttestationData`,
+    /// so they share one message, while a gossip aggregate covers exactly one
+    /// of them. Anything that chooses covers per message rather than per
+    /// committee only shows it here.
+    pub fn with_committees(
+        config: ChainConfig,
+        epoch: u64,
+        slots: u64,
+        committees: u64,
+        per_committee: usize,
+    ) -> Self {
+        let boundary = (epoch - 1) * config.slots_per_epoch;
+        Self::build(config, epoch, slots, committees, per_committee, boundary)
     }
 
     /// The same, with the finalized epoch's first slot skipped.
@@ -77,16 +95,18 @@ impl Epoch {
         per_slot: usize,
     ) -> Self {
         let boundary = (epoch - 1) * config.slots_per_epoch;
-        Self::build(config, epoch, slots, per_slot, boundary - 2)
+        Self::build(config, epoch, slots, 1, per_slot, boundary - 2)
     }
 
     fn build(
         config: ChainConfig,
         epoch: u64,
         slots: u64,
-        per_slot: usize,
+        committees: u64,
+        per_committee: usize,
         previous_block_slot: u64,
     ) -> Self {
+        let per_slot = committees as usize * per_committee;
         let balance = 32_000_000_000u64;
         let keys: Vec<blst::min_pk::SecretKey> = (0..slots as usize * per_slot)
             .map(|i| {
@@ -129,12 +149,14 @@ impl Epoch {
             .collect();
 
         let committee_responses: Vec<CommitteeResponse> = (0..slots)
-            .map(|s| CommitteeResponse {
-                slot: epoch * config.slots_per_epoch + s,
-                index: 0,
-                validators: (0..per_slot as u64)
-                    .map(|i| s * per_slot as u64 + i)
-                    .collect(),
+            .flat_map(|s| {
+                (0..committees).map(move |c| CommitteeResponse {
+                    slot: epoch * config.slots_per_epoch + s,
+                    index: c,
+                    validators: (0..per_committee as u64)
+                        .map(|i| (s * committees + c) * per_committee as u64 + i)
+                        .collect(),
+                })
             })
             .collect();
 
