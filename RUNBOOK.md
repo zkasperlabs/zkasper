@@ -656,7 +656,8 @@ output directory on local disk, not on network storage.
 
 | Signal | Condition | Meaning |
 |---|---|---|
-| `recent_latencies[].late_groups` | `> 1` | 0 or 1 by construction: the final proof absorbs at most one group, so this is a flag rather than a count. **1 is the planned shape on a real prover, not a symptom** — the schedule's own optimum leaves the last group unfolded, because folding it costs a floor and a recursion more and cannot finish before `T` anyway. The `late_groups = 0` runs in §8 were `--prover native`, where a fold is milliseconds. What to watch on a GPU is `late_group_millis`, which is the same group proven *after* `T` instead of before it, and is the whole of the gap to the modelled `T2 - T`. |
+| `recent_latencies[].late_groups` | `> 1` | 0 or 1 by construction: the final proof absorbs at most one group, so this is a flag rather than a count. **1 is the planned shape on a real prover, not a symptom** — the schedule's own optimum leaves the last group unfolded, because folding it costs a floor and a recursion more and cannot finish before `T` anyway. The `late_groups = 0` runs in §8 were `--prover native`, where a fold is milliseconds. What to watch on a GPU is `late_group_millis`, which is the same group proven *after* `T` instead of before it, and `observation_millis`, which is the same blind tick seen from the other side and is the larger of the two. |
+| `recent_latencies[].observation_millis` | more than one proof | The daemon is not seeing the chain cross until after whatever it was proving finishes, because the trigger is only evaluated on a tick with no proof in flight. It is a real part of `T2 - T` and the largest one on a saturated daemon — a median 105 s on the 2026-08-19 mainnet run. It is also the only term a consumer pays that no faster prover would remove. |
 | `gossip.reconnects` | rising | The node or the network is unstable. Epochs around each reconnect were sourced from blocks, so their `T2 - T` is not representative — exclude them from any latency claim. |
 | `gossip` | **absent** | The daemon is reading blocks instead of gossip and is a slot behind by construction. Either `--no-gossip` is set or the pipeline is `batch`. |
 | `recent_latencies[].t2_minus_t_millis` | drifting up | Compare against the baseline in §8. |
@@ -1116,6 +1117,13 @@ epoch diff and the committee proof together are about 60 s of a 384 s epoch, bot
 off the critical path.
 
 ### Measured `T2 - T`
+
+**These rows predate the 2026-08-19 correction to `T` and are lower bounds.**
+`T` was stamped when the daemon noticed the crossing rather than when the chain
+crossed, so each is short by an `observation_millis` nobody recorded. The error
+is bounded by the length of one proof, which under `--prover native` is seconds
+rather than the minutes it was on a GPU — but it is not zero, and these must not
+be compared with a figure from a daemon at or after that change.
 
 | epoch | `T2-T` ms | `wait` ms | `tail_named` | `folded_groups` | `late_groups` | shape |
 |---|---|---|---|---|---|---|

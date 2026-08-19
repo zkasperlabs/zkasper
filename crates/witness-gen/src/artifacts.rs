@@ -122,22 +122,76 @@ impl StageTiming {
 
 /// What the streaming pipeline's only latency actually was.
 ///
-/// `T` is when the daemon held the attestation that carried the epoch over the
-/// threshold; `T2` is when a proof of it existed. Everything else the pipeline
-/// does happens before `T`, so this is the whole of what a consumer waits for.
+/// `T` is when the *chain* carried the epoch over the threshold; `T2` is when a
+/// proof of it existed. Everything else the pipeline does happens before `T`, so
+/// this is the whole of what a consumer waits for.
+///
+/// `T` was stamped when the daemon noticed instead, until 2026-08-19, and that
+/// made every published figure a lower bound. The threshold check sits below the
+/// in-flight-proof early return in [`super::orchestrator`], so the daemon is
+/// blind to the crossing for the length of every proof. Over the 37 measured
+/// mainnet epochs of the 2026-08-19 run the notice came a median **105 s** after
+/// the crossing slot began, and 743 s after it once. Every one of those seconds
+/// was a second a consumer waited and the metric did not report, and the error
+/// was largest exactly when the daemon was furthest behind — which is when the
+/// number matters. [`Self::observation_millis`] is that gap, kept rather than
+/// folded away, because it is the pipeline's own defect and not the prover's.
 #[derive(Clone, Debug, Serialize)]
 pub struct EpochLatency {
     pub epoch: u64,
+    /// The slot whose attestations carried the epoch over the quorum: the last
+    /// one the final proof carried inline, since the plan stops there.
+    pub threshold_slot: u64,
+    /// `T`, from the chain: the instant `threshold_slot` began.
+    ///
+    /// The slot boundary rather than the attestation deadline a third of the way
+    /// into it, for two reasons. It is the only instant here that is a pure
+    /// function of the chain — genesis plus a slot count, with no daemon state
+    /// and no unmeasured assumption about when validators published. And it can
+    /// only be *earlier* than the moment the attestations existed, so `T2 - T`
+    /// over-states what a consumer waits instead of under-stating it: a metric
+    /// that cannot be exact should err in the direction that shows the problem
+    /// rather than the one that hides it.
+    ///
+    /// The over-statement is small and measured. The crossing slot supplies only
+    /// the last third of the quorum, and on 193 slots of mainnet gossip a third
+    /// of a slot's attestations are in **2.87 s** after it begins (p90 4.64 s).
+    ///
+    /// It is also the anchor [`crate::streaming::schedule`] plans against — its
+    /// `arrival(i)` is `(slot_i - first_slot) * seconds_per_slot`, and
+    /// `threshold_s` is `arrival` of the crossing unit — so the measured
+    /// `T2 - T` and the modelled one now denote the same quantity. They did not
+    /// before, and were compared anyway.
     pub threshold_unix_millis: u64,
+    /// When the daemon first saw that the chain had crossed — the old `T`.
+    ///
+    /// Never before `threshold_unix_millis`, and later than it by however long
+    /// the prover was holding the tick that would have looked.
+    pub observed_unix_millis: u64,
+    /// `observed_unix_millis - threshold_unix_millis`: the part of `T2 - T` that
+    /// is the daemon not looking, rather than the pipeline working.
+    ///
+    /// Reported beside `T2 - T` and not inside it, because the two answer
+    /// different questions: `T2 - T` is what a consumer waits, and this is how
+    /// much of that a change to [`super::orchestrator`]'s tick could remove
+    /// without making a single proof faster. It is the largest term in the
+    /// mainnet run.
+    pub observation_millis: u64,
     /// When the trigger fired: the end of the wait, not the start of the final
-    /// proof. Never before `threshold_unix_millis`, and later than it whenever
+    /// proof. Never before `observed_unix_millis`, and later than it whenever
     /// waiting for in-flight attestations was the cheaper way to a postable
     /// proof.
     pub fired_unix_millis: u64,
     pub proof_unix_millis: u64,
+    /// The number this project exists to minimise, `proof_unix_millis -
+    /// threshold_unix_millis`. It splits into four, in order and without
+    /// overlap: `observation_millis`, `wait_millis`, `late_group_millis`, and
+    /// the final proof itself as the remainder.
     pub t2_minus_t_millis: u64,
     /// The part of `t2_minus_t_millis` that was the trigger holding back rather
-    /// than the prover working. Reading it against `tail_named` is what says
+    /// than the prover working, measured from `observed_unix_millis`: the
+    /// trigger cannot hold back before the daemon knows there is anything to
+    /// hold back for. Reading it against `tail_named` is what says
     /// whether the wait bought what the model says it should have, and
     /// `StreamPolicy::wait_budget_s` is the bound: a tail of `tail_named` leaves
     /// is worth `tail_named * per_named_s` of proving, so a wait longer than
@@ -156,8 +210,10 @@ pub struct EpochLatency {
     /// threshold, and only its recursion is meant to land after it. Above zero
     /// it is that same group started at `T` instead, because the trigger is
     /// evaluated only on a tick with no proof in flight and the tick that fires
-    /// is therefore the first one after a fold. It is the whole of the gap
-    /// between the measured `T2 - T` and the modelled one.
+    /// is therefore the first one after a fold. It was called the whole of the
+    /// gap between the measured `T2 - T` and the modelled one; it is the smaller
+    /// half of it, and `observation_millis` — the same blind tick, seen from the
+    /// other side — is the larger.
     pub late_group_millis: u64,
     /// Accumulator leaves the final proof opened for its inline tail — the
     /// absentees the wait did not remove. Every one of them is

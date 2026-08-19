@@ -295,6 +295,101 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
     );
 }
 
+/// `T` is the chain's, and a daemon that noticed the crossing late must still
+/// report the moment the chain crossed.
+///
+/// The same scenario as the test above — the epoch is opened after its threshold
+/// has already gone by — because that is the only case where the two candidate
+/// definitions of `T` differ, and it is also the production case: the daemon is
+/// blind to the crossing for the length of every proof, so it notices late
+/// exactly when it is busiest.
+///
+/// It was defined the other way until 2026-08-19, and the last assertion here is
+/// the one that failed then: `T2 - T` was `proof - observed`, so an epoch the
+/// daemon reached late reported only the part it had been awake for. On mainnet
+/// that hid a median of 105 s and once 743 s, and it hid the most from the
+/// epochs that were worst — a metric that flatters itself under load is worse
+/// than one that is merely wrong, because the case it hides is the case worth
+/// seeing.
+#[tokio::test]
+async fn test_t_is_the_crossing_slot_even_when_the_daemon_noticed_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = chain();
+    let mut daemon = streaming_daemon(dir.path(), &chain).await;
+
+    let boundary = (FIRST_EPOCH + 1) * SPE;
+    daemon
+        .api()
+        .set_head(chain.header_at(boundary + SLOTS_TO_THRESHOLD));
+    daemon.catch_up().await.unwrap();
+
+    // Where the chain crossed, known without asking the daemon: one validator
+    // attests per slot from the boundary on, and the third of them carries this
+    // epoch over 2/3.
+    let crossing = boundary + SLOTS_TO_THRESHOLD - 1;
+
+    let latency = latency(dir.path());
+    assert_eq!(
+        latency["threshold_slot"], crossing,
+        "T belongs to the slot that crossed the threshold",
+    );
+    assert_eq!(
+        latency["threshold_unix_millis"].as_u64(),
+        Some(chain.slot_unix_millis(crossing)),
+        "T is that slot's boundary, genesis plus a slot count, and nothing else",
+    );
+
+    let threshold = latency["threshold_unix_millis"]
+        .as_u64()
+        .expect("threshold");
+    let observed = latency["observed_unix_millis"].as_u64().expect("observed");
+    let proof = latency["proof_unix_millis"].as_u64().expect("proof");
+    let t2_minus_t = latency["t2_minus_t_millis"].as_u64().expect("t2_minus_t");
+    let observation = latency["observation_millis"].as_u64().expect("observation");
+
+    // The premise: this daemon really did notice late. Without it the test would
+    // pass under either definition and pin nothing.
+    assert!(
+        observed > threshold,
+        "the daemon was supposed to reach this epoch after its threshold; \
+         observed {observed} is not after T {threshold}",
+    );
+    assert_eq!(
+        observation,
+        observed - threshold,
+        "the observation delay is the whole of what the daemon did not see",
+    );
+
+    assert_eq!(
+        t2_minus_t,
+        proof - threshold,
+        "T2 - T runs from the chain's crossing to the proof",
+    );
+    assert_eq!(
+        t2_minus_t - observation,
+        proof - observed,
+        "and it exceeds what the old definition reported by exactly that delay",
+    );
+    assert!(
+        proof - observed < t2_minus_t,
+        "T2 - T ({t2_minus_t} ms) must not collapse to what the daemon was awake \
+         for ({} ms); that is the stamp this test exists to prevent",
+        proof - observed,
+    );
+
+    // The four terms are in order and do not overlap, so a reader can attribute
+    // the number rather than only compare it.
+    let wait = latency["wait_millis"].as_u64().expect("wait_millis");
+    let late_group = latency["late_group_millis"]
+        .as_u64()
+        .expect("late_group_millis");
+    assert!(
+        observation + wait + late_group <= t2_minus_t,
+        "T2 - T ({t2_minus_t} ms) must cover the delay ({observation} ms), the \
+         wait ({wait} ms), the late group ({late_group} ms) and the final proof",
+    );
+}
+
 /// A daemon that reaches the epoch before its threshold folds every group it
 /// has, and the final proof verifies the aggregate rather than a group.
 ///

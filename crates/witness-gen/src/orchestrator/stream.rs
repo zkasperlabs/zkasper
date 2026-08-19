@@ -105,7 +105,10 @@ struct StreamAggregator {
     previous_proof: Proof,
     boundary: BoundaryAnchor,
     opened_unix_millis: u64,
-    /// Unix ms at which the daemon held enough attestations to justify — `T`.
+    /// Unix ms at which the daemon first *saw* it held enough attestations to
+    /// justify. Not `T` — see [`EpochLatency::threshold_unix_millis`], which
+    /// takes that from the chain. This is only ever as early as the first tick
+    /// with no proof in flight, so it is the observation and not the event.
     crossed_unix_millis: Option<u64>,
 }
 
@@ -495,9 +498,10 @@ impl EpochPipeline for StreamPipeline {
         let total = aggregator.context.total_active_balance;
         let held = aggregator.held(spe, engine.chain.head_slot(), &policy);
 
-        // `T`: the first moment the daemon holds what the circuit would accept.
-        // Everything after it is latency a consumer sees, the trigger's own wait
-        // included, which is what keeps that wait honest.
+        // The first moment the daemon *sees* it holds what the circuit would
+        // accept. This is where `T` was stamped until 2026-08-19, and the early
+        // return above is why it could not be: the chain crossed while a proof
+        // was running and this line did not execute until it finished.
         if held.balance as u128 >= policy.quorum_balance(total)
             && aggregator.crossed_unix_millis.is_none()
         {
@@ -1152,17 +1156,35 @@ impl StreamPipeline {
             return Ok(());
         }
 
-        // `T` is when the daemon held enough attestations; if it was already
-        // holding them when the epoch opened — a catch-up, not a live follow —
-        // there is no latency to report and reporting one would flatter it.
-        if let Some(threshold_unix_millis) = aggregator.crossed_unix_millis {
+        // `T` is the chain's, not the daemon's. The crossing slot is the last one
+        // the final proof carried inline — the plan stops at the unit that
+        // crosses — and its boundary is genesis plus a slot count, so the number
+        // a consumer is quoted no longer depends on when this process happened
+        // to be free to look. It did until 2026-08-19, and that made every
+        // published figure a lower bound by however long the prover had been
+        // holding the tick: a median 105 s over this epoch's run.
+        //
+        // `crossed_unix_millis` is kept beside it rather than discarded. It is
+        // still the honest origin for the trigger's own wait, and the difference
+        // between the two is the one term a change to `drive` could remove.
+        let threshold = witness
+            .tail
+            .last()
+            .map(|unit| target_epoch * engine.config.chain.slots_per_epoch + unit.slot_in_epoch)
+            .and_then(|slot| Some((slot, engine.chain.slot_unix_millis(&engine.config, slot)?)));
+        if let (Some((threshold_slot, threshold_unix_millis)), Some(observed_unix_millis)) =
+            (threshold, aggregator.crossed_unix_millis)
+        {
             let latency = EpochLatency {
                 epoch: target_epoch,
+                threshold_slot,
                 threshold_unix_millis,
+                observed_unix_millis,
+                observation_millis: observed_unix_millis.saturating_sub(threshold_unix_millis),
                 fired_unix_millis,
                 proof_unix_millis,
                 t2_minus_t_millis: proof_unix_millis.saturating_sub(threshold_unix_millis),
-                wait_millis: fired_unix_millis.saturating_sub(threshold_unix_millis),
+                wait_millis: fired_unix_millis.saturating_sub(observed_unix_millis),
                 late_group_millis,
                 tail_named,
                 folded_groups: aggregator.folded_groups,
@@ -1171,6 +1193,8 @@ impl StreamPipeline {
             };
             info!(
                 t2_minus_t_millis = latency.t2_minus_t_millis,
+                threshold_slot = latency.threshold_slot,
+                observation_millis = latency.observation_millis,
                 wait_millis = latency.wait_millis,
                 late_group_millis = latency.late_group_millis,
                 tail_named = latency.tail_named,

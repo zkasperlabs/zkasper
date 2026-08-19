@@ -316,10 +316,14 @@ impl Publisher {
         );
     }
 
+    /// The daemon noticed the crossing. Not `T` — this fires on the first tick
+    /// with no proof in flight, which is up to a proof late. `T` itself is the
+    /// crossing slot's boundary and arrives with `proof.landed`, in
+    /// [`crate::artifacts::EpochLatency`].
     pub fn threshold_crossed(
         &self,
         epoch: u64,
-        threshold_unix_millis: u64,
+        observed_unix_millis: u64,
         attesting_balance: u64,
         total_active_balance: u64,
     ) {
@@ -327,7 +331,7 @@ impl Publisher {
             "threshold.crossed",
             epoch,
             json!({
-                "threshold_unix_millis": threshold_unix_millis,
+                "observed_unix_millis": observed_unix_millis,
                 "attesting_balance": attesting_balance.to_string(),
                 "total_active_balance": total_active_balance.to_string(),
                 "attesting_pct": percent(attesting_balance, total_active_balance),

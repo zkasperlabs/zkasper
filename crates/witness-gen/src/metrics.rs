@@ -161,6 +161,7 @@ const BUCKETS: &[(&str, &[f64])] = &[
     ("zkasper_proof_cost_usd", COST_BUCKETS),
     ("zkasper_epoch_cost_usd", COST_BUCKETS),
     ("zkasper_t2_minus_t_seconds", LATENCY_BUCKETS),
+    ("zkasper_threshold_observation_seconds", LATENCY_BUCKETS),
     ("zkasper_trigger_wait_seconds", WAIT_BUCKETS),
     ("zkasper_late_group_seconds", LATE_GROUP_BUCKETS),
     ("zkasper_tail_named", TAIL_BUCKETS),
@@ -402,6 +403,11 @@ pub fn observe_latency(latency: &EpochLatency) {
     };
     histogram!("zkasper_t2_minus_t_seconds", "follow" => follow)
         .record(seconds(latency.t2_minus_t_millis));
+    // How much of that was the daemon not looking. Without it a reader watching
+    // `T2 - T` climb cannot tell a prover that slowed from a tick that went
+    // blind, and only one of those is fixed by buying a card.
+    histogram!("zkasper_threshold_observation_seconds", "follow" => follow)
+        .record(seconds(latency.observation_millis));
     histogram!("zkasper_trigger_wait_seconds", "follow" => follow)
         .record(seconds(latency.wait_millis));
     histogram!("zkasper_late_group_seconds", "follow" => follow)
@@ -547,9 +553,16 @@ fn describe() {
     describe_histogram!(
         "zkasper_t2_minus_t_seconds",
         Unit::Seconds,
-        "From holding the attestation that crossed the threshold to holding a proof of it. \
-         `follow=\"live\"` is the number this project quotes; `follow=\"catchup\"` is an epoch \
-         opened mid-flight, which folds nothing and proves the whole epoch inline."
+        "From the start of the slot whose attestations crossed the threshold to holding a proof \
+         of it. `follow=\"live\"` is the number this project quotes; `follow=\"catchup\"` is an \
+         epoch opened mid-flight, which folds nothing and proves the whole epoch inline."
+    );
+    describe_histogram!(
+        "zkasper_threshold_observation_seconds",
+        Unit::Seconds,
+        "The part of T2 - T between the chain crossing the threshold and the daemon noticing it. \
+         Bounded below by nothing the prover does and above by the length of one proof: the \
+         trigger is only evaluated on a tick with no proof in flight."
     );
     describe_histogram!(
         "zkasper_trigger_wait_seconds",

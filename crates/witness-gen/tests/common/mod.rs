@@ -358,6 +358,12 @@ pub struct SyntheticChain {
     pub genesis_validators_root: [u8; 32],
     pub fork_version: [u8; 4],
     pub domain: [u8; 32],
+    /// Unix seconds at which slot 0 of this chain began, fixed once here rather
+    /// than recomputed per [`Self::mock`]. A test that asserts against the chain
+    /// clock — anything reading `T` — needs the same answer the daemon got, and
+    /// `SystemTime::now()` truncated to seconds gives two answers whenever the
+    /// two calls straddle a second boundary.
+    pub genesis_time: u64,
 }
 
 impl SyntheticChain {
@@ -376,12 +382,31 @@ impl SyntheticChain {
                 &genesis_validators_root,
             ),
             keys: generate_keys(validators),
+            // Genesis puts the *whole* fixture behind us: its last slot ends
+            // now. A daemon is a follower, so a chain it is asked to follow must
+            // already have happened — anchoring on `first_epoch` instead dated
+            // every slot under test into the future, and a `T` taken from the
+            // chain clock then lands after the proof that answered it. These
+            // tests hand the daemon whole epochs in milliseconds, so their
+            // `T2 - T` carries the offset between fixture time and wall-clock
+            // time; what they assert about is its composition, not its size.
+            genesis_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default()
+                .saturating_sub((last_epoch + 1) * config.slots_per_epoch * SECONDS_PER_SLOT),
             config,
             first_epoch,
             last_epoch,
             genesis_validators_root,
             fork_version,
         }
+    }
+
+    /// Unix millis at which `slot` began on this chain — the daemon's `T`, for a
+    /// test that wants to know it independently of the daemon.
+    pub fn slot_unix_millis(&self, slot: u64) -> u64 {
+        (self.genesis_time + slot * SECONDS_PER_SLOT) * 1000
     }
 
     /// Put this chain on the network `root` identifies, so a daemon reading the
@@ -552,11 +577,7 @@ impl SyntheticChain {
     /// This chain, in process, with the head at `head_slot`.
     pub fn mock(&self, head_slot: u64) -> MockBeaconApi {
         let mut mock = MockBeaconApi::new();
-        mock.genesis_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or_default()
-            .saturating_sub(self.first_epoch * self.config.slots_per_epoch * SECONDS_PER_SLOT);
+        mock.genesis_time = self.genesis_time;
         mock.genesis_validators_root = self.genesis_validators_root;
         mock.fork_version = self.fork_version;
 

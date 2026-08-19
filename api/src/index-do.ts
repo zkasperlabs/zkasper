@@ -446,10 +446,14 @@ export class IndexDO extends DurableObject {
         );
         return;
       }
+      // When the daemon noticed, which is not T: T is the crossing slot's
+      // boundary and arrives with proof.landed. Older daemons sent the same
+      // instant under the name this event used to use.
       case "threshold.crossed": {
         if (epoch === null) return;
         this.mergeLatency(epoch, {
-          threshold_unix_millis: num(d.threshold_unix_millis) ?? num(d.unix_millis) ?? undefined,
+          observed_unix_millis:
+            num(d.observed_unix_millis) ?? num(d.threshold_unix_millis) ?? num(d.unix_millis) ?? undefined,
         });
         return;
       }

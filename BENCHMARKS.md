@@ -377,12 +377,74 @@ a 110 s fold. Every slot that arrived during that fold is still unproven when th
 trigger fires. **The whole 62 s of median gap is that displacement**, not the
 absorption.
 
-**`T` is stamped when the daemon looks, not when the chain crosses.** Same five
-epochs, same cause: the threshold check sits below the in-flight-proof early
+**`T` was stamped when the daemon looked, not when the chain crossed — fixed, and
+every figure this document published before 2026-08-19 was short by it.** Same
+five epochs, same cause: the threshold check sits below the in-flight-proof early
 return, so `threshold_unix_millis` landed 0.22-0.33 s after a proof finished on
 all five, and 8.4, 15.7, 46.7, 93.0 and 124.7 s after the crossing slot began.
-`t2_minus_t_millis` is therefore a lower bound on what a consumer waits, and on a
-saturated daemon it understates it by up to two minutes.
+`T` now comes from the chain — the crossing slot's boundary, genesis plus a slot
+count — and the daemon's own notice is published beside it as
+`observation_millis`. See [the corrected distribution](#the-corrected-distribution).
+
+### The corrected distribution
+
+The 2026-08-19 run published **median 123.0 s, p90 131.6 s** over ten folded
+live-gossip epochs. **That number is withdrawn.** It was `T2` minus the tick that
+noticed, and the crossing slot of every one of those epochs is recoverable from
+the daemon's own logs: each group proof logs the slots it covers, the plan stops
+at the unit that crosses, so the crossing slot is one past the last slot any
+group covered. `T` is that slot's boundary.
+
+| epoch | crossing slot | observation delay | published `T2 - T` | corrected `T2 - T` |
+| --- | --- | --- | --- | --- |
+| 469523 | 15024757 | 121.6 | 119.3 | **240.9** |
+| 469524 | 15024789 | 153.4 | 123.5 | **276.9** |
+| 469525 | 15024821 | 39.6 | 135.2 | **174.8** |
+| 469526 | 15024853 | 84.7 | 126.4 | **211.1** |
+| 469527 | 15024885 | 110.1 | 122.4 | **232.5** |
+| 469528 | 15024917 | 131.0 | 116.8 | **247.8** |
+| 469530 | 15024981 | 90.1 | 119.2 | **209.3** |
+| 469531 | 15025013 | 105.2 | 118.7 | **223.9** |
+| 469532 | 15025045 | 137.4 | 131.6 | **269.0** |
+| 469533 | 15025077 | 39.5 | 125.6 | **165.1** |
+
+    median 228.2 s    p90 269.0 s    min 165.1    max 276.9
+
+Recomputed and not re-measured: `proof_unix_millis` is unchanged, and only the
+origin moved. The five epochs of the paragraph above reproduce exactly from this
+procedure — 8.4, 15.7, 46.7, 93.0, 124.7 — which is what says the crossing slots
+are right. Across all 37 epochs of the run the observation delay ran a median
+**105.2 s**, minimum 8.4 s, maximum 742.8 s.
+
+**The old number was tight because of the error, not despite it.** Its spread was
+18.4 s against a corrected spread of 111.8 s, and its standard deviation 6.0 s
+against 36.5 s. The final proof is nearly constant — that is the 117 to 135 s the
+run reported — and the observation delay carries essentially all the variance
+(sd 38.6 s). Reporting `T2 - T` from the daemon's notice reported the constant
+term and subtracted the variable one, which is why it looked reproducible. It is
+also anti-correlated with the delay it dropped (r = **-0.42**): the epochs that
+published best were, on the whole, the ones the daemon had been blindest on.
+
+**The model is not validated by this, and was not validated by the old number
+either.** `schedule` puts `threshold_s` at `arrival` of the crossing unit, and
+`arrival(i)` is `(slot_i - first_slot) * seconds_per_slot` — the crossing slot's
+boundary, the same origin `T` now uses. The two are finally the same quantity.
+Against a model of 117.7 s the corrected median is **1.94x**, not the 1.045x the
+run claimed, and the gap is 110.5 s against an observation delay of 107.7 s over
+the same ten epochs. **The whole of the discrepancy between the measured `T2 - T`
+and the modelled one is the blind tick.** Nothing about the prover, the recursion
+cost or the fold schedule is implicated by it, and none of it was visible while
+`T` was stamped where the gap was.
+
+One conservatism is left in the anchor and it is small. A slot's attestations do
+not exist at its boundary; the crossing slot supplies only the last third of the
+quorum, and on 193 slots of mainnet gossip (`arrivals.tsv` from this run) a third
+of a slot's attestations are in **2.87 s** after it begins, p90 4.64 s. So `T` is
+about 3 s earlier than the instant the chain could first have justified, and
+`T2 - T` over-states by that much. The boundary is kept anyway: it is the only
+instant here that is a pure function of the chain, it is the origin the schedule
+already plans against, and a metric that cannot be exact should err towards
+showing the problem rather than hiding it.
 
 **The largest remaining win is inlining, not folding.** The slots no fold can
 reach are cheaper carried inline by the final proof than proven as a group at

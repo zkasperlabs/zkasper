@@ -88,15 +88,18 @@ epoch (group 0, group 1, …) and is `null` for stages that run once.
 
 ### `latency`
 
-The measured `T2 - T`: `T` is when the daemon held the attestation that carried
-the epoch over the threshold, `T2` is when a proof of it existed. Everything else
-the pipeline does happens before `T`.
+The measured `T2 - T`: `T` is when the **chain** carried the epoch over the
+threshold, `T2` is when a proof of it existed. Everything else the pipeline does
+happens before `T`.
 
 ```json
 {
   "epoch": 469368,
+  "threshold_slot": 15019797,
   "threshold_unix_millis": 1755525130000,
-  "fired_unix_millis": 1755525131200,
+  "observed_unix_millis": 1755525130800,
+  "observation_millis": 800,
+  "fired_unix_millis": 1755525132000,
   "proof_unix_millis": 1755525140400,
   "t2_minus_t_millis": 10400,
   "wait_millis": 1200,
@@ -108,9 +111,26 @@ the pipeline does happens before `T`.
 }
 ```
 
-`t2_minus_t_millis` splits into three: `wait_millis`, the trigger holding back
-after the threshold; `late_group_millis`, proving the backlog the epoch opened
-with; and the final proof itself, which is the remainder.
+`threshold_slot` is the slot whose attestations crossed the threshold, and
+`threshold_unix_millis` is that slot's boundary — genesis plus a slot count, so
+`T` is a fact about the chain and not about this daemon's schedule. The boundary
+rather than the attestation deadline a third of the way into the slot: the
+boundary can only be *earlier* than the moment the attestations existed, so
+`t2_minus_t_millis` over-states what you waited rather than under-stating it. On
+mainnet the over-statement is about 3 s.
+
+`observed_unix_millis` is when the daemon noticed, and `observation_millis` is
+the difference. **`T` was stamped there until 2026-08-19**, which made
+`t2_minus_t_millis` a lower bound: the trigger is only evaluated on a tick with
+no proof in flight, so the daemon is blind to the crossing for the length of
+every proof. Over 37 measured mainnet epochs the notice came a median 105 s after
+the crossing slot began. If you recorded figures from an older daemon, they are
+short by that much and are not comparable with these.
+
+`t2_minus_t_millis` splits into four, in order and without overlap:
+`observation_millis`, the daemon not looking; `wait_millis`, the trigger holding
+back once it has; `late_group_millis`, proving the backlog the epoch opened with;
+and the final proof itself, which is the remainder.
 
 `wait_millis` is bounded twice over — by `--max-trigger-wait-millis` (10 s by
 default) and by what the tail is worth, since `tail_named` leaves cost
@@ -441,7 +461,7 @@ Every `data` object carries `seq` and `unix_millis`.
 | `epoch.progress` | while collecting, at most every 4 s | `{seq, unix_millis, epoch, attesting_balance, total_active_balance, attesting_pct, threshold_pct, folded_groups, slots_held, head_slot}` |
 | `stage.started` | a proof starts | `{seq, unix_millis, epoch, stage, slot, index}` |
 | `stage.finished` | a proof lands | `{seq, unix_millis, epoch, stage, slot, index, millis, prove_millis, wrap_millis, witness, proof_bytes}` |
-| `threshold.crossed` | `T` | `{seq, unix_millis, epoch, threshold_unix_millis, attesting_balance, total_active_balance, attesting_pct}` |
+| `threshold.crossed` | the daemon notices the crossing, which is not `T` | `{seq, unix_millis, epoch, observed_unix_millis, attesting_balance, total_active_balance, attesting_pct}` |
 | `threshold.fired` | the trigger fires | `{seq, unix_millis, epoch, fired_unix_millis, wait_millis, late_group_millis, tail, tail_named, late_groups}` |
 | `proof.landed` | `T2` | `{seq, unix_millis, epoch, proof, public_inputs, latency}` |
 | `posting.landed` | a proof is verified on another chain | `{seq, unix_millis, epoch, posting}` |
@@ -450,8 +470,10 @@ Every `data` object carries `seq` and `unix_millis`.
 
 Rendering a proof being built needs nothing else: `epoch.opened` draws the row,
 `stage.started` opens a bar, `stage.finished` closes it with its measured
-duration, `epoch.progress` moves the weight toward 2/3, `threshold.crossed`
-marks `T`, and `proof.landed` marks `T2` and gives you `t2_minus_t_millis`.
+duration, `epoch.progress` moves the weight toward 2/3, `threshold.crossed` marks
+the moment the daemon saw the weight arrive, and `proof.landed` marks `T2` and
+gives you `t2_minus_t_millis` — and with it `T` itself, which is not known until
+the crossing slot is, and so cannot be carried by `threshold.crossed`.
 
 An event type a client does not know must be ignored. New types will be added.
 

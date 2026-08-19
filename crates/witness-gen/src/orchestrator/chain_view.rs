@@ -182,7 +182,7 @@ impl ChainView {
     /// "no expectation to compare against" rather than an error: a missing
     /// metric is better than a wrong one, and nothing in the pipeline depends
     /// on this.
-    fn slot_unix_millis(&self, config: &OrchestratorConfig, slot: u64) -> Option<u64> {
+    pub(super) fn slot_unix_millis(&self, config: &OrchestratorConfig, slot: u64) -> Option<u64> {
         let seconds_per_slot = config.stream_policy.seconds_per_slot;
         self.genesis_time
             .map(|genesis| genesis * 1000 + (slot as f64 * seconds_per_slot * 1000.0) as u64)
