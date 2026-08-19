@@ -17,7 +17,7 @@ use crate::artifacts::now_unix_millis;
 use crate::beacon_api::{BeaconApi, ChainStatusApi};
 use crate::prover::Stage;
 
-use super::{OrchestratorConfig, LIVE_EPOCHS};
+use super::{OrchestratorConfig, MEASURED_EPOCHS};
 
 /// The node's view of the chain, as of the last time the daemon looked.
 #[derive(Default)]
@@ -215,13 +215,14 @@ impl ChainView {
         let elapsed = now_unix_millis().saturating_sub(epoch_start) as f64;
         let expected = expected.saturating_sub(epoch_start) as f64;
 
-        // Only an epoch the daemon is following live has an expectation worth
-        // measuring. Proving one that ended an hour ago is a catch-up, and
-        // recording its age as a delay would swamp the distribution with the
-        // one case where being late was the point.
+        // Replaying an epoch the chain left behind hours ago is a catch-up
+        // rather than a missed schedule, so it is not recorded — but it is
+        // counted, because a histogram that empties itself is indistinguishable
+        // from a daemon that has stopped proving. See [`MEASURED_EPOCHS`].
         let epoch_millis =
-            spe as f64 * config.stream_policy.seconds_per_slot * 1000.0 * LIVE_EPOCHS;
+            spe as f64 * config.stream_policy.seconds_per_slot * 1000.0 * MEASURED_EPOCHS;
         if elapsed > epoch_millis {
+            crate::metrics::drop_proof_start(stage);
             return;
         }
         crate::metrics::observe_proof_start(stage, (elapsed - expected) / 1000.0);

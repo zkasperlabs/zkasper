@@ -19,6 +19,7 @@ use crate::store::{EpochDiffRecord, Snapshot};
 use crate::witness_epoch_diff;
 
 use super::engine::{write_proof, Engine};
+use super::speculation::AheadDiff;
 
 /// Whether `error` means the node has thrown away a state this run still needs.
 ///
@@ -54,6 +55,16 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
     /// clone is only adopted once the circuit agrees with it.
     #[instrument(name = "stage", skip_all, fields(stage = "epoch_diff", epoch = to_epoch))]
     pub(super) async fn advance_accumulator(&mut self, to_epoch: u64) -> Result<()> {
+        // Proved during the epoch before this one if the daemon had the room.
+        // Awaited rather than started here, which is the whole point.
+        if let Some(ahead) = self
+            .ahead
+            .take_diff(to_epoch, self.snapshot.state.acc_commitment)
+            .await
+        {
+            return self.adopt_diff(to_epoch, ahead);
+        }
+
         let started = Instant::now();
         self.report.begin(Stage::EpochDiff, to_epoch, None, None);
 
@@ -158,6 +169,67 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
                 artifact,
             )
             .with_proof(&proof),
+        );
+        Ok(())
+    }
+
+    /// Move the accumulator onto a diff that was proved before the cursor
+    /// reached it, with the same checks the inline path makes.
+    ///
+    /// Every side effect is here rather than on the task that did the proving,
+    /// so a speculation that is never adopted leaves nothing to undo.
+    fn adopt_diff(&mut self, to_epoch: u64, ahead: AheadDiff) -> Result<()> {
+        if ahead.output.prev_accumulator_commitment != self.snapshot.state.acc_commitment {
+            bail!("epoch diff does not start from the accumulator the cursor sits on");
+        }
+        let acc_root = ahead.output.acc_root;
+        let total_active_balance = ahead.output.total_active_balance;
+        let num_validators = ahead.num_validators;
+
+        let artifact = self
+            .sink
+            .write_witness(to_epoch, "epoch_diff", &ahead.witness)?;
+        write_proof(&self.sink, to_epoch, "epoch_diff", &ahead.proof)?;
+
+        let mut state = self.snapshot.state.clone();
+        state.advance(
+            to_epoch,
+            acc_root,
+            ahead.output.accumulator_commitment,
+            total_active_balance,
+            num_validators,
+            Some(EpochDiffRecord {
+                output: ahead.output,
+                proof: ahead.proof.clone(),
+            }),
+        )?;
+
+        self.snapshot = Snapshot {
+            state,
+            tree: ahead.tree,
+            epoch_state: ahead.epoch_state,
+        };
+        self.store.save(&self.snapshot)?;
+        self.boundaries
+            .forget_before(to_epoch * self.config.chain.slots_per_epoch);
+
+        info!(
+            mutations = ahead.witness.mutations.len(),
+            num_validators,
+            total_active_balance,
+            acc_root = %hex_digest(&acc_root),
+            millis = ahead.took.as_millis() as u64,
+            "accumulator advanced on a diff proved before this epoch",
+        );
+        self.report.record(
+            StageTiming::new(
+                Stage::EpochDiff,
+                to_epoch,
+                Instant::now() - ahead.took,
+                ahead.cost,
+                artifact,
+            )
+            .with_proof(&ahead.proof),
         );
         Ok(())
     }

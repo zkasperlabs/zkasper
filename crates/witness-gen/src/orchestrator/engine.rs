@@ -21,9 +21,11 @@ use crate::committee::EpochCommittees;
 use crate::gossip::AttestationSource;
 use crate::prover::{Proof, Prover, Stage};
 use crate::store::{Snapshot, Store};
+use crate::witness_epoch_diff;
 
 use super::chain_view::ChainView;
 use super::reporter::Reporter;
+use super::speculation::{self, AheadCommittee, Speculation};
 use super::OrchestratorConfig;
 
 /// How many epoch boundaries one hold may take off the node.
@@ -41,7 +43,9 @@ pub(super) struct Engine<A> {
     pub(super) config: OrchestratorConfig,
     pub(super) store: Store,
     pub(super) sink: ArtifactSink,
-    pub(super) prover: Box<dyn Prover>,
+    /// Shared rather than owned because [`Speculation`] proves the next epoch
+    /// on a thread of its own, against the same prover.
+    pub(super) prover: Arc<dyn Prover>,
     pub(super) snapshot: Snapshot,
     /// Where the node is, and the clock the schedule is measured against.
     pub(super) chain: ChainView,
@@ -51,6 +55,9 @@ pub(super) struct Engine<A> {
     pub(super) gossip: Option<Box<dyn AttestationSource>>,
     /// Epoch boundaries this run took while the node still served them.
     pub(super) boundaries: BoundaryCache,
+    /// The next epoch's diff and committee proof, in flight or waiting to be
+    /// adopted. See [`super::speculation`].
+    pub(super) ahead: Speculation,
 }
 
 /// Persist a proof next to the witness it proves.
@@ -158,12 +165,28 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
             .await
             .with_context(|| format!("open the boundary state of epoch {target_epoch}"))?;
 
-        let (committees, committee_output, committee_proof) =
-            self.prove_committee(target_epoch, &boundary).await?;
+        // Made an epoch ago if the daemon had the room, and merely awaited
+        // here; proved on the spot if it did not. See [`super::speculation`].
+        let (committees, committee_output, committee_proof) = match self
+            .ahead
+            .take_committee(target_epoch, self.snapshot.state.acc_commitment)
+        {
+            Some(ready) => self.adopt_committee(target_epoch, ready)?,
+            None => self.prove_committee(target_epoch, &boundary).await?,
+        };
 
         // The epoch after this one is the youngest boundary there is, and the
         // one the diff that closes this epoch will need. Take it now.
         self.hold_boundaries(target_epoch + 1).await;
+
+        // And, having just taken it, start proving the next epoch's opening
+        // against it. Here rather than on the trigger's `!fire` branch, because
+        // a daemon that is behind opens every epoch past its own threshold and
+        // fires on the tick it opens — so `!fire` is the one branch the daemon
+        // this exists to rescue never runs. The witness build this costs is
+        // ~0.8 s of a mainnet epoch; what it takes off the next epoch's chain
+        // is the diff and the committee proof together, ~223 s.
+        self.speculate(target_epoch + 1).await;
 
         let stream = SlotStream::new(
             &self.config.chain,
@@ -180,6 +203,126 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
             committee_proof,
             stream,
         })
+    }
+
+    /// Record a committee proof made before its epoch opened as the stage it
+    /// is, so that an epoch costs the same in the manifest wherever it was
+    /// proved.
+    fn adopt_committee(
+        &mut self,
+        target_epoch: u64,
+        ready: AheadCommittee,
+    ) -> Result<(Arc<EpochCommittees>, CommitteeOutput, Proof)> {
+        self.chain.observe_start_delay(
+            &self.config,
+            Stage::Committee,
+            target_epoch,
+            target_epoch * self.config.chain.slots_per_epoch,
+        );
+        let artifact =
+            self.sink
+                .write_witness(target_epoch, "committee", &ready.committees.witness)?;
+        write_proof(&self.sink, target_epoch, "committee", &ready.proof)?;
+        info!(
+            epoch = target_epoch,
+            millis = ready.took.as_millis() as u64,
+            "opened on a committee proof made before the epoch",
+        );
+        self.report.record(
+            StageTiming::new(
+                Stage::Committee,
+                target_epoch,
+                Instant::now() - ready.took,
+                ready.cost,
+                artifact,
+            )
+            .with_proof(&ready.proof),
+        );
+        Ok((ready.committees, ready.output, ready.proof))
+    }
+
+    /// Start proving the epoch after this one, if nothing is proving it.
+    ///
+    /// Best effort by construction and never fatal. A boundary the chain has not
+    /// reached yet is one the next tick tries again for, and the worst outcome
+    /// is an epoch that proves its own opening on the critical path — which is
+    /// what every epoch did before this existed.
+    pub(super) async fn speculate(&mut self, next_epoch: u64) {
+        if self.ahead.covers(next_epoch) || !self.ahead.may_attempt(self.config.poll_interval) {
+            return;
+        }
+        if let Err(e) = self.start_speculation(next_epoch).await {
+            warn!(
+                epoch = next_epoch,
+                error = %format!("{e:#}"),
+                "could not start the next epoch's proofs early; \
+                 it will prove them on the critical path",
+            );
+        }
+    }
+
+    /// Build the next epoch's diff witness here — it needs the node — and hand
+    /// it and the committees that follow from it to a task of their own.
+    async fn start_speculation(&mut self, next_epoch: u64) -> Result<()> {
+        let slot_2 = next_epoch * self.config.chain.slots_per_epoch;
+        if self.chain.head_slot() < slot_2 {
+            return Ok(());
+        }
+        let held_1 = self
+            .boundary_at(self.snapshot.epoch_state.slot)
+            .await
+            .context("open the boundary the accumulator sits on")?;
+        let held_2 = self
+            .boundary_at(slot_2)
+            .await
+            .context("open the boundary the next epoch opens on")?;
+
+        // On a clone, which is what makes this speculative: nothing the task
+        // produces touches the accumulator until the cursor reaches the epoch.
+        let mut tree = self.snapshot.tree.clone();
+        let (witness, epoch_state, total_active_balance, num_validators) =
+            witness_epoch_diff::build_held(
+                &self.api,
+                &self.config.chain,
+                &mut tree,
+                &self.snapshot.epoch_state,
+                &held_1.validators,
+                &held_2.validators,
+                slot_2,
+                self.snapshot.state.total_active_balance,
+            )
+            .await
+            .context("build the next epoch's diff witness")?;
+        if witness.epoch_1 != self.snapshot.state.cursor_epoch || witness.epoch_2 != next_epoch {
+            bail!(
+                "the next epoch's diff spans {} -> {}, but the accumulator is at {}",
+                witness.epoch_1,
+                witness.epoch_2,
+                self.snapshot.state.cursor_epoch,
+            );
+        }
+
+        self.chain
+            .observe_start_delay(&self.config, Stage::EpochDiff, next_epoch, slot_2);
+        self.report.begin(Stage::EpochDiff, next_epoch, None, None);
+        self.report.begin(Stage::Committee, next_epoch, None, None);
+        info!(epoch = next_epoch, "proving the next epoch ahead of it");
+        self.ahead.start(
+            next_epoch,
+            self.snapshot.state.acc_commitment,
+            speculation::spawn(
+                self.prover.clone(),
+                self.config.chain.clone(),
+                next_epoch,
+                witness,
+                tree,
+                epoch_state,
+                total_active_balance,
+                num_validators,
+                held_2,
+            ),
+        );
+        Ok(())
     }
 
     /// Prove the epoch's committees, and time it like every other stage.

@@ -294,6 +294,11 @@ impl EpochPipeline for StreamPipeline {
                 target_epoch,
                 "the checkpoint reorged out; reopening the epoch"
             );
+            // The next epoch's committees were summed out of a boundary state
+            // that may have moved with it. The accumulator has not, so the diff
+            // would still adopt cleanly — but half a speculation is not worth
+            // the reasoning, and the card that made it is otherwise idle.
+            engine.ahead.forget();
             return Ok(());
         }
 

@@ -51,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::thread::{self, ThreadId};
 
 use anyhow::{bail, Result};
 
@@ -70,9 +71,16 @@ pub struct SplitProver {
     /// Every prover this owns. The first is the one an unrouted stage uses.
     provers: Vec<Box<dyn Prover>>,
     routes: HashMap<Stage, usize>,
-    /// Which prover answered last, so `last_cost` reports the proof the caller
-    /// just asked for rather than whichever backend happens to be first.
-    last: Mutex<usize>,
+    /// Which prover answered last **on each thread**, so `last_cost` reports the
+    /// proof the caller just asked for rather than whichever backend happens to
+    /// be first.
+    ///
+    /// Per thread because the orchestrator now proves two stages at once: the
+    /// next epoch's opening on a blocking task, this epoch's groups and final
+    /// proof on the runtime. A single slot would hand each of them the other's
+    /// cost, and the whole point of routing is to be able to price the cards
+    /// apart.
+    last: Mutex<HashMap<ThreadId, usize>>,
 }
 
 impl SplitProver {
@@ -89,13 +97,16 @@ impl SplitProver {
         Ok(Self {
             provers,
             routes: map,
-            last: Mutex::new(0),
+            last: Mutex::new(HashMap::new()),
         })
     }
 
     fn pick(&self, stage: Stage) -> &dyn Prover {
         let index = self.routes.get(&stage).copied().unwrap_or(0);
-        *self.last.lock().unwrap() = index;
+        self.last
+            .lock()
+            .unwrap()
+            .insert(thread::current().id(), index);
         &*self.provers[index]
     }
 
@@ -121,7 +132,14 @@ impl Prover for SplitProver {
     }
 
     fn last_cost(&self) -> Option<ProveCost> {
-        self.provers[*self.last.lock().unwrap()].last_cost()
+        let index = self
+            .last
+            .lock()
+            .unwrap()
+            .get(&thread::current().id())
+            .copied()
+            .unwrap_or(0);
+        self.provers[index].last_cost()
     }
 
     /// Every prover's counters, added up. An operator wants to know the service

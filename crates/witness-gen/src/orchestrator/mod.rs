@@ -46,6 +46,7 @@ mod config;
 mod engine;
 mod pipeline;
 mod reporter;
+mod speculation;
 mod stream;
 
 pub use config::{OrchestratorConfig, DEFAULT_SLOT_GROUP_WIDTH};
@@ -80,11 +81,21 @@ use stream::StreamPipeline;
 /// How many stage timings the manifest keeps.
 const RECENT_STAGES: usize = 64;
 
-/// How far behind the head an epoch may be and still be called live, in epochs.
+/// How far behind an epoch may be and still have its proof start delays
+/// recorded, in epochs.
 ///
-/// Two, because the daemon keeps looking for a checkpoint's attestations for
-/// `attestation_lookahead_epochs` past it. Anything older is a catch-up.
-const LIVE_EPOCHS: f64 = 2.0;
+/// Sixteen — about an hour and a half. The bound exists so that a run replaying
+/// a week of history does not swamp the delay distribution with the one case
+/// where being late was the point.
+///
+/// It used to be two, and two was the same number as
+/// `attestation_lookahead_epochs`, which made it look principled. It was not: a
+/// daemon whose prover paced the chain sat about 2.25 epochs behind, so every
+/// committee and group sample fell the wrong side of the bound and
+/// `zkasper_proof_start_delay_seconds` was blank for the whole of the run that
+/// most needed reading. A metric must not switch itself off exactly when the
+/// thing it measures goes wrong, and what is still dropped is now counted.
+const MEASURED_EPOCHS: f64 = 16.0;
 
 /// How many epochs' measured `T2 - T` the manifest keeps.
 const RECENT_LATENCIES: usize = 16;
@@ -276,9 +287,10 @@ impl<A: BeaconApi + ChainStatusApi> Orchestrator<A> {
                 config,
                 store,
                 sink,
-                prover,
                 snapshot,
                 boundaries,
+                prover: Arc::from(prover),
+                ahead: speculation::Speculation::default(),
             },
             batch: BatchPipeline::default(),
             stream: StreamPipeline::default(),

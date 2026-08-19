@@ -266,6 +266,15 @@ pub fn observe_proof_start(stage: Stage, delay_s: f64) {
     histogram!("zkasper_proof_start_delay_seconds", "stage" => stage.as_str()).record(delay_s);
 }
 
+/// A start delay that was not recorded because the epoch was too far behind to
+/// be a schedule miss rather than a replay.
+///
+/// Published so that an empty delay histogram always says which of the two it
+/// is: no proofs, or no proofs recent enough to price.
+pub fn drop_proof_start(stage: Stage) {
+    counter!("zkasper_proof_start_delay_dropped_total", "stage" => stage.as_str()).increment(1);
+}
+
 /// Where the accumulator, the chain and the node are, as of now.
 ///
 /// Called wherever the manifest is written, which is the end of every tick.
