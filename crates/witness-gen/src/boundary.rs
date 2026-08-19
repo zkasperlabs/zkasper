@@ -49,34 +49,7 @@ pub async fn build(
             // the boundary slot, which is the state the epoch diff just parsed.
             let known = (current.slot == justified_header.slot)
                 .then(|| list_hash_tree_root(&current.ssz_data_root, current.num_validators));
-            let parsed = ssz_state::parse_boundary_proof(&raw, known, config, boundary_slot)?;
-            // A node can serve a state for a canonical slot that does not match
-            // that slot's own canonical header, and then serve 404 for the same
-            // slot minutes later. Measured on 2026-08-19: slot 15023008 killed
-            // four consecutive runs while its header stayed `canonical: true`
-            // and unchanged, so this is not a reorg and re-resolving the
-            // checkpoint does not help. Proving against the state anyway would
-            // anchor the accumulator to the wrong root, so the only safe reading
-            // of a contradiction is that the node has nothing usable -- which is
-            // the case the synthetic anchor below already exists for.
-            if parsed.state_root != justified_header.state_root {
-                warn!(
-                    slot = justified_header.slot,
-                    "the node served a state that contradicts its own canonical \
-                     header; anchoring this boundary on a synthetic state",
-                );
-                state_diff::make_boundary_proof(
-                    &current.ssz_data_root,
-                    current.num_validators,
-                    &SlotHistory {
-                        slot: boundary_slot,
-                        block_root: *finalized_root,
-                        state_root: *boundary_state_root,
-                    },
-                )
-            } else {
-                parsed
-            }
+            ssz_state::parse_boundary_proof(&raw, known, config, boundary_slot)?
         }
         None => {
             warn!(
@@ -98,6 +71,11 @@ pub async fn build(
 
     // Everything the circuit will assert, asserted here first, so an epoch that
     // cannot be proven says which of the three values disagreed.
+    anyhow::ensure!(
+        proof.state_root == justified_header.state_root,
+        "the state at slot {} is not the one the justified checkpoint produced",
+        justified_header.slot,
+    );
     anyhow::ensure!(
         proof.block_root == *finalized_root,
         "the justified chain has a different checkpoint at slot {boundary_slot}",
