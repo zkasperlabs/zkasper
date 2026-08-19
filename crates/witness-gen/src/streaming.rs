@@ -52,11 +52,13 @@
 //! measured pair rather than rescaled**, because what moved is the shape of the
 //! optimum and not only its price; `BENCHMARKS.md` has the before numbers.
 //!
-//! Against a 3.640 s floor, `T2 − T` on mainnet 430529 is **10.6 s** and it is
+//! Against a 3.640 s floor, `T2 − T` on mainnet 430529 is **10.5 s** and it is
 //! the final proof and nothing else: 3.64 s of floor, 3.87 s of recursion — the
 //! running aggregate the epoch was folded into, the previous epoch's
-//! justification, and the one Poseidon instance they share — 2.40 s for the two
-//! slots it takes inline, and the epoch's one 0.66 s final exponentiation. It
+//! justification, and the one Poseidon instance they share — 2.26 s for the two
+//! slots it takes inline, and the epoch's one 0.66 s final exponentiation. Only
+//! 0.21 s of that is leaves: a slot's absentees are the smallest term in the
+//! proof they gate, which is the whole reason the trigger is cheap to fire. It
 //! was 83.1 s at 35.629 s a child, and 112.4 s before the inline tail was
 //! uncapped. The epoch's own work is one card: two groups, two folds and the
 //! final proof, with the last fold landing 1.6 s before `T`. How to cut the
@@ -137,33 +139,34 @@
 //!
 //! Complement proving inverts the usual latency trade. A slot proof opens the
 //! validators that did *not* attest, so an attestation still in flight when the
-//! trigger fires is one more absentee to open — at
-//! [`ProverModel::per_named_s`], 1.5365 ms each. Mainnet epoch 430529 crosses
-//! 2/3 42.7% of the way through slot 21's arrivals, with 17,128 of that slot's
-//! attesters still in flight: firing on the instant would buy back the wait and
-//! pay 26.3 s of extra proving for it.
+//! trigger fires is one more absentee to open — at [`ProverModel::named_s`],
+//! 601 us each in a tail of 11,379 and 798 us in a tail of 157. Mainnet epoch
+//! 430529 crosses 2/3 42.7% of the way through slot 21's arrivals, with 17,128
+//! of that slot's attesters still in flight: firing on the instant would buy
+//! back the wait and pay 9.98 s of extra proving for it.
 //!
 //! So there are two moments, and the objective is the second: the earliest
 //! instant the circuit would accept, and the instant that minimises `T2`.
-//! [`StreamPolicy::worth_waiting`] is the rule between them, and one interval of
-//! waiting pays for itself above 651 attesters a second at the measured per-leaf
-//! price. What the rule cannot do is read that rate off one interval and call it
-//! the future: a slot's gossip is two arrivals, unaggregated and aggregate, with
-//! a silence between them, and a live mainnet run stopped in that silence with
-//! thousands of attestations still to come. [`Filling`] is what the rule reads
-//! instead. [`Schedule::threshold_s`] is measured at 2/3 regardless, so any wait
-//! shows up in `T2 − T` rather than hiding in the choice of `T`.
+//! [`StreamPolicy::worth_waiting`] is the rule between them, and one 200 ms
+//! interval of waiting pays for itself above 1,289 attesters a second at the
+//! measured leaf price. What the rule cannot do is read that rate off one
+//! interval and call it the future: a slot's gossip is two arrivals,
+//! unaggregated and aggregate, with a silence between them, and a live mainnet
+//! run stopped in that silence with thousands of attestations still to come.
+//! [`Filling`] is what the rule reads instead. [`Schedule::threshold_s`] is
+//! measured at 2/3 regardless, so any wait shows up in `T2 − T` rather than
+//! hiding in the choice of `T`.
 //!
-//! 651 a second is a rate, and a rate cannot bound a wait. It is break-even by
+//! 1,289 a second is a rate, and a rate cannot bound a wait. It is break-even by
 //! construction — a second of waiting against a second of proving avoided — so
 //! an arrival stream that merely keeps clearing it justifies a wait of any
 //! length at all. The bound comes from the stock instead of the flow: the
-//! validators still in flight are worth `in_flight * per_named_s` and no more,
+//! validators still in flight are worth `named_s(in_flight)` and no more,
 //! because that is what the final proof would pay to open every one of them, so
 //! it is what the wait would save if all of them landed in the next instant.
 //! [`StreamPolicy::wait_budget_s`] is that quantity and the rule spends against
-//! it. A tail of 8,454 is worth 13.0 s; waiting 141 s for it loses 128 s on the
-//! best outcome available, and would need roughly 92,000 in flight to break
+//! it. A tail of 8,454 is worth 5.20 s; waiting 141 s for it loses 136 s on the
+//! best outcome available, and would need roughly 314,000 in flight to break
 //! even.
 
 use zkasper_common::acc::Digest;
@@ -253,19 +256,34 @@ pub struct ProverModel {
     /// children, and a panicking guest never returns from `ziskemu`.
     pub stage_floor_s: f64,
     /// Seconds per validator opened out of the accumulator: its leaf, one curve
-    /// addition, and the 2,311 executed steps of walking its witness.
+    /// addition, and the steps of walking its witness.
     ///
-    /// DERIVED from the attester sweep, whose OLS slope over 2,048 .. 154,000
-    /// attesters is 878.2 us +/- 6.5, less one internal node for the contiguous
-    /// range it opened.
+    /// MEASURED on the live mainnet run of 2026-08-19, epochs 469595 .. 469630
+    /// — 31 final proofs under one guest ELF (`0x9535e00...`), with tails from
+    /// 52 to 14,473 leaves. Least squares of the prover's own `prove_millis`
+    /// against the epoch's published `tail_named` is
+    /// **10.777 s + 595.5 us a leaf**, standard error 17.1 us on the slope and
+    /// 67 ms on the intercept, R^2 0.977, worst residual 0.90 s on the largest
+    /// tail. The intercept is fitted rather than assumed, because a final proof
+    /// pays a floor and four recursions before it opens a single leaf.
     ///
-    /// STILL v1.0.0-alpha, and deliberately so. The sweep cannot be reproduced:
-    /// a group-proof witness is now a slot *complement*, so `gen-test-witness
-    /// group-proof n` returns the same 728 bytes at every `n` and there is
-    /// nothing to regress against. Every other measured constant improved
-    /// between the two versions, so carrying this one forward unchanged is the
-    /// conservative choice — it can only make the schedule look worse than it
-    /// is. Re-measuring it needs a fixture that varies the absentee count.
+    /// 595.5 us is the leaf *and* the internal nodes it drags in, so it is not
+    /// this constant. Over that range `scattered_nodes` averages 8.263 nodes a
+    /// leaf, which at [`ProverModel::acc_node_s`] leaves
+    /// `595.5 - 8.263 x 31.9 = 325.8 us` for the validator itself, +/- 16.6.
+    /// The two regressors correlate at 0.9991 over these tails, so the split
+    /// needs `acc_node_s` from its own campaign and cannot be read off this fit;
+    /// what the fit does settle without help is that no positive `acc_node_s`
+    /// leaves room for more than 595.5 us here.
+    ///
+    /// **It was 834.7 us until 2026-08-19, which the data excludes outright.**
+    /// At that price 14,473 leaves are 12.08 s of validator alone, against 8.24 s
+    /// measured for the whole tail, nodes included. The figure came from the
+    /// v1.0.0-alpha attester sweep, which priced a bincode witness;
+    /// [`ProverModel::per_member_s`] fell 404.5 -> 101.2 us when its own witness
+    /// stopped being self-describing and was re-derived, and this one never was.
+    /// `per_member_s` is confirmed to 1.6% by the same run (see its docs), so
+    /// what is wrong here is this constant and not the campaign's rate.
     pub per_validator_s: f64,
     /// Seconds per committee member: the same leaf and the same curve addition,
     /// out of a witness the guest does not parse.
@@ -396,7 +414,7 @@ impl Default for ProverModel {
     fn default() -> Self {
         Self {
             stage_floor_s: 3.640,
-            per_validator_s: 834.7e-6,
+            per_validator_s: 325.8e-6,
             per_member_s: 101.2e-6,
             acc_node_s: 31.9e-6,
             bls_units_per_second: 200_000_000.0,
@@ -419,20 +437,31 @@ impl ProverModel {
         leaves * self.per_validator_s + scattered_nodes(leaves, depth) * self.acc_node_s
     }
 
-    /// Seconds the proof spends on one more *named* validator: its accumulator
-    /// leaf, and the internal nodes only it touches.
+    /// Seconds the proof spends opening `named` more validators out of the
+    /// accumulator: their leaves, and the internal nodes only they touch.
     ///
     /// This is the price of firing early, and the only number the trigger needs.
-    /// A scattered leaf touches every level above it — `scattered_nodes` is
-    /// linear in the leaf count at any density a slot reaches — so at mainnet's
-    /// depth-22 accumulator it is 834.7 us of validator plus 22 x 31.9 us of
-    /// node, or 1.5365 ms. One second of waiting is worth 651 attesters.
+    /// It is `open_scattered_s`, which is what the planner already
+    /// charges a tail, so the trigger and the schedule price one leaf alike.
     ///
-    /// It was 1.79 ms and 558 attesters while `acc_node_s` was v1.0.0-alpha's
-    /// 43.5 us. That pair is stale wherever it still appears: the node is
-    /// 31.9 us on v1.1.0-alpha and this is derived, never written down.
-    pub fn per_named_s(&self) -> f64 {
-        self.per_validator_s + self.acc_depth as f64 * self.acc_node_s
+    /// **It was a per-leaf constant of 1.5365 ms until 2026-08-19, and a leaf
+    /// has no constant price.** Two things were wrong with it and they
+    /// compounded. [`ProverModel::per_validator_s`] was 2.56x too big, and the
+    /// node term charged `acc_depth` — every level of the tree, for every
+    /// leaf — which `scattered_nodes` says only of a tail of exactly one. Its
+    /// marginal is 20.4 nodes at one leaf, 13.4 at 157 and 6.9 at 14,473, so a
+    /// tail deep enough to matter shares most of its path and was charged three
+    /// times over for it. Against the run those tails came from the old constant
+    /// is 1.50x high at one leaf and 2.64x at 17,128.
+    ///
+    /// So it is a curve: 1,027.6 us a leaf at one leaf, 798.4 at 157, 601.4 at
+    /// 11,379. What that does to the trigger is move both of its bars. One
+    /// 200 ms interval is now paid for by 258 leaves rather than 130 — **1,289
+    /// validators a second, not 651** — and one second of waiting is worth
+    /// 1,436. [`StreamPolicy::wait_budget_s`] reaches its 10 s cap at 17,168 in
+    /// flight where it used to reach it at 6,508.
+    pub fn named_s(&self, named: f64) -> f64 {
+        self.open_scattered_s(named, self.acc_depth)
     }
 
     /// The same, when the leaves are one index range and the guest reads them
@@ -671,11 +700,16 @@ impl StreamPolicy {
     /// The objective is the earliest *postable* proof, not the earliest proof
     /// start, and complement proving separates the two: `interval_s` of waiting
     /// delays the start by exactly that, and removes `removed` absentees the
-    /// final proof would otherwise have opened at [`ProverModel::per_named_s`]
-    /// each. So an interval pays for itself while arrivals run above 651
-    /// validators a second.
+    /// final proof would otherwise have opened at [`ProverModel::named_s`]. So
+    /// an interval pays for itself while arrivals run above 1,289 validators a
+    /// second, at the 200 ms tick the daemon runs.
+    ///
+    /// A rate, so it is read off the leaves the interval actually removed. They
+    /// are priced as a set rather than one at a time, because that is what they
+    /// cost: `scattered_nodes` is concave, and 258 absentees share more of the
+    /// tree than 258 times one absentee does.
     pub fn interval_paid(&self, removed: usize, interval_s: f64) -> bool {
-        removed as f64 * self.prover.per_named_s() > interval_s
+        self.prover.named_s(removed as f64) > interval_s
     }
 
     /// Every second of latency the attestations still in flight could buy back.
@@ -683,21 +717,21 @@ impl StreamPolicy {
     /// [`Self::interval_paid`] prices one interval against the arrivals it saw,
     /// which is a rate test and says nothing about how long the wait may run in
     /// total. This is the other half, and it is a *stock* rather than a rate:
-    /// the final proof opens `in_flight` accumulator leaves if it fires now, at
-    /// [`ProverModel::per_named_s`] each, so that product is the entire prize —
-    /// what the wait would save if every one of them arrived in the next
-    /// instant and the tail went to zero.
+    /// the final proof opens `in_flight` accumulator leaves if it fires now, and
+    /// [`ProverModel::named_s`] of them is the entire prize — what the wait
+    /// would save if every one of them arrived in the next instant and the tail
+    /// went to zero.
     ///
     /// A second of waiting costs a second of `T2 - T` outright, so a wait longer
     /// than the prize loses on every outcome, including the best one. That makes
-    /// this a budget and not a target: 8,454 leaves in flight are worth 13.0 s,
+    /// this a budget and not a target: 8,454 leaves in flight are worth 5.20 s,
     /// so no rate, however fast, makes a 141 s wait for them rational. 112
-    /// leaves are worth 0.17 s and the trigger should barely pause at all.
+    /// leaves are worth 91 ms and the trigger should barely pause at all.
     ///
     /// `max_wait_s` bounds it from the other side, for the case the prize is
     /// large but the arrivals never come.
     pub fn wait_budget_s(&self, in_flight: usize) -> f64 {
-        (in_flight as f64 * self.prover.per_named_s()).min(self.max_wait_s)
+        self.prover.named_s(in_flight as f64).min(self.max_wait_s)
     }
 
     /// Whether the wait is still worth taking.
@@ -718,7 +752,7 @@ impl StreamPolicy {
     /// it licenses a wait of any length whatever, provided each interval clears
     /// the bar. It never asks what the wait has cost in total against what is
     /// still left to win, and that second quantity is bounded: the tail in
-    /// flight is worth `in_flight * per_named_s` and not a millisecond more.
+    /// flight is worth `named_s(in_flight)` and not a millisecond more.
     ///
     /// So the budget is an `&&` over the whole rule rather than a clause inside
     /// one arm of it. Both readings of "still collecting" spend from the same
@@ -1876,7 +1910,7 @@ mod tests {
     /// fills whatever the deadline work leaves and never moves `T2`.
     ///
     /// It used to need cards of its own on top of that, and does not any more:
-    /// at a million members one chunk is 176 s against a 384 s epoch, so it
+    /// at a million members one chunk is 140 s against a 384 s epoch, so it
     /// lands inside the epoch that owes it, in one piece, on the card the
     /// deadline work had already idle.
     #[test]
@@ -1899,14 +1933,20 @@ mod tests {
             0.0,
             "the committee proof is late"
         );
-        // It does take a card of its own here, and that is the change rather
-        // than a regression: the epoch's own work is one group, one fold and one
-        // final proof in series on a single card now, so there is no idle card
-        // left to fill and no gap in the busy one wide enough for 140 s. What it
-        // costs is that card's idle time, not `T2` — which is what the equality
-        // above says.
+        // And it no longer takes a card of its own either, which is what the
+        // measured leaf price changed here. The epoch's own work is one group,
+        // one fold and one final proof in series, and at 325.8 us a validator
+        // that series is short enough that a single card absorbs the 140 s chunk
+        // in the stretch between the epoch's first fold and its last group
+        // without moving `T2` at all: the one-, two- and three-lane candidates
+        // all reach 12.8 s, so `better` takes the fewest cards.
+        //
+        // At 834.7 us the one-card candidate was 13.5 s against 13.0 s on two,
+        // and `better` ranks latency above GPUs, so it bought the second card
+        // for half a second. What it costs now is one card's idle time, not
+        // `T2` — which is what the equality above says.
         assert_eq!(without.lanes, 1);
-        assert_eq!(with.lanes, 2);
+        assert_eq!(with.lanes, 1);
     }
 
     #[test]
@@ -1928,18 +1968,33 @@ mod tests {
     }
 
     /// The trigger's whole argument in the units it is made of: an arrival rate
-    /// above one validator per `per_named_s` shortens the proof by more than the
-    /// wait costs, and below it does not.
+    /// above the price of the leaves the interval removed shortens the proof by
+    /// more than the wait costs, and below it does not.
+    ///
+    /// **There is no single break-even rate, and there never was one.** A tail
+    /// is priced as a set, `scattered_nodes` is concave, so a longer interval
+    /// collects leaves that share more of the tree and the bar it has to clear
+    /// rises with it: 1,289 a second over one 200 ms tick, 1,436 over a whole
+    /// second. The 651 this asserted until 2026-08-19 was one rate for every
+    /// interval, from a constant per-leaf price that was 2.58x too cheap to
+    /// begin with.
     #[test]
     fn waiting_pays_exactly_while_arrivals_outrun_the_per_leaf_price() {
         let policy = StreamPolicy::default();
-        let per_second = 1.0 / policy.prover.per_named_s();
-        assert!((per_second - 650.8).abs() < 0.1, "{per_second} a second");
 
-        assert!(policy.interval_paid(700, 1.0), "700 a second did not pay");
-        assert!(!policy.interval_paid(600, 1.0), "600 a second paid");
+        assert!(
+            policy.interval_paid(1_500, 1.0),
+            "1,500 a second did not pay"
+        );
+        assert!(!policy.interval_paid(1_400, 1.0), "1,400 a second paid");
+
+        // The same rule over the tick the daemon actually runs, where the bar is
+        // 1,289 a second and not the 1,436 a whole second asks for.
+        assert!(policy.interval_paid(300, 0.2), "1,500 a second did not pay");
+        assert!(!policy.interval_paid(200, 0.2), "1,000 a second paid");
+
         // The burst mainnet epoch 430529 actually crosses in: 17,128 attesters
-        // still in flight, 26.3 s of absentee openings, against a wait measured
+        // still in flight, 9.98 s of absentee openings, against a wait measured
         // in hundreds of milliseconds.
         assert!(policy.worth_waiting(drained(17_128, 17_128), 0.3, 0.0, 0.3));
     }
@@ -1963,18 +2018,29 @@ mod tests {
         );
 
         // The aggregates land, and the interval that carries them pays for
-        // itself many times over.
+        // itself many times over: 4,150 leaves are 2.69 s of proving against a
+        // 0.2 s tick.
         let landing = Filling {
             in_flight: 2_150,
             removed: 4_150,
             aggregates: 64,
             new_aggregates: 64,
         };
-        assert!(policy.worth_waiting(landing, 0.2, 0.0, 3.2));
+        assert!(policy.interval_paid(4_150, 0.2));
+        assert!(policy.worth_waiting(landing, 0.2, 0.0, 1.0));
 
-        // One quiet interval after them, both halves have been and gone.
+        // The rate clause is not the whole rule, and this is where the measured
+        // price changes the answer. By 3.2 s the wait has spent more than the
+        // 2,150 still in flight can ever repay — they are worth 1.46 s — so the
+        // budget ends it on the very interval that paid best. At 1.5365 ms a
+        // leaf those 2,150 were worth 3.30 s and this held on.
+        assert!(!policy.worth_waiting(landing, 0.2, 0.0, 3.2));
+
+        // One quiet interval after them, both halves have been and gone. Held
+        // inside the budget, so it is the aggregates clause that ends it here
+        // and not the bill.
         assert!(
-            !policy.worth_waiting(drained(2_150, 0), 0.2, 0.2, 3.4),
+            !policy.worth_waiting(drained(2_150, 0), 0.2, 0.2, 1.0),
             "kept waiting on a slot whose gossip was finished",
         );
     }
@@ -1995,8 +2061,8 @@ mod tests {
             aggregates: 0,
             new_aggregates: 0,
         };
-        // 300 leaves are 0.46 s of proving, and that is the whole budget.
-        assert!(policy.worth_waiting(converged, 0.2, 0.2, 0.4));
+        // 300 leaves are 0.23 s of proving, and that is the whole budget.
+        assert!(policy.worth_waiting(converged, 0.2, 0.2, 0.2));
         // Still only 0.2 s of silence, but the wait as a whole has now cost more
         // than these 300 could ever repay. The old rule held on here, because it
         // was looking at the silence rather than at the bill.
@@ -2008,29 +2074,31 @@ mod tests {
     ///
     /// [`StreamPolicy::interval_paid`] is break-even by construction — one
     /// second of waiting against one second of proving avoided — so arrivals
-    /// that merely keep clearing 651 a second license a wait of any length, and
-    /// the only thing that ever ended one was `max_wait_s`. What actually bounds
-    /// it is the stock rather than the flow: a tail of `in_flight` leaves is
-    /// worth `in_flight * per_named_s` and no more, whatever rate delivers it.
+    /// that merely keep clearing the leaf price license a wait of any length,
+    /// and the only thing that ever ended one was `max_wait_s`. What actually
+    /// bounds it is the stock rather than the flow: a tail of `in_flight` leaves
+    /// is worth `named_s(in_flight)` and no more, whatever rate delivers it.
     #[test]
     fn a_paying_rate_does_not_license_a_wait_past_what_the_tail_is_worth() {
         let policy = StreamPolicy::default();
 
-        // 1,000 in flight: 1.54 s of proving, in total, for ever.
-        let worth_s = 1_000.0 * policy.prover.per_named_s();
-        assert!((worth_s - 1.5365).abs() < 1e-3, "{worth_s} s");
+        // 1,000 in flight: 0.71 s of proving, in total, for ever. It was 1.54 s
+        // while a leaf was priced at a flat 1.5365 ms.
+        let worth_s = policy.prover.named_s(1_000.0);
+        assert!((worth_s - 0.7132).abs() < 1e-3, "{worth_s} s");
 
-        // Arriving at 2,500 a second — nearly four times break-even — so the
-        // rate test clears on every interval and never ends the wait itself.
+        // Arriving at 2,500 a second — nearly twice break-even over a 200 ms
+        // tick — so the rate test clears on every interval and never ends the
+        // wait itself.
         let pouring = drained(1_000, 500);
         assert!(policy.interval_paid(500, 0.2));
 
         assert!(
-            policy.worth_waiting(pouring, 0.2, 0.0, 1.0),
-            "a second spent chasing 1.54 s of proving is still ahead",
+            policy.worth_waiting(pouring, 0.2, 0.0, 0.5),
+            "half a second spent chasing 0.71 s of proving is still ahead",
         );
         assert!(
-            !policy.worth_waiting(pouring, 0.2, 0.0, 2.0),
+            !policy.worth_waiting(pouring, 0.2, 0.0, 1.0),
             "waited past what the whole tail could repay, because the arrivals \
              were still clearing a break-even rate",
         );
@@ -2042,18 +2110,24 @@ mod tests {
         let policy = StreamPolicy::default();
 
         // Mainnet 469483 fired with 8,454 leaves still in its tail. That is
-        // 13.0 s of proving: the most any wait for them could ever have saved,
-        // against the 141.6 s that epoch was reported to have waited.
-        let worth_s = 8_454.0 * policy.prover.per_named_s();
-        assert!((worth_s - 12.99).abs() < 0.01, "{worth_s} s");
-        assert!(141.6 / policy.prover.per_named_s() > 90_000.0, "break-even");
+        // 5.20 s of proving: the most any wait for them could ever have saved,
+        // against the 141.6 s that epoch was reported to have waited. It would
+        // take 314,000 in flight to make that wait break even, and a mainnet
+        // slot has 28,166 members in it.
+        let worth_s = policy.prover.named_s(8_454.0);
+        assert!((worth_s - 5.199).abs() < 0.01, "{worth_s} s");
+        assert!(policy.prover.named_s(300_000.0) < 141.6, "break-even");
 
-        // Above `max_wait_s`, so the cap is what binds for a filling slot — the
-        // budget changes nothing in the case the rule was tuned on.
-        assert_eq!(policy.wait_budget_s(8_454), policy.max_wait_s);
+        // **Below `max_wait_s`, which is what the measured leaf price changed.**
+        // At 1.5365 ms a leaf a tail this size was worth 13.0 s and the cap was
+        // what ended the wait; at the measured price the budget ends it 4.8 s
+        // sooner, and the cap does not bind until 17,168 leaves are in flight —
+        // more than half a mainnet slot's committee.
+        assert!(policy.wait_budget_s(8_454) < policy.max_wait_s);
+        assert_eq!(policy.wait_budget_s(20_000), policy.max_wait_s);
 
-        // 469480's tail was 112 leaves, worth 0.17 s, and the budget says so.
-        assert!((policy.wait_budget_s(112) - 0.172).abs() < 0.001);
+        // 469480's tail was 112 leaves, worth 91 ms, and the budget says so.
+        assert!((policy.wait_budget_s(112) - 0.0912).abs() < 0.001);
 
         // Nothing in flight is worth nothing, which is why an epoch that opens
         // past its own threshold fires on the instant.
@@ -2195,9 +2269,9 @@ mod tests {
     ///
     /// What the tail is still worth is the floor it keeps off the critical path,
     /// which is what a cap of zero prices: the epoch's end becomes a group no
-    /// fold can reach, the final proof absorbs it, and `T2 - T` goes from 10.6 s
-    /// to 15.8 s. Two slots is the whole of the win — a cap of one gives back
-    /// 0.3 s of it — so the bound that mattered is the model's, not a policy's.
+    /// fold can reach, the final proof absorbs it, and `T2 - T` goes from 10.5 s
+    /// to 15.7 s. Two slots is the whole of the win — a cap of one gives back
+    /// 0.4 s of it — so the bound that mattered is the model's, not a policy's.
     ///
     /// `test_ssz_file_streaming_schedule` prints these numbers off the 320 MB
     /// state download that [`EPOCH_430529`] was taken from; this runs offline.
@@ -2222,13 +2296,13 @@ mod tests {
 
         // In tenths, because that is the precision the constants underneath
         // carry and the precision `better` compares at.
-        assert_eq!((uncapped.latency_s() * 10.0).round(), 106.0);
+        assert_eq!((uncapped.latency_s() * 10.0).round(), 105.0);
 
         // The tail priced from the other side: forbid it and the epoch's end is
         // a proof of its own, in series after the last attestation.
         let no_tail = schedule_capped(&units, TOTAL_ACTIVE_BALANCE_430529, &policy, 0);
         assert_eq!(no_tail.plan.absorbed.len(), 1);
-        assert_eq!((no_tail.latency_s() * 10.0).round(), 158.0);
+        assert_eq!((no_tail.latency_s() * 10.0).round(), 157.0);
 
         // And it is cheaper, not a latency-for-throughput trade: a group's floor
         // and its complement work both leave the epoch with the group.
