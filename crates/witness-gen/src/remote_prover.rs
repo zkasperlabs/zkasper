@@ -154,6 +154,16 @@
 //! the same witness: **7,845,411 bytes**, or **15.3x** less, which is about 5 s
 //! of wire instead of 70. See [`crate::committee_cache`] for the encoding.
 //!
+//! Production bore that out on 2026-08-19: the committee round trip went 198.8 s
+//! cold to **152.3 s** warm, and `late_group_millis` — the cliff this was for —
+//! went from 22-47 s to **141 ms**.
+//!
+//! Both ends say what an epoch put on the wire, because for three proofs nobody
+//! could tell. The client logs `request_bytes` with the table shape beside the
+//! round trip, and the server logs `frame_bytes` apart from `witness_bytes`;
+//! either one alone is enough to see the cache working, from one machine,
+//! without arithmetic.
+//!
 //! Nothing about the proof changes. The server rebuilds the witness and hashes
 //! it against a digest the client computed over the bytes it would otherwise
 //! have sent, so the circuit is fed byte-identical input or it is fed nothing.
@@ -167,17 +177,20 @@
 //! - **A restarted server** holds nothing. It reports that at the handshake, and
 //!   because a restart drops the connection there is always a handshake. The
 //!   client's belief is reconciled there and the next request carries the keys.
-//! - **A server that lost the table any other way**, or a second client that
-//!   replaced it, answers [`Reply::NeedMemberTable`]. It has reconstructed
-//!   nothing at that point. The client sends the keys and the epoch still lands,
-//!   one round trip later.
-//! - **A different server behind the same address** reports a table this end
-//!   cannot name. A reported digest is only ever grounds to *forget* — this end
-//!   can build on a table only if it knows what went into it — so that too falls
-//!   back to sending them. With `--prover-route committee=<second card>` the two
-//!   servers keep independent caches and neither is told about the other's.
+//! - **A server that evicted the table**, or a different server behind the same
+//!   address, answers [`Reply::NeedMemberTable`]. It has reconstructed nothing
+//!   at that point. The client sends the keys and the epoch still lands, one
+//!   round trip later. This is the only path that finds out, because the
+//!   handshake names one table and the server keeps
+//!   [`committee_cache::TABLES_HELD`] — so a digest that merely *differs* from
+//!   this end's is no evidence at all, and treating it as evidence would resend
+//!   every key across exactly the restart overlap the several tables exist to
+//!   cover.
 //! - **A daemon restart** forgets its own belief, so the first committee witness
 //!   of a run always carries the keys whatever the server says it holds.
+//!
+//! With `--prover-route committee=<second card>` the two servers keep
+//! independent caches and neither is told about the other's.
 //!
 //! The table lives in server memory and nowhere else. It cannot outlive the
 //! process, because a table that survived a restart would be a claim about keys
@@ -335,7 +348,12 @@ fn write_frame<T: Serialize>(w: &mut impl Write, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> Result<T> {
+/// Read a frame, and say how many bytes came off the socket to make it.
+///
+/// The count is the one thing the value cannot tell anyone: a committee request
+/// that names its keys deserializes into a witness fifteen times the size of
+/// the frame that carried it, and no field of the result says so.
+fn read_frame_sized<T: DeserializeOwned>(r: &mut impl Read) -> Result<(T, usize)> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as usize;
@@ -344,7 +362,12 @@ fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> Result<T> {
     }
     let mut bytes = vec![0u8; len];
     r.read_exact(&mut bytes)?;
-    bincode::deserialize(&bytes).context("deserialize a frame")
+    let value = bincode::deserialize(&bytes).context("deserialize a frame")?;
+    Ok((value, len))
+}
+
+fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> Result<T> {
+    read_frame_sized(r).map(|(value, _)| value)
 }
 
 /// Compare without leaking where the difference is.
@@ -490,22 +513,29 @@ pub fn serve_client(
         &HelloReply::Ready {
             prover: prover.name().to_string(),
             programs,
-            member_table: config.members.digest(),
+            member_table: config.members.newest(),
         },
     )?;
 
     loop {
-        let request: Request = match read_frame(&mut stream) {
-            Ok(request) => request,
+        let (request, frame_bytes): (Request, usize) = match read_frame_sized(&mut stream) {
+            Ok(framed) => framed,
             Err(e) if is_disconnect(&e) => return Ok(()),
             Err(e) => return Err(e.context("read a request")),
         };
         let started = Instant::now();
         let reply = match request {
             Request::Prove { stage, witness } => {
-                answer(prover, stage, witness.len(), started, || {
-                    prove_stage(prover, stage, &witness)
-                })
+                let witness_bytes = witness.len();
+                answer(
+                    prover,
+                    stage,
+                    "prove",
+                    frame_bytes,
+                    witness_bytes,
+                    started,
+                    || prove_stage(prover, stage, &witness),
+                )
             }
             Request::ProveCommittee {
                 table,
@@ -514,18 +544,22 @@ pub fn serve_client(
             } => match reconstruct(&config.members, &table, &delta, witness_digest) {
                 Ok(None) => {
                     info!(
-                        holds_a_table = config.members.digest().is_some(),
+                        frame_bytes,
+                        named = hex::encode(table.resulting_digest()),
+                        resident = config.members.len(),
                         "a client named a member table this server does not hold; asking for it",
                     );
                     Reply::NeedMemberTable
                 }
-                // The witness size is what was rebuilt and proven, not what the
-                // frame carried, so one log line still says what an epoch cost.
-                Ok(Some((witness, witness_bytes))) => {
-                    answer(prover, Stage::Committee, witness_bytes, started, || {
-                        Ok(prover.prove_committee(&witness)?.1)
-                    })
-                }
+                Ok(Some((witness, witness_bytes))) => answer(
+                    prover,
+                    Stage::Committee,
+                    "prove_committee",
+                    frame_bytes,
+                    witness_bytes,
+                    started,
+                    || Ok(prover.prove_committee(&witness)?.1),
+                ),
                 Err(e) => {
                     warn!(error = %format!("{e:#}"), "could not rebuild a committee witness");
                     Reply::Failed(format!("{e:#}"))
@@ -537,9 +571,24 @@ pub fn serve_client(
 }
 
 /// Prove one witness and say on the log what it cost.
+///
+/// **`frame_bytes` and `witness_bytes` are different numbers, and this log line
+/// must never merge them again.** They were one field once, `witness_bytes`,
+/// meaning the bytes that arrived for a [`Request::Prove`] and the bytes that
+/// were rebuilt for a [`Request::ProveCommittee`] — 7.8 MB and 113 MB for the
+/// same request. On 2026-08-19 that is what made a member cache that was
+/// working read as one that was not: from this end there was no way to tell a
+/// compact request from a whole one, so the wire could only be inferred by
+/// subtracting this line's `millis` from a `round_trip_millis` on another
+/// machine, and the two proofs anyone had the patience to do that for were both
+/// cold. `frame_bytes` is always what came off the socket and `witness_bytes`
+/// is always what the circuit was fed; their ratio is the saving, readable
+/// here, on one line.
 fn answer(
     prover: &dyn Prover,
     stage: Stage,
+    request: &'static str,
+    frame_bytes: usize,
     witness_bytes: usize,
     started: Instant,
     prove: impl FnOnce() -> Result<Proof>,
@@ -548,6 +597,8 @@ fn answer(
         Ok(proof) => {
             info!(
                 stage = stage.as_str(),
+                request,
+                frame_bytes,
                 witness_bytes,
                 words = proof.len(),
                 millis = started.elapsed().as_millis() as u64,
@@ -773,25 +824,29 @@ struct Delivery {
     with_table: Option<MemberTable>,
 }
 
-impl Delivery {
-    /// How large the frame this sends is, near enough to judge against the cap
-    /// the far end reads with.
-    ///
-    /// Counted from the shapes rather than by serializing a copy or by walking
-    /// one: `bincode::serialized_size` visits a `Vec<u8>` a byte at a time, and
-    /// the largest witness a run sends is 916 MB of exactly that. It undercounts
-    /// by the frame's own headers, which is nothing against a 512 MB cap.
-    fn request_bytes(&self) -> usize {
-        match &self.request {
-            Request::Prove { witness, .. } => witness.len(),
-            Request::ProveCommittee { table, delta, .. } => {
-                table.len() * (8 + 96)
-                    + delta.index_gaps.len()
-                    + delta.slots.len()
-                    + delta.balance_ids.len()
-                    + delta.balances.len() * 8
-                    + delta.acc_multi_proof.auxiliaries.len() * 32
-            }
+/// How large the frame a request will send is, near enough to judge against the
+/// cap the far end reads with and to say on the log what an epoch cost.
+///
+/// Counted from the shapes rather than by serializing a copy or by walking one:
+/// `bincode::serialized_size` visits a `Vec<u8>` a byte at a time, and the
+/// largest witness a run sends is 916 MB of exactly that. It undercounts by the
+/// frame's own headers, which is nothing against a 512 MB cap and nothing
+/// against a number whose reason for existing is to separate 8 MB from 113 MB.
+///
+/// A free function rather than a method on [`Delivery`], because the request
+/// that matters is the one finally sent: a committee request that was asked for
+/// its keys goes out larger than the one that was planned, and the log has to
+/// say what left rather than what was intended.
+fn request_bytes(request: &Request) -> usize {
+    match request {
+        Request::Prove { witness, .. } => witness.len(),
+        Request::ProveCommittee { table, delta, .. } => {
+            table.len() * (8 + 96)
+                + delta.index_gaps.len()
+                + delta.slots.len()
+                + delta.balance_ids.len()
+                + delta.balances.len() * 8
+                + delta.acc_multi_proof.auxiliaries.len() * 32
         }
     }
 }
@@ -1349,12 +1404,12 @@ impl Inner {
         // a witness-only run gives: the daemon holds the outputs its own
         // circuits computed, so it keeps following the chain and the epoch is
         // published without a proof for this stage.
-        let request_bytes = delivery.request_bytes();
-        if request_bytes > self.config.max_request_bytes {
+        let planned_bytes = request_bytes(&delivery.request);
+        if planned_bytes > self.config.max_request_bytes {
             self.note_unproven();
             warn!(
                 stage = stage.as_str(),
-                witness_bytes = request_bytes,
+                witness_bytes = planned_bytes,
                 cap_bytes = self.config.max_request_bytes,
                 "this witness is larger than one frame and cannot be proven remotely",
             );
@@ -1364,6 +1419,21 @@ impl Inner {
             .store(now_unix_millis(), Ordering::Relaxed);
         let started = Instant::now();
         let mut request = delivery.request;
+        // Said before the ask rather than after it, so an epoch the prover never
+        // answers for still leaves a record of what it would have cost. Only the
+        // stage that carries a table says it: this one runs once an epoch, and
+        // the stages that run dozens of times carry nothing worth a line of
+        // their own.
+        if let Request::ProveCommittee { table, .. } = &request {
+            info!(
+                addr = %self.config.addr,
+                stage = stage.as_str(),
+                request_bytes = planned_bytes,
+                table = table.shape(),
+                keys = table.len(),
+                "asking for a committee proof",
+            );
+        }
         let mut result = self.attempt(&mut self.conn.lock().unwrap(), &request);
         // The server does not hold the member table this request names its keys
         // out of, so it has reconstructed nothing and there is nothing here to
@@ -1376,12 +1446,14 @@ impl Inner {
         if let Ok(Reply::NeedMemberTable) = &result {
             match (&mut request, delivery.with_table.take()) {
                 (Request::ProveCommittee { table, .. }, Some(every_key)) => {
+                    let keys = every_key.len();
+                    *table = every_key;
                     info!(
                         addr = %self.config.addr,
-                        keys = every_key.len(),
+                        request_bytes = request_bytes(&request),
+                        keys,
                         "the prover is not holding this run's member table; sending the keys",
                     );
-                    *table = every_key;
                     result = self.attempt(&mut self.conn.lock().unwrap(), &request);
                 }
                 // Either a stage with no table asked for one, or the request
@@ -1470,14 +1542,23 @@ impl Inner {
         self.last_foreground
             .store(now_unix_millis(), Ordering::Relaxed);
 
+        // What actually left, which is the planned size unless the prover asked
+        // for its keys back mid-request.
+        let sent_bytes = request_bytes(&request);
+
         match result {
             Ok(Reply::Proved { proof, cost }) => {
                 self.reject_empty(stage, &proof)?;
                 self.check(stage, &proof, publics)?;
                 *self.last_cost.lock().unwrap() = Some(cost);
                 self.counters.proved.fetch_add(1, Ordering::Relaxed);
+                // `request_bytes` sits beside the timings deliberately: this
+                // is the one line that says both what an epoch put on the wire
+                // and what it got back for it, on the machine that has the
+                // spare attention to read it.
                 info!(
                     stage = stage.as_str(),
+                    request_bytes = sent_bytes,
                     words = proof.len(),
                     prove_millis = cost.prove_millis,
                     wrap_millis = cost.wrap_millis,
