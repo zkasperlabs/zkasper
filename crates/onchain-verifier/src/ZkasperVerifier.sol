@@ -30,7 +30,8 @@ interface IZiskVerifier {
 /// no circuit is in a position to pin: a program cannot contain its own
 /// verification key, and nothing but the next epoch's proof consumes this one.
 /// Skip the check and the proof on chain is genuine while the epoch below it is
-/// whatever the prover chose. See `docs/assumptions.md` section 3.
+/// whatever the prover chose. See `docs/finality/assumptions.md`, "Which
+/// program a child proof came from".
 ///
 /// The accumulator_commitment is poseidon(poseidon_root, total_active_balance),
 /// binding the Poseidon validator tree to the total active balance in one value.

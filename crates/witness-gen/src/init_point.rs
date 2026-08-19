@@ -8,7 +8,8 @@
 //!
 //! It only ever proved the accumulator matched *a* state root. Whether that root
 //! is canonical Ethereum was the operator's choice then and is the operator's
-//! choice now — `docs/assumptions.md` has always said so. What the proof added
+//! choice now — `docs/shared/assumptions.md` has always said so. What the
+//! proof added
 //! was a way to check the accumulator against the root without redoing the work.
 //! Since the accumulator is a deterministic function of the validator list,
 //! redoing the work is a thing anyone can do, and it is what this module does:

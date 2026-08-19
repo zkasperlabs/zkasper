@@ -744,7 +744,8 @@ pub struct StreamFinalOutput {
     /// rather than to a circuit: **an on-chain verifier must require this to
     /// equal the program key it already pins.** Without that comparison the
     /// proof it holds is genuine and the epoch below it is whatever the prover
-    /// chose. See `docs/assumptions.md` §3.
+    /// chose. See `docs/finality/assumptions.md`, "Which program a child
+    /// proof came from".
     pub program_vk: crate::recursion::ProgramVk,
 }
 

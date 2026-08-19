@@ -41,7 +41,7 @@ set -euo pipefail
 # The three keys no step can bake are the ones a program would have to contain
 # its own copy of: the justification, aggregate and stream-final fold chains.
 # Those are published in the proof's public outputs instead; see
-# `docs/assumptions.md` §3.
+# `docs/finality/assumptions.md`, "Which program a child proof came from".
 #
 # ---------------------------------------------------------------------------
 # What a mismatch looks like

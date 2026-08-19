@@ -37,7 +37,8 @@ the epoch diff; a 404 was reported as a parse error; a pruned bootstrap state
 wedged startup. See §8 and §6.
 
 **Fixed since**: bootstrap is gone. The daemon starts from a trusted init point —
-see [docs/assumptions.md](docs/assumptions.md) — which deletes the two-minute
+see [docs/shared/assumptions.md](docs/shared/assumptions.md) — which deletes
+the two-minute
 startup and the whole "bootstrap epoch pruned" failure mode with it.
 
 **Fixed after it**: an empty epoch boundary slot no longer ends the run — the
@@ -417,7 +418,7 @@ Tell the daemon what the card costs, so every epoch it publishes can be priced:
 It is published as given and nothing multiplies by it. The daemon measures
 prover milliseconds per epoch and publishes those separately, because an hourly
 rate is a fact about a rental contract rather than about the pipeline. See
-[docs/api-v1.md](docs/api-v1.md#what-an-epoch-cost).
+[docs/finality/api-v1.md](docs/finality/api-v1.md#what-an-epoch-cost).
 
 ### Step 7 — Take the init point
 
@@ -451,7 +452,7 @@ a run should start. The file is small enough to read:
 **Publish it with the run.** It is the declared root of trust, and the only way a
 consumer can check it is to regenerate it: `zkasper-init-point --slot <epoch*32>`
 against any node that still holds that state, then `diff`. See
-[docs/assumptions.md](docs/assumptions.md).
+[docs/shared/assumptions.md](docs/shared/assumptions.md).
 
 Confirm the node still holds the state the file names — the daemon walks that
 registry on its first breath:
@@ -758,8 +759,8 @@ voluntary.
 moves, and `acc_chain_digest` restarts and will not match a peer that never lost
 theirs. Do it only when the table above says to, and publish the new init point
 alongside the old one — a consumer applying the rule in
-[docs/assumptions.md](docs/assumptions.md) needs to know where one chain ended
-and the next began.
+[docs/shared/assumptions.md](docs/shared/assumptions.md) needs to know where one
+chain ended and the next began.
 
 ```sh
 pkill -f run_zkasperd.sh; pkill -f 'target/release/zkasperd'

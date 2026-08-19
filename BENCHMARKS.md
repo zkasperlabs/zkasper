@@ -208,7 +208,8 @@ ZKASPER_GPU=1 ZKASPER_REPEATS=3 cargo test --release --features zisk-prover \
 | wrap compression | 0.048 s | **0.050 s ± 0.004** (n=18) | +4.6% |
 
 Every stage is faster than the figure the schedule is built on and the wrap is
-the same, so `docs/architecture.md` is conservative rather than optimistic.
+the same, so `docs/finality/architecture.md` is conservative rather than
+optimistic.
 Only the wrap is like for like: the other three drop the process start and the
 device allocation a per-proof `cargo-zisk` pays, which is the point of holding
 one client open.

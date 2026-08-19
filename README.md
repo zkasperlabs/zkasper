@@ -15,7 +15,7 @@ against. The accumulator is a second validator-set tree, hashed with Poseidon2
 over Goldilocks, that costs far less to open than the SSZ registry. Its
 commitments chain back through one epoch diff per epoch to a single trusted
 init point — one beacon state root the operator chose. See
-[docs/assumptions.md](docs/assumptions.md).
+[docs/shared/assumptions.md](docs/shared/assumptions.md).
 
 `T` is the moment the chain publishes enough attestations to justify a
 checkpoint. `T2` is the moment a proof of it exists. `T2 - T` is the only
@@ -62,7 +62,8 @@ that verify it, which is what makes a recursive verification bind a *program*
 rather than a key the prover supplied. The keys form a dependency graph, so the
 script builds in the order the graph requires and one pass is enough;
 `build_guests.sh` builds ELFs alone and leaves the constants describing the
-previous ones. See [docs/assumptions.md](docs/assumptions.md) section 3.
+previous ones. See [docs/finality/assumptions.md](docs/finality/assumptions.md),
+"Which program a child proof came from".
 
 ## Run
 
@@ -87,7 +88,7 @@ commitment does not bind its own root and balance, and then refuses to start
 unless the accumulator it rebuilds from the registry is the one the file claims.
 `--init-point` is ignored once a state file exists, so a restart resumes rather
 than starting a second chain. What this trusts, and what it does not, is
-[docs/assumptions.md](docs/assumptions.md).
+[docs/shared/assumptions.md](docs/shared/assumptions.md).
 
 `--mode streaming` proves each epoch as the attestations arrive.
 `--mode batch`, the default, proves each slot and folds the epoch after the
@@ -95,7 +96,8 @@ epoch ends. `--once` catches up to the head of the chain and exits. `--chain`
 selects `mainnet` or `gnosis`.
 
 The batch pipeline carries a known soundness gap. Read
-[docs/assumptions.md](docs/assumptions.md) before you secure value with it.
+[docs/finality/assumptions.md](docs/finality/assumptions.md) before you secure
+value with it.
 
 `--prover native`, the default, runs each guest natively and returns an empty
 proof. It needs no proving hardware, and it checks every witness with the
@@ -122,8 +124,8 @@ If the server goes away the daemon keeps generating witnesses, spools the ones
 it could not prove, and backfills them when the server returns.
 
 Given `--api-url`, the daemon also mirrors every stage to
-[the v1 API](docs/api-v1.md) as it happens, and uploads the proof bytes of each
-epoch. That is what drives the live view on zkasper.com. Publishing never holds
+[the v1 API](docs/finality/api-v1.md) as it happens, and uploads the proof bytes
+of each epoch. That is what drives the live view on zkasper.com. Publishing never holds
 proving up: a batch the API will not take is spooled to `<output-dir>/spool`.
 
 ```sh
@@ -133,8 +135,8 @@ cargo run --release --bin zkasperd -- --beacon-url http://localhost:5052 \
 ```
 
 The beacon node needs specific flags. Read
-[docs/architecture.md](docs/architecture.md) before you point the daemon at a
-node, and [RUNBOOK.md](RUNBOOK.md) to operate one.
+[docs/finality/architecture.md](docs/finality/architecture.md) before you point
+the daemon at a node, and [RUNBOOK.md](RUNBOOK.md) to operate one.
 
 For one step at a time, use the `zkasper-witness-gen` binary:
 
@@ -166,21 +168,28 @@ Open:
   zero.
 - The Solidity verifier is not integrated with the Zisk proof format.
 - The init point is trusted, not proven. A consumer has to regenerate it, or
-  hold the accumulator to the rule in [docs/assumptions.md](docs/assumptions.md)
-  that every state root it passed through be named by a later finalization.
+  hold the accumulator to the rule in
+  [docs/shared/assumptions.md](docs/shared/assumptions.md) that every state root
+  it passed through be named by a later finalization.
 
 ## Read next
 
+zkasper documents **two proofs** separately, because they are two products with
+two threat models, two thresholds and two sets of circuits.
+[docs/README.md](docs/README.md) is the map.
+
 | document | what it holds |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | the proofs, and the machines they run on |
-| [docs/assumptions.md](docs/assumptions.md) | every trust assumption and accepted risk |
+| [docs/finality/architecture.md](docs/finality/architecture.md) | the finality proofs, and the machines they run on |
+| [docs/finality/assumptions.md](docs/finality/assumptions.md) | what a finalization proof trusts, and the risks accepted in it |
+| [docs/finality/api-v1.md](docs/finality/api-v1.md) | the public HTTP API, which serves finality proofs |
+| [docs/fcr/architecture.md](docs/fcr/architecture.md) | fast confirmation, designed and not built |
+| [docs/fcr/assumptions.md](docs/fcr/assumptions.md) | what a fast confirmation proof would trust |
+| [docs/shared/assumptions.md](docs/shared/assumptions.md) | the accumulator, the BLS arithmetic, the prover and the wrap — what both rest on |
+| [docs/shared/gossip.md](docs/shared/gossip.md) | where attestations come from, and what they cost |
 | [RUNBOOK.md](RUNBOOK.md) | how to provision, run, monitor and recover a mainnet deployment |
 | [BENCHMARKS.md](BENCHMARKS.md) | every cost constant, and what measured it |
-| [docs/gossip.md](docs/gossip.md) | where attestations come from, and what they cost |
-| [docs/api-v1.md](docs/api-v1.md) | the public HTTP API |
 | [monitoring/README.md](monitoring/README.md) | the metrics the daemon serves, and what pages on them |
-| [FCR_CIRCUIT_DESIGN.md](FCR_CIRCUIT_DESIGN.md) | fast confirmation, designed and not built |
 
 ## Requirements
 

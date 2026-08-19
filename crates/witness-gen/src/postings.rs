@@ -6,7 +6,8 @@
 //! two apart means the submitter can be replaced, or run on another machine,
 //! without the daemon growing a wallet.
 //!
-//! The shape is the `posting` object of `docs/api-v1.md`. Fields the submitter
+//! The shape is the `posting` object of `docs/finality/api-v1.md`. Fields the
+//! submitter
 //! did not report are absent rather than zero, on the same terms as every other
 //! number this daemon publishes.
 

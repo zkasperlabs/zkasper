@@ -1,6 +1,7 @@
 //! Proving over the network.
 //!
-//! [`docs/architecture.md`](../../../docs/architecture.md) settles the topology:
+//! [`docs/finality/architecture.md`](../../../docs/finality/architecture.md)
+//! settles the topology:
 //! the beacon node and `zkasperd` run on a stable machine, and the rented GPU
 //! box runs a prover server and nothing else. This module is both ends of the
 //! link between them — [`RemoteProver`], which implements [`Prover`] by asking

@@ -9,7 +9,7 @@
 //!
 //! Run it on the rented GPU machine, and `zkasperd --prover remote` against it
 //! on the stable machine. See `crate::remote_prover` for the protocol and
-//! `docs/architecture.md` for why the two are not the same box.
+//! `docs/finality/architecture.md` for why the two are not the same box.
 //!
 //! ```text
 //! ZKASPER_PROVER_TOKEN=... zkasper-prover-server --gpu --listen 0.0.0.0:9099 \
