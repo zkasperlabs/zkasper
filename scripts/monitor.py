@@ -366,11 +366,25 @@ def published_gaps():
     check stayed green. A consumer cannot detect a missing epoch for themselves,
     so the hole has to be found here.
     """
+    # Page the whole run, not a window. This read the last 40 epochs, and on
+    # 2026-08-19 the run passed 40 and the window slid off the init point -- so
+    # from then on a hole would have scrolled out of view unnoticed, on the one
+    # check whose entire job is to notice holes. The criterion is over 100+
+    # epochs; the check has to be too.
     try:
-        req = Request("https://api.zkasper.com/v1/epochs?limit=40",
-                      headers={"User-Agent": "zkasper-monitor"})
-        with urlopen(req, timeout=25) as r:
-            d = json.loads(r.read())
+        d = {"epochs": []}
+        before = None
+        while len(d["epochs"]) < 400:
+            url = "https://api.zkasper.com/v1/epochs?limit=200"
+            if before is not None:
+                url += f"&before={before}"
+            req = Request(url, headers={"User-Agent": "zkasper-monitor"})
+            with urlopen(req, timeout=30) as r:
+                page = json.loads(r.read())
+            d["epochs"].extend(page.get("epochs", []))
+            before = page.get("next_before")
+            if before is None:
+                break
         req = Request("https://api.zkasper.com/v1/status",
                       headers={"User-Agent": "zkasper-monitor"})
         with urlopen(req, timeout=25) as r:
