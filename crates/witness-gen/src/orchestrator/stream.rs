@@ -408,32 +408,49 @@ impl StreamAggregator {
     /// Whether waiting another interval is still worth it, which is the whole of
     /// the firing decision once the weight is there.
     ///
-    /// No reading to compare against — nothing still filling, or a different
-    /// slot than last time — means fire. There is nothing in flight to wait for,
-    /// and a daemon that opened an epoch already past the threshold must not
-    /// invent a wait it never observed.
+    /// Nothing still filling means fire: there is nothing in flight to wait for,
+    /// and `held` only ever marks the frontier slot filling, so an epoch opened
+    /// long after it crossed has no slot here and invents no wait.
+    ///
+    /// **A slot with no earlier reading of it is not the same as no slot.** Two
+    /// readings are what a *rate* needs, and the rule is two questions, only one
+    /// of which is a rate — [`StreamPolicy::worth_waiting`] also asks whether
+    /// this slot's aggregates have landed, and one reading answers that. The
+    /// first reading was treated as no reading until 2026-08-20, and on the live
+    /// mainnet run that was every reading the trigger ever got: the ticks
+    /// between the crossing and the fire are spent inside the settle that waits
+    /// on the epoch's own backlog, and those return before this is reached, so
+    /// the reading the fire tick compared against was from before that proof
+    /// started and named an earlier slot. The rule bailed here, on its first
+    /// line, on every epoch of the run.
+    ///
+    /// What that cost is the tail. Measured over 69 mainnet epochs on
+    /// 2026-08-19/20, by the second of the crossing slot the trigger fired in:
+    /// firing at 6-8 s leaves a median 7,524 named leaves and firing at 10-12 s
+    /// leaves 130, because a slot's aggregates land in one piece at 8.1-8.2 s
+    /// and carry its coverage from 76% to 99.7%. At
+    /// [`streaming::ProverModel::per_named_s`] and the 1.026 s a megabyte the
+    /// same run measured on the link, those 7,394 leaves are 6.1 s of `T2 - T`
+    /// against the 2-4 s of waiting they cost.
     fn worth_waiting(
         &mut self,
         policy: &StreamPolicy,
         filling: Option<(u64, usize, usize)>,
     ) -> bool {
-        let (Some((at, was, named, aggregates)), Some((slot, now_named, now_aggregates))) =
-            (self.last_filling, filling)
-        else {
+        let Some(now) = filling else {
             self.stalled_s = 0.0;
             return false;
         };
-        if was != slot {
+        // A reading of *this* slot. One of another slot says nothing about this
+        // one, and is the same as none.
+        let previous = self
+            .last_filling
+            .filter(|(_, was, _, _)| *was == now.0)
+            .map(|(at, _, named, aggregates)| (at.elapsed().as_secs_f64(), named, aggregates));
+        if previous.is_none() {
             self.stalled_s = 0.0;
-            return false;
         }
-        let interval_s = at.elapsed().as_secs_f64();
-        let filling = Filling {
-            in_flight: now_named,
-            removed: named.saturating_sub(now_named),
-            aggregates: now_aggregates,
-            new_aggregates: now_aggregates.saturating_sub(aggregates),
-        };
+        let (interval_s, filling) = reading(previous, now);
         self.stalled_s = if policy.interval_paid(filling.removed, interval_s) {
             0.0
         } else {
@@ -442,11 +459,56 @@ impl StreamAggregator {
         policy.worth_waiting(filling, interval_s, self.stalled_s, self.waited_s())
     }
 
-    /// Seconds since `T`, which is what the cap on waiting is measured against.
+    /// Seconds the trigger has held, which is what the budget on waiting is
+    /// measured against.
+    ///
+    /// Since the crossing **less the prover's own backlog**. A proof that was
+    /// already running when the chain crossed is work and not waiting: the
+    /// trigger could not have fired during it whatever it decided, so charging
+    /// it here spends a budget the trigger never got to use. On the live
+    /// mainnet run that was 1.4-3.2 s of a 4.1 s budget gone before the trigger
+    /// was consulted once, which left it a wait too short to reach the
+    /// aggregates it exists to wait for.
+    ///
+    /// This is the same distinction [`EpochLatency::blocked_millis`] draws one
+    /// layer up, for the same reason and against the same number. It was drawn
+    /// there on 2026-08-19 and not here.
     fn waited_s(&self) -> f64 {
-        self.crossed_unix_millis
-            .map_or(0.0, |t| now_unix_millis().saturating_sub(t) as f64 / 1000.0)
+        held_for_s(
+            self.crossed_unix_millis,
+            self.blocked_millis,
+            now_unix_millis(),
+        )
     }
+}
+
+/// What the trigger saw, out of this tick's reading of the filling slot and the
+/// last one's of the same slot.
+///
+/// `None` for the previous reading is the first sight of this slot, and the
+/// answer is a zero interval with nothing removed: no arrivals were observed,
+/// so [`StreamPolicy::interval_paid`] is false and the decision falls to the
+/// half of the rule that one reading answers. See
+/// [`StreamAggregator::worth_waiting`] for what treating that as no reading at
+/// all cost.
+fn reading(previous: Option<(f64, usize, usize)>, now: (u64, usize, usize)) -> (f64, Filling) {
+    let (_slot, named, aggregates) = now;
+    (
+        previous.map_or(0.0, |(interval_s, _, _)| interval_s),
+        Filling {
+            in_flight: named,
+            removed: previous.map_or(0, |(_, was, _)| was.saturating_sub(named)),
+            aggregates,
+            new_aggregates: previous.map_or(0, |(_, _, was)| aggregates.saturating_sub(was)),
+        },
+    )
+}
+
+/// Seconds the trigger has held: since the crossing, less the prover's backlog.
+fn held_for_s(crossed_unix_millis: Option<u64>, blocked_millis: u64, now: u64) -> f64 {
+    crossed_unix_millis.map_or(0.0, |t| {
+        now.saturating_sub(t).saturating_sub(blocked_millis) as f64 / 1000.0
+    })
 }
 
 /// The streaming pipeline, and the one epoch it may have part-built.
@@ -1558,5 +1620,101 @@ impl StreamPipeline {
             slots_held: aggregator.units.len(),
             finalizes_epoch: aggregator.previous.target_epoch(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a mainnet crossing slot looks like to the trigger on the tick it
+    /// first sees it: three quarters covered by the unaggregated burst, and no
+    /// aggregate published yet.
+    const CROSSING_SLOT: (u64, usize, usize) = (15_030_741, 7_183, 0);
+
+    fn mainnet() -> StreamPolicy {
+        StreamPolicy {
+            validators: 960_974.0,
+            ..StreamPolicy::default()
+        }
+    }
+
+    /// The first reading of a slot answers the half of the rule that is a stock
+    /// and leaves the half that is a rate unanswered — which is what says the
+    /// aggregates for this slot have not landed.
+    #[test]
+    fn the_first_reading_of_a_slot_is_a_reading() {
+        let (interval_s, filling) = reading(None, CROSSING_SLOT);
+
+        assert_eq!(
+            interval_s, 0.0,
+            "no interval was observed, so none is priced"
+        );
+        assert_eq!(filling.removed, 0);
+        assert_eq!(filling.in_flight, 7_183);
+        assert!(
+            filling.aggregates_pending(),
+            "a slot with no aggregate has not had its second arrival",
+        );
+        assert!(
+            !mainnet().interval_paid(filling.removed, interval_s),
+            "and the rate half stays unanswered rather than being guessed at",
+        );
+    }
+
+    /// A second reading of the same slot prices what the interval between them
+    /// removed, exactly as it always did.
+    #[test]
+    fn a_second_reading_prices_what_the_interval_removed() {
+        let (interval_s, filling) = reading(Some((0.2, 7_183, 0)), (15_030_741, 583, 4));
+
+        assert_eq!(interval_s, 0.2);
+        assert_eq!(filling.removed, 6_600, "the aggregate wave landed");
+        assert_eq!(filling.new_aggregates, 4);
+        assert!(mainnet().interval_paid(filling.removed, interval_s));
+    }
+
+    /// The whole point: on its first sight of the crossing slot the trigger
+    /// waits, and it waits because that slot's aggregates have not landed.
+    #[test]
+    fn the_trigger_waits_for_the_aggregates_of_a_slot_it_has_just_seen() {
+        let policy = mainnet();
+        let (interval_s, filling) = reading(None, CROSSING_SLOT);
+
+        assert!(
+            policy.worth_waiting(filling, interval_s, 0.0, 0.02),
+            "7,183 leaves in flight and no aggregate is the case this rule is for",
+        );
+        assert!(
+            policy.wait_budget_s(filling.in_flight) > 4.0,
+            "and they are worth over four seconds of it",
+        );
+    }
+
+    /// A slot whose aggregates have landed and stopped is finished, however
+    /// large its tail, so the wait ends rather than running to the budget.
+    #[test]
+    fn a_slot_that_has_had_both_arrivals_is_not_waited_on() {
+        let policy = mainnet();
+        let (interval_s, filling) = reading(Some((0.2, 583, 4)), (15_030_741, 583, 4));
+
+        assert!(!policy.worth_waiting(filling, interval_s, 0.4, 2.3));
+    }
+
+    /// The budget is the trigger's own, so a prover that was still working when
+    /// the chain crossed does not spend it.
+    #[test]
+    fn the_provers_backlog_does_not_spend_the_triggers_budget() {
+        let crossed = Some(1_000_000u64);
+
+        // Epoch 469710: 2,977 ms between the crossing and the fire, of which
+        // 2,956 was a group proof the crossing landed in the middle of.
+        assert_eq!(held_for_s(crossed, 2_956, 1_002_977), 0.021);
+        assert_eq!(
+            held_for_s(crossed, 0, 1_002_977),
+            2.977,
+            "and with nothing in flight it is the whole interval, as before",
+        );
+        assert_eq!(held_for_s(None, 0, 1_002_977), 0.0);
     }
 }
