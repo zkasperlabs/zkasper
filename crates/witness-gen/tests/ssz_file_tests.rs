@@ -1090,12 +1090,20 @@ async fn test_ssz_file_streaming_schedule() {
         .unwrap();
     let (tree, total_active_balance) = (snapshot.tree, init.total_active_balance);
 
+    // Timed, because on one card this sits in the chain the epoch opens on and
+    // nothing in the schedule charges it: on the live mainnet fleet there are
+    // 24-25 s between the accumulator advancing and the committee request going
+    // out, against ~190 s for the whole opening chain.
+    let node_committees = api
+        .get_committees(&slot.to_string(), target_epoch)
+        .await
+        .unwrap();
+    let validators = api.get_validators(&slot.to_string()).await.unwrap();
+    let built = std::time::Instant::now();
     let committees = Arc::new(
         zkasper_witness_gen::committee::build(
-            &api.get_committees(&slot.to_string(), target_epoch)
-                .await
-                .unwrap(),
-            &api.get_validators(&slot.to_string()).await.unwrap(),
+            &node_committees,
+            &validators,
             &tree,
             &CONFIG,
             target_epoch,
@@ -1103,6 +1111,11 @@ async fn test_ssz_file_streaming_schedule() {
             total_active_balance,
         )
         .unwrap(),
+    );
+    eprintln!(
+        "\ncommittee::build over {} members took {:.2} s",
+        committees.witness.members.len(),
+        built.elapsed().as_secs_f64(),
     );
 
     let units = zkasper_witness_gen::attestation_collector::collect_per_slot_for_checkpoint(

@@ -527,6 +527,176 @@ against 254,624 above, and the only cost this change has.
 proof and it verifies nothing recursively, so no amount of recursion work
 reaches it. Every stage that recursion priced is now under 15 s.
 
+## One card or two
+
+The fleet was split on 2026-08-18 by `78c35b4`, "route stages to different
+cards, because one cannot keep up", and the reason was written into
+`run_zkasperd.sh`: one card in series put the committee proof ahead of the
+epoch's own stages and the daemon closed an epoch 3.5 epochs after it began.
+
+**That measurement predates the daemon it was made on.** `78c35b4` is 2026-08-18
+23:04. `fd9764d` — the uncompressed children that took `stream_final` from
+211.3 s to 13.5 s — is 2026-08-19 14:34. `575106b`, which proves the next
+epoch's opening ahead of it, is 2026-08-19 23:00, and `7b07739`/`7c967d8`, which
+took the committee witness from 113 MB to 8 MB, are nine minutes after it. The
+card count was decided against a pipeline where an epoch cost three serial
+proofs of 56 s, 167 s and 152 s — 375 s of an epoch's 384.
+
+**The second card proved nothing concurrently with anything.** MEASURED on the
+mainnet fleet, 2026-08-20 06:43-07:56 UTC, twelve epochs, `--prover-route
+committee=127.0.0.1:9098` in force. Every `proved remotely` line carries
+`round_trip_millis`, so each proof is an interval; sorted and swept, **one pair
+of the 94 overlaps, and it is a `stream_final` against the next epoch's
+`epoch_diff` — two stages that were both routed to the same card anyway.** No
+committee proof overlapped anything. The other two runs that reached steady
+state, 05:20 and 06:04 local, are the same: one overlapping pair each, neither
+of them the committee.
+
+Which is structural rather than lucky. The pipeline holds at most one proof in
+`StreamPipeline::pending`. The only other caller of the prover is the task
+`Engine::speculate` starts, and `Engine::start_speculation` returns without
+starting one while `head_slot() < next_epoch * slots_per_epoch` — so an epoch's
+opening proofs are made ahead only when the chain has already entered the epoch
+*after* the one the daemon is on. A caught-up daemon closes `E` about 272 s into
+`E` and opens `E+1` out of `E+1`'s own first block, so it never gets there:
+eleven of the twelve epochs of that run took the critical path, and the twelfth
+is 469751, the one the daemon was still catching up on. **Two proofs can only be
+in flight while the daemon is behind**, which is what the speculation is for and
+is the one regime where a second card does anything: across three catch-up runs
+the committee proof overlapped other proofs by 13, 27 and 66 s in total.
+
+So the epoch's own shape is a chain and not a race. MEASURED on epoch 469753,
+which is typical, as seconds from the epoch's first slot:
+
+| | at | |
+|---|---:|---|
+| epoch diff witness built | 14 s | |
+| epoch diff proved | 21 s | 3.7 s of prove |
+| committee witness built and sent | 46 s | 25 s, host side |
+| committee proved | 175 s | 123.5 s of prove |
+| epoch opened | 176 s | |
+| first group proof starts | 189 s | |
+| fold chain done | 256 s | |
+| `T` | 252 s | |
+| `T2` | 272 s | |
+
+The committee proof and the epoch's own proofs cannot overlap because the epoch
+does not open until the committee proof lands. `open_epoch` awaits it, and
+nothing before it needs a card.
+
+**Card occupancy is 188.7 s of prove and 219.1 s of round trip in a 384 s
+epoch**, summed over both cards — 49.1% and 57.1% of one card, over the 94
+proofs of that run. Per epoch, as round trip against prove: committee
+140.4/130.5 s, group 34.7/24.9 s over 2.71 proofs, aggregate 19.9/16.2 s over
+2.36, `stream_final` 16.0/13.3 s, epoch diff 8.1/3.8 s. **Two cards are 768
+card-seconds an epoch against 219 used, so the fleet is 71% idle**, and one card
+still is 43%.
+
+**The schedule has wanted one card since recursion was measured.** Re-running
+`test_ssz_file_streaming_schedule` on epoch 430529 at today's constants, every
+lane budget from 1 to 6 and both lane pools return the same schedule: one card,
+`T2 - T` 10.5 s, 182 prover-seconds, the committee proof done at 132 s. The
+83.1 s two-GPU row below is at 35.629 s a child and is a before number.
+
+### Chunking the committee proof buys nothing
+
+`ProverModel::committee_chunk_s` and `committee_fold_s` already price the split
+the committee guest's module doc describes, and the answer at 1.520 s a child is
+that it is a pessimisation at every width. On epoch 430529's 960,974 members:
+
+| chunks | per chunk | fold | committee total | `T2 - T` | cards |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 131.6 s | — | **132 s** | 10.5 s | 1 |
+| 2 | 67.6 s | 9.03 s | 144 s | 10.5 s | 1 |
+| 3 | 46.3 s | 10.55 s | 149 s | 10.5 s | 1 |
+| 4 | 35.6 s | 12.07 s | 155 s | 10.5 s | 1 |
+| 6 | 25.0 s | 15.11 s | 165 s | 10.5 s | 1 |
+| 8 | 19.6 s | 18.15 s | 175 s | 10.5 s | 1 |
+
+`T2 - T` does not move at any width, because the committee proof is not on it.
+What moves is the epoch's prover time, 182 s to 225 s, and the instant the
+committee proof is ready, 132 s to 175 s — and on one card that instant is what
+the epoch opens on. **Chunking makes the epoch open later on exactly the fleet
+it was proposed for.** It would earn its cost only if the epoch stopped opening
+on the committee proof and group proofs had to interleave with it, and the
+`blocked_millis` that would recover is a measured 2.1 s median.
+
+### What one card actually costs, and it is not the committee proof queueing
+
+**The two cards are not the same card.** MEASURED: the committee proof is
+122.6-130.6 s over 67 proofs on the card behind 9098 (median 125.0 s) and
+143.7-144.8 s over three on the card behind 9099, which is the 143.4 s the
+recursion table above records for 48101536, the same card. At the live active
+set of 901,647 the model is
+`3.640 + 901,647 x 101.2 us + 901,659 x 31.9 us = 123.65 s`, which is 1.1% under
+9098's median and 14% under 9099's — so 9098 is the card the constants were
+fitted on and 9099 is 16% slower on this one proof. `epoch_diff` is 3.55-3.81 s
+on 9099 against a 3.640 s stage floor, so the card is not slow on small proofs; the likeliest cause is the one
+the recursion campaign already found, that the prover sizes its thread pool from
+the node's core count and not from its affinity mask, and that the same proof
+spans 35.7 to 44.5 s on one card as the mask changes.
+
+That 20 s is spent in the one place with a margin to lose. The epoch's own work
+cannot start before the epoch opens and `T` is at 252 s, and the backlog it has
+to get through is about **80 s of wall clock** — 54.6 s of round trip for the
+groups and the folds, plus the witness builds between them. On 9098 the epoch
+opened at a median **179 s** over fifteen steady epochs, so the window was
+73 s. On 9099 it opens at **193-207 s** and the window is 45-59 s.
+
+**Both windows are shorter than the backlog, which is why the cost is a few
+seconds and not fifteen.** The epoch is still working when the chain crosses
+either way, and what it pays for that is bounded twice over: `blocked_millis` is
+the remainder of whichever proof was running, and the slots the backlog never
+reached go into the final proof's inline tail rather than into a second floor.
+Across 22 steady epochs at open times of 174-184 s, `blocked_millis` ran 0 to
+10.3 s with a median of 2.1 s and regressing it on the open time gives a slope
+of **−0.04 s per second** — no signal at all over that range. Below the backlog
+the sensitivity turns sharp: epoch 469751 opened 4 s before `T` and paid
+**32.5 s**, and 469726 opened 34 s after it and paid **63.3 s**.
+
+### One card, live
+
+MEASURED on the mainnet daemon from 2026-08-20 08:00 UTC, `--prover-route`
+dropped, all eight stages on 9099. Seconds from the epoch's first slot for the
+open, seconds for everything else; the first two epochs of the run are the
+restart catching up and are not here.
+
+| epoch | opened | `T2 - T` | observation | blocked | wait | final proof | tail |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 469763 | 207 s | 26.3 s | 3.2 | 10.1 | 0.0 | 12.8 | 554 |
+| 469764 | 193 s | 23.5 s | 5.4 | 2.1 | 2.1 | 13.8 | 1,512 |
+| 469765 | 196 s | 19.8 s | 5.2 | 4.6 | 0.2 | 9.7 | 169 |
+| 469766 | 197 s | 18.0 s | 3.7 | 3.7 | 1.1 | 9.3 | 132 |
+| 469767 | 196 s | 18.6 s | 4.8 | 1.3 | 2.4 | 9.9 | 209 |
+| **median** | **196 s** | **19.8 s** | 4.8 | 3.7 | 1.1 | 9.9 | 209 |
+
+Against the two-card fleet over the fifteen epochs before it: open 179 s,
+`T2 - T` **21.0 s**, observation 3.2, blocked 2.1, wait 3.8, final proof 11.3,
+tail 313. **The epoch opens 17 s later and the proof lands 1.2 s earlier**, which
+at n = 5 against n = 15 says only that the difference is inside the spread of
+either — the four epochs after the restart settled at 19.8, 18.0, 18.6 and
+23.5 s against a two-card range of 18.3 to 28.0. The
+committee proof is 143.7-144.8 s on this card against 125.0 s on the one that
+left, which is where the 17 s went; nothing queued behind it on any of the four.
+
+**It closes one epoch per epoch and it recovered its restart in one cycle.**
+Close to close over the run: 250 s for the epoch that was catching up, then 381,
+380 and 383 s against a 384 s epoch. That 250 s is the whole of what the second
+card was ever buying — a catch-up epoch on one card is the committee proof plus
+the epoch's own work in series, about 215-250 s of wall, so a one-epoch deficit
+clears in one to two cycles instead of one.
+
+Which makes the 25 s of host-side committee work the cheapest thing left in that
+chain, and nothing in the schedule charges it. MEASURED on the daemon's own box,
+20 cores, over the epoch-430529 fixture: **`committee::build` over 960,974
+members takes 13.00 s**, so about half of the 25 s is that and the rest is the
+witness encode and the column packing behind it. Two things are available and
+neither is a circuit change. It does not depend on the epoch diff's *proof* —
+only on the post-diff accumulator tree, which the host builds itself and holds
+before it asks — so it can run while that proof is in flight, which is 5 s in
+steady state and 14 s when the request queues. And the diff moves 37 to 41
+leaves of 901,647, so nearly the whole multi-proof is last epoch's.
+
 ## `T2 - T`
 
 `T` is the moment the chain has published enough attestations to justify a
@@ -535,6 +705,13 @@ checkpoint. `T2` is the moment a wrapped proof exists.
 ```sh
 cargo test --release --test ssz_file_tests test_ssz_file_streaming_schedule -- --ignored --nocapture
 ```
+
+**The two-GPU figure below is withdrawn.** It is `recursion_verify_s = 35.629`,
+which was the compression `fd9764d` removed. Re-run at the measured 1.520 s, the
+same test returns **one card and 10.5 s** at every lane budget from 1 to 6 and
+under both lane pools. See *One card or two* above for the fleet measurement
+beside it. The rest of this section is kept because it is the reasoning the live
+run was read against, and every number in it is a before number.
 
 On mainnet epoch 430529, 2,212,730 validators, the schedule needs **two GPUs**
 and puts `T2 - T` at **83.1 s**, with the final proof verifying the running
