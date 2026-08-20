@@ -1639,6 +1639,17 @@ impl Inner {
                 self.spool(stage, witness, publics, &e);
                 match self.gone() {
                     Some(why) => Err(e.context(why)),
+                    // The witness is spooled either way. What differs is whether
+                    // carrying on is survivable: see
+                    // [`Stage::is_recursion_child`]. For a child it is not, and
+                    // stopping here keeps the accumulator clean, so a restart
+                    // retries the stage instead of reloading an empty proof for
+                    // ever.
+                    None if stage.is_recursion_child() => Err(e.context(format!(
+                        "the {} proof is verified as a recursion child, so carrying on \
+                         without one would poison every parent that verifies it",
+                        stage.as_str(),
+                    ))),
                     None => Ok(Proof::new()),
                 }
             }

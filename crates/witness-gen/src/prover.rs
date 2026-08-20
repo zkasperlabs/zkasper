@@ -101,6 +101,24 @@ impl Stage {
         }
     }
 
+    /// Whether some parent circuit verifies this stage's proof as a recursion
+    /// child.
+    ///
+    /// An unreachable prover hands back an empty proof so that the run keeps
+    /// following the chain and the epoch is published unproven rather than not
+    /// published at all. That is only survivable where nothing verifies the
+    /// proof. Hand an empty one to a stage a parent recurses into and the guest
+    /// panics inside the prover -- `committee proof failed recursive
+    /// verification`, `epoch diff proof failed recursive verification` -- without
+    /// replying, so the daemon waits out its whole prover timeout on a response
+    /// that will never come. Worse, the empty proof is persisted: an epoch diff
+    /// is stored as `last_epoch_diff` by the accumulator advance, so every
+    /// restart reloads it and the epoch can never be proven again. That cost two
+    /// wedges and a chain restart on 2026-08-20.
+    pub fn is_recursion_child(self) -> bool {
+        !matches!(self, Stage::StreamFinal | Stage::Finalization)
+    }
+
     /// Guest crate whose ELF proves this stage, and whose verification key a
     /// third party rebuilds to check a proof came from this circuit.
     pub fn guest(self) -> &'static str {
