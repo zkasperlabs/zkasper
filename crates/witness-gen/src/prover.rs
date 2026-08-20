@@ -101,22 +101,34 @@ impl Stage {
         }
     }
 
-    /// Whether some parent circuit verifies this stage's proof as a recursion
-    /// child.
+    /// Whether this stage's proof is kept in the store and consumed by a *later*
+    /// epoch's circuit.
     ///
-    /// An unreachable prover hands back an empty proof so that the run keeps
+    /// An unreachable prover hands back an empty proof so the run keeps
     /// following the chain and the epoch is published unproven rather than not
-    /// published at all. That is only survivable where nothing verifies the
-    /// proof. Hand an empty one to a stage a parent recurses into and the guest
-    /// panics inside the prover -- `committee proof failed recursive
-    /// verification`, `epoch diff proof failed recursive verification` -- without
-    /// replying, so the daemon waits out its whole prover timeout on a response
-    /// that will never come. Worse, the empty proof is persisted: an epoch diff
-    /// is stored as `last_epoch_diff` by the accumulator advance, so every
-    /// restart reloads it and the epoch can never be proven again. That cost two
-    /// wedges and a chain restart on 2026-08-20.
-    pub fn is_recursion_child(self) -> bool {
-        !matches!(self, Stage::StreamFinal | Stage::Finalization)
+    /// published at all. That is the documented contract, and it is worth
+    /// keeping: an outage should cost the epoch and not the daemon.
+    ///
+    /// It stops being survivable exactly where the empty proof is **persisted**.
+    /// `last_epoch_diff`, `last_stream_final` and `last_justification` are all
+    /// written into [`crate::store::StoreState`] and then verified as recursion
+    /// children by the next epoch, so an empty one is reloaded on every restart
+    /// and that epoch can never be proven again. The store is a single bincode
+    /// blob with no per-epoch rollback, so this is a chain restart. It cost one
+    /// on 2026-08-20, through `last_epoch_diff`.
+    ///
+    /// Every other stage is a child too, and an empty one still makes the parent
+    /// guest panic without replying — but only for its own epoch, which a
+    /// restart gets back. Erroring on those as well, as this predicate did when
+    /// it was `is_recursion_child`, turned a recoverable outage into a dead
+    /// daemon for `group`, `committee` and `aggregate`, which is what
+    /// `an_outage_costs_the_epoch_and_not_the_daemon` and six sibling tests were
+    /// there to prevent.
+    pub fn is_persisted(self) -> bool {
+        matches!(
+            self,
+            Stage::EpochDiff | Stage::StreamFinal | Stage::Justification
+        )
     }
 
     /// Guest crate whose ELF proves this stage, and whose verification key a

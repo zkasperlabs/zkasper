@@ -1467,7 +1467,7 @@ impl Inner {
         // for a committee table -- and start a second proof beside the first on
         // a card that proves one thing at a time. Only a link that failed to
         // carry the ask is worth repeating.
-        if stage.is_recursion_child() {
+        if stage.is_persisted() {
             let mut asked = 0;
             while asked < LINK_RETRIES
                 && matches!(&result, Err(e) if !is_timeout(e))
@@ -1696,9 +1696,9 @@ impl Inner {
                     // stopping here keeps the accumulator clean, so a restart
                     // retries the stage instead of reloading an empty proof for
                     // ever.
-                    None if stage.is_recursion_child() => Err(e.context(format!(
-                        "the {} proof is verified as a recursion child, so carrying on \
-                         without one would poison every parent that verifies it",
+                    None if stage.is_persisted() => Err(e.context(format!(
+                        "the {} proof is persisted and verified by a later epoch, so \
+                         carrying on without one would poison the store past a restart",
                         stage.as_str(),
                     ))),
                     None => Ok(Proof::new()),
