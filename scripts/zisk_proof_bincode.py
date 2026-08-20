@@ -49,6 +49,11 @@ def main():
         sys.exit("not a whole number of u64 words")
     w = list(struct.unpack("<%dQ" % (len(raw) // 8), raw))
 
+    # `out-remote/*_proof.bin` prefixes the word count; the API serves the words
+    # bare. Both are the same vector otherwise.
+    if w and w[0] == len(w) - 1:
+        w = w[1:]
+
     minimal, n_publics = w[0], w[1]
     if minimal not in (0, 1):
         sys.exit("first word is not the minimal flag")
