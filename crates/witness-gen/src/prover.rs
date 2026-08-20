@@ -225,6 +225,58 @@ pub trait Prover: Send + Sync {
 
     fn prove_epoch_diff(&self, witness: &EpochDiffWitness) -> Result<(EpochDiffOutput, Proof)>;
     fn prove_committee(&self, witness: &CommitteeWitness) -> Result<(CommitteeOutput, Proof)>;
+
+    /// Prove a committee witness for someone who already knows what it says.
+    ///
+    /// [`Prover::prove_committee`] runs the circuit natively before it proves
+    /// it, to get the outputs it returns. That native run is the single largest
+    /// non-proving cost a committee proof has — **13.39 s** of the ~24 s between
+    /// a frame arriving and `prove_millis` starting, measured on the real
+    /// mainnet witness for epoch 430529 — because it is 961k BLS point
+    /// additions and a multi-proof over 961k leaves.
+    ///
+    /// A prover server does not need any of it. The outputs are dropped: the
+    /// client computed them from the same witness before it sent anything, and
+    /// that is the copy the accumulator advances on. So this exists for the one
+    /// caller that wants the cryptography and nothing else, and a prover that
+    /// can skip the native run overrides it to do so.
+    ///
+    /// # Why skipping is safe
+    ///
+    /// The native run produced two things, and neither survives scrutiny as a
+    /// check.
+    ///
+    /// The outputs went to `verify_child` on the *proving* side, against publics
+    /// the prover itself had just derived from the witness it was about to
+    /// prove. That check cannot fail in a way the client's cannot: it compares a
+    /// proof against the prover's own arithmetic, while the client compares the
+    /// same proof against publics computed on the daemon, from the daemon's own
+    /// circuit run, and refuses it otherwise. Anything the card could have
+    /// caught, the daemon catches; the reverse is not true, which is why the
+    /// client's check is the one the design leans on.
+    ///
+    /// The other thing was a fail-fast on a witness the circuit rejects. That is
+    /// unreachable here. A witness only arrives by
+    /// [`Request::ProveCommittee`](crate::remote_prover::Request), which
+    /// reconstructs it and refuses it unless it hashes to the digest the client
+    /// computed — so by the time anything is proven the bytes are identical to
+    /// ones the daemon has already run this circuit over, successfully, or they
+    /// were never proven at all. A witness sent whole still goes through
+    /// `prove_committee` and keeps the guard, because that path has no digest
+    /// and is the spool draining rather than an epoch waiting.
+    ///
+    /// # What is given up
+    ///
+    /// A proof that does not verify now travels back and is refused by the
+    /// daemon rather than by the card. That is 369 kB of wire and one refusal,
+    /// and a refusal is offered a second time before it stops the run — so the
+    /// failure mode is a retry, not a dead run.
+    ///
+    /// The default is [`Prover::prove_committee`] with the outputs dropped, so a
+    /// prover that does not override this behaves exactly as it did.
+    fn prove_committee_only(&self, witness: &CommitteeWitness) -> Result<Proof> {
+        Ok(self.prove_committee(witness)?.1)
+    }
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)>;
     fn prove_justification(
         &self,

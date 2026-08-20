@@ -1477,3 +1477,214 @@ fn a_committee_witness_sent_whole_is_still_served() {
         "and it should not have put anything in the cache",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The native run a prover server does not need
+// ---------------------------------------------------------------------------
+
+/// Counts which of the two committee methods it was asked for.
+///
+/// Everything else goes straight through to a real [`NativeProver`], so the
+/// server under test is the real one answering with real proofs.
+struct CountingProver {
+    inner: NativeProver,
+    full: Arc<AtomicUsize>,
+    only: Arc<AtomicUsize>,
+}
+
+impl Prover for CountingProver {
+    fn name(&self) -> &'static str {
+        "native (counting which committee method is asked for)"
+    }
+
+    fn program_vk(&self, stage: Stage) -> zkasper_common::recursion::ProgramVk {
+        self.inner.program_vk(stage)
+    }
+
+    fn prove_committee(
+        &self,
+        witness: &CommitteeWitness,
+    ) -> Result<(zkasper_common::types::CommitteeOutput, Vec<u64>), anyhow::Error> {
+        self.full.fetch_add(1, Ordering::Relaxed);
+        self.inner.prove_committee(witness)
+    }
+
+    fn prove_committee_only(&self, witness: &CommitteeWitness) -> Result<Vec<u64>, anyhow::Error> {
+        self.only.fetch_add(1, Ordering::Relaxed);
+        // Deliberately the default's body rather than `self.prove_committee`,
+        // so the count says which the *caller* asked for.
+        Ok(self.inner.prove_committee(witness)?.1)
+    }
+
+    fn prove_epoch_diff(
+        &self,
+        w: &zkasper_common::types::EpochDiffWitness,
+    ) -> Result<(zkasper_common::types::EpochDiffOutput, Vec<u64>), anyhow::Error> {
+        self.inner.prove_epoch_diff(w)
+    }
+
+    fn prove_slot(
+        &self,
+        w: &SlotProofWitness,
+    ) -> Result<(zkasper_common::types::SlotProofOutput, Vec<u64>), anyhow::Error> {
+        self.inner.prove_slot(w)
+    }
+
+    fn prove_justification(
+        &self,
+        w: &zkasper_common::types::JustificationWitness,
+    ) -> Result<(zkasper_common::types::JustificationOutput, Vec<u64>), anyhow::Error> {
+        self.inner.prove_justification(w)
+    }
+
+    fn prove_finalization(
+        &self,
+        w: &zkasper_common::types::FinalizationWitness,
+    ) -> Result<(zkasper_common::types::FinalizationOutput, Vec<u64>), anyhow::Error> {
+        self.inner.prove_finalization(w)
+    }
+
+    fn prove_group(
+        &self,
+        w: &SlotProofWitness,
+    ) -> Result<
+        (
+            zkasper_common::types::GroupProofOutput,
+            zkasper_common::bls::Fp12,
+            Vec<u64>,
+        ),
+        anyhow::Error,
+    > {
+        self.inner.prove_group(w)
+    }
+
+    fn prove_aggregate(
+        &self,
+        w: &zkasper_common::types::AggregateWitness,
+    ) -> Result<(zkasper_common::types::AggregateOutput, Vec<u64>), anyhow::Error> {
+        self.inner.prove_aggregate(w)
+    }
+
+    fn prove_stream_final(
+        &self,
+        w: &zkasper_common::types::StreamFinalWitness,
+    ) -> Result<(zkasper_common::types::StreamFinalOutput, Vec<u64>), anyhow::Error> {
+        self.inner.prove_stream_final(w)
+    }
+}
+
+/// A server asks for the proof and not for the outputs.
+///
+/// The outputs cost a full native run of the circuit — 13.39 s on the real
+/// mainnet witness — and are dropped one line after they are produced. The
+/// client computed them before it sent anything.
+#[test]
+fn a_server_does_not_compute_outputs_it_throws_away() {
+    let full = Arc::new(AtomicUsize::new(0));
+    let only = Arc::new(AtomicUsize::new(0));
+    let witness = committee_witness();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (counted_full, counted_only) = (full.clone(), only.clone());
+    std::thread::spawn(move || {
+        let prover = CountingProver {
+            inner: NativeProver::new(chain()),
+            full: counted_full,
+            only: counted_only,
+        };
+        let config = ServerConfig::new(TOKEN, COMMITTEE_STAGES);
+        while let Ok((stream, _)) = listener.accept() {
+            let _ = serve_client(stream, &prover, &config);
+        }
+    });
+
+    let prover = RemoteProver::connect(committee_client(&addr)).expect("connect");
+    prover.prove_committee(&witness).expect("cold");
+    prover.prove_committee(&witness).expect("warm");
+
+    assert_eq!(
+        only.load(Ordering::Relaxed),
+        2,
+        "both epochs took the cheap path"
+    );
+    assert_eq!(
+        full.load(Ordering::Relaxed),
+        0,
+        "no epoch asked the card for outputs nobody reads",
+    );
+}
+
+/// A witness sent whole keeps the native run, because that path has no digest.
+///
+/// This is the spool draining after an outage, not an epoch waiting, so the
+/// guard is worth its seconds there.
+#[test]
+fn a_committee_witness_sent_whole_still_runs_the_circuit() {
+    let full = Arc::new(AtomicUsize::new(0));
+    let only = Arc::new(AtomicUsize::new(0));
+    let witness = committee_witness();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (counted_full, counted_only) = (full.clone(), only.clone());
+    std::thread::spawn(move || {
+        let prover = CountingProver {
+            inner: NativeProver::new(chain()),
+            full: counted_full,
+            only: counted_only,
+        };
+        let config = ServerConfig::new(TOKEN, COMMITTEE_STAGES);
+        while let Ok((stream, _)) = listener.accept() {
+            let _ = serve_client(stream, &prover, &config);
+        }
+    });
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    write_frame(
+        &mut stream,
+        &Hello {
+            version: PROTOCOL_VERSION,
+            token: TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    let _: HelloReply = read_frame(&mut stream).unwrap();
+    write_frame(
+        &mut stream,
+        &Request::Prove {
+            stage: Stage::Committee,
+            witness: bincode::serialize(&witness).unwrap(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame::<Reply>(&mut stream).unwrap(),
+        Reply::Proved { .. }
+    ));
+
+    assert_eq!(
+        full.load(Ordering::Relaxed),
+        1,
+        "the whole-witness path checks"
+    );
+    assert_eq!(only.load(Ordering::Relaxed), 0);
+}
+
+/// A prover that does not override it behaves exactly as it did.
+#[test]
+fn the_default_still_runs_the_circuit_and_still_rejects_a_bad_witness() {
+    let native = NativeProver::new(chain());
+    let witness = committee_witness();
+    assert!(native.prove_committee_only(&witness).is_ok());
+
+    // The circuit is still what answers, so a witness it will not take is still
+    // refused by the default.
+    let mut bad = committee_witness();
+    bad.acc_root = [9, 9, 9, 9];
+    assert!(native.prove_committee(&bad).is_err());
+    assert!(
+        native.prove_committee_only(&bad).is_err(),
+        "the default is the old method with the outputs dropped",
+    );
+}
