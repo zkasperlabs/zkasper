@@ -157,25 +157,42 @@ async fn test_the_daemon_follows_four_epochs_over_http() {
     );
     let latency = &status["recent_latencies"][0];
     assert_eq!(latency["epoch"], FIRST_EPOCH + 1);
-    // What the plan asks the final proof to swallow, and it is one slot again: a
-    // child is 1.520 s against about 0.93 s of complement work a mainnet slot,
-    // so the tail is only what no group could have been proven for in time and
-    // everything behind it is worth grouping. It was the whole crossing — nine
-    // slots — while a child was 35.629 s and inlining was how to avoid one.
+    // What the plan asks the final proof to swallow, and on *this* fixture it is
+    // the whole crossing.
+    //
+    // The reasoning for a tail of one is about a streaming epoch: a child is
+    // 1.520 s against about 0.93 s of complement work a mainnet slot, so the
+    // tail is only what no group could have been proven for in time and
+    // everything behind it is worth grouping. This fixture is not a streaming
+    // epoch. The mock node serves the whole epoch as fast as the daemon can read
+    // it, so the fold chain never reaches those groups, and `7281b74` made a
+    // group the fold never reached cheaper inline than as its own proof paying
+    // its own stage floor. Nine slots is that policy working, not a regression:
+    // the live run reads `tail` 2 on every steady-state epoch and 22 on the
+    // catch-up epoch after a restart, which is the shape this fixture has.
+    //
+    // Pinned at nine rather than deleted, because the number still says which
+    // policy ran: a tail of one here would mean the fold chain reached groups on
+    // a clock that has no room for it.
     assert_eq!(
-        latency["tail"], 1,
+        latency["tail"], 9,
         "the final proof did not carry the plan's tail: {latency}",
     );
-    // And on this fixture that group is late. The mock node serves the epoch as
-    // fast as the daemon can read it, while the plan cuts groups against a 12 s
-    // slot, so there is no wall-clock here for a group to be proven and folded
-    // before the trigger fires. `late_groups = 1` is the fixture's compressed
-    // clock rather than the plan's shape — the model lands the last fold 1.6 s
-    // before `T` on mainnet 430529 — and it is worth pinning because it is the
-    // path where the fire path has to bridge what the tail no longer covers.
+    // And there is no late group any more, which is the same change as the tail
+    // above seen from the other side.
+    //
+    // The mock node serves the epoch as fast as the daemon can read it, while
+    // the plan cuts groups against a 12 s slot, so there is no wall-clock here
+    // for a group to be proven and folded before the trigger fires. That used to
+    // force one group to be proven *late*, after `T`. Since `7281b74` the same
+    // group is carried inline instead, so it shows up in `tail` rather than in
+    // `late_groups` — nine slots inline and nothing late, rather than eight
+    // inline and one late. Pinning both is what makes the pair legible: a late
+    // group reappearing here would mean the inline path stopped covering what
+    // the compressed clock leaves it.
     assert_eq!(
-        latency["late_groups"], 1,
-        "the late group a compressed clock forces: {latency}",
+        latency["late_groups"], 0,
+        "a compressed clock should inline the group, not prove it late: {latency}",
     );
     assert!(
         latency["t2_minus_t_millis"].is_number(),
