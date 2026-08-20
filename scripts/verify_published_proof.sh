@@ -62,13 +62,14 @@ fi
 echo "epoch $EPOCH"
 curl -fsS "$API/v1/epochs/$EPOCH" -o "$WORK/epoch.json"
 
-read -r STAGE PROGRAM PROGRAM_VK PUBLIC_BYTES ELF_SHA ZISK_VERSION COMMIT PROOF_URL PROOF_SHA PROOF_WORDS <<EOF
+read -r STAGE PROGRAM PROGRAM_VK PUBLIC_BYTES ELF_SHA ZISK_VERSION COMMIT PROOF_URL PROOF_SHA PROOF_WORDS ANCHOR <<EOF
 $(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
 v, p = d["verify"], d["proof"]
 print(v["stage"], v["program"], v["program_vk"], v["public_bytes"], v["elf_sha256"],
-      v["zisk_version"], v["zkasper_commit"], v["proof_url"], p["sha256"], p["words"])
+      v["zisk_version"], v["zkasper_commit"], v["proof_url"], p["sha256"], p["words"],
+      p.get("vadcop_final_vk") or v.get("vadcop_final_vk") or "absent")
 ' "$WORK/epoch.json")
 EOF
 
@@ -78,6 +79,7 @@ echo "program_vk     $PROGRAM_VK"
 echo "elf_sha256     $ELF_SHA"
 echo "zisk_version   $ZISK_VERSION"
 echo "zkasper_commit $COMMIT"
+echo "vadcop_final_vk $ANCHOR"
 
 say "2. the proof bytes"
 curl -fsS "$API$PROOF_URL" -o "$WORK/proof.bin"
@@ -116,6 +118,38 @@ print("program_vk     matches")
 print("public_bytes   matches, %d bytes, rest zero" % len(want_pub))
 print("proof vadcop vk %s" % list(struct.unpack("<4Q", raw[-32:])))
 PY
+
+say "3b. the anchor the API publishes, against the proof's own tail"
+# This is the step that decides whether the API alone is enough. Verifying a
+# vadcop_final proof means knowing the rootC it was proved under, and upstream
+# rebuilt v1.1.0-alpha in place on 2026-08-19 and changed that root -- so the
+# version string no longer identifies it, and a fresh install of the tag this
+# proof names refuses every proof published before that date. The daemon
+# therefore publishes the root it actually proves under, compiled into the
+# binary rather than configured.
+#
+# An anchor merely asserted beside the proofs would be worse than none, because
+# a reader would trust it. So it is checked against the proof's own last four
+# words, which cost nothing to read, and a disagreement is fatal here.
+if [ "$ANCHOR" = "absent" ]; then
+  echo "the API publishes no vadcop_final_vk yet."
+  echo "A third party therefore cannot get the anchor from the API and must take"
+  echo "it from this source tree, which is what step 5 compiles in. That is the"
+  echo "gap the anchor closes; until the daemon that publishes it is deployed,"
+  echo "this run leans on the repository and does not prove the criterion."
+else
+  python3 - "$WORK/proof.bin" "$ANCHOR" <<'ANCHORPY'
+import struct, sys
+tail = list(struct.unpack("<4Q", open(sys.argv[1], "rb").read()[-32:]))
+published = list(struct.unpack("<4Q", bytes.fromhex(sys.argv[2][2:])))
+if tail != published:
+    raise SystemExit(
+        "FAIL: the published anchor %s is not the one the proof carries %s. "
+        "An anchor that disagrees with its own proof is worse than none."
+        % (published, tail))
+print("published anchor matches the proof's own tail")
+ANCHORPY
+fi
 
 say "4. the vadcop_final key upstream serves today"
 # Cheap, and it is the failure everyone hits. Upstream rebuilt the
