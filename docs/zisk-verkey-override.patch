@@ -1,0 +1,17 @@
+--- /root/.cargo/git/checkouts/zisk-627550f4f7ac9ffb/9a5a1ac/prover-backend/src/prover/backend.rs	2026-08-19 14:29:14.423906231 +0000
++++ /root/zisk-patched/prover-backend/src/prover/backend.rs	2026-08-20 22:07:28.131349466 +0000
+@@ -533,12 +533,12 @@
+ 
+         // Read the program VK from the flag-free view (a full vadcop_final
+         // publics vector carries the `is_vadcop_final_proof` flag at index 0).
+-        let proof_verkey = &program_publics(publics_full)[..PROGRAM_VK_LEN];
++        let _proof_verkey = &program_publics(publics_full)[..PROGRAM_VK_LEN];
+         let snark_proof = self
+             .snark_wrapper
+             .as_ref()
+             .unwrap()
+-            .generate_final_snark_proof(&vadcop_final_proof, Some(proof_verkey))?;
++            .generate_final_snark_proof(&vadcop_final_proof, None)?;
+ 
+         let time = start.elapsed();
+ 
