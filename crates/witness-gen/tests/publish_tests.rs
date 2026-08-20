@@ -12,7 +12,8 @@ mod common;
 
 use common::stub_api::StubApi;
 
-use zkasper_witness_gen::artifacts::EpochCost;
+use zkasper_common::types::{JustificationOutput, StreamFinalOutput};
+use zkasper_witness_gen::artifacts::{EpochCost, VerifyAnchor};
 use zkasper_witness_gen::prover::Stage;
 use zkasper_witness_gen::publish::{ClosedEpoch, DaemonInfo, PublishConfig, Publisher};
 
@@ -229,5 +230,108 @@ async fn an_epoch_with_no_proof_is_not_published_as_proven() {
     assert_eq!(
         proven["summary"]["status"], "proven",
         "an epoch with proof bytes still has to say so: {proven}",
+    );
+}
+
+/// A proof handed around on its own says what to check it against.
+///
+/// The `vadcop_final` root a proof must be proved under stopped being a
+/// constant of the pinned Zisk release on 2026-08-19, when upstream rebuilt
+/// v1.1.0-alpha in place and changed it. A verifier who installs the tag today
+/// derives a different root and refuses every proof this project has published,
+/// so the anchor has to travel with the proof rather than be looked up — and it
+/// has to read exactly as the manifest's does, or a reader comparing the two
+/// learns nothing from them agreeing.
+#[test]
+fn a_proof_carries_the_anchor_it_was_proved_under() {
+    let proof = zkasper_witness_gen::publish::proof_ref(
+        469368,
+        Stage::StreamFinal,
+        &[1u64, 2, 3, 4],
+        &[9; 4],
+        &[0xAB; 8],
+        Some("0xelf"),
+    );
+    let manifest = serde_json::to_value(VerifyAnchor::compiled()).expect("the anchor serializes");
+    for field in ["vadcop_final_vk", "zisk_version", "zkasper_commit"] {
+        assert_eq!(
+            proof[field], manifest[field],
+            "{field} must render as the manifest renders it: {proof}",
+        );
+    }
+    assert_eq!(
+        proof["vadcop_final_vk"],
+        zkasper_witness_gen::publish::vk_hex(&zkasper_common::recursion::VADCOP_FINAL_VK),
+        "the anchor must be the root this binary proves under, not a configured one: {proof}",
+    );
+}
+
+/// An epoch with no proof bytes still names the build that would have proved
+/// it. The anchor is a fact about this binary, not about a proof landing.
+#[test]
+fn an_unproven_proof_still_carries_the_anchor() {
+    let proof = zkasper_witness_gen::publish::proof_ref(
+        469368,
+        Stage::StreamFinal,
+        &[],
+        &[9; 4],
+        &[0xAB; 8],
+        None,
+    );
+    assert_eq!(proof["available"], false, "{proof}");
+    assert_eq!(
+        proof["vadcop_final_vk"],
+        zkasper_witness_gen::publish::vk_hex(&zkasper_common::recursion::VADCOP_FINAL_VK),
+        "{proof}",
+    );
+}
+
+/// The decoded public inputs carry every field the circuit committed.
+///
+/// `public_inputs` is a convenience over `public_bytes`, and a convenience that
+/// silently drops a field is worse than none: step 4 of "Verifying a proof"
+/// tells a stranger to compare `public_inputs.program_vk` against the key they
+/// pinned, and until 2026-08-20 that field was not there to compare. It is the
+/// last 32 bytes of `public_bytes` either way, so the check here is that the
+/// decoded form agrees with the encoded one rather than that it exists.
+#[test]
+fn decoded_public_inputs_name_the_program_the_bytes_commit_to() {
+    let program_vk = [0x1122_3344_5566_7788u64, 2, 3, 4];
+    let stream = StreamFinalOutput {
+        accumulator_commitment: [1; 4],
+        next_accumulator_commitment: [2; 4],
+        finalized_epoch: 469_367,
+        finalized_root: [3; 32],
+        finalized_state_root: [4; 32],
+        justified_epoch: 469_368,
+        justified_root: [5; 32],
+        program_vk,
+    };
+    let justification = JustificationOutput {
+        accumulator_commitment: [1; 4],
+        committee_root: [2; 4],
+        target_epoch: 469_368,
+        target_root: [5; 32],
+        attesting_balance: 22_000_000_000,
+        slots_mask: 0xFFFF,
+        justified: true,
+        program_vk,
+    };
+
+    let tail = |bytes: Vec<u8>| zkasper_witness_gen::artifacts::hex0x(&bytes[bytes.len() - 32..]);
+    assert_eq!(
+        zkasper_witness_gen::publish::stream_final_public_inputs(&stream)["program_vk"],
+        tail(stream.public_bytes()),
+        "a stream final proof's decoded claim must name the program its bytes commit to",
+    );
+    assert_eq!(
+        zkasper_witness_gen::publish::justification_public_inputs(&justification)["program_vk"],
+        tail(justification.public_bytes()),
+        "a justification read on its own must name the program its bytes commit to",
+    );
+    assert_eq!(
+        zkasper_witness_gen::publish::stream_final_public_inputs(&stream)["program_vk"],
+        zkasper_witness_gen::publish::vk_hex(&program_vk),
+        "and must render as `verify.program_vk` does, so the two compare directly",
     );
 }

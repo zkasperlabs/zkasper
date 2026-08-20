@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use zkasper_common::types::{FinalizationOutput, JustificationOutput, StreamFinalOutput};
 
 use crate::artifacts::{
-    hex0x, hex_digest, now_unix_millis, write_atomic, EpochCost, StageTiming, Status,
+    hex0x, hex_digest, now_unix_millis, write_atomic, EpochCost, StageTiming, Status, VerifyAnchor,
 };
 use crate::postings::Posting;
 use crate::prover::Stage;
@@ -553,7 +553,16 @@ pub fn epoch_status(proof: &Value) -> &'static str {
 ///
 /// `available` is false for a witness-only run: the timings are real, there is
 /// simply nothing to verify. Everything else is what a verifier binds the proof
-/// to — the program that produced it and the bytes it committed.
+/// to — the program that produced it, the bytes it committed, and the proving
+/// system it was proved under.
+///
+/// The anchor is repeated on every proof rather than referenced from the
+/// manifest, because a proof is quoted, stored and handed on by itself far more
+/// often than the whole manifest is, and the three fields it costs are worth
+/// less than a reader who has to fetch a second document — or worse, one who
+/// pairs a proof with a manifest fetched from a daemon of a different build.
+/// It is [`crate::artifacts::VerifyAnchor::compiled`], the same value rendered
+/// the same way as in `status.json`, so the two compare by string equality.
 pub fn proof_ref(
     epoch: u64,
     stage: Stage,
@@ -563,6 +572,7 @@ pub fn proof_ref(
     elf_sha256: Option<&str>,
 ) -> Value {
     let bytes = proof_to_bytes(words);
+    let anchor = VerifyAnchor::compiled();
     json!({
         "stage": stage.as_str(),
         "available": !words.is_empty(),
@@ -573,11 +583,22 @@ pub fn proof_ref(
         "program_vk": vk_hex(program_vk),
         "elf_sha256": elf_sha256,
         "public_bytes": hex0x(public_bytes),
+        "vadcop_final_vk": anchor.vadcop_final_vk,
+        "zisk_version": anchor.zisk_version,
+        "zkasper_commit": anchor.zkasper_commit,
         "url": format!("/v1/proofs/{epoch}"),
     })
 }
 
 /// The claim a streaming final proof makes, decoded.
+///
+/// Every field the circuit committed, in the order it committed them. The
+/// decoded form is a convenience over `public_bytes` and must never be a subset
+/// of it: `program_vk` is the last 32 bytes, it is the one recursive edge no
+/// circuit above this proof checks, and the instruction a verifier follows is to
+/// compare it against the key they pinned. It was missing here until 2026-08-20,
+/// which left that instruction impossible to follow without re-slicing the bytes
+/// by hand.
 pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
     json!({
         "accumulator_commitment": hex_digest(&output.accumulator_commitment),
@@ -587,6 +608,7 @@ pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
         "finalized_state_root": hex0x(&output.finalized_state_root),
         "justified_epoch": output.justified_epoch,
         "justified_root": hex0x(&output.justified_root),
+        "program_vk": vk_hex(&output.program_vk),
     })
 }
 
@@ -597,6 +619,10 @@ pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
 /// one link of a fold chain, and the links before the last are valid proofs of
 /// a partial count. A reader that ignored the flag would read a third of the
 /// stake as a supermajority.
+///
+/// `program_vk` is published for the same reason as on a stream final proof: a
+/// fold chain cannot bake its own key, so a consumer reading one of these on its
+/// own is the only thing that compares it against the justification guest's.
 pub fn justification_public_inputs(output: &JustificationOutput) -> Value {
     json!({
         "accumulator_commitment": hex_digest(&output.accumulator_commitment),
@@ -604,6 +630,7 @@ pub fn justification_public_inputs(output: &JustificationOutput) -> Value {
         "justified_root": hex0x(&output.target_root),
         "attesting_balance": output.attesting_balance.to_string(),
         "justified": output.justified,
+        "program_vk": vk_hex(&output.program_vk),
     })
 }
 

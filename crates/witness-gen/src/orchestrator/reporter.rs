@@ -150,6 +150,7 @@ impl<A> Orchestrator<A> {
                 .genesis_validators_root()
                 .as_ref()
                 .map(|root| hex0x(root)),
+            verify: crate::artifacts::VerifyAnchor::compiled(),
             prover_usd_per_hour: self.engine.config.prover_usd_per_hour,
             prover_health: self.engine.prover.health(),
             prover: self.engine.prover.name().to_string(),
