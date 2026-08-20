@@ -1102,6 +1102,13 @@ impl Drop for RemoteProver {
 /// A read or write deadline on a socket surfaces as `WouldBlock` or
 /// `TimedOut` depending on the platform, and both mean the same thing here: the
 /// server has the witness and has said nothing since.
+/// How many times a recursion child re-asks after the link fails to carry the
+/// ask, and how long it waits between tries. Three tries ten seconds apart
+/// covers the ~30 s an ssh tunnel took to come back on 2026-08-19/20, and costs
+/// a genuinely absent prover 30 s before it spools and stops the run.
+const LINK_RETRIES: u32 = 3;
+const LINK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn is_timeout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
@@ -1441,6 +1448,50 @@ impl Inner {
             );
         }
         let mut result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+
+        // A link that drops is not a prover that is gone, and since `e21a1ba`
+        // the difference ends the run: a recursion child may not carry on
+        // without a proof, so an unanswered ask for one is an error that goes
+        // out of the process. `attempt` already redials, but it redials
+        // *immediately* -- both round trips land inside the same instant -- so
+        // it cannot survive the thing that actually happens here, which is an
+        // ssh tunnel going away for tens of seconds. That happened at least
+        // twice on the night of 2026-08-19/20.
+        //
+        // So pause and ask again, a bounded number of times, and only for the
+        // stages that cannot carry on without an answer. Everything else keeps
+        // the old behaviour.
+        //
+        // **Never on a timeout.** A timeout means the prover took the witness
+        // and is still working on it; asking again would re-send it -- 101 MB
+        // for a committee table -- and start a second proof beside the first on
+        // a card that proves one thing at a time. Only a link that failed to
+        // carry the ask is worth repeating.
+        if stage.is_recursion_child() {
+            let mut asked = 0;
+            while asked < LINK_RETRIES
+                && matches!(&result, Err(e) if !is_timeout(e))
+                && self.gone().is_none()
+            {
+                asked += 1;
+                std::thread::sleep(LINK_RETRY_PAUSE);
+                warn!(
+                    addr = %self.config.addr,
+                    stage = stage.as_str(),
+                    attempt = asked,
+                    of = LINK_RETRIES,
+                    "the link went before the prover could answer; asking again",
+                );
+                result = self.attempt(&mut self.conn.lock().unwrap(), &request);
+            }
+            if asked > 0 && result.is_ok() {
+                info!(
+                    stage = stage.as_str(),
+                    attempts = asked,
+                    "the link came back and the stage was proven without stopping the run",
+                );
+            }
+        }
         // The server does not hold the member table this request names its keys
         // out of, so it has reconstructed nothing and there is nothing here to
         // retry -- only something to send. This is the whole recovery path for
