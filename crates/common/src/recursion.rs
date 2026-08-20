@@ -387,12 +387,6 @@ mod tests {
         assert_eq!(child_program_vk(&proof[..proof.len() - 1]), None);
     }
 
-    /// Against a real proof, which is the only thing that can say the pinned
-    /// constant is the one honest proofs actually carry. A wrong constant is the
-    /// safe failure — it refuses everything — but it refuses everything at the
-    /// far end of a proving run, so pin it here where it costs nothing.
-    ///
-
     fn stored_words(minimal: bool) -> Vec<u64> {
         let n_publics = PROGRAM_VK_LEN + ZISK_PUBLICS + usize::from(!minimal);
         let mut words = vec![minimal as u64, n_publics as u64];
@@ -451,6 +445,11 @@ mod tests {
         );
     }
 
+    /// Against a real proof, which is the only thing that can say the pinned
+    /// constant is the one honest proofs actually carry. A wrong constant is the
+    /// safe failure — it refuses everything — but it refuses everything at the
+    /// far end of a proving run, so pin it here where it costs nothing.
+    ///
     /// ```text
     /// ZKASPER_CHILD_PROOF=/path/to/child.words.bin cargo test -p zkasper-common
     /// ```
