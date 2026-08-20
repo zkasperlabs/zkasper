@@ -676,6 +676,13 @@ n = 4 against n = 15 the difference is inside the spread of either. The
 committee proof is 143.7-144.8 s on this card against 125.0 s on the one that
 left, which is where the 17 s went; nothing queued behind it on any of the four.
 
+**It closes one epoch per epoch and it recovered its restart in one cycle.**
+Close to close over the run: 250 s for the epoch that was catching up, then 381,
+380 and 383 s against a 384 s epoch. That 250 s is the whole of what the second
+card was ever buying — a catch-up epoch on one card is the committee proof plus
+the epoch's own work in series, about 215-250 s of wall, so a one-epoch deficit
+clears in one to two cycles instead of one.
+
 Which makes the 25 s of host-side committee work the cheapest thing left in that
 chain, and nothing in the schedule charges it. MEASURED on the daemon's own box,
 20 cores, over the epoch-430529 fixture: **`committee::build` over 960,974
