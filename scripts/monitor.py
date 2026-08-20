@@ -90,6 +90,9 @@ MAX_LAG_EPOCHS = 4
 # Instance ids that are meant to sit unrouted, one per line. A spare is a
 # decision, not a fault, and the key on it cannot be re-obtained.
 SPARE_FILE = "/mnt/ssd/zkasper-run/spare-instances"
+# One refusal in fewer proofs than this and the retry is carrying the run.
+# Two cards measured 1 in 1,402; one card measured 1 in 43.
+REFUSAL_FLOOR = 25
 # A healthy epoch_diff is 3.5-5 s. This is the line above which the prover has
 # stopped using its GPU rather than merely being busy.
 EPOCH_DIFF_CEILING_MS = 60_000
@@ -399,6 +402,62 @@ def unrouted(inst):
         return check("routing", True, f"not checked: {e}")
 
 
+def refusals():
+    """How often the prover refuses a witness, which the manifest cannot show.
+
+    A refused witness is offered once more and a second refusal stops the run by
+    design, so this is the fault that ends a 24-hour attempt -- and until
+    2026-08-20 nothing watched it. A refusal that the retry clears leaves no
+    trace in the manifest, no counter in `/metrics` (`zkasper_verify_total` is
+    host-side verification of proofs that arrived), and the daemon looks
+    perfectly healthy right up until the ask that is refused twice.
+
+    Measured that morning: 1 refusal in 1,402 proofs across 13 h on two cards,
+    then 2 in 87 after the whole pipeline moved to one. Both on the card that had
+    just gained the committee stage, both `Error generating witness ... type
+    Recursive1`, both proved by the second ask.
+
+    The log is the only source, and the daemon's own stdout names it exactly --
+    the launcher redirects it, so `/proc/PID/fd/1` is the file, with no
+    convention to guess at.
+    """
+    try:
+        pid = None
+        for candidate in subprocess.run(["pgrep", "-x", "zkasperd"], capture_output=True,
+                                        text=True, timeout=15).stdout.split():
+            try:
+                if Path(f"/proc/{candidate}/exe").resolve().name.startswith("zkasperd"):
+                    pid = candidate
+                    break
+            except OSError:
+                continue
+        if pid is None:
+            return check("refusals", True, "no daemon, not checked")
+        log = Path(f"/proc/{pid}/fd/1").resolve()
+        if not log.is_file():
+            return check("refusals", True, "no log on stdout, not checked")
+        # This run only: the log is appended across restarts.
+        text = log.read_text(errors="replace")
+        start = text.rfind("=== zkasperd start at ")
+        run = text[start:] if start >= 0 else text
+        asked = run.count("proved remotely")
+        refused = run.count("the prover refused this witness")
+        stopped = run.count("refused again; the witness is what the circuit will not take")
+        if stopped:
+            return check("refusals", False,
+                         f"{stopped} witness(es) refused twice, which stops the run")
+        if not refused:
+            return check("refusals", True, f"none in {asked} proofs this run")
+        rate = asked // refused if refused else 0
+        return check("refusals", rate >= REFUSAL_FLOOR,
+                     f"{refused} refused of {asked} proofs this run, 1 in {rate}"
+                     + ("" if rate >= REFUSAL_FLOOR else
+                        f", worse than 1 in {REFUSAL_FLOOR}; a second refusal of one"
+                        " witness stops the run"))
+    except Exception as e:
+        return check("refusals", True, f"not checked: {e}")
+
+
 def gpus():
     """Rented instances and what they are burning. Silence here costs money."""
     try:
@@ -633,7 +692,7 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="print only failures")
     a = ap.parse_args()
 
-    checks = (daemon() + gpus()
+    checks = (daemon() + [refusals()] + gpus()
               + [url("api", API, api_detail), published_latency(), published_gaps(),
                  url("site", SITE, None)])
     healthy = all(c["ok"] for c in checks)
