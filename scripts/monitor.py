@@ -162,9 +162,15 @@ def daemon():
         # daemon will not read. The age bound is what keeps this from firing in
         # the seconds between crossing and closing: `attesting_pct` counts
         # closed units only, so it lags the reading the trigger fires on.
-        stuck = (head >= scan_end
-                 and c["attesting_pct"] < c["threshold_pct"]
-                 and open_s > 2 * 384)
+        # Two shapes, and the second wedge tonight was the one a shortfall test
+        # alone would have missed: 469735 sat at 99.8% and simply never fired,
+        # because the child proof its final needed was a poisoned backfill. So
+        # an epoch that has been open far longer than a close cycle (~354 s) is
+        # a fault whatever its balance reads.
+        stuck = (open_s > 900
+                 or (head >= scan_end
+                     and c["attesting_pct"] < c["threshold_pct"]
+                     and open_s > 2 * 384))
         out.append(check("in flight", not stuck,
                          f"epoch {c['epoch']} at {c['attesting_pct']:.1f}% of "
                          f"{c['threshold_pct']:.1f}%, open {open_s:.0f}s, head {head} "
