@@ -521,9 +521,16 @@ pub fn serve_client(
                 }
                 // The witness size is what was rebuilt and proven, not what the
                 // frame carried, so one log line still says what an epoch cost.
+                //
+                // `prove_committee_only`, because the outputs a full
+                // `prove_committee` would compute are dropped a line later and
+                // cost 13.39 s of native circuit to produce. The client
+                // computed them before it sent anything and checks the returned
+                // proof against its own copy; the digest above already
+                // guarantees these are the bytes it ran that circuit over.
                 Ok(Some((witness, witness_bytes))) => {
                     answer(prover, Stage::Committee, witness_bytes, started, || {
-                        Ok(prover.prove_committee(&witness)?.1)
+                        prover.prove_committee_only(&witness)
                     })
                 }
                 Err(e) => {

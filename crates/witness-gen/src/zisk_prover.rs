@@ -188,12 +188,18 @@ impl ZiskProver {
         self.prove_input(
             stage,
             bincode::serialize(witness).context("serialize witness")?,
-            publics,
+            Some(publics),
         )
     }
 
     /// The same, for a guest whose witness is not bincode.
-    fn prove_input(&self, stage: Stage, input: Vec<u8>, publics: &[u8]) -> Result<Proof> {
+    ///
+    /// `publics` is what the proof is checked against here, and `None` is a
+    /// caller saying there is nothing on this side worth checking it with — see
+    /// [`Prover::prove_committee_only`]. Deriving them costs a full native run
+    /// of the circuit, and a proof checked against publics this process derived
+    /// itself cannot fail in a way the client's check will not.
+    fn prove_input(&self, stage: Stage, input: Vec<u8>, publics: Option<&[u8]>) -> Result<Proof> {
         let program = self.program(stage);
         let stdin = ZiskStdin::from_bytes(input);
 
@@ -209,11 +215,13 @@ impl ZiskProver {
             .get_proof_u64()
             .map_err(|e| anyhow!("serialize the {} proof: {e}", stage.as_str()))?;
 
-        if !verify_child(&proof, &program.vk, publics) {
-            bail!(
-                "the {} proof does not verify against its own program key and outputs",
-                stage.as_str(),
-            );
+        if let Some(publics) = publics {
+            if !verify_child(&proof, &program.vk, publics) {
+                bail!(
+                    "the {} proof does not verify against its own program key and outputs",
+                    stage.as_str(),
+                );
+            }
         }
 
         *self.last_cost.lock().unwrap() = Some(ProveCost {
@@ -324,9 +332,23 @@ impl Prover for ZiskProver {
         let proof = self.prove_input(
             Stage::Committee,
             zkasper_common::committee::to_bytes(&words),
-            &output.public_bytes(),
+            Some(&output.public_bytes()),
         )?;
         Ok((output, proof))
+    }
+
+    /// The same proof, without the native run that only produced the outputs.
+    ///
+    /// Worth 13.39 s an epoch on the real mainnet witness, on the critical path
+    /// of opening one. See [`Prover::prove_committee_only`] for why nothing is
+    /// checking anything here that the daemon is not checking better.
+    fn prove_committee_only(&self, witness: &CommitteeWitness) -> Result<Proof> {
+        let words = zkasper_common::committee::encode(witness);
+        self.prove_input(
+            Stage::Committee,
+            zkasper_common::committee::to_bytes(&words),
+            None,
+        )
     }
 
     fn prove_slot(&self, witness: &SlotProofWitness) -> Result<(SlotProofOutput, Proof)> {
