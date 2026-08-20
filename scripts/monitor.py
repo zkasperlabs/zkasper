@@ -83,6 +83,10 @@ HEARTBEAT_STALE_S = 90
 # The manifest is still worth a much looser bound: no stage finishing for half an
 # hour means the pipeline is stuck even if the process breathes.
 STALE_S = 1800
+# Beyond this the node has migrated past the boundary state the daemon needs
+# and the run cannot recover, so it is the line that matters rather than the
+# close rate, which equals the epoch length whenever the daemon is caught up.
+MAX_LAG_EPOCHS = 4
 # A healthy epoch_diff is 3.5-5 s. This is the line above which the prover has
 # stopped using its GPU rather than merely being busy.
 EPOCH_DIFF_CEILING_MS = 60_000
@@ -245,10 +249,31 @@ def daemon():
         if slot_s > 0 and epochs_closed > 0:
             epoch_s = 32 * slot_s
             cycle_s = (b["proof_unix_millis"] - a["proof_unix_millis"]) / 1000 / epochs_closed
-            out.append(check("keeping up", cycle_s <= epoch_s,
+            # Report the rate, but decide on the lag.
+            #
+            # `cycle_s <= epoch_s` is the right idea and the wrong test, because
+            # a daemon that has caught up closes exactly one epoch per epoch --
+            # it cannot close faster than epochs arrive. So at the steady state
+            # this run is in, `cycle_s` *equals* `epoch_s` and the comparison is
+            # a coin toss on measurement noise: the twelve closes to 469758
+            # measured 381-393 s against a 384 s epoch, so a single 393 s close
+            # would have failed this check and woken someone for a run doing
+            # exactly what it should.
+            #
+            # Lag has no such floor. A daemon keeping up sits one or two epochs
+            # back whatever the jitter; one falling behind grows monotonically,
+            # and at three to four epochs the node stops serving the boundary
+            # state it needs and the run dies. That is the condition worth
+            # waking someone for, and it is what this now tests.
+            head_epoch = (s.get("head_slot") or 0) // 32
+            lag = head_epoch - b["epoch"]
+            out.append(check("keeping up", lag <= MAX_LAG_EPOCHS,
                              f"{cycle_s:.0f}s a close against a {epoch_s:.0f}s epoch"
-                             f" over {epochs_closed}"
-                             + ("" if cycle_s <= epoch_s else " -- FALLING BEHIND")))
+                             f" over {epochs_closed}, {lag} epoch{'' if lag == 1 else 's'}"
+                             f" behind the head"
+                             + ("" if lag <= MAX_LAG_EPOCHS
+                                else " -- FALLING BEHIND, the node stops serving the"
+                                     " state at three to four")))
 
     # Cost per epoch: sum the prover time of a whole epoch's stages and price it.
     stages = s.get("recent_stages") or []
