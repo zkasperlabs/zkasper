@@ -667,12 +667,15 @@ restart catching up and are not here.
 | 469764 | 193 s | 23.5 s | 5.4 | 2.1 | 2.1 | 13.8 | 1,512 |
 | 469765 | 196 s | 19.8 s | 5.2 | 4.6 | 0.2 | 9.7 | 169 |
 | 469766 | 197 s | 18.0 s | 3.7 | 3.7 | 1.1 | 9.3 | 132 |
-| **median** | **196 s** | **21.6 s** | 4.5 | 4.2 | 0.7 | 11.3 | 362 |
+| 469767 | 196 s | 18.6 s | 4.8 | 1.3 | 2.4 | 9.9 | 209 |
+| **median** | **196 s** | **19.8 s** | 4.8 | 3.7 | 1.1 | 9.9 | 209 |
 
 Against the two-card fleet over the fifteen epochs before it: open 179 s,
 `T2 - T` **21.0 s**, observation 3.2, blocked 2.1, wait 3.8, final proof 11.3,
-tail 313. **The epoch opens 17 s later and closes at the same instant**, and at
-n = 4 against n = 15 the difference is inside the spread of either. The
+tail 313. **The epoch opens 17 s later and the proof lands 1.2 s earlier**, which
+at n = 5 against n = 15 says only that the difference is inside the spread of
+either — the four epochs after the restart settled at 19.8, 18.0, 18.6 and
+23.5 s against a two-card range of 18.3 to 28.0. The
 committee proof is 143.7-144.8 s on this card against 125.0 s on the one that
 left, which is where the 17 s went; nothing queued behind it on any of the four.
 
