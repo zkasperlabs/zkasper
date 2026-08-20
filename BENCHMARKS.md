@@ -553,13 +553,17 @@ state, 05:20 and 06:04 local, are the same: one overlapping pair each, neither
 of them the committee.
 
 Which is structural rather than lucky. The pipeline holds at most one proof in
-`StreamPipeline::pending`; the only other caller of the prover is
-`Engine::speculate`, and `Engine::start_speculation` returns without starting
-anything while `head_slot() < next_epoch * slots_per_epoch`. A daemon that is
-caught up closes epoch `E` about 272 s into `E` and never has a cursor more than
-one epoch behind the head, so that test is false on every tick and the
-speculation never starts. **Two proofs can only be in flight while the daemon is
-behind**, which is what the speculation is for.
+`StreamPipeline::pending`. The only other caller of the prover is the task
+`Engine::speculate` starts, and `Engine::start_speculation` returns without
+starting one while `head_slot() < next_epoch * slots_per_epoch` — so an epoch's
+opening proofs are made ahead only when the chain has already entered the epoch
+*after* the one the daemon is on. A caught-up daemon closes `E` about 272 s into
+`E` and opens `E+1` out of `E+1`'s own first block, so it never gets there:
+eleven of the twelve epochs of that run took the critical path, and the twelfth
+is 469751, the one the daemon was still catching up on. **Two proofs can only be
+in flight while the daemon is behind**, which is what the speculation is for and
+is the one regime where a second card does anything: across three catch-up runs
+the committee proof overlapped other proofs by 13, 27 and 66 s in total.
 
 So the epoch's own shape is a chain and not a race. MEASURED on epoch 469753,
 which is typical, as seconds from the epoch's first slot:
@@ -621,32 +625,34 @@ on the committee proof and group proofs had to interleave with it, and the
 
 **The two cards are not the same card.** MEASURED: the committee proof is
 122.6-130.6 s over 67 proofs on the card behind 9098 (median 125.0 s) and
-144.7-144.8 s over two on the card behind 9099, which is the 143.4 s the
-recursion table above records for 48101536, the same card. At 901,647 members
-the model predicts `3.640 + 91.25 + 28.76 = 123.65 s`, so 9098 is the card the
-constants were fitted on and 9099 is 16% slower on this one proof. `epoch_diff`
-is 3.55-3.81 s on 9099 against a 3.640 s stage
-floor, so the card is not slow on small proofs; the likeliest cause is the one
+143.7-144.8 s over three on the card behind 9099, which is the 143.4 s the
+recursion table above records for 48101536, the same card. At the live active
+set of 901,647 the model is
+`3.640 + 901,647 x 101.2 us + 901,659 x 31.9 us = 123.65 s`, which is 1.1% under
+9098's median and 14% under 9099's — so 9098 is the card the constants were
+fitted on and 9099 is 16% slower on this one proof. `epoch_diff` is 3.55-3.81 s
+on 9099 against a 3.640 s stage floor, so the card is not slow on small proofs; the likeliest cause is the one
 the recursion campaign already found, that the prover sizes its thread pool from
 the node's core count and not from its affinity mask, and that the same proof
 spans 35.7 to 44.5 s on one card as the mask changes.
 
 That 20 s is spent in the one place with a margin to lose. The epoch's own work
-cannot start before the epoch opens and must finish by `T` at 252 s, and the
-backlog measures about 60 s. On 9098 the epoch opened at a median **178.5 s**
-over fifteen steady epochs, so the window was 74 s and the work usually finished
-before the chain crossed. On 9099 it opens at **192 s**, and the window is 60 s
-against a 60 s backlog.
+cannot start before the epoch opens and `T` is at 252 s, and the backlog it has
+to get through is about **80 s of wall clock** — 54.6 s of round trip for the
+groups and the folds, plus the witness builds between them. On 9098 the epoch
+opened at a median **179 s** over fifteen steady epochs, so the window was
+73 s. On 9099 it opens at **193-207 s** and the window is 45-59 s.
 
-**The cost of that is a few seconds and not fifteen, and it is worth being
-precise about which.** `blocked_millis` is whatever proof happened to be running
-when the chain crossed, so it is bounded by one proof and not by the shortfall:
-across 22 steady epochs at open times of 174-184 s it ran 0 to 10.3 s with a
-median of 2.1 s, and regressing it on the open time over that range gives a
-slope of −0.04 s per second — no signal at all. What the window decides is
-whether the backlog is *still running* at `T`, not how far behind it is. Below
-the backlog the sensitivity turns sharp: epoch 469751 opened 4 s before `T` and
-paid **32.5 s**, and 469726 opened 34 s after it and paid **63.3 s**.
+**Both windows are shorter than the backlog, which is why the cost is a few
+seconds and not fifteen.** The epoch is still working when the chain crosses
+either way, and what it pays for that is bounded twice over: `blocked_millis` is
+the remainder of whichever proof was running, and the slots the backlog never
+reached go into the final proof's inline tail rather than into a second floor.
+Across 22 steady epochs at open times of 174-184 s, `blocked_millis` ran 0 to
+10.3 s with a median of 2.1 s and regressing it on the open time gives a slope
+of **−0.04 s per second** — no signal at all over that range. Below the backlog
+the sensitivity turns sharp: epoch 469751 opened 4 s before `T` and paid
+**32.5 s**, and 469726 opened 34 s after it and paid **63.3 s**.
 
 Which makes the 25 s of host-side committee work the cheapest thing left in that
 chain, and nothing in the schedule charges it. MEASURED on the daemon's own box,
@@ -667,6 +673,13 @@ checkpoint. `T2` is the moment a wrapped proof exists.
 ```sh
 cargo test --release --test ssz_file_tests test_ssz_file_streaming_schedule -- --ignored --nocapture
 ```
+
+**The two-GPU figure below is withdrawn.** It is `recursion_verify_s = 35.629`,
+which was the compression `fd9764d` removed. Re-run at the measured 1.520 s, the
+same test returns **one card and 10.5 s** at every lane budget from 1 to 6 and
+under both lane pools. See *One card or two* above for the fleet measurement
+beside it. The rest of this section is kept because it is the reasoning the live
+run was read against, and every number in it is a before number.
 
 On mainnet epoch 430529, 2,212,730 validators, the schedule needs **two GPUs**
 and puts `T2 - T` at **83.1 s**, with the final proof verifying the running
