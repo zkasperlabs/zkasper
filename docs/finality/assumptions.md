@@ -3,8 +3,14 @@
 Read this before you trust a zkasper **finalization** proof.
 
 A finalization proof claims one thing. **In each of two consecutive epochs, at
-least 2/3 of the active effective balance attested to the target checkpoint.**
-The accumulator commits to the validator set behind those balances. Everything
+least 2/3 of the active effective balance attested to the target checkpoint, and
+the earlier checkpoint is the block at the later one's epoch boundary.** The
+accumulator commits to the validator set behind those balances.
+
+That is not the justification rule of the specification, which counts a target
+vote only when its source is the justified checkpoint. Read "The FFG source
+checkpoint is not constrained" in section 4 before treating `finalized_root` as
+a checkpoint Ethereum finalized; it holds the exact claim a consumer may make. Everything
 that claim rests on is either listed here or in
 [../shared/assumptions.md](../shared/assumptions.md), which holds what this
 proof shares with the fast confirmation rule: the accumulator, the init point,
@@ -309,16 +315,172 @@ it, as it does for any other change a guest compiles.
 
 ### The FFG source checkpoint is not constrained
 
-The circuits assert that every attestation names the expected target epoch and
-target root. They never compare `data_source_epoch` and `data_source_root`
-against the checkpoint that the epoch builds on. The signature binds both
-fields, and every attestation in one group must agree on them, but nothing pins
-them to the justified checkpoint.
+**This is not an accepted risk. It is a scheduled fix, kept in this section
+until it lands, because a consumer reading the proof today has to know what it
+does not say.**
 
-A zkasper proof therefore claims **that a supermajority attested to the
-target**, which is weaker than the justification rule of the specification. The
-protection against a mismatched source is the slashing rules of the protocol,
-not the proof. Fix this before a bridge secures value.
+`push_message` asserts the target epoch and the target root of every message it
+queues for the pairing, and asserts nothing else about the checkpoint
+(`crates/slot-proof-guest/src/lib.rs`). `data_source_epoch` and
+`data_source_root` go into `attestation_data_root` as `field3`, so the signature
+binds them and no prover can change one after the fact, and `same_data` requires
+the aggregates that share one derived key to agree on them. **Nothing requires
+two counted attestations in different slots to name the same source, and nothing
+requires the source to be the checkpoint the proof finalizes.**
+
+#### What the specification does with the source, and what this proof does instead
+
+The specification never counts a target vote whose source is wrong.
+`get_attestation_participation_flag_indices` computes `is_matching_target =
+is_matching_source and target_root_matches`, so `TIMELY_TARGET_FLAG_INDEX` --
+the one flag `process_justification_and_finalization` weighs -- is unset on a
+mismatched source. **A supermajority on a target, in the specification, is
+already a supermajority on a link.**
+
+The rule this pipeline implements is `all(bits[0:2]) and
+old_current_justified_checkpoint.epoch + 1 == current_epoch`, and the second
+conjunct is the link: it says epoch `E+1`'s supermajority used epoch `E` as its
+source. zkasper proves the two supermajorities and proves the *ancestry* between
+them -- `open_boundary` requires the finalized root to be the block at the
+finalized epoch's boundary slot in the justified checkpoint's own `block_roots`
+-- and never the link.
+
+So the proof establishes **a supermajority target vote in each of two
+consecutive epochs, plus ancestry**, where the rule it is named after is **a
+supermajority link**. Ancestry is a weaker substitute, and the two come apart
+whenever the chain justified an epoch late.
+
+#### The threshold is not weakened
+
+No adversary under two thirds gains anything from this. Every counted validator
+signed a message carrying the exact target epoch and target root, the aggregate
+key is pinned by the pairing, the balance is pinned by the accumulator leaf, and
+the slot mask counts each validator once. A wrong source buys no balance it did
+not already have. **This is not a forgery hole, and no construction under two
+thirds exists.**
+
+#### Honest validators cannot split on the source
+
+The source is a function of the target root, so the split case does not arise on
+its own. `current_justified_checkpoint` changes only in `process_epoch`, and the
+state at slot `E * SLOTS_PER_EPOCH` is determined by the block at that slot,
+which *is* the target root. Every chain that carries target `T` at epoch `E`
+therefore agrees on the justified checkpoint for the whole of epoch `E`, whatever
+head each validator is following. **Two honest attestations that agree on the
+target agree on the source.** A source split is always either an equivocation or
+a lie.
+
+#### The divergence that reaches the output needs no adversary at all
+
+Let epoch `E`'s target participation be under two thirds by the end of epoch `E`
+and over it once the late attestations land in epoch `E+1`.
+
+- The chain does not justify `E` at the `E` boundary, so every attester of epoch
+  `E+1` carries source `(E-1, .)`.
+- At the `E+1` boundary the chain justifies `E` and `E+1` together and finalizes
+  **`E-1`**, by the `bits[0:3]` rule -- a two-epoch link.
+- zkasper sees two thirds for `E`'s target and two thirds for `E+1`'s target,
+  consecutive epochs, ancestry intact, and finalizes **`E`**.
+
+The proof is one epoch ahead of the chain, and what it is ahead by is exactly the
+missing link. `E` is a checkpoint the chain has *justified* and not finalized.
+
+#### Why that difference is the whole of the economic guarantee
+
+A finalized checkpoint cannot be reverted without a slashable pair. A justified
+one can. In the case above the honest votes are `(E-1 -> E)` and `(E-1 -> E+1)`.
+A two-thirds coalition that later builds a branch conflicting with `E` votes
+`(E-1 -> E+7)` on it: the source epochs are equal, so
+`is_slashable_attestation_data`'s surround clause is not met, and the target
+epochs differ, so the double-vote clause is not met either. **Nobody is
+slashable.** Had the link `(E -> E+1)` existed, the same branch would have had to
+surround it, and a third of the stake would burn. That link is precisely what
+this proof does not check.
+
+The recourse Casper promises is therefore absent for the epoch the proof calls
+finalized, and a bridge that released value against `finalized_root` has no claim
+on anyone.
+
+#### What survives, and what it rests on
+
+A consumer that requires its finalized epochs to be **consecutive** keeps the
+double-vote half of accountable safety for its own sequence of claims. Every
+epoch in such a sequence carries a supermajority target vote, so two sequences
+that disagree anywhere disagree at an epoch where both claim two thirds, which is
+a third of the stake double-voting. Casper's surround clause is what covers the
+gaps, and a consecutive chain has no gaps -- which is why dropping the source
+costs nothing *there*.
+
+It does not follow that the consumer is safe. It follows that the consumer cannot
+be **moved** onto the conflicting branch without a slashable pair. If it already
+acted on an epoch the chain only justified and the chain then abandons it, the
+consumer is stranded on a dead branch, unable to advance, and no stake was burned.
+
+`zkasper-solana` gets the consecutive property from its accumulator chaining, and
+gets it by implication rather than by assertion: `submit_finalization` requires
+the incoming `accumulator_commitment` to equal the stored one, which pins the
+value but not its epoch label. It already stores `accumulator_epoch` and never
+reads it. **Asserting `finalized_epoch == accumulator_epoch` costs nothing and
+turns the property the argument above rests on into a check.**
+
+#### The exact claim a consumer of `StreamFinalOutput` may make
+
+Everything below holds; nothing above it does.
+
+1. A set of validators holding at least two thirds of the active effective
+   balance committed by `accumulator_commitment` each signed an `AttestationData`
+   whose target is `(finalized_epoch, finalized_root)`.
+2. A set of validators holding at least two thirds of the active effective
+   balance committed by `next_accumulator_commitment` each signed an
+   `AttestationData` whose target is `(justified_epoch, justified_root)`, and
+   `justified_epoch == finalized_epoch + 1`.
+3. `finalized_root` is the block at slot `finalized_epoch * SLOTS_PER_EPOCH` in
+   the `block_roots` of the state of `justified_root`'s block, and
+   `finalized_state_root` is `state_roots` at that same slot.
+4. **Nothing about the source of any of those attestations**, and therefore
+   nothing about whether `process_justification_and_finalization` would have
+   finalized `finalized_root`.
+
+A consumer may read this as *"two thirds of the stake attested to this
+checkpoint and to its successor"*. It may **not** read it as *"Ethereum finalized
+this checkpoint"*. The gap between the two is one epoch of latency in the good
+case and the entire slashing guarantee in the bad one.
+
+#### What closing it costs
+
+The check is two comparisons per distinct message, beside the two `push_message`
+already makes for the target -- under 100 us across a whole mainnet epoch, which
+is not measurable against a 3.640 s stage floor.
+
+Carrying the source up to `stream-final-guest` is the only real constraint, and
+it is a public-window constraint rather than a proving one. `MAX_PUBLIC_BYTES` is
+256 and `AggregateOutput` already spends 248. Adding `(u64, [u8; 32])` to it
+overflows by 32 bytes; adding a 32-byte source digest overflows by 24. Replacing
+`target_root` with `sha256(source_leaf || target_leaf)` -- both of them nodes
+`attestation_data_root` already computes -- spends **zero** net bytes and one
+`sha256_pair`, which is 36,207 cost units, 155 us at the measured slope, about
+4 ms over an epoch's whole proof chain. `StreamFinalOutput` needs no new field at
+all: under the fix the source of the justified epoch *is* `finalized_epoch` and
+`finalized_root`, which it already publishes. **No new recursion at 1.520 s a
+child, and no new stage at 3.640 s.**
+
+The cost that is real is on either side of the circuits:
+
+- Constraining the source makes this pipeline implement the specification's
+  one-epoch rule exactly, and the specification sometimes finalizes by the
+  two-epoch rule instead -- in the very case that motivates the fix. zkasper will
+  then publish nothing for that pair and resume one epoch later, so **a consumer
+  has to tolerate a gap in `finalized_epoch`**, which today's strict accumulator
+  chaining does not. Either the skipped epoch's diff proof reaches the consumer,
+  or the two-epoch rule goes in the circuit as well, at one more recursive child
+  on a path that is not the steady-state one.
+- Every guest ELF moves, so every baked child key moves, so the wrap key moves,
+  so `zkasper-solana`'s pinned `program_vk` is wrong and the light client has to
+  be re-initialized. There is no instruction to update it.
+
+Steady-state liveness does not change. Every attestation for epoch `E+1` on a
+healthy chain already carries source `(E, R_E)`, because the source is a function
+of the target, so nothing that is counted today stops being counted.
 
 ### Reorg detection is the word of the node
 
