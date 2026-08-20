@@ -388,6 +388,26 @@ pub struct VerifyAnchor {
     pub zkasper_commit: String,
 }
 
+impl VerifyAnchor {
+    /// Compiled in, never configured: the whole point is that this cannot drift
+    /// from what the proofs are actually proved under.
+    ///
+    /// The one constructor for both places the anchor is published — the
+    /// manifest and every proof in it — so the two cannot disagree and a reader
+    /// can compare them by string equality.
+    pub fn compiled() -> Self {
+        Self {
+            // The same renderer the API already uses for `program_vk`, so a
+            // reader compares two anchors written the same way.
+            vadcop_final_vk: crate::publish::vk_hex(&zkasper_common::recursion::VADCOP_FINAL_VK),
+            zisk_version: crate::publish::ZISK_VERSION.to_string(),
+            zkasper_commit: option_env!("ZKASPER_COMMIT")
+                .unwrap_or("unknown")
+                .to_string(),
+        }
+    }
+}
+
 /// `status.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct Status {

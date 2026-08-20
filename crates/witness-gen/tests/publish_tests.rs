@@ -12,7 +12,7 @@ mod common;
 
 use common::stub_api::StubApi;
 
-use zkasper_witness_gen::artifacts::EpochCost;
+use zkasper_witness_gen::artifacts::{EpochCost, VerifyAnchor};
 use zkasper_witness_gen::prover::Stage;
 use zkasper_witness_gen::publish::{ClosedEpoch, DaemonInfo, PublishConfig, Publisher};
 
@@ -229,5 +229,58 @@ async fn an_epoch_with_no_proof_is_not_published_as_proven() {
     assert_eq!(
         proven["summary"]["status"], "proven",
         "an epoch with proof bytes still has to say so: {proven}",
+    );
+}
+
+/// A proof handed around on its own says what to check it against.
+///
+/// The `vadcop_final` root a proof must be proved under stopped being a
+/// constant of the pinned Zisk release on 2026-08-19, when upstream rebuilt
+/// v1.1.0-alpha in place and changed it. A verifier who installs the tag today
+/// derives a different root and refuses every proof this project has published,
+/// so the anchor has to travel with the proof rather than be looked up — and it
+/// has to read exactly as the manifest's does, or a reader comparing the two
+/// learns nothing from them agreeing.
+#[test]
+fn a_proof_carries_the_anchor_it_was_proved_under() {
+    let proof = zkasper_witness_gen::publish::proof_ref(
+        469368,
+        Stage::StreamFinal,
+        &[1u64, 2, 3, 4],
+        &[9; 4],
+        &[0xAB; 8],
+        Some("0xelf"),
+    );
+    let manifest = serde_json::to_value(VerifyAnchor::compiled()).expect("the anchor serializes");
+    for field in ["vadcop_final_vk", "zisk_version", "zkasper_commit"] {
+        assert_eq!(
+            proof[field], manifest[field],
+            "{field} must render as the manifest renders it: {proof}",
+        );
+    }
+    assert_eq!(
+        proof["vadcop_final_vk"],
+        zkasper_witness_gen::publish::vk_hex(&zkasper_common::recursion::VADCOP_FINAL_VK),
+        "the anchor must be the root this binary proves under, not a configured one: {proof}",
+    );
+}
+
+/// An epoch with no proof bytes still names the build that would have proved
+/// it. The anchor is a fact about this binary, not about a proof landing.
+#[test]
+fn an_unproven_proof_still_carries_the_anchor() {
+    let proof = zkasper_witness_gen::publish::proof_ref(
+        469368,
+        Stage::StreamFinal,
+        &[],
+        &[9; 4],
+        &[0xAB; 8],
+        None,
+    );
+    assert_eq!(proof["available"], false, "{proof}");
+    assert_eq!(
+        proof["vadcop_final_vk"],
+        zkasper_witness_gen::publish::vk_hex(&zkasper_common::recursion::VADCOP_FINAL_VK),
+        "{proof}",
     );
 }

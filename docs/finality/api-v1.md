@@ -188,6 +188,9 @@ already contains their verification, so a third party needs only this one.
   "program": "zkasper-stream-final-guest",
   "program_vk": "0x9d...12",
   "public_bytes": "0x01...00",
+  "vadcop_final_vk": "0x1c...8e",
+  "zisk_version": "v1.1.0-alpha",
+  "zkasper_commit": "e4afd4c",
   "url": "/v1/proofs/469368"
 }
 ```
@@ -197,6 +200,16 @@ already contains their verification, so a third party needs only this one.
 - `public_bytes` — the exact byte string the circuit committed, as
   `PublicWriter` laid it out. The proof carries the same bytes; these are
   published so a verifier can compare without parsing the proof.
+- `vadcop_final_vk` — `rootC` of the `vadcop_final` circuit this proof was proved
+  under, rendered like `program_vk`. Repeated on every proof, and identical to
+  `/v1/status`'s `verify.vadcop_final_vk`, so a proof quoted on its own still
+  names what to check it against. It is not derivable from `zisk_version`:
+  upstream rebuilt v1.1.0-alpha in place on 2026-08-19 and changed this root
+  while leaving the release hash untouched, so a verifier who installs the tag
+  today and trusts the tag alone refuses every proof published before then.
+- `zisk_version`, `zkasper_commit` — the release and revision this binary was
+  built from, which is what rebuilds the guests and rederives the two keys
+  above.
 - `available: false` with `bytes: 0` means the run produced no proof bytes —
   which is what `--prover native` does. Every timing is still real.
 
@@ -298,6 +311,11 @@ everything here also arrives on `/v1/live` as a `status` event.
   "last_finalized": { "...": "checkpoint" },
   "node_finalized": { "...": "checkpoint" },
   "genesis_validators_root": "0x4b36...fe95",
+  "verify": {
+    "vadcop_final_vk": "0x1c...8e",
+    "zisk_version": "v1.1.0-alpha",
+    "zkasper_commit": "e4afd4c"
+  },
   "prover_usd_per_hour": 0.51,
   "gossip": { "attestations": 4210233, "reconnects": 0, "dropped": 0 },
   "recent_stages": [ { "...": "stage" } ],
@@ -606,6 +624,13 @@ Nothing here has to be taken on trust. To check that epoch `E` was finalized:
    &program_vk, &public_bytes)`. It checks the key the proof commits to, the
    public bytes it commits to, that nothing was smuggled into the unused public
    words, and then the STARK itself.
+
+   `verify_child` checks the proof against `zkasper_common::recursion::VADCOP_FINAL_VK`,
+   the root of the proving system rather than of any guest. Compare that constant
+   against the proof's own `vadcop_final_vk` before you conclude anything from a
+   refusal: if they differ, your Zisk install is not the one the proof was made
+   under and the refusal says nothing about the proof. That is the failure mode
+   `zisk_version` alone does not protect against — see the `proof` fields above.
 
    The proof's *children* need nothing from you: every child key is a constant of
    the guest you just rebuilt, so verifying the top proof pins the tree under it.

@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use zkasper_common::types::{FinalizationOutput, JustificationOutput, StreamFinalOutput};
 
 use crate::artifacts::{
-    hex0x, hex_digest, now_unix_millis, write_atomic, EpochCost, StageTiming, Status,
+    hex0x, hex_digest, now_unix_millis, write_atomic, EpochCost, StageTiming, Status, VerifyAnchor,
 };
 use crate::postings::Posting;
 use crate::prover::Stage;
@@ -553,7 +553,16 @@ pub fn epoch_status(proof: &Value) -> &'static str {
 ///
 /// `available` is false for a witness-only run: the timings are real, there is
 /// simply nothing to verify. Everything else is what a verifier binds the proof
-/// to — the program that produced it and the bytes it committed.
+/// to — the program that produced it, the bytes it committed, and the proving
+/// system it was proved under.
+///
+/// The anchor is repeated on every proof rather than referenced from the
+/// manifest, because a proof is quoted, stored and handed on by itself far more
+/// often than the whole manifest is, and the three fields it costs are worth
+/// less than a reader who has to fetch a second document — or worse, one who
+/// pairs a proof with a manifest fetched from a daemon of a different build.
+/// It is [`crate::artifacts::VerifyAnchor::compiled`], the same value rendered
+/// the same way as in `status.json`, so the two compare by string equality.
 pub fn proof_ref(
     epoch: u64,
     stage: Stage,
@@ -563,6 +572,7 @@ pub fn proof_ref(
     elf_sha256: Option<&str>,
 ) -> Value {
     let bytes = proof_to_bytes(words);
+    let anchor = VerifyAnchor::compiled();
     json!({
         "stage": stage.as_str(),
         "available": !words.is_empty(),
@@ -573,6 +583,9 @@ pub fn proof_ref(
         "program_vk": vk_hex(program_vk),
         "elf_sha256": elf_sha256,
         "public_bytes": hex0x(public_bytes),
+        "vadcop_final_vk": anchor.vadcop_final_vk,
+        "zisk_version": anchor.zisk_version,
+        "zkasper_commit": anchor.zkasper_commit,
         "url": format!("/v1/proofs/{epoch}"),
     })
 }
