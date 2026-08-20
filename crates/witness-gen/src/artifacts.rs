@@ -373,6 +373,21 @@ impl From<&Checkpoint> for CheckpointStatus {
     }
 }
 
+/// The constants a reader needs to check a proof without trusting this daemon
+/// about anything except which release it was built against.
+#[derive(Clone, Debug, Serialize)]
+pub struct VerifyAnchor {
+    /// `rootC` of the `vadcop_final` circuit every proof here is proved under,
+    /// as four little-endian u64s rendered `0x`-hex.
+    pub vadcop_final_vk: String,
+    /// The Zisk release this binary pins. Ambiguous on its own since the
+    /// 2026-08-19 in-place rebuild, which is why `vadcop_final_vk` is published
+    /// beside it rather than left to be looked up.
+    pub zisk_version: String,
+    /// The zkasper revision, so the guest ELFs and this anchor can be rebuilt.
+    pub zkasper_commit: String,
+}
+
 /// `status.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct Status {
@@ -385,6 +400,24 @@ pub struct Status {
     /// instead of trusting it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub genesis_validators_root: Option<String>,
+    /// What a third party needs to check a published proof, which they can no
+    /// longer get anywhere else.
+    ///
+    /// Verifying a `vadcop_final` proof means knowing the `rootC` it must be
+    /// proved under. That used to be a constant of the pinned Zisk release, read
+    /// from `provingKey/zisk/vadcop_final/vadcop_final.verkey.bin` — until
+    /// upstream rebuilt v1.1.0-alpha in place on 2026-08-19, changed that root,
+    /// and left `zisk-provingkey-1.1.0-alpha.hash` byte-identical. The same tag
+    /// now yields two different anchors depending on the day it was fetched, and
+    /// a verifier installing it today refuses every proof this project has
+    /// published.
+    ///
+    /// So the daemon publishes the anchor it actually proves under. It is
+    /// [`crate::recursion::VADCOP_FINAL_VK`] compiled into this binary, not a
+    /// value the API or an operator retypes, because the failure that matters is
+    /// the two drifting apart: an anchor that is merely *asserted* alongside the
+    /// proofs is worse than none, since a reader would trust it.
+    pub verify: VerifyAnchor,
     /// What an hour of the proving hardware costs, as the operator gave it. The
     /// daemon cannot know this and never multiplies by it — it is published so
     /// a reader can price `prover_millis` for themselves, at this rate or at

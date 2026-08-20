@@ -150,6 +150,19 @@ impl<A> Orchestrator<A> {
                 .genesis_validators_root()
                 .as_ref()
                 .map(|root| hex0x(root)),
+            // Compiled in, never configured: the whole point is that this cannot
+            // drift from what the proofs are actually proved under.
+            verify: crate::artifacts::VerifyAnchor {
+                // The same renderer the API already uses for `program_vk`, so a
+                // reader compares two anchors written the same way.
+                vadcop_final_vk: crate::publish::vk_hex(
+                    &zkasper_common::recursion::VADCOP_FINAL_VK,
+                ),
+                zisk_version: crate::publish::ZISK_VERSION.to_string(),
+                zkasper_commit: option_env!("ZKASPER_COMMIT")
+                    .unwrap_or("unknown")
+                    .to_string(),
+            },
             prover_usd_per_hour: self.engine.config.prover_usd_per_hour,
             prover_health: self.engine.prover.health(),
             prover: self.engine.prover.name().to_string(),
