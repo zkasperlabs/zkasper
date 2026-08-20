@@ -154,7 +154,18 @@ def daemon():
         scan_end = (c["epoch"] + ATTESTATION_LOOKAHEAD_EPOCHS) * 32
         head = s.get("head_slot") or 0
         open_s = time.time() - (c.get("opened_unix_millis") or 0) / 1000
-        out.append(check("in flight", head < scan_end,
+        # Past the scan window is normal on its own -- the daemon runs a
+        # couple of epochs behind the head and closes them from there, and
+        # 469735 sat past its window at 99.8% and closed fine. What is fatal is
+        # past the window *and* still short of the threshold, because then the
+        # attestations that would make up the difference are in blocks the
+        # daemon will not read. The age bound is what keeps this from firing in
+        # the seconds between crossing and closing: `attesting_pct` counts
+        # closed units only, so it lags the reading the trigger fires on.
+        stuck = (head >= scan_end
+                 and c["attesting_pct"] < c["threshold_pct"]
+                 and open_s > 2 * 384)
+        out.append(check("in flight", not stuck,
                          f"epoch {c['epoch']} at {c['attesting_pct']:.1f}% of "
                          f"{c['threshold_pct']:.1f}%, open {open_s:.0f}s, head {head} "
                          f"against a scan window ending at {scan_end}"))
