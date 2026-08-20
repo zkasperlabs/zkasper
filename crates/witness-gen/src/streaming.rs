@@ -606,27 +606,31 @@ pub struct Filling {
     pub in_flight: usize,
     /// How many the last interval removed.
     pub removed: usize,
+    /// How many the whole wait has removed so far, this interval included.
+    ///
+    /// `in_flight + taken` is what the tail held when the trigger first looked
+    /// at this slot, and so what the wait set out to win. Kept because the
+    /// prize and what is left of it are different numbers and the rule needs
+    /// both: see [`StreamPolicy::worth_waiting`], which bounds the wait by the
+    /// first and ends the silence by the second.
+    pub taken: usize,
     /// Network aggregates the node has published for this slot.
+    ///
+    /// **Read, not acted on.** A count of aggregates once ended the wait: no new
+    /// one in the last interval was taken to mean the slot had had both of its
+    /// arrivals and was finished. It does not mean that. A mainnet slot is
+    /// aggregated by up to 64 subnet aggregators and their aggregates arrive
+    /// spread over several hundred milliseconds, so a quiet 200 ms tick in the
+    /// middle of the wave is the common case and not the end of it — on
+    /// 2026-08-20 mainnet epochs 469720 and 469721 fired on exactly that
+    /// reading, with 9,961 and 2,432 leaves still in flight. What says the slot
+    /// has finished delivering is the tail no longer moving, which is `removed`
+    /// and the silence [`StreamPolicy::worth_waiting`] measures against the
+    /// budget. These two stay because they are the cheapest way to see, from
+    /// one published record, which half of a slot's gossip an epoch fired on.
     pub aggregates: usize,
-    /// How many of those arrived in the last interval.
+    /// How many of those arrived in the last interval, on the same terms.
     pub new_aggregates: usize,
-}
-
-impl Filling {
-    /// Whether the aggregate half of this slot's gossip may still deliver.
-    ///
-    /// A slot that has had no aggregate at all has not had that arrival yet; one
-    /// that had an aggregate this interval may have more coming. A slot whose
-    /// aggregates have been quiet for a whole interval has had both halves and
-    /// is finished, and waiting on it buys nothing.
-    ///
-    /// This is a statement about *which* gossip has been seen, not about when it
-    /// was due — a node that never publishes aggregates leaves this true, and
-    /// the in-flight clause in [`StreamPolicy::worth_waiting`] and `max_wait_s`
-    /// are what end the wait then.
-    pub fn aggregates_pending(&self) -> bool {
-        self.aggregates == 0 || self.new_aggregates > 0
-    }
 }
 
 /// How to cut an epoch.
@@ -739,12 +743,12 @@ impl StreamPolicy {
     /// Two questions, and the rule needs both of them.
     ///
     /// *Is the wait still collecting?* is a rate. [`Self::interval_paid`] reads
-    /// it off the last interval, widened by [`Filling::aggregates_pending`]
-    /// because a slot's gossip is **two arrivals, not one**: the unaggregated
-    /// attestations burst and drain, then the aggregates land in a piece, and
-    /// the silence between them says nothing at all about whether the slot is
-    /// finished. A rule that reads only the last interval's rate stops in the
-    /// first silence it meets.
+    /// it off the last interval, and a slot's gossip is **two arrivals, not
+    /// one**: the unaggregated attestations burst and drain, then the aggregates
+    /// land, and the silence between them says nothing at all about whether the
+    /// slot is finished. A rule that reads only the last interval's rate stops
+    /// in the first silence it meets, so the silence is carried by `stalled_s`
+    /// against the same budget the wait as a whole is spent from.
     ///
     /// *Is the wait still affordable?* is [`Self::wait_budget_s`], and it is the
     /// half that was missing. The rate test is break-even by construction — one
@@ -755,16 +759,50 @@ impl StreamPolicy {
     /// flight is worth `named_s(in_flight)` and not a millisecond more.
     ///
     /// So the budget is an `&&` over the whole rule rather than a clause inside
-    /// one arm of it. Both readings of "still collecting" spend from the same
-    /// budget, which is what puts the trade in the code: the wait continues
-    /// while it is collecting *and* while it has not already spent what the tail
-    /// is worth.
+    /// one arm of it: the wait continues while it is collecting *and* while it
+    /// has not already spent what the tail is worth.
+    ///
+    /// **Which tail.** The bound is what the tail held when the wait began —
+    /// `in_flight + taken` — and not what is left of it. Pricing the whole wait
+    /// against the remainder makes the rule cut a collection off in the middle
+    /// of collecting: the wave delivers, `in_flight` falls, the budget falls
+    /// with it, and the wait ends on the very intervals that were paying, with
+    /// the rest of the wave still on the wire. Replayed over the profile of
+    /// mainnet 469720 that fires at 1,900 leaves in flight one tick before the
+    /// last of them lands — refusing a 0.2 s interval that was about to remove
+    /// 1,750 leaves, which is 1.22 s of proving. The remainder is still what
+    /// ends the *silence*, and it has to be: once the tail is small a quiet
+    /// interval is quickly not worth another, and that is what fires the tick
+    /// after the wave.
     ///
     /// Nothing here models *when* attestations arrive. Every input is read off
-    /// the gossip itself — the rate off the last interval, the second arrival
-    /// off whether the node has published an aggregate for this slot yet — so a
-    /// chain that gossips earlier or later, or aggregates on a different
-    /// schedule, moves the firing instant without moving this code.
+    /// the gossip itself — the rate off the last interval, the silence off how
+    /// long the tail has not moved — so a chain that gossips earlier or later,
+    /// or aggregates on a different schedule, moves the firing instant without
+    /// moving this code.
+    ///
+    /// **The silence is measured on the tail and not on the aggregate count.**
+    /// It was measured on the count until 2026-08-20: an interval with no new
+    /// aggregate ended the wait outright, whatever the tail was doing. A
+    /// mainnet slot's aggregates come from up to 64 subnet aggregators over
+    /// several hundred milliseconds, so that reading arrives in the middle of
+    /// the wave as often as at the end of it, and it arrives on the first sight
+    /// of a slot the daemon was blocked through. Both happened on the first
+    /// four epochs the rule ever ran on: 469720 fired 1.79 s into its wait with
+    /// **9,961** leaves in flight and 469721 fired 29 ms into its with
+    /// **2,432**, while 469722, whose silence happened to fall after its wave
+    /// rather than inside it, fired on the budget with **113** and closed in
+    /// 17.6 s. All three held budgets of 6.05 s, 1.64 s and 0.09 s against
+    /// waits of 1.79 s, 0.03 s and 1.15 s, so on every one of them it was the
+    /// aggregate count that ended the wait and never the bill.
+    ///
+    /// Dropping it costs nothing that was not already bounded. The budget is
+    /// `named_s(in_flight)`, so a wait that collects nothing loses exactly what
+    /// the tail it was chasing was worth and never more — that is what the
+    /// budget was added for — and a wait that collects sees `in_flight` fall,
+    /// the budget fall with it, and the outer clause fire on the next tick. A
+    /// converged slot is therefore held one tick and no longer: 132 leaves are
+    /// a 0.09 s budget.
     ///
     /// Replaying the rule against 23 measured mainnet epochs fires at a median
     /// 8.7 s into the filling slot, and the budget does not move that: a slot
@@ -781,10 +819,10 @@ impl StreamPolicy {
     /// authorise, and it is measured on its own on both sides of the fire — see
     /// `EpochLatency::blocked_millis` and `EpochLatency::late_group_millis`.
     ///
-    /// Which makes what this rule costs measurable, and it is 79 ms median on
-    /// the live mainnet run: the wait it authorises never ran there at all,
-    /// because `held` marks a slot filling only at or past the chain head and
-    /// this daemon fires slots behind it.
+    /// Which makes what this rule costs measurable, and on the four mainnet
+    /// epochs that first ran it the wait it authorised was 1.79 s, 0.03 s and
+    /// 1.15 s against tails of 9,961, 2,432 and 113 leaves — 5.9 s, 1.4 s and
+    /// nothing of proving and wire, for waits an order of magnitude smaller.
     pub fn worth_waiting(
         &self,
         filling: Filling,
@@ -792,10 +830,11 @@ impl StreamPolicy {
         stalled_s: f64,
         waited_s: f64,
     ) -> bool {
-        let budget_s = self.wait_budget_s(filling.in_flight);
-        waited_s < budget_s
-            && (self.interval_paid(filling.removed, interval_s)
-                || (filling.aggregates_pending() && stalled_s < budget_s))
+        // What the wait set out to win, and what is left of it.
+        let prize_s = self.wait_budget_s(filling.in_flight + filling.taken);
+        let left_s = self.wait_budget_s(filling.in_flight);
+        waited_s < prize_s
+            && (self.interval_paid(filling.removed, interval_s) || stalled_s < left_s)
     }
 
     /// Lanes each stage may run on, in the order it should prefer them.
@@ -1962,6 +2001,7 @@ mod tests {
         Filling {
             in_flight,
             removed,
+            taken: 0,
             aggregates: 64,
             new_aggregates: 0,
         }
@@ -2009,6 +2049,7 @@ mod tests {
         let singles_drained = Filling {
             in_flight: 6_300,
             removed: 0,
+            taken: 0,
             aggregates: 0,
             new_aggregates: 0,
         };
@@ -2023,6 +2064,7 @@ mod tests {
         let landing = Filling {
             in_flight: 2_150,
             removed: 4_150,
+            taken: 0,
             aggregates: 64,
             new_aggregates: 64,
         };
@@ -2036,13 +2078,150 @@ mod tests {
         // leaf those 2,150 were worth 3.30 s and this held on.
         assert!(!policy.worth_waiting(landing, 0.2, 0.0, 3.2));
 
-        // One quiet interval after them, both halves have been and gone. Held
-        // inside the budget, so it is the aggregates clause that ends it here
-        // and not the bill.
+        // One quiet interval after them, and the slot's aggregate count has not
+        // moved. That is **not** the slot finishing: 64 subnet aggregators
+        // deliver a mainnet slot over several hundred milliseconds and a 200 ms
+        // gap inside that wave is ordinary. Held, because 2,150 leaves are
+        // worth 1.46 s and only 1.0 s has been spent.
         assert!(
-            !policy.worth_waiting(drained(2_150, 0), 0.2, 0.2, 1.0),
-            "kept waiting on a slot whose gossip was finished",
+            policy.worth_waiting(drained(2_150, 0), 0.2, 0.2, 1.0),
+            "gave up inside the wave on a count of aggregates",
         );
+        // What ends it is the bill, on the same reading, once the wait has
+        // cost what the tail can repay.
+        assert!(!policy.worth_waiting(drained(2_150, 0), 0.2, 1.5, 1.5));
+    }
+
+    /// The reading the first four live epochs fired on, in their own numbers.
+    ///
+    /// `drained` is a slot whose aggregates have been seen and did not move in
+    /// the last interval, which is where the rule used to stop outright. On
+    /// 2026-08-20 mainnet 469720 met it 1.79 s into its wait with 9,961 leaves
+    /// still in flight and 469721 met it on the first sight of a slot it had
+    /// been blocked through, with 2,432. Both are inside a budget those tails
+    /// pay for many times over.
+    #[test]
+    fn the_wave_is_not_over_because_one_interval_of_it_was_quiet() {
+        let policy = StreamPolicy::default();
+
+        let epoch_469720 = drained(9_961, 0);
+        assert!((policy.wait_budget_s(9_961) - 6.051).abs() < 1e-2);
+        assert!(
+            policy.worth_waiting(epoch_469720, 0.2, 1.79, 1.79),
+            "fired with 9,961 leaves in flight and 4.3 s of budget unspent",
+        );
+
+        let epoch_469721 = drained(2_432, 0);
+        assert!((policy.wait_budget_s(2_432) - 1.635).abs() < 1e-2);
+        assert!(
+            policy.worth_waiting(epoch_469721, 0.0, 0.0, 0.03),
+            "fired 29 ms into a wait its tail was worth 1.6 s of",
+        );
+
+        // And 469722, whose silence fell after its wave rather than inside it,
+        // is unchanged: 113 leaves are a 0.09 s budget and 1.15 s had gone.
+        let epoch_469722 = drained(113, 0);
+        assert!(policy.wait_budget_s(113) < 0.1);
+        assert!(!policy.worth_waiting(epoch_469722, 0.2, 1.15, 1.15));
+    }
+
+    /// The whole wait, tick by tick, over the gossip profile the live run
+    /// measured — which is the claim that matters and the one a clause-level
+    /// test cannot make.
+    ///
+    /// The crossing slot of mainnet 469720: the daemon is freed by its backlog
+    /// 6.18 s into the slot with 9,961 leaves in flight, nothing arrives until
+    /// the aggregates start at 8.1 s, they land in pieces over the next 600 ms
+    /// with quiet intervals between them, and the tail settles at 150. The
+    /// firing instant is what this asserts, and it has to be *after* the wave
+    /// and within a tick of it: later is latency spent for nothing and earlier
+    /// is the 5.9 s of proving and 2.2 s of wire that epoch actually paid.
+    #[test]
+    fn the_wait_ends_on_the_tick_after_the_wave_and_not_before_it() {
+        let policy = StreamPolicy::default();
+        let interval_s = 0.2;
+
+        // Leaves still in flight, as the wave delivers them in pieces.
+        let in_flight = |t: f64| -> usize {
+            match t {
+                t if t < 8.1 => 9_961,
+                t if t < 8.3 => 6_400,
+                t if t < 8.5 => 6_400,
+                t if t < 8.7 => 1_900,
+                _ => 150,
+            }
+        };
+
+        let (mut stalled_s, mut fired_at, mut taken) = (0.0, None, 0);
+        let (freed_at, mut previous) = (6.18, in_flight(6.18));
+        let mut t = freed_at;
+        while t < 14.0 {
+            let now = in_flight(t);
+            let removed = previous.saturating_sub(now);
+            taken += removed;
+            let filling = Filling {
+                in_flight: now,
+                removed,
+                taken,
+                aggregates: usize::from(t >= 8.1) * 40,
+                new_aggregates: 0,
+            };
+            stalled_s = if policy.interval_paid(filling.removed, interval_s) {
+                0.0
+            } else {
+                stalled_s + interval_s
+            };
+            if !policy.worth_waiting(filling, interval_s, stalled_s, t - freed_at) {
+                fired_at = Some(t);
+                break;
+            }
+            previous = now;
+            t += interval_s;
+        }
+
+        let fired_at = fired_at.expect("the wait must end");
+        assert!(
+            (8.7..=9.1).contains(&fired_at),
+            "fired {fired_at} s into the slot, which is not the tick after the wave",
+        );
+        assert_eq!(
+            in_flight(fired_at),
+            150,
+            "and it fired on the tail the wave left, not the one it found",
+        );
+    }
+
+    /// A wave that never comes costs exactly what the tail it was waiting for
+    /// was worth, and not a second more. That is the bound removing the
+    /// aggregate clause leans on.
+    #[test]
+    fn a_wave_that_never_comes_costs_the_budget_and_stops() {
+        let policy = StreamPolicy::default();
+        let interval_s = 0.2;
+
+        let (mut stalled_s, mut waited_s) = (0.0, 0.0);
+        while policy.worth_waiting(drained(9_961, 0), interval_s, stalled_s, waited_s) {
+            stalled_s += interval_s;
+            waited_s += interval_s;
+            assert!(waited_s < 7.0, "a wait with no arrivals ran away");
+        }
+        let budget_s = policy.wait_budget_s(9_961);
+        assert!(
+            waited_s >= budget_s && waited_s < budget_s + interval_s,
+            "stopped at {waited_s} s against a {budget_s} s budget",
+        );
+    }
+
+    /// A converged slot is held one tick and no longer, so the fix cannot
+    /// delay an epoch that was already firing on a small tail.
+    #[test]
+    fn a_slot_that_has_already_converged_is_held_one_tick() {
+        let policy = StreamPolicy::default();
+
+        // Epoch 469716 fired on 132 leaves with 20 ms of wait behind it.
+        assert!(policy.worth_waiting(drained(132, 0), 0.2, 0.0, 0.02));
+        // One 200 ms tick later the budget is spent and it fires.
+        assert!(!policy.worth_waiting(drained(132, 0), 0.2, 0.22, 0.22));
     }
 
     /// The hold is not unconditional: it costs latency, so it is taken only
@@ -2058,6 +2237,7 @@ mod tests {
         let converged = Filling {
             in_flight: 300,
             removed: 0,
+            taken: 0,
             aggregates: 0,
             new_aggregates: 0,
         };
