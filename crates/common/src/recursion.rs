@@ -87,6 +87,20 @@ pub const UNSET_VK: ProgramVk = [0; PROGRAM_VK_LEN];
 /// repository, so unlike the child program keys it depends on no guest ELF,
 /// there is no dependency graph to walk, and one shared constant is enough.
 ///
+/// **It is not a constant of that release any more, and that is not our doing.**
+/// Upstream rebuilt the v1.1.0-alpha proving key in place on 2026-08-19 and
+/// changed this root, while leaving `zisk-provingkey-1.1.0-alpha.hash`
+/// byte-identical, so the same tag yields two different values depending on the
+/// day it was fetched. The value below is the **2026-08-17 build**, which is what
+/// every proof this project has published is proved under. A fresh install today
+/// gives `[13156505134420657395, ..]` and refuses all of them. The Aug-17
+/// proving key survives at `/mnt/ssd/zisk-1.1.0` on the build box and nowhere
+/// else that we know of.
+///
+/// So **do not re-read this from a release to check it** -- that instruction was
+/// safe when a tag meant one artifact. Anyone verifying a published proof needs
+/// this value from here, not from `provingKey`.
+///
 /// **Rederive it on a Zisk bump, before anything else.** A stale value refuses
 /// every proof, which is the safe direction and an obvious one; the value for
 /// v1.0.0-alpha is `[16418290590932191654, 2682920145730279116,
