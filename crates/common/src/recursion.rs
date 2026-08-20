@@ -141,6 +141,67 @@ pub fn child_public_bytes(proof: &[u64]) -> Option<[u8; MAX_PUBLIC_BYTES]> {
     Some(out)
 }
 
+/// A stored proof, split back into the parts Zisk's own `Proof` is made of.
+///
+/// The pipeline keeps proofs as the flat word vector `ProveOutput::get_proof_u64`
+/// hands out — `[minimal | n_publics | stark_publics | proof | zisk_vk]` — and
+/// that is all any zkasper consumer needs. Zisk's `wrap_proof`, the only door to
+/// an on-chain proof, wants a `zisk_common::Proof` instead, and the SDK has no
+/// inverse: `Proof::load` reads its own bincode and nothing rebuilds a
+/// `ProofBody::Vadcop` from words. Everything it needs is here except the hash
+/// family, which is a constant of the Zisk release rather than of the proof.
+pub struct StoredProof<'a> {
+    /// Whether the proof was compressed. The PLONK wrap refuses a compressed
+    /// one, so this is the first thing a wrapper must look at.
+    pub minimal: bool,
+    /// `[is_vadcop_final_proof?] | program_vk(4) | inputs(64)`, as the STARK
+    /// transcript committed it.
+    pub stark_publics: &'a [u64],
+    /// The proof itself.
+    pub proof: &'a [u64],
+    /// The VADCOP final key the proof asks to be checked under.
+    pub zisk_vk: ProgramVk,
+}
+
+impl StoredProof<'_> {
+    /// The flag-free `[program_vk | inputs]` Zisk calls `publics_full`.
+    pub fn publics_full(&self) -> &[u64] {
+        if self.minimal {
+            self.stark_publics
+        } else {
+            &self.stark_publics[1..]
+        }
+    }
+}
+
+/// Split a stored proof into its parts, or `None` if the words are not one.
+pub fn split(words: &[u64]) -> Option<StoredProof<'_>> {
+    let (&minimal, rest) = words.split_first()?;
+    let (&n_publics, rest) = rest.split_first()?;
+    let minimal = match minimal {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let n_publics = usize::try_from(n_publics).ok()?;
+    // A minimal proof carries no `is_vadcop_final_proof` flag, so its public
+    // vector is one word shorter. Anything else is not this format.
+    if n_publics != PROGRAM_VK_LEN + ZISK_PUBLICS + usize::from(!minimal) {
+        return None;
+    }
+    let (stark_publics, rest) = rest.split_at_checked(n_publics)?;
+    let (proof, tail) = rest.split_at_checked(rest.len().checked_sub(VADCOP_VK_LEN)?)?;
+    if proof.is_empty() {
+        return None;
+    }
+    Some(StoredProof {
+        minimal,
+        stark_publics,
+        proof,
+        zisk_vk: [tail[0], tail[1], tail[2], tail[3]],
+    })
+}
+
 /// Verify a child proof and bind it to the program and outputs the caller expects.
 ///
 /// An empty proof is accepted on native targets so circuit logic can be
@@ -331,6 +392,65 @@ mod tests {
     /// safe failure — it refuses everything — but it refuses everything at the
     /// far end of a proving run, so pin it here where it costs nothing.
     ///
+
+    fn stored_words(minimal: bool) -> Vec<u64> {
+        let n_publics = PROGRAM_VK_LEN + ZISK_PUBLICS + usize::from(!minimal);
+        let mut words = vec![minimal as u64, n_publics as u64];
+        if !minimal {
+            words.push(1);
+        }
+        words.extend([7, 8, 9, 10]);
+        words.extend((0..ZISK_PUBLICS).map(|i| i as u64));
+        words.extend([100, 101, 102]);
+        words.extend(VADCOP_FINAL_VK);
+        words
+    }
+
+    #[test]
+    fn a_stored_proof_splits_into_what_zisk_wants_back() {
+        let words = stored_words(false);
+        let split = split(&words).expect("an uncompressed stored proof");
+        assert!(!split.minimal);
+        assert_eq!(split.zisk_vk, VADCOP_FINAL_VK);
+        assert_eq!(split.proof, &[100, 101, 102]);
+        assert_eq!(split.publics_full()[..PROGRAM_VK_LEN], [7, 8, 9, 10]);
+        assert_eq!(split.publics_full().len(), PROGRAM_VK_LEN + ZISK_PUBLICS);
+    }
+
+    #[test]
+    fn a_compressed_proof_says_so() {
+        let words = stored_words(true);
+        let split = split(&words).expect("a minimal stored proof");
+        assert!(split.minimal, "the PLONK wrap refuses this one");
+        assert_eq!(split.publics_full().len(), PROGRAM_VK_LEN + ZISK_PUBLICS);
+    }
+
+    #[test]
+    fn a_truncated_or_mislabelled_proof_is_not_split() {
+        let words = stored_words(false);
+        assert!(split(&[]).is_none());
+        // Shorter than the header, the publics and the key together. Losing
+        // whole words off the tail is *not* detectable here — the format
+        // carries no length, so the key just slides — which is why the key
+        // itself is checked against [`VADCOP_FINAL_VK`] rather than trusted.
+        assert!(split(&words[..2 + 69 + 2]).is_none());
+        assert!(split(&[2, 69]).is_none(), "the minimal flag is a bool");
+
+        let mut wrong = words.clone();
+        wrong[1] = 68;
+        assert!(
+            split(&wrong).is_none(),
+            "68 publics is a compressed proof count"
+        );
+
+        let mut empty = words[..2 + 69].to_vec();
+        empty.extend(VADCOP_FINAL_VK);
+        assert!(
+            split(&empty).is_none(),
+            "a header and a key with nothing between"
+        );
+    }
+
     /// ```text
     /// ZKASPER_CHILD_PROOF=/path/to/child.words.bin cargo test -p zkasper-common
     /// ```
