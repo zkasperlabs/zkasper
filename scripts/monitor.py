@@ -420,22 +420,36 @@ def refusals():
     The log is the only source, and the daemon's own stdout names it exactly --
     the launcher redirects it, so `/proc/PID/fd/1` is the file, with no
     convention to guess at.
+
+    Every giving-up path here returns ok, because this check going quiet is not
+    itself a fault worth waking anyone for. That makes a transient miss read as
+    green on the one fault that ends 24-hour runs, so the lookup is retried
+    rather than believed the first time: it returned "no log on stdout" once on
+    2026-08-20 against a `/proc/PID/fd/1` that resolved to a 37 MB file a second
+    later, on a daemon that had not restarted.
     """
     try:
-        pid = None
-        for candidate in subprocess.run(["pgrep", "-x", "zkasperd"], capture_output=True,
-                                        text=True, timeout=15).stdout.split():
-            try:
-                if Path(f"/proc/{candidate}/exe").resolve().name.startswith("zkasperd"):
-                    pid = candidate
-                    break
-            except OSError:
-                continue
-        if pid is None:
-            return check("refusals", True, "no daemon, not checked")
-        log = Path(f"/proc/{pid}/fd/1").resolve()
-        if not log.is_file():
-            return check("refusals", True, "no log on stdout, not checked")
+        log = None
+        for attempt in range(2):
+            pid = None
+            for candidate in subprocess.run(["pgrep", "-x", "zkasperd"], capture_output=True,
+                                            text=True, timeout=15).stdout.split():
+                try:
+                    if Path(f"/proc/{candidate}/exe").resolve().name.startswith("zkasperd"):
+                        pid = candidate
+                        break
+                except OSError:
+                    continue
+            if pid is None:
+                return check("refusals", True, "no daemon, not checked")
+            found = Path(f"/proc/{pid}/fd/1").resolve()
+            if found.is_file():
+                log = found
+                break
+            if attempt == 0:
+                time.sleep(1)
+        if log is None:
+            return check("refusals", True, "no log on stdout twice, not checked")
         # This run only: the log is appended across restarts.
         text = log.read_text(errors="replace")
         start = text.rfind("=== zkasperd start at ")
