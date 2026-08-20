@@ -367,8 +367,15 @@ look worse than it is.
 
 **Modelled, not measured**:
 
-- **`T2 - T` is 83.1 s in a model** over measured per-stage times, on two GPUs.
-  **No prover has run this shape.** It was 112.4 s while the final proof's inline
+- **`T2 - T` is 10.5 s in a model** over measured per-stage times, on **one**
+  GPU, and a live mainnet daemon measures **21.0 s median** over eleven
+  steady-state epochs. **The 83.1 s on two GPUs this document quoted until
+  2026-08-20 is withdrawn**: it priced a child at 35.629 s, which was the
+  compression `fd9764d` removed, and at the measured 1.520 s the schedule wants
+  one card at every lane budget. The live gap over the model is not the prover —
+  it is 3.2 s of gossip the daemon has to see, 2.1 s of a proof still running
+  when the chain crossed, and 3.8 s of trigger wait the daemon chose to spend.
+  It was 112.4 s while the final proof's inline
   tail was capped at four slots and the epoch's end had to be a group it then
   verified as a child; uncapping it removes that child but not the two the final
   proof cannot avoid — the running aggregate and the previous epoch's
