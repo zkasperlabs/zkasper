@@ -883,7 +883,37 @@ export class IndexDO extends DurableObject {
       Date.now(),
     );
     this.sql.exec("DELETE FROM proof_chunks WHERE epoch = ?", epoch);
+    this.landProof(epoch, m);
     return jsonResponse({ ok: true, stored: "r2" });
+  }
+
+  // Proof bytes that arrive after the epoch closed still close the hole.
+  //
+  // The daemon marks an epoch `unproven` when it closes with its prover down
+  // and the final proof spooled. The proof is usually produced minutes later,
+  // and until 2026-08-20 it landed in the spool's `recovered/` directory and
+  // nowhere else: the bytes existed, they were uploaded, they were served by
+  // `/v1/proofs/{epoch}` -- and the epoch stayed `unproven`, because this
+  // handler wrote the `proofs` table and never revisited the summary the
+  // listing reads. 469734 is that epoch, and "no epoch the chain justified goes
+  // unproven" is a launch criterion, so the hole was permanent and false.
+  //
+  // `unproven` is nominally settled and a consumer may have cached it. A
+  // settled lie is worse than a status that improves, so a real proof promotes
+  // it; nothing else is touched, and an epoch that was never `unproven` keeps
+  // whatever status it had.
+  private landProof(epoch: number, m: any): void {
+    const bytes = num(m.bytes);
+    if (bytes === null || bytes <= 0) return;
+    const v: Record<string, unknown> = { available: true, bytes };
+    for (const k of ["sha256", "stage", "program_vk", "public_bytes"]) {
+      if (typeof m[k] === "string" && m[k]) v[k] = m[k];
+    }
+    const patch: Record<string, unknown> = { proof: this.jmerge(epoch, "proof", v) };
+    if (this.one("SELECT status FROM epochs WHERE epoch = ?", epoch)?.status === "unproven") {
+      patch.status = "proven";
+    }
+    this.setEpoch(epoch, patch);
   }
 
   private async putProofInline(request: Request, epoch: number): Promise<Response> {
