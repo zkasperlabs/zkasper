@@ -323,6 +323,54 @@ def daemon():
     return out
 
 
+
+def unrouted(inst):
+    """A rented card nothing routes to. The named wake-worthy condition, and
+    until 2026-08-20 this script could not see it.
+
+    On that morning the committee route was removed to test the whole pipeline
+    on one GPU, and 48117430 sat running and idle at $0.39/hr while `gpu` above
+    reported "2 instance(s) ... running" and exited 0. Listing what is rented
+    says nothing about whether anything uses it.
+
+    The link is on this box: each tunnel is `ssh -N -T -L <local>:127.0.0.1:<remote>
+    ... root@<ip>`, which maps a local port to an instance's public address, and
+    the daemon's own argv names the local ports it proves against. An instance
+    whose port is in no tunnel, or whose tunnel port the daemon never names, is
+    being paid for and not used.
+    """
+    try:
+        ps = subprocess.run(["ps", "-eo", "args"], capture_output=True,
+                            text=True, timeout=20).stdout
+        # local port -> the instance address the tunnel reaches
+        tunnels = dict(re.findall(r"-L (\d+):\S+?\s+.*?root@(\S+)", ps))
+        argv = ""
+        for proc in Path("/proc").iterdir():
+            try:
+                cmd = (proc / "cmdline").read_bytes().decode(errors="replace")
+            except Exception:
+                continue
+            if "bin/zkasperd" in cmd and "--beacon-url" in cmd:
+                argv = cmd
+                break
+        if not argv:
+            return check("routing", True, "no daemon, nothing to route")
+        used_ports = set(re.findall(r"127\.0\.0\.1:(\d+)", argv))
+        used_ips = {ip for port, ip in tunnels.items() if port in used_ports}
+        idle = [i for i in inst
+                if i.get("public_ipaddr") and i["public_ipaddr"] not in used_ips]
+        if not idle:
+            return check("routing", True,
+                         f"every rented card is routed to ({len(inst)})")
+        cost = sum(i.get("dph_total") or 0 for i in idle)
+        names = ", ".join(f"{i['id']} ({i.get('public_ipaddr')})" for i in idle)
+        return check("routing", False,
+                     f"{names} rented and nothing routes to it, "
+                     f"${cost:.2f}/hr = ${cost * 730:.0f}/month for nothing")
+    except Exception as e:
+        return check("routing", True, f"not checked: {e}")
+
+
 def gpus():
     """Rented instances and what they are burning. Silence here costs money."""
     try:
@@ -343,6 +391,7 @@ def gpus():
     burn = sum(i.get("dph_total") or 0 for i in inst)
     what = ", ".join(f"{i['id']} {i.get('actual_status')}" for i in inst) or "none"
     out = [check("gpu", True, f"{len(inst)} instance(s): {what} | ${burn:.2f}/hr")]
+    out.append(unrouted(inst))
     # A card left running overnight is the expensive failure, so credit that
     # cannot cover another day is worth surfacing before it runs out.
     out.append(check("credit", credit > burn * 24 if burn else credit > 0,
