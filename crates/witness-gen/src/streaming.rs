@@ -1754,6 +1754,18 @@ mod tests {
         AttestationWitness, BlsSignature, CommitteeAggregate, SlotComplementWitness,
     };
 
+    /// Seconds into a slot at which its network aggregates land, and so the
+    /// earliest instant the trigger can fire without paying more in tail than
+    /// the wait costs.
+    ///
+    /// MEASURED on 1.08M live mainnet gossip events of epoch 469606: the
+    /// singles union reaches 60.3% at 5.0 s and stops at 76-77%, and the
+    /// aggregates land in one piece at 8.1-8.2 s and carry the slot to 99.7%.
+    /// The published epochs agree without being told — over 38 of them the
+    /// eleven fires before 8.2 s left a median 8,456 named leaves and the
+    /// twenty-seven from 8.2 s left 154.
+    const AGGREGATE_WAVE_S: f64 = 8.2;
+
     /// A complement worth `balance` that opens `named` accumulator leaves.
     ///
     /// Naming is what a complement costs — mainnet slots name 85 to 334 — so it
@@ -2401,6 +2413,46 @@ mod tests {
                 < 0.01,
             "folding costs {:.2}s against absorbing's {absorbed:.2}s",
             folded,
+        );
+    }
+
+    /// And why the fold that is running when the chain crosses is started
+    /// anyway: it lands before the trigger could have fired.
+    ///
+    /// That fold is the whole of
+    /// [`crate::artifacts::EpochLatency::blocked_millis`] — the epoch's last
+    /// one, folding the group that covers the slot before the crossing slot.
+    /// Over the eleven steady-state mainnet epochs of the 2026-08-20 run that
+    /// reported a block, ten were this fold and one was a group; the folds ran
+    /// 7.51-7.78 s against the 7.514 s below and started between 1.8 s before
+    /// `T` and 3.5 s after it. It reads 4.5-7.1 s and looks like the largest
+    /// term left.
+    ///
+    /// Declining one is a branch condition. What it buys is the gap between
+    /// when the fold lands and when the trigger could fire, and the trigger
+    /// cannot fire before [`AGGREGATE_WAVE_S`] — the daemon absorbs gossip
+    /// above its in-flight early return, so the tail shrinks all through the
+    /// block exactly as it would through a wait. A fold is shorter than that
+    /// wait, so one started at the crossing is free; and what declining costs
+    /// is not, because the group the fold would have taken becomes a child of
+    /// the final proof instead.
+    #[test]
+    fn a_fold_started_at_the_crossing_lands_before_the_trigger_could_fire() {
+        let m = ProverModel::default();
+        let overhang = m.fold_s(1.0, false) - AGGREGATE_WAVE_S;
+        assert!(
+            overhang < 0.0,
+            "a fold started at `T` runs {:.2}s into a wait of {AGGREGATE_WAVE_S}s;              a fold longer than the wait it runs inside is one worth declining",
+            m.fold_s(1.0, false),
+        );
+
+        // And the price of declining it, which is what makes the margin above
+        // worth a test rather than a comment: the final proof verifies the
+        // group itself.
+        let child = m.final_s(130.0, 1.0, 3.0, 1.0, true) - m.final_s(130.0, 1.0, 3.0, 0.0, true);
+        assert!(
+            child > overhang,
+            "declining costs {child:.2}s of recursion to save {overhang:.2}s",
         );
     }
 
