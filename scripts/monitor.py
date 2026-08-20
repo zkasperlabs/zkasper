@@ -87,6 +87,9 @@ STALE_S = 1800
 # and the run cannot recover, so it is the line that matters rather than the
 # close rate, which equals the epoch length whenever the daemon is caught up.
 MAX_LAG_EPOCHS = 4
+# Instance ids that are meant to sit unrouted, one per line. A spare is a
+# decision, not a fault, and the key on it cannot be re-obtained.
+SPARE_FILE = "/mnt/ssd/zkasper-run/spare-instances"
 # A healthy epoch_diff is 3.5-5 s. This is the line above which the prover has
 # stopped using its GPU rather than merely being busy.
 EPOCH_DIFF_CEILING_MS = 60_000
@@ -362,11 +365,36 @@ def unrouted(inst):
         if not idle:
             return check("routing", True,
                          f"every rented card is routed to ({len(inst)})")
-        cost = sum(i.get("dph_total") or 0 for i in idle)
-        names = ", ".join(f"{i['id']} ({i.get('public_ipaddr')})" for i in idle)
+        # An unrouted card is not automatically waste, and saying so cost this
+        # check its credibility for a morning. The proving key cannot be rebuilt
+        # -- Zisk overwrote it upstream with versioning off -- so an idle card
+        # holding a copy is the only spare a fleet that cannot be reconstituted
+        # has. Reporting "$285/month for nothing" about the one thing standing
+        # between the run and an unrecoverable loss is how an instrument talks
+        # someone into destroying it at three in the morning.
+        #
+        # So: name the cost, never the verdict, and let a card be declared a
+        # deliberate spare in `spare-instances` next to the run.
+        spare = set()
+        try:
+            spare = {line.split("#")[0].strip()
+                     for line in Path(SPARE_FILE).read_text().splitlines()}
+            spare.discard("")
+        except Exception:
+            pass
+        held = [i for i in idle if str(i["id"]) in spare]
+        loose = [i for i in idle if str(i["id"]) not in spare]
+        def money(cards):
+            c = sum(i.get("dph_total") or 0 for i in cards)
+            return f"${c:.2f}/hr = ${c * 730:.0f}/month"
+        if not loose:
+            return check("routing", True,
+                         ", ".join(str(i["id"]) for i in held)
+                         + f" unrouted, held as a declared spare, {money(held)}")
+        names = ", ".join(f"{i['id']} ({i.get('public_ipaddr')})" for i in loose)
         return check("routing", False,
-                     f"{names} rented and nothing routes to it, "
-                     f"${cost:.2f}/hr = ${cost * 730:.0f}/month for nothing")
+                     f"{names} rented and nothing routes to it, {money(loose)}"
+                     " -- declare it in spare-instances if that is deliberate")
     except Exception as e:
         return check("routing", True, f"not checked: {e}")
 
