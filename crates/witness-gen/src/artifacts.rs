@@ -227,6 +227,21 @@ pub struct EpochLatency {
     /// after the trigger fired. Both are the backlog, so
     /// `blocked_millis + late_group_millis` is what it cost wherever the race
     /// put it; what neither of them is, is a wait.
+    ///
+    /// **It is not, however, all of it removable, because most of it is a wait
+    /// the trigger would have taken.** [`super::orchestrator`] absorbs gossip
+    /// above the in-flight early return, so the epoch's tail keeps shrinking
+    /// all through the block and the fire that follows is against a current
+    /// view — and the trigger cannot usefully fire before a crossing slot's
+    /// aggregates land at 8.1-8.2 s anyway. Two epochs of the 2026-08-20 run
+    /// say it outright: 469731 was blocked 2.35 s and then waited 2.99 s,
+    /// 469729 was blocked 4.51 s and waited 0.48 s, and both fired 8.6 s into
+    /// the crossing slot. What is left is `observation_millis + blocked_millis`
+    /// past that wave — 0 to 2.9 s over the five epochs, 0.6 s median — and
+    /// buying it back costs the final proof one
+    /// [`crate::streaming::ProverModel::recursion_verify_s`] for the group the
+    /// fold would have absorbed. See
+    /// `a_fold_started_at_the_crossing_lands_before_the_trigger_could_fire`.
     pub blocked_millis: u64,
     /// The part of `t2_minus_t_millis` that was the trigger holding back rather
     /// than the prover working: `fired_unix_millis - observed_unix_millis`,
