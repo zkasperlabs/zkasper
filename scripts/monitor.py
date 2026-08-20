@@ -83,6 +83,9 @@ HEARTBEAT_STALE_S = 90
 # The manifest is still worth a much looser bound: no stage finishing for half an
 # hour means the pipeline is stuck even if the process breathes.
 STALE_S = 1800
+# A healthy epoch_diff is 3.5-5 s. This is the line above which the prover has
+# stopped using its GPU rather than merely being busy.
+EPOCH_DIFF_CEILING_MS = 60_000
 # zkasperd's default, and not overridden on the command line. It bounds the
 # slot the daemon will still scan blocks for an epoch's attestations in.
 ATTESTATION_LOOKAHEAD_EPOCHS = 2
@@ -263,6 +266,29 @@ def daemon():
             out.append(check("cost", True,
                              f"${avg / 3_600_000 * rate:.4f}/epoch, "
                              f"{avg / 1000:.0f}s prover over {len(full)}"))
+
+    # A prover that has taken a guest panic keeps working and stops using its
+    # GPU. It still handshakes as `gpu=true`, still holds its GPU memory, still
+    # answers, and still returns proofs that verify -- roughly 100x slower. On
+    # 2026-08-20 one server proved the same 46,153-word epoch diff in 4 s and
+    # then, after eleven `failed recursive verification` panics, in 410 s, and
+    # the slow one read as "the first epoch is expensive" for the better part of
+    # an hour while a chain restart and a deploy were measured through it.
+    #
+    # `epoch_diff` is the canary because it is the one stage whose size barely
+    # moves: 3.5-5 s on every healthy epoch this run has ever proved, whatever
+    # else is going on. A ceiling an order of magnitude above that cannot fire on
+    # a busy card, only on a broken one. The committee stage is deliberately not
+    # checked -- a cold full-table proof is legitimately ~209 s.
+    slow = [st for st in stages
+            if st.get("stage") == "epoch_diff"
+            and (st.get("prove_millis") or 0) > EPOCH_DIFF_CEILING_MS]
+    out.append(check("prover", not slow,
+                     f"epoch_diff {max((st.get('prove_millis') or 0) for st in slow) / 1000:.0f}s "
+                     f"against a {EPOCH_DIFF_CEILING_MS / 1000:.0f}s ceiling: the card has "
+                     f"dropped off its GPU, restart it"
+                     if slow else
+                     f"epoch_diff within its {EPOCH_DIFF_CEILING_MS / 1000:.0f}s ceiling"))
 
     pub = s.get("publish") or {}
     if pub:
