@@ -68,6 +68,21 @@ pub fn verify_stream_final_with(
         "accumulator commitment mismatch",
     );
 
+    // The checkpoint this proof finalizes is the source every attestation it
+    // counts has to name. Deriving it from the previous justification, rather
+    // than taking it as an input, is what makes the link unforgeable: it is the
+    // same value this proof publishes as `finalized_root`, and the previous
+    // justification is bound to its own proof below.
+    let previous = &witness.previous_justification;
+    let source_epoch = previous.target_epoch();
+    let source_root = previous.target_root();
+    let checkpoint_digest = zkasper_common::ssz::checkpoint_digest(
+        source_epoch,
+        &source_root,
+        witness.target_epoch,
+        &witness.target_root,
+    );
+
     // -- the running aggregate ------------------------------------------------
     //
     // The epoch diff that links the previous epoch's accumulator to this one's
@@ -132,8 +147,8 @@ pub fn verify_stream_final_with(
                 "aggregate target_epoch mismatch",
             );
             assert_eq!(
-                aggregate.target_root, witness.target_root,
-                "aggregate target_root mismatch",
+                aggregate.checkpoint_digest, checkpoint_digest,
+                "aggregate checkpoint mismatch",
             );
             assert_eq!(
                 acc::commit_fp12(&witness.aggregate_miller.0),
@@ -169,6 +184,8 @@ pub fn verify_stream_final_with(
             &witness.group_proofs[i],
             witness.accumulator_commitment,
             committee_root,
+            source_epoch,
+            &source_root,
             witness.target_epoch,
             &witness.target_root,
             miller_i,
@@ -200,6 +217,8 @@ pub fn verify_stream_final_with(
             &witness.tail_acc_multi_proof,
             &committee_root,
             &witness.tail_committee_multi_proof,
+            source_epoch,
+            &source_root,
             witness.target_epoch,
             &witness.target_root,
             &witness.signing_domain,
@@ -252,7 +271,6 @@ pub fn verify_stream_final_with(
     // key, so that one key is still read from the witness — and published, so
     // that a verifier holding this program's key can require the two to agree.
     // See [`StreamFinalOutput::program_vk`].
-    let previous = &witness.previous_justification;
     match previous {
         PreviousJustification::Batch(batch) => {
             assert!(

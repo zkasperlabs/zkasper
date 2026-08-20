@@ -42,6 +42,8 @@ pub fn verify_slot_proof_with_depth(witness: &SlotProofWitness, acc_depth: u32) 
     SlotProofOutput {
         accumulator_commitment: witness.accumulator_commitment,
         committee_root: witness.committee_root,
+        source_epoch: witness.source_epoch,
+        source_root: witness.source_root,
         target_epoch: witness.target_epoch,
         target_root: witness.target_root,
         attesting_balance: attested.attesting_balance,
@@ -83,6 +85,8 @@ pub fn verify_group_proof_with_depth(
     GroupProofOutput {
         accumulator_commitment: witness.accumulator_commitment,
         committee_root: witness.committee_root,
+        source_epoch: witness.source_epoch,
+        source_root: witness.source_root,
         target_epoch: witness.target_epoch,
         target_root: witness.target_root,
         attesting_balance: attested.attesting_balance,
@@ -113,6 +117,8 @@ pub fn attest(witness: &SlotProofWitness, acc_depth: u32) -> Attested {
         &witness.acc_multi_proof,
         &witness.committee_root,
         &witness.committee_multi_proof,
+        witness.source_epoch,
+        &witness.source_root,
         witness.target_epoch,
         &witness.target_root,
         &witness.signing_domain,
@@ -153,6 +159,15 @@ pub fn attest(witness: &SlotProofWitness, acc_depth: u32) -> Attested {
 /// because every key that goes into `agg_pk` is either opened here or summed
 /// into `committee.pubkey` by the committee proof.
 ///
+/// **The source checkpoint is pinned, not merely signed.** Every message is
+/// required to name `source_epoch`/`source_root` as its source, so a
+/// supermajority counted here is a supermajority on the *link* rather than on
+/// the target alone. The specification never counts a target vote whose source
+/// is wrong — `is_matching_target = is_matching_source and ...` — and this is
+/// the assertion that says the same thing. Without it two thirds of the stake
+/// can abandon a target zkasper called final without surrounding anything, and
+/// so without becoming slashable.
+///
 /// **The balances are not pinned by the pairing**, and are bound instead by the
 /// accumulator leaf, which is one Poseidon2 hash over `(pubkey, balance)`
 /// together. A validator cannot be subtracted from `agg_pk` at one balance and
@@ -184,6 +199,8 @@ pub fn verify_attestations(
     acc_multi_proof: &AccMultiProof,
     committee_root: &Digest,
     committee_multi_proof: &AccMultiProof,
+    source_epoch: u64,
+    source_root: &[u8; 32],
     target_epoch: u64,
     target_root: &[u8; 32],
     signing_domain: &[u8; 32],
@@ -270,6 +287,8 @@ pub fn verify_attestations(
             push_message(
                 core::slice::from_ref(attestation),
                 keys.get().expect("secondary aggregate names no signers"),
+                source_epoch,
+                source_root,
                 target_epoch,
                 target_root,
                 signing_domain,
@@ -297,6 +316,8 @@ pub fn verify_attestations(
             primary_key
                 .get()
                 .expect("committee aggregate is the identity"),
+            source_epoch,
+            source_root,
             target_epoch,
             target_root,
             signing_domain,
@@ -383,6 +404,8 @@ fn same_data(a: &AttestationWitness, b: &AttestationWitness) -> bool {
 fn push_message(
     aggregates: &[AttestationWitness],
     aggregate_key: G1Point,
+    source_epoch: u64,
+    source_root: &[u8; 32],
     target_epoch: u64,
     target_root: &[u8; 32],
     signing_domain: &[u8; 32],
@@ -391,6 +414,14 @@ fn push_message(
     signatures: &mut Vec<Vec<[u8; 96]>>,
 ) {
     let attestation = &aggregates[0];
+    assert_eq!(
+        attestation.data_source_epoch, source_epoch,
+        "attestation source_epoch mismatch",
+    );
+    assert_eq!(
+        attestation.data_source_root, *source_root,
+        "attestation source_root mismatch",
+    );
     assert_eq!(
         attestation.data_target_epoch, target_epoch,
         "attestation target_epoch mismatch",

@@ -30,6 +30,7 @@ pub async fn build_per_slot(
     committees: Arc<EpochCommittees>,
     target_epoch: u64,
     target_root: [u8; 32],
+    source_root: [u8; 32],
     total_active_balance: u64,
     signing_domain: [u8; 32],
 ) -> Result<Vec<SlotWitnessData>> {
@@ -45,6 +46,7 @@ pub async fn build_per_slot(
         committees.clone(),
         target_epoch,
         &target_root,
+        &source_root,
     )
     .await
     .context("collect per-slot complements")?;
@@ -69,6 +71,8 @@ pub async fn build_per_slot(
             witness: SlotProofWitness {
                 accumulator_commitment: commitment,
                 committee_root,
+                source_epoch: target_epoch.saturating_sub(1),
+                source_root,
                 target_epoch,
                 target_root,
                 signing_domain,

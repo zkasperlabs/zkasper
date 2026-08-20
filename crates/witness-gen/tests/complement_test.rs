@@ -57,6 +57,8 @@ fn witness_for(epoch: &Epoch, slots: &[SlotComplementWitness]) -> SlotProofWitne
     SlotProofWitness {
         accumulator_commitment: epoch.accumulator_commitment,
         committee_root: epoch.committees.root(),
+        source_epoch: epoch.epoch - 1,
+        source_root: epoch.source_root,
         target_epoch: epoch.epoch,
         target_root: epoch.target_root,
         signing_domain: epoch.signing_domain,
@@ -430,6 +432,7 @@ fn two_aggregates_over_one_message_each_name_their_own_signers() {
         epoch.committees.clone(),
         epoch.epoch,
         epoch.target_root,
+        epoch.source_root,
     );
     stream
         .ingest(&[
@@ -501,6 +504,7 @@ fn singles_are_summed_into_one_aggregate_per_message() {
         epoch.committees.clone(),
         epoch.epoch,
         epoch.target_root,
+        epoch.source_root,
     );
     let members = epoch.committees.members[0].clone();
     let singles: Vec<AttestationResponse> = members
@@ -537,6 +541,7 @@ fn a_validator_gossiped_twice_is_summed_once() {
         epoch.committees.clone(),
         epoch.epoch,
         epoch.target_root,
+        epoch.source_root,
     );
     let members = epoch.committees.members[0].clone();
     let mut gossip: Vec<AttestationResponse> = members
@@ -573,6 +578,7 @@ fn an_overlapping_aggregate_is_taken_alongside_the_singles() {
             epoch.committees.clone(),
             epoch.epoch,
             epoch.target_root,
+            epoch.source_root,
         );
         stream.ingest(&gossip).unwrap();
         stream.close(epoch.slot(0)).expect("close the slot")
@@ -635,6 +641,7 @@ fn late_singles_do_not_displace_the_aggregate_a_slot_was_repaired_with() {
         epoch.committees.clone(),
         epoch.epoch,
         epoch.target_root,
+        epoch.source_root,
     );
     stream
         .ingest(&[aggregate(&epoch, 0, head, &members)])
@@ -749,6 +756,7 @@ fn collect_two_waves(epoch: &Epoch, aggregated: bool) -> Vec<SlotComplement> {
         epoch.committees.clone(),
         epoch.epoch,
         epoch.target_root,
+        epoch.source_root,
     );
     let mut units = Vec::new();
 
@@ -885,6 +893,7 @@ fn a_cover_is_the_union_of_the_waves_not_the_larger_of_them() {
             epoch.committees.clone(),
             epoch.epoch,
             epoch.target_root,
+            epoch.source_root,
         );
         stream.ingest(&gossip).unwrap();
         stream.close(epoch.slot(0)).expect("close the slot")
@@ -936,4 +945,83 @@ fn a_cover_is_the_union_of_the_waves_not_the_larger_of_them() {
             balance,
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The FFG source
+// ---------------------------------------------------------------------------
+
+/// An attestation is counted only if it names the checkpoint the proof is a
+/// link *from* as its FFG source.
+///
+/// The signature has always bound the source — it is `field3` of
+/// `AttestationData` — but binding is not constraining. Until the circuit
+/// compared it against something, nothing required two counted attestations to
+/// name the same source, and nothing required any of them to name the
+/// checkpoint being finalized. A supermajority on the target was therefore not
+/// a supermajority on the link, and the specification's `is_matching_target =
+/// is_matching_source and ...` is exactly the clause that makes those one claim.
+///
+/// The signatures below are real and verify against the data they were made
+/// over. What rejects them is the checkpoint, not the cryptography — before the
+/// source was constrained this witness produced a proof.
+#[test]
+fn an_attestation_from_another_source_is_not_counted() {
+    let honest = fixture();
+
+    // A committee that voted this target from some older justified checkpoint,
+    // signing that link rather than the one being proven.
+    let mut epoch = fixture();
+    epoch.source_root = [0x5A; 32];
+    assert_ne!(epoch.source_root, honest.source_root);
+
+    let mut witness = witness_for(&epoch, &[epoch.complement(0, &[]).witness]);
+    witness.source_root = honest.source_root;
+
+    let message = rejection(
+        "an attestation from another source was counted",
+        move || {
+            verify(&witness);
+        },
+    );
+    assert!(
+        message.contains("attestation source_root mismatch"),
+        "{message}",
+    );
+}
+
+/// The same, one epoch out: a vote whose source is the right root at the wrong
+/// epoch is a different checkpoint, and is not counted either.
+#[test]
+fn an_attestation_from_another_source_epoch_is_not_counted() {
+    let epoch = fixture();
+    let mut witness = witness_for(&epoch, &[epoch.complement(0, &[]).witness]);
+    witness.source_epoch -= 1;
+
+    let message = rejection(
+        "an attestation from another source epoch was counted",
+        move || {
+            verify(&witness);
+        },
+    );
+    assert!(
+        message.contains("attestation source_epoch mismatch"),
+        "{message}",
+    );
+}
+
+/// The link a real chain votes still proves, so the constraint costs no
+/// liveness: every attestation for epoch `E` on a healthy chain already carries
+/// source `(E-1, R)`.
+#[test]
+fn the_link_a_real_chain_votes_still_proves() {
+    let epoch = fixture();
+    let witness = witness_for(&epoch, &[epoch.complement(0, &[]).witness]);
+
+    assert_eq!(witness.source_epoch, EPOCH - 1);
+    assert_eq!(witness.source_root, epoch.previous_root);
+    assert_eq!(
+        verify(&witness).attesting_balance,
+        PER_SLOT as u64 * BALANCE_GWEI,
+    );
 }

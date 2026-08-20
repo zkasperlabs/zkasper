@@ -78,7 +78,7 @@ fn load_state(api: &mut Api, filename: &str, config: &ChainConfig) -> u64 {
     slot
 }
 
-fn load_finality(api: &mut Api, filename: &str) -> (u64, [u8; 32]) {
+fn load_finality(api: &mut Api, filename: &str) -> (u64, [u8; 32], [u8; 32]) {
     use flate2::read::GzDecoder;
     use std::io::Read;
     let f = std::fs::File::open(format!("{DIR}/{filename}")).unwrap();
@@ -114,7 +114,18 @@ fn load_finality(api: &mut Api, filename: &str) -> (u64, [u8; 32]) {
                 .collect(),
         );
     }
-    (target_epoch, target_root)
+    let source_root = api
+        .atts
+        .values()
+        .flatten()
+        .find(|a| {
+            a.data_target_epoch == target_epoch
+                && a.data_target_root == target_root
+                && a.data_source_epoch + 1 == target_epoch
+        })
+        .expect("no attestation for the target checkpoint names the previous epoch as source")
+        .data_source_root;
+    (target_epoch, target_root, source_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +252,8 @@ async fn diag_finality_bls() {
         committees: HashMap::new(),
     };
     let slot = load_state(&mut api, "state_13776928.ssz", &CONFIG);
-    let (target_epoch, target_root) = load_finality(&mut api, "finality_epoch_430529.json.gz");
+    let (target_epoch, target_root, source_root) =
+        load_finality(&mut api, "finality_epoch_430529.json.gz");
 
     let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
         .await
@@ -275,6 +287,7 @@ async fn diag_finality_bls() {
         committees,
         target_epoch,
         target_root,
+        source_root,
         total_active_balance,
         signing_domain,
     )

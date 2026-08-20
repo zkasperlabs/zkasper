@@ -124,7 +124,7 @@ impl SszFileApi {
     }
 
     /// Load finality JSON data (attestations + committees) from a gzipped JSON file.
-    fn load_finality_data(&mut self, path: &str) -> (u64, [u8; 32]) {
+    fn load_finality_data(&mut self, path: &str) -> (u64, [u8; 32], [u8; 32]) {
         use flate2::read::GzDecoder;
         use std::io::Read;
 
@@ -169,7 +169,22 @@ impl SszFileApi {
             self.attestations_by_slot.insert(slot_str.clone(), atts);
         }
 
-        (target_epoch, target_root)
+        // The checkpoint those attestations name as their FFG source. On real
+        // data it is the previous epoch's checkpoint, and the circuit counts
+        // only attestations that name it.
+        let source_root = self
+            .attestations_by_slot
+            .values()
+            .flatten()
+            .find(|a| {
+                a.data_target_epoch == target_epoch
+                    && a.data_target_root == target_root
+                    && a.data_source_epoch + 1 == target_epoch
+            })
+            .expect("no attestation for the target checkpoint names the previous epoch as source")
+            .data_source_root;
+
+        (target_epoch, target_root, source_root)
     }
 
     fn get_state(&self, state_id: &str) -> &StateData {
@@ -707,7 +722,7 @@ async fn test_ssz_file_finality() {
 
     // Load finality attestation + committee data
     let finality_path = ensure_file(FINALITY_DATA);
-    let (target_epoch, target_root) = api.load_finality_data(&finality_path);
+    let (target_epoch, target_root, source_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
     eprintln!(
         "target_epoch={target_epoch}, target_root=0x{}",
@@ -764,6 +779,7 @@ async fn test_ssz_file_finality() {
         committees.clone(),
         target_epoch,
         target_root,
+        source_root,
         total_active_balance,
         signing_domain,
     )
@@ -803,6 +819,7 @@ async fn test_ssz_file_finality() {
         acc_root: tree.root(),
         target_epoch,
         target_root,
+        source_root,
         total_active_balance,
         justification_program_vk: child_vks::JUSTIFICATION,
     };
@@ -882,7 +899,7 @@ async fn test_ssz_file_streaming_finality() {
     let epoch = slot / CONFIG.slots_per_epoch;
 
     let finality_path = ensure_file(FINALITY_DATA);
-    let (target_epoch, target_root) = api.load_finality_data(&finality_path);
+    let (target_epoch, target_root, source_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
 
     let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
@@ -920,6 +937,7 @@ async fn test_ssz_file_streaming_finality() {
         committees.clone(),
         target_epoch,
         &target_root,
+        &source_root,
     )
     .await
     .unwrap();
@@ -959,6 +977,7 @@ async fn test_ssz_file_streaming_finality() {
         total_active_balance,
         target_epoch,
         target_root,
+        source_root,
         signing_domain,
         aggregate_program_vk: child_vks::AGGREGATE,
         stream_program_vk: [3; 4],
@@ -1082,7 +1101,7 @@ async fn test_ssz_file_streaming_schedule() {
     let epoch = slot / CONFIG.slots_per_epoch;
 
     let finality_path = ensure_file(FINALITY_DATA);
-    let (target_epoch, target_root) = api.load_finality_data(&finality_path);
+    let (target_epoch, target_root, source_root) = api.load_finality_data(&finality_path);
     assert_eq!(target_epoch, epoch);
 
     let (init, snapshot) = zkasper_witness_gen::init_point::take(&api, &CONFIG, "mainnet", slot)
@@ -1124,6 +1143,7 @@ async fn test_ssz_file_streaming_schedule() {
         committees.clone(),
         target_epoch,
         &target_root,
+        &source_root,
     )
     .await
     .unwrap();

@@ -79,6 +79,26 @@ pub fn verify_finalization_with_slots(
         just_e1.target_epoch,
     );
 
+    // And E+1 has to have been justified *from* E, which is the link that makes
+    // this a finalization rather than two unrelated supermajorities.
+    //
+    // The specification never counts a target vote whose source is wrong:
+    // `is_matching_target = is_matching_source and ...`, so a supermajority on a
+    // target is already a supermajority on a link. This is where that becomes
+    // true here. Without it, two thirds of the stake can abandon E by voting
+    // `(E-1 -> E+7)` — sources equal, so no surround; targets distinct, so no
+    // double vote — and finalize a conflicting checkpoint with nobody slashable.
+    assert_eq!(
+        just_e1.source_epoch, just_e.target_epoch,
+        "epoch {} was justified from epoch {} rather than from {}",
+        just_e1.target_epoch, just_e1.source_epoch, just_e.target_epoch,
+    );
+    assert_eq!(
+        just_e1.source_root, just_e.target_root,
+        "epoch {} was justified from a different checkpoint of epoch {}",
+        just_e1.target_epoch, just_e.target_epoch,
+    );
+
     // Relate the two accumulators with an epoch-diff proof.
     //
     // The accumulator leaf commits an *effective balance*, which the beacon

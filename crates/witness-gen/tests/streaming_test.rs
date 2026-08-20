@@ -374,7 +374,7 @@ fn an_aggregate_from_another_checkpoint_is_rejected() {
     let run = run(&fixture, &folded(&grouped(&plan)));
 
     let mut forged = run.final_witness.clone();
-    forged.aggregate.as_mut().unwrap().target_root = [0xEE; 32];
+    forged.aggregate.as_mut().unwrap().checkpoint_digest = [0xEE; 32];
 
     rejection("a foreign aggregate was accepted", || {
         zkasper_stream_final_guest::verify_stream_final_with_depth(&forged, ACC_DEPTH);

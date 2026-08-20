@@ -82,6 +82,10 @@ pub(super) fn write_proof(
 /// every later proof of it counts against.
 pub(super) struct OpenEpoch {
     pub(super) target_root: [u8; 32],
+    /// Checkpoint of the epoch before this one: the FFG source every
+    /// attestation counted here has to name, and the checkpoint a proof of this
+    /// epoch finalizes.
+    pub(super) source_root: [u8; 32],
     pub(super) signing_domain: [u8; 32],
     pub(super) committees: Arc<EpochCommittees>,
     pub(super) committee_output: CommitteeOutput,
@@ -156,6 +160,10 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
             .chain
             .checkpoint_root(&self.api, &self.config, target_epoch)
             .await?;
+        let source_root = self
+            .chain
+            .checkpoint_root(&self.api, &self.config, target_epoch.saturating_sub(1))
+            .await?;
         let signing_domain = self
             .chain
             .signing_domain(&self.api, &self.config, target_epoch)
@@ -193,10 +201,12 @@ impl<A: BeaconApi + ChainStatusApi> Engine<A> {
             committees.clone(),
             target_epoch,
             target_root,
+            source_root,
         );
 
         Ok(OpenEpoch {
             target_root,
+            source_root,
             signing_domain,
             committees,
             committee_output,

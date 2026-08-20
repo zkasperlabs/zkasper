@@ -326,6 +326,10 @@ pub fn build_acc_tree(acc_leaves: &[Digest], depth: u32) -> (Digest, Vec<Vec<Dig
 /// `program_vk` is not decoration: a consumer requires it to be the key of the
 /// program it was built to verify, so a fixture that names the wrong one is
 /// refused exactly as an attacker's chain would be.
+///
+/// The source is left as a zero root, which no chain has. A finalization
+/// requires E+1 to have been justified *from* E, so a fixture that has to
+/// satisfy that link sets `source_root` on the later of the pair itself.
 pub fn justified_output(
     program_vk: crate::recursion::ProgramVk,
     accumulator_commitment: Digest,
@@ -335,6 +339,8 @@ pub fn justified_output(
     JustificationOutput {
         accumulator_commitment,
         committee_root: ZERO,
+        source_epoch: target_epoch.saturating_sub(1),
+        source_root: [0u8; 32],
         target_epoch,
         target_root,
         attesting_balance: 0,

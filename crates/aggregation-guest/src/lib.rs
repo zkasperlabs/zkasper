@@ -62,6 +62,13 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
         "groups and Miller accumulators length mismatch",
     );
 
+    let checkpoint_digest = zkasper_common::ssz::checkpoint_digest(
+        witness.source_epoch,
+        &witness.source_root,
+        witness.target_epoch,
+        &witness.target_root,
+    );
+
     // The aggregate being extended. Absent means the epoch opens here: nothing
     // counted, an empty slot mask, an empty product of pairings, and the epoch
     // diff still to be verified.
@@ -119,8 +126,8 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
                 "previous aggregate target_epoch mismatch",
             );
             assert_eq!(
-                previous.target_root, witness.target_root,
-                "previous aggregate target_root mismatch",
+                previous.checkpoint_digest, checkpoint_digest,
+                "previous aggregate checkpoint mismatch",
             );
             assert_eq!(
                 acc::commit_fp12(&witness.previous_miller.0),
@@ -144,6 +151,8 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
             &witness.group_proofs[i],
             witness.accumulator_commitment,
             committee_root,
+            witness.source_epoch,
+            &witness.source_root,
             witness.target_epoch,
             &witness.target_root,
             miller_i,
@@ -171,7 +180,7 @@ pub fn verify_aggregate(witness: &AggregateWitness) -> AggregateOutput {
         previous_accumulator_commitment,
         anchor_state_root,
         target_epoch: witness.target_epoch,
-        target_root: witness.target_root,
+        checkpoint_digest,
         attesting_balance,
         slots_mask,
         miller_commitment: acc::commit_fp12(&miller),
@@ -189,6 +198,8 @@ pub fn verify_group(
     proof: &[u64],
     accumulator_commitment: acc::Digest,
     committee_root: acc::Digest,
+    source_epoch: u64,
+    source_root: &[u8; 32],
     target_epoch: u64,
     target_root: &[u8; 32],
     miller: &Fp12,
@@ -205,6 +216,14 @@ pub fn verify_group(
     assert_eq!(
         group.committee_root, committee_root,
         "group proof {position} committee mismatch",
+    );
+    assert_eq!(
+        group.source_epoch, source_epoch,
+        "group proof {position} source_epoch mismatch",
+    );
+    assert_eq!(
+        group.source_root, *source_root,
+        "group proof {position} source_root mismatch",
     );
     assert_eq!(
         group.target_epoch, target_epoch,

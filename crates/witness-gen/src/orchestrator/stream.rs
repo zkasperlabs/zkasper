@@ -958,6 +958,7 @@ impl StreamPipeline {
         let spe = engine.config.chain.slots_per_epoch;
         let OpenEpoch {
             target_root,
+            source_root,
             signing_domain,
             committees,
             committee_output,
@@ -996,6 +997,7 @@ impl StreamPipeline {
             total_active_balance: state.total_active_balance,
             target_epoch,
             target_root,
+            source_root,
             signing_domain,
             aggregate_program_vk: engine.prover.program_vk(Stage::Aggregate),
             stream_program_vk: engine.prover.program_vk(Stage::StreamFinal),
