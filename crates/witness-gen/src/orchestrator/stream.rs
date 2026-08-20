@@ -88,6 +88,10 @@ struct StreamAggregator {
     /// Seconds the wait has run without an interval paying for itself. Reset by
     /// any interval that does, and by anything that ends the wait.
     stalled_s: f64,
+    /// Leaves the wait on the current filling slot has taken off the tail so
+    /// far. Reset with `stalled_s` when the trigger first sees a slot, and what
+    /// tells [`StreamPolicy::worth_waiting`] what this wait set out to win.
+    taken_while_filling: usize,
     /// Attestation slots closed so far, in order.
     units: Vec<SlotComplement>,
     /// How many of them a group proof already covers.
@@ -449,8 +453,10 @@ impl StreamAggregator {
             .map(|(at, _, named, aggregates)| (at.elapsed().as_secs_f64(), named, aggregates));
         if previous.is_none() {
             self.stalled_s = 0.0;
+            self.taken_while_filling = 0;
         }
-        let (interval_s, filling) = reading(previous, now);
+        let (interval_s, filling) = reading(previous, now, self.taken_while_filling);
+        self.taken_while_filling = filling.taken;
         self.stalled_s = if policy.interval_paid(filling.removed, interval_s) {
             0.0
         } else {
@@ -491,13 +497,19 @@ impl StreamAggregator {
 /// half of the rule that one reading answers. See
 /// [`StreamAggregator::worth_waiting`] for what treating that as no reading at
 /// all cost.
-fn reading(previous: Option<(f64, usize, usize)>, now: (u64, usize, usize)) -> (f64, Filling) {
+fn reading(
+    previous: Option<(f64, usize, usize)>,
+    now: (u64, usize, usize),
+    taken: usize,
+) -> (f64, Filling) {
     let (_slot, named, aggregates) = now;
+    let removed = previous.map_or(0, |(_, was, _)| was.saturating_sub(named));
     (
         previous.map_or(0.0, |(interval_s, _, _)| interval_s),
         Filling {
             in_flight: named,
-            removed: previous.map_or(0, |(_, was, _)| was.saturating_sub(named)),
+            removed,
+            taken: taken + removed,
             aggregates,
             new_aggregates: previous.map_or(0, |(_, _, was)| aggregates.saturating_sub(was)),
         },
@@ -1022,6 +1034,7 @@ impl StreamPipeline {
             reorged: false,
             last_filling: None,
             stalled_s: 0.0,
+            taken_while_filling: 0,
             units: Vec::new(),
             proved: 0,
             attesting_balance: 0,
@@ -1644,7 +1657,7 @@ mod tests {
     /// aggregates for this slot have not landed.
     #[test]
     fn the_first_reading_of_a_slot_is_a_reading() {
-        let (interval_s, filling) = reading(None, CROSSING_SLOT);
+        let (interval_s, filling) = reading(None, CROSSING_SLOT, 0);
 
         assert_eq!(
             interval_s, 0.0,
@@ -1652,10 +1665,7 @@ mod tests {
         );
         assert_eq!(filling.removed, 0);
         assert_eq!(filling.in_flight, 7_183);
-        assert!(
-            filling.aggregates_pending(),
-            "a slot with no aggregate has not had its second arrival",
-        );
+        assert_eq!(filling.aggregates, 0, "no aggregate has been seen for it");
         assert!(
             !mainnet().interval_paid(filling.removed, interval_s),
             "and the rate half stays unanswered rather than being guessed at",
@@ -1666,7 +1676,7 @@ mod tests {
     /// removed, exactly as it always did.
     #[test]
     fn a_second_reading_prices_what_the_interval_removed() {
-        let (interval_s, filling) = reading(Some((0.2, 7_183, 0)), (15_030_741, 583, 4));
+        let (interval_s, filling) = reading(Some((0.2, 7_183, 0)), (15_030_741, 583, 4), 0);
 
         assert_eq!(interval_s, 0.2);
         assert_eq!(filling.removed, 6_600, "the aggregate wave landed");
@@ -1679,7 +1689,7 @@ mod tests {
     #[test]
     fn the_trigger_waits_for_the_aggregates_of_a_slot_it_has_just_seen() {
         let policy = mainnet();
-        let (interval_s, filling) = reading(None, CROSSING_SLOT);
+        let (interval_s, filling) = reading(None, CROSSING_SLOT, 0);
 
         assert!(
             policy.worth_waiting(filling, interval_s, 0.0, 0.02),
@@ -1691,14 +1701,28 @@ mod tests {
         );
     }
 
-    /// A slot whose aggregates have landed and stopped is finished, however
-    /// large its tail, so the wait ends rather than running to the budget.
+    /// A slot whose tail has stopped moving is fired on within a tick or two,
+    /// because the silence is priced against what is *left* rather than against
+    /// what the wait set out to win.
+    ///
+    /// It is not fired on because its aggregate count stopped moving. That
+    /// reading is what mainnet 469720 and 469721 fired on with 9,961 and 2,432
+    /// leaves in flight; the wave comes from up to 64 subnet aggregators and a
+    /// quiet 200 ms tick inside it is ordinary. See
+    /// [`StreamPolicy::worth_waiting`].
     #[test]
-    fn a_slot_that_has_had_both_arrivals_is_not_waited_on() {
+    fn a_slot_whose_tail_has_stopped_moving_is_fired_on() {
         let policy = mainnet();
-        let (interval_s, filling) = reading(Some((0.2, 583, 4)), (15_030_741, 583, 4));
+        let (interval_s, filling) = reading(Some((0.2, 583, 4)), (15_030_741, 583, 4), 6_600);
 
-        assert!(!policy.worth_waiting(filling, interval_s, 0.4, 2.3));
+        // 583 leaves are worth 0.42 s, so two quiet ticks are still inside it
+        // and three are not.
+        assert!(policy.worth_waiting(filling, interval_s, 0.4, 2.3));
+        assert!(!policy.worth_waiting(filling, interval_s, 0.6, 2.5));
+
+        // And the wait as a whole is still bounded by the 7,183 it began on,
+        // which is what stops the remainder cutting off a wave mid-delivery.
+        assert!(policy.wait_budget_s(filling.in_flight + filling.taken) > 4.0);
     }
 
     /// The budget is the trigger's own, so a prover that was still working when
