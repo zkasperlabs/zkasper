@@ -668,14 +668,25 @@ restart catching up and are not here.
 | 469765 | 196 s | 19.8 s | 5.2 | 4.6 | 0.2 | 9.7 | 169 |
 | 469766 | 197 s | 18.0 s | 3.7 | 3.7 | 1.1 | 9.3 | 132 |
 | 469767 | 196 s | 18.6 s | 4.8 | 1.3 | 2.4 | 9.9 | 209 |
-| **median** | **196 s** | **19.8 s** | 4.8 | 3.7 | 1.1 | 9.9 | 209 |
+| 469768 | 203 s | 24.7 s | 3.2 | 7.5 | 0.2 | 13.6 | 3,754 |
+| 469769 | 204 s | 29.7 s | 3.0 | 0.0 | 5.6 | 21.0 | 244 |
+| 469771 | 195 s | 18.6 s | 2.9 | 1.2 | 4.5 | 9.9 | 209 |
+| 469772 | 195 s | 20.1 s | 3.6 | 0.1 | 4.7 | 11.5 | 146 |
+| 469773 | 209 s | 19.6 s | 3.6 | 0.0 | 4.7 | 11.1 | 353 |
+| **median** | **196 s** | **19.9 s** | 3.6 | 1.7 | 2.5 | 11.3 | 227 |
+
+The last three are `14edb26`; 469770 is the redeploy catching up and is left out
+on the same terms as the first two. 469769 is a prover fault and not a schedule
+one — `stream_final` came back `Error generating witness for instance id 4 [0:0]
+of type Recursive1`, the daemon asked once more, and the same witness proved, so
+its 21.0 s final proof is a 10 s retry on top of a 10 s proof.
 
 Against the two-card fleet over the fifteen epochs before it: open 179 s,
 `T2 - T` **21.0 s**, observation 3.2, blocked 2.1, wait 3.8, final proof 11.3,
-tail 313. **The epoch opens 17 s later and the proof lands 1.2 s earlier**, which
-at n = 5 against n = 15 says only that the difference is inside the spread of
-either — the four epochs after the restart settled at 19.8, 18.0, 18.6 and
-23.5 s against a two-card range of 18.3 to 28.0. The
+tail 313. **The epoch opens 17 s later and the proof lands 1.1 s earlier.** At
+n = 10 against n = 15, with one-card epochs spanning 18.0 to 29.7 s and two-card
+epochs 18.3 to 28.0 s, the honest reading is that the second card was not
+measurable in `T2 - T` at all. The
 committee proof is 143.7-144.8 s on this card against 125.0 s on the one that
 left, which is where the 17 s went; nothing queued behind it on any of the four.
 
