@@ -421,8 +421,12 @@ def published_latency():
     recent = sorted(t for _, t in series[-10:])
     return check("time", True,
                  f"T2-T median {v[len(v) // 2]:.0f}s "
+                 # The "/100" that used to be here counted toward a criterion the
+                 # user withdrew on 2026-08-20 -- "that goal is imaginary" -- and
+                 # an instrument that keeps scoring a retired goal teaches you to
+                 # read the wrong number. The distribution is still the point;
+                 # the count toward a hundred is not.
                  f"p90 {v[int(0.9 * (len(v) - 1))]:.0f}s over {len(v)}"
-                 f" ({len(v)}/100 for the criterion)"
                  + (f", last {len(recent)} median {recent[len(recent) // 2]:.0f}s"
                     if len(v) > 10 else "")
                  + latency_split(live))
