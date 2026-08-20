@@ -578,7 +578,18 @@ export class IndexDO extends DurableObject {
     // What the daemon says it is working on. A speculating daemon publishes the
     // next epoch's opening stages while this one is still open, so `highest`
     // alone strands a live epoch; its own word is the exemption.
-    const current = jparse(this.getKv("status"))?.current_epoch;
+    // `current_epoch` is null exactly while the daemon is working toward opening
+    // an epoch -- it is built from the aggregator, which does not exist until the
+    // epoch opens -- and that is precisely the window a committee proof occupies.
+    // So it stranded 469690 on 2026-08-20 while a healthy daemon was resuming it.
+    // The accumulator's epoch is the cursor and is non-null whenever the daemon
+    // is alive, so take whichever is higher.
+    const st = jparse(this.getKv("status"));
+    const cur = st?.current_epoch;
+    const acc = st?.accumulator?.epoch;
+    const current = [cur, acc]
+      .filter((e) => typeof e === "number")
+      .reduce((a: number | undefined, b: number) => (a === undefined || b > a ? b : a), undefined);
     const out: Array<{ seq: number; type: string; data: any }> = [];
     for (const r of open) {
       const epoch = r.epoch as number;
