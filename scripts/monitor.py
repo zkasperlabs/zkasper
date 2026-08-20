@@ -83,6 +83,9 @@ HEARTBEAT_STALE_S = 90
 # The manifest is still worth a much looser bound: no stage finishing for half an
 # hour means the pipeline is stuck even if the process breathes.
 STALE_S = 1800
+# zkasperd's default, and not overridden on the command line. It bounds the
+# slot the daemon will still scan blocks for an epoch's attestations in.
+ATTESTATION_LOOKAHEAD_EPOCHS = 2
 
 
 def check(name, ok, detail):
@@ -132,6 +135,33 @@ def daemon():
                              "which is what a shutting-down or wedged daemon looks like")))
     out.append(check("pipeline", age <= STALE_S,
                      f"last stage finished {age:.0f}s ago"))
+
+    # Ticking is not progress. The manifest is rewritten on every tick of the
+    # epoch in flight, so `age` above measures the tick loop and not the run: it
+    # read "last stage finished 1s ago" for the whole of a 25-minute wedge on
+    # 2026-08-20 and this script exited 0 through all of it.
+    #
+    # The sharp condition is the daemon's own. It collects attestations for
+    # epoch E out of blocks up to `(E + attestation_lookahead_epochs) * 32` and
+    # abandons the epoch once the head passes that slot, so beyond it the epoch
+    # cannot reach two thirds from gossip, from blocks, or from anywhere, and no
+    # amount of waiting changes the answer. That is exactly what happened: a
+    # 2.4-minute prover outage opened 469734 late, block repair capped at 59.1%
+    # against a 66.7% threshold, and the epoch sat past its own scan window with
+    # both GPUs idle.
+    c = s.get("current_epoch")
+    if c:
+        scan_end = (c["epoch"] + ATTESTATION_LOOKAHEAD_EPOCHS) * 32
+        head = s.get("head_slot") or 0
+        open_s = time.time() - (c.get("opened_unix_millis") or 0) / 1000
+        out.append(check("in flight", head < scan_end,
+                         f"epoch {c['epoch']} at {c['attesting_pct']:.1f}% of "
+                         f"{c['threshold_pct']:.1f}%, open {open_s:.0f}s, head {head} "
+                         f"against a scan window ending at {scan_end}"))
+    else:
+        # Between epochs: there is no epoch in flight to report on, and the
+        # opening stages are what `pipeline` above covers.
+        out.append(check("in flight", True, "no epoch in flight"))
 
     g = s.get("gossip") or {}
     if g:
