@@ -654,6 +654,28 @@ of **−0.04 s per second** — no signal at all over that range. Below the back
 the sensitivity turns sharp: epoch 469751 opened 4 s before `T` and paid
 **32.5 s**, and 469726 opened 34 s after it and paid **63.3 s**.
 
+### One card, live
+
+MEASURED on the mainnet daemon from 2026-08-20 08:00 UTC, `--prover-route`
+dropped, all eight stages on 9099. Seconds from the epoch's first slot for the
+open, seconds for everything else; the first two epochs of the run are the
+restart catching up and are not here.
+
+| epoch | opened | `T2 - T` | observation | blocked | wait | final proof | tail |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 469763 | 207 s | 26.3 s | 3.2 | 10.1 | 0.0 | 12.8 | 554 |
+| 469764 | 193 s | 23.5 s | 5.4 | 2.1 | 2.1 | 13.8 | 1,512 |
+| 469765 | 196 s | 19.8 s | 5.2 | 4.6 | 0.2 | 9.7 | 169 |
+| 469766 | 197 s | 18.0 s | 3.7 | 3.7 | 1.1 | 9.3 | 132 |
+| **median** | **196 s** | **21.6 s** | 4.5 | 4.2 | 0.7 | 11.3 | 362 |
+
+Against the two-card fleet over the fifteen epochs before it: open 179 s,
+`T2 - T` **21.0 s**, observation 3.2, blocked 2.1, wait 3.8, final proof 11.3,
+tail 313. **The epoch opens 17 s later and closes at the same instant**, and at
+n = 4 against n = 15 the difference is inside the spread of either. The
+committee proof is 143.7-144.8 s on this card against 125.0 s on the one that
+left, which is where the 17 s went; nothing queued behind it on any of the four.
+
 Which makes the 25 s of host-side committee work the cheapest thing left in that
 chain, and nothing in the schedule charges it. MEASURED on the daemon's own box,
 20 cores, over the epoch-430529 fixture: **`committee::build` over 960,974
