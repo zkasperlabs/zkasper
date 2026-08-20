@@ -1039,9 +1039,25 @@ average sat near 48. Treat 436 s as an upper bound; the GPU path is unmeasured.
 
 **A PLONK wrap consumes the uncompressed proof.** `backend.plonk()` builds
 `VadcopFinalProof::new(.., compressed: false, ..)` on both v1.0.0-alpha and
-v1.1.0-alpha, and the last row above is that in practice. `ZiskProver::prove_input`
-compresses to `VadcopFinalMinimal` and returns only the compressed words, so
-nothing the pipeline keeps today can be wrapped.
+v1.1.0-alpha, and the last row above is that in practice.
+
+**That is no longer an argument for anything.** `ZiskProver::prove_input`
+compressed to `VadcopFinalMinimal` on the day this was measured, so nothing the
+pipeline kept was wrappable — and the sentence saying so outlived the code by
+one day. `fd9764d` dropped the wrap, for what compression cost a verifying guest
+rather than for this, and `ProofKind::default()` is `VadcopFinal`. Every proof
+the store and `/v1/proofs` have carried since is the full `vadcop_final` proof,
+which is the input `wrap --plonk` wants. Do not re-derive the old conclusion
+from the table above: the 254,624-byte artifact it is reasoning about stopped
+being produced at `fd9764d`.
+
+**What is missing is the inverse, not the proof.** `wrap_proof` takes a
+`zisk_common::Proof`; what is kept is `get_proof_u64()`'s flattening of one,
+`[minimal][n_publics][publics][proof][zisk_vk]`. The SDK has no way back —
+`Proof::load` reads its own bincode and nothing rebuilds a `ProofBody` from the
+words. Everything but the hash family is recoverable from them, and that is a
+constant of the release rather than of the proof, so what stands between a
+stored proof and an on-chain one is a constructor and not a re-prove.
 
 Disk, on the same box:
 
