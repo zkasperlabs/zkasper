@@ -12,6 +12,7 @@ mod common;
 
 use common::stub_api::StubApi;
 
+use zkasper_common::types::{JustificationOutput, StreamFinalOutput};
 use zkasper_witness_gen::artifacts::{EpochCost, VerifyAnchor};
 use zkasper_witness_gen::prover::Stage;
 use zkasper_witness_gen::publish::{ClosedEpoch, DaemonInfo, PublishConfig, Publisher};
@@ -282,5 +283,55 @@ fn an_unproven_proof_still_carries_the_anchor() {
         proof["vadcop_final_vk"],
         zkasper_witness_gen::publish::vk_hex(&zkasper_common::recursion::VADCOP_FINAL_VK),
         "{proof}",
+    );
+}
+
+/// The decoded public inputs carry every field the circuit committed.
+///
+/// `public_inputs` is a convenience over `public_bytes`, and a convenience that
+/// silently drops a field is worse than none: step 4 of "Verifying a proof"
+/// tells a stranger to compare `public_inputs.program_vk` against the key they
+/// pinned, and until 2026-08-20 that field was not there to compare. It is the
+/// last 32 bytes of `public_bytes` either way, so the check here is that the
+/// decoded form agrees with the encoded one rather than that it exists.
+#[test]
+fn decoded_public_inputs_name_the_program_the_bytes_commit_to() {
+    let program_vk = [0x1122_3344_5566_7788u64, 2, 3, 4];
+    let stream = StreamFinalOutput {
+        accumulator_commitment: [1; 4],
+        next_accumulator_commitment: [2; 4],
+        finalized_epoch: 469_367,
+        finalized_root: [3; 32],
+        finalized_state_root: [4; 32],
+        justified_epoch: 469_368,
+        justified_root: [5; 32],
+        program_vk,
+    };
+    let justification = JustificationOutput {
+        accumulator_commitment: [1; 4],
+        committee_root: [2; 4],
+        target_epoch: 469_368,
+        target_root: [5; 32],
+        attesting_balance: 22_000_000_000,
+        slots_mask: 0xFFFF,
+        justified: true,
+        program_vk,
+    };
+
+    let tail = |bytes: Vec<u8>| zkasper_witness_gen::artifacts::hex0x(&bytes[bytes.len() - 32..]);
+    assert_eq!(
+        zkasper_witness_gen::publish::stream_final_public_inputs(&stream)["program_vk"],
+        tail(stream.public_bytes()),
+        "a stream final proof's decoded claim must name the program its bytes commit to",
+    );
+    assert_eq!(
+        zkasper_witness_gen::publish::justification_public_inputs(&justification)["program_vk"],
+        tail(justification.public_bytes()),
+        "a justification read on its own must name the program its bytes commit to",
+    );
+    assert_eq!(
+        zkasper_witness_gen::publish::stream_final_public_inputs(&stream)["program_vk"],
+        zkasper_witness_gen::publish::vk_hex(&program_vk),
+        "and must render as `verify.program_vk` does, so the two compare directly",
     );
 }

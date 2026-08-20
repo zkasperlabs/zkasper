@@ -225,13 +225,23 @@ The decoded form of `public_bytes` for a `stream_final` proof. This is the claim
   "finalized_root": "0x8f...c1",
   "finalized_state_root": "0x3d...aa",
   "justified_epoch": 469368,
-  "justified_root": "0x2e...5c"
+  "justified_root": "0x2e...5c",
+  "program_vk": "0x9d...12"
 }
 ```
 
+- `program_vk` — the last 32 bytes of `public_bytes`, rendered as `verify.program_vk`
+  is, so the two compare by string equality. This is the field step 4 below has
+  you check, and it is the one recursive edge no circuit above the proof checks
+  for you: the proof is genuine either way, and this is what says the epoch under
+  it came from the program you pinned rather than one the prover chose.
+
 For a `finalization` proof (the batch pipeline, which runs for the first epoch
 of a run) the fields are `accumulator_commitment`, `finalized_epoch`,
-`finalized_root`, `finalized_state_root`.
+`finalized_root`, `finalized_state_root` — that circuit commits no `program_vk`.
+A `justification` proof, which is what the first epoch of a run publishes,
+carries `accumulator_commitment`, `justified_epoch`, `justified_root`,
+`attesting_balance`, `justified` and `program_vk`.
 
 ### `verify`
 

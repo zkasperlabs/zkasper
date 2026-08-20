@@ -591,6 +591,14 @@ pub fn proof_ref(
 }
 
 /// The claim a streaming final proof makes, decoded.
+///
+/// Every field the circuit committed, in the order it committed them. The
+/// decoded form is a convenience over `public_bytes` and must never be a subset
+/// of it: `program_vk` is the last 32 bytes, it is the one recursive edge no
+/// circuit above this proof checks, and the instruction a verifier follows is to
+/// compare it against the key they pinned. It was missing here until 2026-08-20,
+/// which left that instruction impossible to follow without re-slicing the bytes
+/// by hand.
 pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
     json!({
         "accumulator_commitment": hex_digest(&output.accumulator_commitment),
@@ -600,6 +608,7 @@ pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
         "finalized_state_root": hex0x(&output.finalized_state_root),
         "justified_epoch": output.justified_epoch,
         "justified_root": hex0x(&output.justified_root),
+        "program_vk": vk_hex(&output.program_vk),
     })
 }
 
@@ -610,6 +619,10 @@ pub fn stream_final_public_inputs(output: &StreamFinalOutput) -> Value {
 /// one link of a fold chain, and the links before the last are valid proofs of
 /// a partial count. A reader that ignored the flag would read a third of the
 /// stake as a supermajority.
+///
+/// `program_vk` is published for the same reason as on a stream final proof: a
+/// fold chain cannot bake its own key, so a consumer reading one of these on its
+/// own is the only thing that compares it against the justification guest's.
 pub fn justification_public_inputs(output: &JustificationOutput) -> Value {
     json!({
         "accumulator_commitment": hex_digest(&output.accumulator_commitment),
@@ -617,6 +630,7 @@ pub fn justification_public_inputs(output: &JustificationOutput) -> Value {
         "justified_root": hex0x(&output.target_root),
         "attesting_balance": output.attesting_balance.to_string(),
         "justified": output.justified,
+        "program_vk": vk_hex(&output.program_vk),
     })
 }
 
