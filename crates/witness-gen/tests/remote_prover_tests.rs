@@ -1339,18 +1339,18 @@ fn a_restarted_prover_is_sent_the_keys_without_asking() {
     let witness = committee_witness();
 
     prover.prove_committee(&witness).expect("the first epoch");
-    let held = server.members.digest().expect("the server took the keys");
+    let held = server.members.newest().expect("the server took the keys");
 
     // A new process on the same address, holding nothing.
     server.stop();
     server.restart();
-    assert_eq!(server.members.digest(), None, "a restart forgets the table");
+    assert_eq!(server.members.newest(), None, "a restart forgets the table");
 
     prover
         .prove_committee(&witness)
         .expect("the epoch after a prover restart");
     assert_eq!(
-        server.members.digest(),
+        server.members.newest(),
         Some(held),
         "the same keys, so the same table",
     );
@@ -1376,13 +1376,13 @@ fn a_second_prover_gets_its_own_table() {
         .expect("the second card");
 
     assert_eq!(
-        first.members.digest(),
-        second.members.digest(),
+        first.members.newest(),
+        second.members.newest(),
         "the same keys either side, because it is the same epoch",
     );
     // Each card was sent them, rather than one being told the other holds them.
-    assert!(first.members.digest().is_some());
-    assert!(second.members.digest().is_some());
+    assert!(first.members.newest().is_some());
+    assert!(second.members.newest().is_some());
 }
 
 /// A witness rebuilt out of keys the client did not use is refused, not proven.
@@ -1472,7 +1472,7 @@ fn a_committee_witness_sent_whole_is_still_served() {
         "a whole committee witness should still prove",
     );
     assert_eq!(
-        server.members.digest(),
+        server.members.newest(),
         None,
         "and it should not have put anything in the cache",
     );
@@ -1687,4 +1687,43 @@ fn the_default_still_runs_the_circuit_and_still_rejects_a_bad_witness() {
         native.prove_committee_only(&bad).is_err(),
         "the default is the old method with the outputs dropped",
     );
+}
+
+/// The overlap every restart has, and what it used to cost.
+///
+/// A daemon's socket outlives the process that opened it, so a replacement
+/// starts while its predecessor is still connected and still proving. On
+/// 2026-08-19 the server held one table: the outgoing daemon took the slot at
+/// 23:35:23, and the incoming daemon's first witness two minutes later carried
+/// all 961k keys again — 108 MB and 49 s, on a link that had just been cut to
+/// 5 s. Neither daemon was at fault and neither log said so.
+#[test]
+fn a_daemon_starting_under_its_predecessor_does_not_cost_it_its_keys() {
+    let server = Server::bind_with(COMMITTEE_STAGES);
+    let witness = committee_witness();
+
+    let outgoing = RemoteProver::connect(committee_client(&server.addr)).expect("connect");
+    outgoing
+        .prove_committee(&witness)
+        .expect("the outgoing daemon's epoch");
+    let table = server.members.newest().expect("the server took the keys");
+
+    // The replacement starts while the first is still connected and proving.
+    let incoming = RemoteProver::connect(committee_client(&server.addr)).expect("connect");
+    incoming
+        .prove_committee(&witness)
+        .expect("the incoming daemon's first epoch");
+    assert!(
+        server.members.holds(&table),
+        "the incoming daemon must not evict the table the outgoing one is using",
+    );
+
+    // Both are warm from here, and neither was asked for its keys again.
+    outgoing
+        .prove_committee(&witness)
+        .expect("the outgoing daemon, still warm");
+    incoming
+        .prove_committee(&witness)
+        .expect("the incoming daemon, warm");
+    assert!(server.members.holds(&table));
 }

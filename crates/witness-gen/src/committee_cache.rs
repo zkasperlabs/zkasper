@@ -93,6 +93,7 @@ use std::sync::Mutex;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tracing::info;
 
 use zkasper_common::acc::{Digest, G1Point};
 use zkasper_common::committee::MAX_SLOTS;
@@ -180,6 +181,14 @@ impl MemberTable {
     /// activations on a warm one.
     pub fn len(&self) -> usize {
         self.entries().len()
+    }
+
+    /// Which shape this is, for a log line that has to say so at a glance.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            MemberTable::Full(_) => "full",
+            MemberTable::Append { .. } => "append",
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -391,20 +400,46 @@ fn decode(delta: &CommitteeDelta, pubkeys: &HashMap<u64, G1Point>) -> Result<Com
 // The server's side
 // ---------------------------------------------------------------------------
 
+/// Tables one server keeps at once.
+///
+/// One was not enough, and production settled it rather than argument. A daemon
+/// restart on 2026-08-19 left the outgoing process still connected and still
+/// proving: it took the single slot at 23:35:23 with its own table, and the
+/// incoming daemon's first witness had to carry all 961k keys again — 108 MB
+/// and 49 s of a link that had just been cut to 5 s. **Every restart has that
+/// window**, because the outgoing daemon's socket outlives the process that
+/// opened it.
+///
+/// Three rather than two, because the window holds two daemons and leaving no
+/// headroom means the next arrival evicts a table still in use. Each table is
+/// about 100 MB at mainnet's registry size — 961k keys at 104 bytes — so this
+/// is ~300 MB on a box that already holds a resident prover and its buffers.
+pub const TABLES_HELD: usize = 3;
+
 /// The keys the server is holding for its clients.
 ///
-/// One table, not a map of them. There is one daemon per card, so a second
-/// table would only ever be a second client's, and the one it displaced would
-/// be asked for again — which is exactly what happens anyway, one round trip
-/// later, and costs nothing to a run that has one client.
+/// Found by the digest a client names, and bounded: when there is no room the
+/// **least recently used** table goes. Recency is by use and not by age, so a
+/// daemon that proves every epoch keeps its table however many other clients
+/// come and go, and the one evicted is the one nothing has asked for.
 ///
 /// **In memory only, deliberately.** A table that outlived the process would be
 /// a claim about keys nothing in the new process ever saw. A restarted server
 /// holds nothing, says so at the handshake and at the first request that names
 /// a table, and is sent the keys again.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemberCache {
-    held: Mutex<Option<Held>>,
+    /// Least recently used first. [`TABLES_HELD`] is small enough that a scan
+    /// beats a map, and keeping it a list keeps the eviction order in one
+    /// place rather than in a second structure beside it.
+    held: Mutex<Vec<Held>>,
+    capacity: usize,
+}
+
+impl Default for MemberCache {
+    fn default() -> Self {
+        Self::with_capacity(TABLES_HELD)
+    }
 }
 
 #[derive(Debug)]
@@ -418,16 +453,50 @@ impl MemberCache {
         Self::default()
     }
 
-    /// The table this server is holding, for the handshake to report.
-    pub fn digest(&self) -> Option<TableDigest> {
-        self.held.lock().unwrap().as_ref().map(|held| held.digest)
+    /// A cache that holds `capacity` tables. One is the old behaviour, and the
+    /// tests that pin what eviction costs use it.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            held: Mutex::new(Vec::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The table most recently used, for the handshake to report.
+    ///
+    /// One digest of possibly several, which is all the frame has room for and
+    /// all the client needs from it: it reads this only to learn whether the
+    /// server holds anything at all. A client whose own table is resident but
+    /// is not this one finds that out from a request instead, at the cost of
+    /// one small frame rather than a resend of every key — see
+    /// [`TableBelief::reconcile`].
+    pub fn newest(&self) -> Option<TableDigest> {
+        self.held.lock().unwrap().last().map(|held| held.digest)
+    }
+
+    /// Whether a client naming `digest` could be served without resending.
+    pub fn holds(&self, digest: &TableDigest) -> bool {
+        self.held
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.digest == *digest)
+    }
+
+    /// How many tables are resident.
+    pub fn len(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Take the client's table update and rebuild its witness.
     ///
     /// `Ok(None)` is "I do not hold the table you are building on" — the client
-    /// names a base this server has never had or has since replaced, and the
-    /// answer is to be sent the table rather than to guess at it.
+    /// names a base this server has never had, or one it has since evicted, and
+    /// the answer is to be sent the table rather than to guess at it.
     ///
     /// The update is applied before the witness is built and stays applied
     /// whatever the witness turns out to be, so the client can advance its own
@@ -438,16 +507,51 @@ impl MemberCache {
         delta: &CommitteeDelta,
     ) -> Result<Option<CommitteeWitness>> {
         let mut held = self.held.lock().unwrap();
-        let entry = match table {
-            MemberTable::Full(_) => held.insert(Held {
-                digest: EMPTY_TABLE,
-                pubkeys: HashMap::with_capacity(delta.member_count as usize),
-            }),
-            MemberTable::Append { base, .. } => match held.as_mut() {
-                Some(held) if held.digest == *base => held,
-                _ => return Ok(None),
+        let at = match table {
+            MemberTable::Full(_) => {
+                // A client re-sending a table this server already has — which
+                // is what a daemon restarted under a live server does — gets
+                // the resident one rather than a second copy of it. Equal
+                // digests mean equal contents: the digest is a chain over every
+                // key in the order it went in.
+                let resulting = table.resulting_digest();
+                match held.iter().position(|h| h.digest == resulting) {
+                    Some(at) => {
+                        let entry = held.remove(at);
+                        held.push(entry);
+                        let resident = held.last().expect("just pushed");
+                        return decode(delta, &resident.pubkeys).map(Some);
+                    }
+                    None => {
+                        if held.len() >= self.capacity {
+                            let evicted = held.remove(0);
+                            info!(
+                                digest = hex::encode(evicted.digest),
+                                keys = evicted.pubkeys.len(),
+                                resident = held.len(),
+                                "no room for another member table; dropped the least recently used",
+                            );
+                        }
+                        held.push(Held {
+                            digest: EMPTY_TABLE,
+                            pubkeys: HashMap::with_capacity(delta.member_count as usize),
+                        });
+                        held.len() - 1
+                    }
+                }
+            }
+            // Touched as well as found, so proving on a table is what keeps it
+            // resident.
+            MemberTable::Append { base, .. } => match held.iter().position(|h| h.digest == *base) {
+                Some(at) => {
+                    let entry = held.remove(at);
+                    held.push(entry);
+                    held.len() - 1
+                }
+                None => return Ok(None),
             },
         };
+        let entry = &mut held[at];
         for added in table.entries() {
             entry.pubkeys.insert(added.validator_index, added.pubkey);
             entry.digest = extend(&entry.digest, added);
@@ -533,14 +637,21 @@ impl TableBelief {
 
     /// Reconcile with what a server said it holds, at the handshake.
     ///
-    /// A digest is only ever grounds to **forget**, never to adopt: this end
-    /// can only build on a table it knows the contents of, and after a restart
-    /// it knows nothing whatever the far end reports. So anything other than
-    /// the digest already believed puts this back to sending the table whole —
-    /// which covers a restarted server, a second server behind the same
-    /// address, and a daemon that restarted under a server that did not.
+    /// A digest is only ever grounds to **forget**, never to adopt: this end can
+    /// build only on a table it knows the contents of, and after a restart it
+    /// knows nothing whatever the far end reports.
+    ///
+    /// And now only *no* digest is grounds to forget. A server keeps
+    /// [`TABLES_HELD`] tables and the handshake has room to name one, so "not
+    /// the one it named" stopped meaning "not held" — and treating it that way
+    /// would resend every key in exactly the overlap the multi-table cache
+    /// exists to cover, which is the same 108 MB the cache was added to avoid.
+    /// A belief that really has gone stale costs one [`MemberTable::Append`]
+    /// naming a base the server does not have, which is a few kilobytes and one
+    /// round trip. That is the cheap way to be wrong, and it is checked by the
+    /// far end rather than guessed at here.
     pub fn reconcile(&mut self, reported: Option<TableDigest>) {
-        if reported.is_none() || reported != self.digest {
+        if reported.is_none() {
             *self = Self::default();
         }
     }
@@ -672,7 +783,7 @@ mod tests {
         let original = witness(vec![member(0, 1, 0), member(1, 1, 1)]);
         let delta = encode(&original).unwrap();
         let cache = MemberCache::new();
-        assert_eq!(cache.digest(), None);
+        assert_eq!(cache.newest(), None);
 
         let full = MemberTable::Full(vec![
             TableEntry {
@@ -685,7 +796,7 @@ mod tests {
             },
         ]);
         assert!(cache.rebuild(&full, &delta).unwrap().is_some());
-        assert_eq!(cache.digest(), Some(full.resulting_digest()));
+        assert_eq!(cache.newest(), Some(full.resulting_digest()));
 
         // Built on a table this cache has never held.
         let wrong = MemberTable::Append {
@@ -694,7 +805,7 @@ mod tests {
         };
         assert!(cache.rebuild(&wrong, &delta).unwrap().is_none());
         // ...and declining it left what it does hold alone.
-        assert_eq!(cache.digest(), Some(full.resulting_digest()));
+        assert_eq!(cache.newest(), Some(full.resulting_digest()));
     }
 
     #[test]
@@ -761,8 +872,13 @@ mod tests {
         assert!(cache.rebuild(&settled, &delta).unwrap().is_some());
     }
 
+    /// Only *no* table is evidence this end's table is gone.
+    ///
+    /// A server keeps several and the handshake names one, so a digest that
+    /// merely differs says nothing — and acting on it would resend every key in
+    /// the restart overlap the several tables exist to cover.
     #[test]
-    fn a_server_reporting_another_table_puts_the_belief_back_to_nothing() {
+    fn a_server_that_names_another_table_does_not_cost_this_one_its_keys() {
         let members = [member(0, 1, 0)];
         let mut belief = TableBelief::default();
         let plan = belief.plan(&members);
@@ -773,15 +889,105 @@ mod tests {
         belief.reconcile(Some(held));
         assert!(matches!(belief.plan(&members), MemberTable::Append { .. }));
 
-        // A restarted server, holding nothing.
+        // Another of the server's tables, which is not evidence about ours.
+        belief.reconcile(Some([3u8; 32]));
+        assert!(
+            matches!(belief.plan(&members), MemberTable::Append { .. }),
+            "a differing digest is not proof the table went",
+        );
+
+        // A server holding nothing holds nothing of ours.
         belief.reconcile(None);
         assert!(matches!(belief.plan(&members), MemberTable::Full(_)));
+    }
 
-        // A different server, holding something this end cannot name.
-        let mut belief = TableBelief::default();
-        let plan = belief.plan(&members);
-        belief.adopt(&plan);
-        belief.reconcile(Some([3u8; 32]));
-        assert!(matches!(belief.plan(&members), MemberTable::Full(_)));
+    /// The overlap production actually had: an outgoing daemon still proving
+    /// while its replacement starts.
+    #[test]
+    fn two_clients_tables_live_side_by_side() {
+        let cache = MemberCache::new();
+        let outgoing = vec![member(0, 1, 0), member(1, 1, 1)];
+        let incoming = vec![member(0, 1, 0), member(1, 1, 1), member(2, 1, 2)];
+        let (out_table, out_delta) = (
+            MemberTable::full(&outgoing),
+            encode(&witness(outgoing.clone())).unwrap(),
+        );
+        let (in_table, in_delta) = (
+            MemberTable::full(&incoming),
+            encode(&witness(incoming.clone())).unwrap(),
+        );
+
+        assert!(cache.rebuild(&out_table, &out_delta).unwrap().is_some());
+        assert!(cache.rebuild(&in_table, &in_delta).unwrap().is_some());
+        assert_eq!(cache.len(), 2, "neither client displaced the other");
+
+        // The outgoing daemon's next epoch is still warm: one table did not
+        // cost the other its keys.
+        let warm = MemberTable::Append {
+            base: out_table.resulting_digest(),
+            added: Vec::new(),
+        };
+        assert!(cache.rebuild(&warm, &out_delta).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_same_keys_are_the_same_table() {
+        let cache = MemberCache::new();
+        let members = vec![member(0, 1, 0), member(1, 1, 1)];
+        let table = MemberTable::full(&members);
+        let delta = encode(&witness(members)).unwrap();
+
+        assert!(cache.rebuild(&table, &delta).unwrap().is_some());
+        // A daemon restarted under a live server sends exactly this again.
+        assert!(cache.rebuild(&table, &delta).unwrap().is_some());
+        assert_eq!(cache.len(), 1, "one table, not a copy of it beside itself");
+    }
+
+    /// What eviction takes, when it has to take something.
+    #[test]
+    fn a_full_cache_drops_the_table_nothing_has_asked_for() {
+        let cache = MemberCache::with_capacity(2);
+        let sets: Vec<Vec<CommitteeMember>> = (0..3).map(|i| vec![member(i, 1, 0)]).collect();
+        let built: Vec<(MemberTable, CommitteeDelta)> = sets
+            .iter()
+            .map(|m| (MemberTable::full(m), encode(&witness(m.clone())).unwrap()))
+            .collect();
+
+        assert!(cache.rebuild(&built[0].0, &built[0].1).unwrap().is_some());
+        assert!(cache.rebuild(&built[1].0, &built[1].1).unwrap().is_some());
+        assert_eq!(cache.len(), 2);
+
+        // Use the first again, so the second is the one nothing has asked for.
+        let touch = MemberTable::Append {
+            base: built[0].0.resulting_digest(),
+            added: Vec::new(),
+        };
+        assert!(cache.rebuild(&touch, &built[0].1).unwrap().is_some());
+
+        assert!(cache.rebuild(&built[2].0, &built[2].1).unwrap().is_some());
+        assert_eq!(cache.len(), 2, "bounded");
+        assert!(
+            cache.holds(&built[0].0.resulting_digest()),
+            "the one being used survives however old it is",
+        );
+        assert!(
+            !cache.holds(&built[1].0.resulting_digest()),
+            "the least recently used is what goes",
+        );
+        assert!(cache.holds(&built[2].0.resulting_digest()));
+    }
+
+    #[test]
+    fn a_table_says_which_shape_it_is() {
+        let members = [member(0, 1, 0)];
+        assert_eq!(MemberTable::full(&members).shape(), "full");
+        assert_eq!(
+            MemberTable::Append {
+                base: EMPTY_TABLE,
+                added: Vec::new()
+            }
+            .shape(),
+            "append",
+        );
     }
 }
