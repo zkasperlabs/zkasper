@@ -386,42 +386,50 @@ async fn test_a_daemon_behind_the_threshold_folds_nothing() {
         "an epoch opened past its own threshold has no tick on which to fold",
     );
     assert_eq!(
-        latency["late_groups"], 1,
-        "the backlog is one group now that a child is cheaper than inlining it",
+        latency["late_groups"], 0,
+        "since 7281b74 the backlog the fold never reached goes inline, not late: {latency}",
     );
     assert_eq!(
-        latency["tail"],
-        1,
-        "the crossing slot goes inline; the {} before it are the group",
-        SLOTS_TO_THRESHOLD - 1,
+        latency["tail"], SLOTS_TO_THRESHOLD,
+        "the whole backlog goes inline, not just the crossing slot: {latency}",
     );
 
-    // One group, and still nothing folded: a fold needs a tick the daemon never
-    // gets here, and the final proof verifies the group directly instead.
+    // And no group at all, which is the point of `7281b74`. A fold needs a tick
+    // the daemon never gets here, so a group proved for this backlog would pay
+    // its own stage floor to become a child the final proof then has to verify —
+    // strictly worse than carrying the same slots inline. The artifact is the
+    // check that matters: a `group_0.bin` reappearing here would mean the
+    // pipeline started proving groups it can never fold again.
     let epoch_dir = epoch_dir(dir.path(), stream_epoch);
     assert!(
-        epoch_dir.join("group_0.bin").exists(),
-        "the backlog should be a group the final proof verifies as a child",
+        !epoch_dir.join("group_0.bin").exists(),
+        "a backlog the fold can never reach should be inline, not a group",
     );
     assert!(
         !epoch_dir.join("aggregate_0.bin").exists(),
         "nothing was folded, so there is no aggregate",
     );
 
-    // The window between `T` and the final proof holds that group, and the
-    // repricing is what put it there: this asserted the window was *empty* while
-    // a child cost 35.629 s and inlining three slots beat proving one group.
-    // Charging it is the point of the metric — `late_group_millis` is the term
-    // that names work done after `T` — so the invariant is that it accounts for
-    // the group rather than that no group exists.
+    // Nothing is done after `T` here at all, so the window is empty again.
+    //
+    // This assertion has now been true, then false, then true, and the reason is
+    // worth keeping. It began as "the window is empty" while a child cost
+    // 35.629 s and inlining three slots beat proving one group. `fd9764d`
+    // repriced a child to 1.520 s, one group became cheaper than three inline
+    // slots, and the window held that group — so the invariant became that
+    // `late_group_millis` *accounts* for it. `7281b74` then observed that a
+    // group the fold chain can never reach is cheaper inline whatever a child
+    // costs, because it pays a stage floor to become a child the final proof
+    // must verify anyway. This daemon opens past its own threshold and gets no
+    // tick to fold on, so it is exactly that case: no group, nothing after `T`,
+    // an empty window.
     let late_group = latency["late_group_millis"]
         .as_u64()
         .expect("late_group_millis");
     assert!(
-        late_group >= GROUP_PROVE.as_millis() as u64,
-        "late_group_millis ({late_group} ms) is under one group proof ({} ms), \
-         so the group the plan puts after `T` is not being charged to it",
-        GROUP_PROVE.as_millis(),
+        late_group < GROUP_PROVE.as_millis() as u64,
+        "late_group_millis ({late_group} ms) is a whole group proof, so something \
+         is being proven after `T` that 7281b74 should have put inline",
     );
 
     // And it is not charged to the trigger either. This is the assertion that
