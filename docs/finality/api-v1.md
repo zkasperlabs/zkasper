@@ -513,9 +513,19 @@ nothing.
 
 ## `GET /v1/proofs/{epoch}`
 
-The proof bytes, exactly as the prover produced them: the serialized Zisk
-proof's `u64` words, little-endian, 8 bytes each, no header, no framing.
-`content-length` is always a multiple of 8.
+The proof bytes, exactly as the prover produced them: the flat `u64` word vector
+`Proof::get_proof_u64()` hands out, little-endian, 8 bytes each, no header, no
+framing. `content-length` is always a multiple of 8.
+
+**This is the form `zkasper_common::recursion::verify_child` takes, and it is not
+the form `cargo-zisk verify -p` takes.** The CLI wants a bincode-serialized
+`zisk_common::Proof`, and on these bytes it does not return a wrong answer — it
+panics with `Expected 68 u64 publics, got 0`. Neither the Zisk SDK nor the CLI
+rebuilds one from words, so `scripts/zisk_proof_bincode.py` does; it needs one
+constant the words do not carry, the hash family of the release. Reach for it
+only for a second opinion: the CLI reads the `vadcop_final` key out of the
+proof's own tail, so it attests to "a valid proof of some circuit" and never "of
+this one".
 
 ```
 content-type: application/octet-stream
@@ -621,8 +631,17 @@ Authenticated. `{ "last_seq": 918245, "last_epoch": 469368, "missing_proofs": [4
 
 Nothing here has to be taken on trust. To check that epoch `E` was finalized:
 
+`./scripts/verify_published_proof.sh [E]` runs steps 1, 2 and 4 of what follows
+end to end, in a directory that has never held a proving key — it clears the
+environment and refuses to start if a Zisk install is reachable. Read it rather
+than run it if you would rather do this yourself; it is the recipe below with
+nothing left implicit. Step 3, rebuilding the guest, needs a Zisk toolchain and a
+proving key and is deliberately not in it.
+
 1. `GET /v1/epochs/E` and read `verify`.
-2. `GET /v1/proofs/E` — the proof words.
+2. `GET /v1/proofs/E` — the proof words, the flat `get_proof_u64()` vector.
+   `cargo-zisk verify -p` does not read that form and panics on it; see the
+   endpoint's own section above before you reach for the CLI.
 3. Build the guest yourself: `git checkout <verify.zkasper_commit>`, then
    `./scripts/bake_child_vks.sh` with Zisk `verify.zisk_version`. Its
    verification key must equal `verify.program_vk`. That is what binds the proof
