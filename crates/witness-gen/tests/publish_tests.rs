@@ -310,6 +310,8 @@ fn decoded_public_inputs_name_the_program_the_bytes_commit_to() {
     let justification = JustificationOutput {
         accumulator_commitment: [1; 4],
         committee_root: [2; 4],
+        source_epoch: 469_367,
+        source_root: [3; 32],
         target_epoch: 469_368,
         target_root: [5; 32],
         attesting_balance: 22_000_000_000,
