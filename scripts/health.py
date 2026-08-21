@@ -70,14 +70,9 @@ def main(path):
     if gossip is None:
         notes.append("gossip OFF (reading blocks, a slot behind)")
     else:
-        if gossip["dropped"]:
-            failures.append(
-                f"the node dropped events {gossip['dropped']} times; "
-                "raise --http-sse-capacity-multiplier"
-            )
         notes.append(
             f"gossip {gossip['attestations']} attestations, "
-            f"{gossip['reconnects']} reconnects, {gossip['dropped']} dropped"
+            f"{gossip['reconnects']} reconnects"
         )
 
     latencies = status.get("recent_latencies", [])

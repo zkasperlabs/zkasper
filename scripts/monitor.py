@@ -195,13 +195,7 @@ def daemon():
 
     g = s.get("gossip") or {}
     if g:
-        # `dropped` is not reported. It has been 0 on every check ever taken,
-        # --http-sse-capacity-multiplier 2000 makes it structurally unable to
-        # fire, and it stayed 0 through the worst data loss this project has had
-        # -- the collector discarding every network aggregate, ~35 points of
-        # stake missing and four justified epochs skipped. It measures the SSE
-        # ring, not whether attestations are used, so a green reading here is
-        # evidence of nothing. `reconnects` still tells you the node bounced.
+        # Only `reconnects` is reported, and it tells you the node bounced.
         out.append(check("gossip", True,
                          f"reconnects {g.get('reconnects', 0)}"))
 
@@ -613,9 +607,9 @@ def published_gaps():
 
     Nothing watched this until 2026-08-19, which is how a collector bug that
     discarded every network aggregate ran for a whole night: it abandoned four
-    epochs at 62-76% support while `gossip.dropped` stayed 0 and every other
-    check stayed green. A consumer cannot detect a missing epoch for themselves,
-    so the hole has to be found here.
+    epochs at 62-76% support while every other check stayed green. A consumer
+    cannot detect a missing epoch for themselves, so the hole has to be found
+    here.
     """
     # Page the whole run, not a window. This read the last 40 epochs, and on
     # 2026-08-19 the run passed 40 and the window slid off the init point -- so
