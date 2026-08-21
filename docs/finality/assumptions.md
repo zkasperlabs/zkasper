@@ -216,10 +216,28 @@ against circuits that did not constrain the source.
   output.finalized_epoch`. Its own comment gives the reason: consecutiveness was
   the safety property, because Casper's double-vote clause only bites while every
   epoch in the sequence carries a supermajority vote. The surround clause is what
-  covers the gaps, and constraining the source is what makes it available -- so
-  this assertion may be relaxed to reject only `output.finalized_epoch <
-  state.accumulator_epoch`, and only against a `program_vk` that pins the
-  source-constrained guests.
+  covers the gaps, and constraining the source is what makes it available.
+
+  **Do not relax it to reject only `output.finalized_epoch <
+  state.accumulator_epoch`.** An earlier version of this document proposed
+  exactly that, and it is not merely useless but harmful. It admits **no**
+  legitimate gap: a real gap means an epoch went unproven, that epoch moved the
+  validator set, so `accumulator_commitment` moved with it and the check below
+  rejects one line later. The only gaps it does admit are those where the
+  accumulator did *not* move -- and on a chain with a static validator set, which
+  is every devnet and the demo, `acc::commitment(root, total_active_balance)` is
+  **identical every epoch**, so the epoch assertion is the only thing ordering
+  finalizations at all. Relaxing it there lets a submitter advance the client to
+  any epoch, in any order, on any proof it can obtain: withheld, forked, or from
+  far in the future.
+
+  It also costs the evidence. Under the dense rule two conflicting client
+  sequences must overlap at some epoch where both claim two thirds on different
+  targets -- a double vote that is self-evidencing from the two proofs alone.
+  Allowing gaps lets a two-thirds coalition move a client from `E-1` to a
+  conflicting `E+k` with **no shared epoch**, so the fraud carries no such
+  evidence, and the surround clause meant to replace it needs the chain of
+  justification links, which the client does not hold across a gap.
 - It also requires `state.accumulator_commitment == output.accumulator_commitment`.
   A skipped epoch moves the accumulator, so the client cannot chain across the gap
   from what it holds. Either the skipped epoch's diff proof has to reach the
