@@ -534,27 +534,54 @@ def site_is_current():
     is what made an earlier hand check look clean.
     """
     root = Path(__file__).resolve().parent.parent.parent / "zkasper-site"
-    local = root / "index.html"
-    if not local.is_file():
+    if not (root / "index.html").is_file():
         return check("deployed", True, "no site checkout beside the repo, not checked")
-    try:
-        req = Request(SITE + "/", headers={"User-Agent": "zkasper-monitor"})
-        with urlopen(req, timeout=20) as r:
-            served = r.read(2_000_000)
-    except (URLError, HTTPError, TimeoutError) as e:
-        return check("deployed", False, f"cannot read the live page: {e}")
 
-    want = local.read_bytes()
-    if hashlib.sha256(served).digest() == hashlib.sha256(want).digest():
-        return check("deployed", True, "the live page is the page in the repo")
+    # Every asset, not just the page. Checking one file and concluding is the
+    # error this check exists to catch: a hand check of `postings.js` came back
+    # clean while `dashboard.js` was a release behind.
+    assets = sorted(f.name for f in root.iterdir()
+                    if f.is_file() and f.suffix in (".js", ".html", ".css")
+                    # 404.html is only reachable by missing a route, so there is
+                    # no URL whose bytes can be compared with it.
+                    and f.name != "404.html")
 
-    a = served.decode("utf-8", "replace").splitlines()
-    b = want.decode("utf-8", "replace").splitlines()
-    drift = sum(1 for line in difflib.unified_diff(a, b, n=0)
-                if line[:1] in "+-" and line[:3] not in ("---", "+++"))
-    return check("deployed", False,
-                 f"the live page is NOT what the repo says, {drift} lines differ"
-                 " -- `npx wrangler pages deploy . --project-name=zkasper` in zkasper-site")
+    def served_at(name):
+        # Pages strips .html: index.html is at `/`, epoch.html at `/epoch`.
+        # Asking for the .html path gets a 308 and no body -- the same trap that
+        # made an earlier hand check of index.html look clean, hit twice.
+        if not name.endswith(".html"):
+            return "/" + name
+        return "/" if name == "index.html" else "/" + name[:-len(".html")]
+
+    stale, unreachable = [], []
+    for name in assets:
+        path = served_at(name)
+        try:
+            req = Request(SITE + path, headers={"User-Agent": "zkasper-monitor"})
+            with urlopen(req, timeout=20) as r:
+                served = r.read(2_000_000)
+        except (URLError, HTTPError, TimeoutError) as e:
+            unreachable.append(name)
+            continue
+        want = (root / name).read_bytes()
+        if hashlib.sha256(served).digest() != hashlib.sha256(want).digest():
+            a = served.decode("utf-8", "replace").splitlines()
+            b = want.decode("utf-8", "replace").splitlines()
+            n = sum(1 for line in difflib.unified_diff(a, b, n=0)
+                    if line[:1] in "+-" and line[:3] not in ("---", "+++"))
+            stale.append(f"{name} ({n})")
+
+    if not stale and not unreachable:
+        return check("deployed", True,
+                     f"the live site is the site in the repo ({len(assets)} assets)")
+    bits = []
+    if stale:
+        bits.append("stale: " + ", ".join(stale))
+    if unreachable:
+        bits.append("unreadable: " + ", ".join(unreachable))
+    return check("deployed", False, "; ".join(bits)
+                 + " -- `npx wrangler pages deploy . --project-name=zkasper` in zkasper-site")
 
 
 def url(name, u, want):
