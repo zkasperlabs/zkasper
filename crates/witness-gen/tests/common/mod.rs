@@ -622,6 +622,15 @@ impl SyntheticChain {
             }
         }
 
+        // The checkpoint before the first epoch under test. Nothing is proven
+        // about it, but the daemon resolves it as the FFG source of that epoch,
+        // and a node that had blocks in the first epoch had them in this one.
+        let previous = self.first_epoch.saturating_sub(1);
+        mock.block_roots.insert(
+            (previous * self.config.slots_per_epoch).to_string(),
+            self.checkpoint_root(previous),
+        );
+
         mock.headers
             .insert("head".to_string(), self.header_at(head_slot));
         mock.set_finality(self.first_epoch, self.checkpoint_root(self.first_epoch));
@@ -689,6 +698,7 @@ fn stream_fixture_from(epoch: Epoch) -> StreamFixture {
         total_active_balance: epoch.total_active_balance,
         target_epoch: STREAM_EPOCH,
         target_root: epoch.target_root,
+        source_root: epoch.source_root,
         signing_domain: epoch.signing_domain,
         aggregate_program_vk: child_vks::AGGREGATE,
         stream_program_vk: [3; 4],

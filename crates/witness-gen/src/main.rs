@@ -68,6 +68,10 @@ enum Command {
         /// Target block root (hex, 0x-prefixed)
         #[arg(long)]
         target_root: String,
+        /// FFG source block root: the checkpoint of the epoch before this one
+        /// (hex, 0x-prefixed)
+        #[arg(long)]
+        source_root: String,
         /// Signing domain (hex, 0x-prefixed)
         #[arg(long)]
         signing_domain: String,
@@ -152,6 +156,7 @@ async fn main() -> Result<()> {
         Command::SlotProofs {
             epoch,
             target_root,
+            source_root,
             signing_domain,
         } => {
             eprintln!("slot proofs for epoch {epoch}...");
@@ -161,6 +166,7 @@ async fn main() -> Result<()> {
                 .context("no saved state — run `init` + `epoch-diff` first")?;
 
             let target_root = parse_hex_bytes32(&target_root)?;
+            let source_root = parse_hex_bytes32(&source_root)?;
             let signing_domain = parse_hex_bytes32(&signing_domain)?;
 
             let boundary = (epoch * config.slots_per_epoch).to_string();
@@ -181,6 +187,7 @@ async fn main() -> Result<()> {
                 committees,
                 epoch,
                 target_root,
+                source_root,
                 total_active_balance,
                 signing_domain,
             )

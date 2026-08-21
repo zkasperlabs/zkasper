@@ -157,6 +157,30 @@ pub fn verify_ssz_multi_proof(
     merkle::batch_root(sha256_pair, leaves, &proof.auxiliaries, depth)
 }
 
+/// `hash_tree_root(Checkpoint)` from its two fields.
+pub fn checkpoint_leaf(epoch: u64, root: &[u8; 32]) -> [u8; 32] {
+    sha256_pair(&u64_to_chunk(epoch), root)
+}
+
+/// The FFG link an attestation votes for, as one 32-byte digest.
+///
+/// A proof carries 256 public bytes and [`crate::types::AggregateOutput`]
+/// already spends 248, so the source checkpoint cannot travel beside the target
+/// root. Both checkpoints are leaves [`attestation_data_root`] already computes,
+/// and hashing the pair binds all four fields in the bytes the target root used
+/// to occupy on its own.
+pub fn checkpoint_digest(
+    source_epoch: u64,
+    source_root: &[u8; 32],
+    target_epoch: u64,
+    target_root: &[u8; 32],
+) -> [u8; 32] {
+    sha256_pair(
+        &checkpoint_leaf(source_epoch, source_root),
+        &checkpoint_leaf(target_epoch, target_root),
+    )
+}
+
 /// Compute `hash_tree_root(AttestationData)` from its constituent fields.
 ///
 /// AttestationData is a 5-field SSZ container merkleized into an 8-leaf tree:
@@ -182,8 +206,8 @@ pub fn attestation_data_root(
     let field0 = u64_to_chunk(slot);
     let field1 = u64_to_chunk(index);
     let field2 = *beacon_block_root;
-    let field3 = sha256_pair(&u64_to_chunk(source_epoch), source_root);
-    let field4 = sha256_pair(&u64_to_chunk(target_epoch), target_root);
+    let field3 = checkpoint_leaf(source_epoch, source_root);
+    let field4 = checkpoint_leaf(target_epoch, target_root);
 
     // Depth-3 tree with 8 leaves (5 data + 3 zero)
     let n0 = sha256_pair(&field0, &field1);
@@ -580,5 +604,24 @@ mod tests {
                 "proof failed for leaf {i}"
             );
         }
+    }
+
+    /// The digest that carries an FFG link through a proof's public outputs has
+    /// to move when any of the four fields it stands for moves. It replaces the
+    /// target root in `AggregateOutput`, so anything it left unbound would be a
+    /// field a prover could choose.
+    #[test]
+    fn a_checkpoint_digest_binds_both_checkpoints() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let base = checkpoint_digest(100, &a, 101, &b);
+
+        assert_ne!(base, checkpoint_digest(99, &a, 101, &b));
+        assert_ne!(base, checkpoint_digest(100, &b, 101, &b));
+        assert_ne!(base, checkpoint_digest(100, &a, 102, &b));
+        assert_ne!(base, checkpoint_digest(100, &a, 101, &a));
+        // Not symmetric: a link from A to B is not a link from B to A.
+        assert_ne!(base, checkpoint_digest(101, &b, 100, &a));
+        assert_eq!(base, checkpoint_digest(100, &a, 101, &b));
     }
 }

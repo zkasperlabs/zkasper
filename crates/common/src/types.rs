@@ -261,6 +261,11 @@ pub struct SlotProofOutput {
     pub accumulator_commitment: Digest,
     /// Committee tree the slots below were counted against.
     pub committee_root: Digest,
+    /// FFG source: the checkpoint every attestation counted below named as its
+    /// source. A supermajority on the target is only a supermajority on the
+    /// *link* because this is pinned.
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     /// Sum over the slots proven here of `committee_balance − absentee balances`.
@@ -280,6 +285,8 @@ pub struct SlotProofWitness {
     // -- public inputs --
     pub accumulator_commitment: Digest,
     pub committee_root: Digest,
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub signing_domain: [u8; 32],
@@ -312,6 +319,11 @@ pub struct JustificationOutput {
     /// validator in exactly one slot, so a chain that mixed two partitions of
     /// the same epoch could count a validator twice.
     pub committee_root: Digest,
+    /// FFG source: the checkpoint every attestation counted below named as its
+    /// source. A supermajority on the target is only a supermajority on the
+    /// *link* because this is pinned.
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     /// Deduplicated attesting balance folded in so far.
@@ -353,6 +365,8 @@ pub struct JustificationOutput {
 pub struct JustificationWitness {
     // -- public inputs --
     pub accumulator_commitment: Digest,
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub total_active_balance: u64,
@@ -489,6 +503,8 @@ impl SlotProofOutput {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
             .digest(&self.committee_root)
+            .u64(self.source_epoch)
+            .bytes32(&self.source_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
             .u64(self.attesting_balance)
@@ -527,6 +543,8 @@ impl JustificationOutput {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
             .digest(&self.committee_root)
+            .u64(self.source_epoch)
+            .bytes32(&self.source_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
             .u64(self.attesting_balance)
@@ -575,6 +593,11 @@ impl Default for MillerAccumulator {
 pub struct GroupProofOutput {
     pub accumulator_commitment: Digest,
     pub committee_root: Digest,
+    /// FFG source: the checkpoint every attestation counted below named as its
+    /// source. A supermajority on the target is only a supermajority on the
+    /// *link* because this is pinned.
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
     pub target_epoch: u64,
     pub target_root: [u8; 32],
     pub attesting_balance: u64,
@@ -607,7 +630,14 @@ pub struct AggregateOutput {
     /// finalizations it sees.
     pub anchor_state_root: [u8; 32],
     pub target_epoch: u64,
-    pub target_root: [u8; 32],
+    /// [`crate::ssz::checkpoint_digest`] of the FFG link every folded group
+    /// counted for: source checkpoint and target checkpoint together.
+    ///
+    /// The target root travelled here on its own until the source had to be
+    /// carried too. A proof holds 256 public bytes and this output already
+    /// spends 248, so the pair is bound as one digest rather than two fields,
+    /// and the consumer that knows both checkpoints rehashes them to compare.
+    pub checkpoint_digest: [u8; 32],
     /// Attesting balance accumulated so far, already deduplicated.
     pub attesting_balance: u64,
     /// Which slots of the epoch have been counted, one bit each.
@@ -627,6 +657,8 @@ pub struct AggregateOutput {
 pub struct AggregateWitness {
     // -- public inputs --
     pub accumulator_commitment: Digest,
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
     pub target_epoch: u64,
     pub target_root: [u8; 32],
 
@@ -814,6 +846,8 @@ impl GroupProofOutput {
         PublicWriter::new()
             .digest(&self.accumulator_commitment)
             .digest(&self.committee_root)
+            .u64(self.source_epoch)
+            .bytes32(&self.source_root)
             .u64(self.target_epoch)
             .bytes32(&self.target_root)
             .u64(self.attesting_balance)
@@ -831,7 +865,7 @@ impl AggregateOutput {
             .digest(&self.previous_accumulator_commitment)
             .bytes32(&self.anchor_state_root)
             .u64(self.target_epoch)
-            .bytes32(&self.target_root)
+            .bytes32(&self.checkpoint_digest)
             .u64(self.attesting_balance)
             .u64(self.slots_mask)
             .digest(&self.miller_commitment)

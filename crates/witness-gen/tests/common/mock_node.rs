@@ -169,6 +169,21 @@ fn routes(chain: &SyntheticChain, head_slot: u64) -> HashMap<String, String> {
         .to_string(),
     );
 
+    // The checkpoint before the first epoch under test: the daemon resolves it
+    // as that epoch's FFG source, and a node with blocks in the first epoch had
+    // them in this one.
+    let previous = chain.first_epoch.saturating_sub(1);
+    routes.insert(
+        format!(
+            "/eth/v1/beacon/blocks/{}/root",
+            previous * chain.config.slots_per_epoch,
+        ),
+        json!({"execution_optimistic": false, "finalized": true, "data": {
+            "root": hex0x(&chain.checkpoint_root(previous)),
+        }})
+        .to_string(),
+    );
+
     for epoch in chain.epochs() {
         let boundary = epoch * chain.config.slots_per_epoch;
         let header = chain.header_at(boundary);

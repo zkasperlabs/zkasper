@@ -13,6 +13,7 @@ pub struct Context {
     pub acc_root: Digest,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
+    pub source_root: [u8; 32],
     pub total_active_balance: u64,
     /// The key the chain's links verify each other under. The slot-proof and
     /// committee keys used to sit beside it; they are constants of the guest
@@ -42,6 +43,8 @@ pub fn build(
         accumulator_commitment: context.accumulator_commitment,
         target_epoch: context.target_epoch,
         target_root: context.target_root,
+        source_epoch: context.target_epoch.saturating_sub(1),
+        source_root: context.source_root,
         total_active_balance: context.total_active_balance,
         acc_root: context.acc_root,
         justification_program_vk: context.justification_program_vk,

@@ -48,6 +48,9 @@ use super::Tick;
 struct EpochAggregator {
     target_epoch: u64,
     target_root: [u8; 32],
+    /// Checkpoint of the epoch before this one, which every counted attestation
+    /// names as its FFG source.
+    source_root: [u8; 32],
     signing_domain: [u8; 32],
     /// Accumulator the slot proofs are bound to, captured when the epoch opened.
     acc_root: Digest,
@@ -93,6 +96,7 @@ impl EpochAggregator {
             acc_root: self.acc_root,
             target_epoch: self.target_epoch,
             target_root: self.target_root,
+            source_root: self.source_root,
             total_active_balance: self.total_active_balance,
             justification_program_vk: prover.program_vk(Stage::Justification),
         }
@@ -214,6 +218,7 @@ impl BatchPipeline {
         let spe = engine.config.chain.slots_per_epoch;
         let OpenEpoch {
             target_root,
+            source_root,
             signing_domain,
             committees,
             committee_output,
@@ -240,6 +245,7 @@ impl BatchPipeline {
         Ok(EpochAggregator {
             target_epoch,
             target_root,
+            source_root,
             signing_domain,
             acc_root: engine.snapshot.state.acc_root,
             acc_commitment: engine.snapshot.state.acc_commitment,
@@ -302,6 +308,8 @@ impl BatchPipeline {
         let witness = SlotProofWitness {
             accumulator_commitment: aggregator.acc_commitment,
             committee_root: aggregator.committee_output.committee_root,
+            source_epoch: target_epoch.saturating_sub(1),
+            source_root: aggregator.source_root,
             target_epoch,
             target_root: aggregator.target_root,
             signing_domain: aggregator.signing_domain,

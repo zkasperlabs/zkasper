@@ -1471,6 +1471,9 @@ pub struct StreamContext {
     pub total_active_balance: u64,
     pub target_epoch: u64,
     pub target_root: [u8; 32],
+    /// Checkpoint of the epoch before this one: the FFG source every counted
+    /// attestation names, and the checkpoint the final proof finalizes.
+    pub source_root: [u8; 32],
     pub signing_domain: [u8; 32],
     /// The key an aggregate chain's links verify each other under.
     pub aggregate_program_vk: ProgramVk,
@@ -1503,6 +1506,8 @@ pub fn group_witness(
     SlotProofWitness {
         accumulator_commitment: context.accumulator_commitment,
         committee_root: committees.root(),
+        source_epoch: context.target_epoch.saturating_sub(1),
+        source_root: context.source_root,
         target_epoch: context.target_epoch,
         target_root: context.target_root,
         signing_domain: context.signing_domain,
@@ -1551,6 +1556,8 @@ pub fn aggregate_witness(
         accumulator_commitment: context.accumulator_commitment,
         target_epoch: context.target_epoch,
         target_root: context.target_root,
+        source_epoch: context.target_epoch.saturating_sub(1),
+        source_root: context.source_root,
         aggregate_program_vk: context.aggregate_program_vk,
         epoch_diff: opens_the_epoch.then(|| context.epoch_diff.clone()),
         epoch_diff_proof: if opens_the_epoch {

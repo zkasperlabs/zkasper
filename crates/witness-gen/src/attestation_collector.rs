@@ -172,6 +172,8 @@ fn data_key(a: &AttestationWitness) -> DataKey {
 pub struct SlotStream {
     target_epoch: u64,
     target_root: [u8; 32],
+    source_epoch: u64,
+    source_root: [u8; 32],
     slots_per_epoch: u64,
     committees: Arc<EpochCommittees>,
     /// Network aggregates seen so far, keyed by the slot they attest to. The
@@ -197,10 +199,13 @@ impl SlotStream {
         committees: Arc<EpochCommittees>,
         target_epoch: u64,
         target_root: [u8; 32],
+        source_root: [u8; 32],
     ) -> Self {
         Self {
             target_epoch,
             target_root,
+            source_epoch: target_epoch.saturating_sub(1),
+            source_root,
             slots_per_epoch: config.slots_per_epoch,
             committees,
             pending: BTreeMap::new(),
@@ -233,6 +238,8 @@ impl SlotStream {
         for att in attestations {
             if att.data_target_epoch != self.target_epoch
                 || att.data_target_root != self.target_root
+                || att.data_source_epoch != self.source_epoch
+                || att.data_source_root != self.source_root
             {
                 continue;
             }
@@ -544,15 +551,17 @@ impl SlotStream {
 /// Scans every block in `[target_epoch, target_epoch + 2)` with no early stop.
 /// Continuous mode drives [`SlotStream`] directly so that it can stop at the
 /// threshold; this stays for one-shot generation of a whole epoch's witnesses.
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_per_slot_for_checkpoint(
     api: &impl BeaconApi,
     config: &ChainConfig,
     committees: Arc<EpochCommittees>,
     target_epoch: u64,
     target_root: &[u8; 32],
+    source_root: &[u8; 32],
 ) -> Result<Vec<SlotComplement>> {
     let spe = config.slots_per_epoch;
-    let mut stream = SlotStream::new(config, committees, target_epoch, *target_root);
+    let mut stream = SlotStream::new(config, committees, target_epoch, *target_root, *source_root);
 
     for slot in target_epoch * spe..(target_epoch + 2) * spe {
         let Ok(attestations) = api.get_block_attestations(&slot.to_string()).await else {

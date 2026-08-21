@@ -120,6 +120,14 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
                 previous.target_root, witness.target_root,
                 "previous justification target_root mismatch",
             );
+            assert_eq!(
+                previous.source_epoch, witness.source_epoch,
+                "previous justification source_epoch mismatch",
+            );
+            assert_eq!(
+                previous.source_root, witness.source_root,
+                "previous justification source_root mismatch",
+            );
             (previous.attesting_balance, previous.slots_mask)
         }
         None => (0u64, 0u64),
@@ -163,6 +171,16 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
             "slot proof {} target_root mismatch",
             i,
         );
+        assert_eq!(
+            slot_output.source_epoch, witness.source_epoch,
+            "slot proof {} source_epoch mismatch",
+            i,
+        );
+        assert_eq!(
+            slot_output.source_root, witness.source_root,
+            "slot proof {} source_root mismatch",
+            i,
+        );
 
         // Cross-slot deduplication, across the whole chain and not only this
         // fold. A committee proof assigns every validator to exactly one slot,
@@ -180,6 +198,8 @@ pub fn verify_justification(witness: &JustificationWitness) -> JustificationOutp
     JustificationOutput {
         accumulator_commitment: witness.accumulator_commitment,
         committee_root,
+        source_epoch: witness.source_epoch,
+        source_root: witness.source_root,
         target_epoch: witness.target_epoch,
         target_root: witness.target_root,
         attesting_balance: total_attesting_balance,

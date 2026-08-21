@@ -161,6 +161,8 @@ fn a_child_proof_from_another_program_is_refused() {
     let witness = SlotProofWitness {
         accumulator_commitment: epoch.accumulator_commitment,
         committee_root: epoch.committees.root(),
+        source_epoch: epoch.epoch - 1,
+        source_root: epoch.source_root,
         target_epoch: epoch.epoch,
         target_root: epoch.target_root,
         signing_domain: epoch.signing_domain,
@@ -182,6 +184,7 @@ fn a_child_proof_from_another_program_is_refused() {
         acc_root: epoch.acc_root,
         target_epoch: epoch.epoch,
         target_root: epoch.target_root,
+        source_root: epoch.source_root,
         total_active_balance: epoch.total_active_balance,
         justification_program_vk: prover.program_vk(Stage::Justification),
     };
@@ -347,6 +350,8 @@ fn recursion_cost_curve() {
             .prove_slot(&SlotProofWitness {
                 accumulator_commitment: epoch.accumulator_commitment,
                 committee_root: epoch.committees.root(),
+                source_epoch: epoch.epoch - 1,
+                source_root: epoch.source_root,
                 target_epoch: epoch.epoch,
                 target_root: epoch.target_root,
                 signing_domain: epoch.signing_domain,
@@ -367,6 +372,7 @@ fn recursion_cost_curve() {
         acc_root: epoch.acc_root,
         target_epoch: epoch.epoch,
         target_root: epoch.target_root,
+        source_root: epoch.source_root,
         total_active_balance: epoch.total_active_balance,
         justification_program_vk: prover.program_vk(Stage::Justification),
     };

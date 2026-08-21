@@ -224,7 +224,7 @@ impl Epoch {
                 block_roots_siblings: opened.block_roots_siblings,
                 state_roots_siblings: opened.state_roots_siblings,
             },
-            source_root: [0x01; 32],
+            source_root: previous_root,
             signing_domain: compute_domain(&DOMAIN_BEACON_ATTESTER, &[0x04, 0, 0, 0], &[0xAA; 32]),
             keys,
             validators,

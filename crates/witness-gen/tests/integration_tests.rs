@@ -469,6 +469,12 @@ async fn test_full_pipeline_init_point_then_epoch_diff() {
 /// deduplicate against a single partition of the validator set.
 const COMMITTEE_ROOT: acc::Digest = [3u64; 4];
 
+/// The checkpoint these fixtures' attestations name as their FFG source. Only
+/// its consistency across a fold chain matters here; the finalization tests
+/// pin it to the checkpoint being finalized, in `finalization_witness`.
+const SOURCE_EPOCH: u64 = 99;
+const SOURCE_ROOT: [u8; 32] = [6u8; 32];
+
 fn committee_output(accumulator_commitment: acc::Digest, target_epoch: u64) -> CommitteeOutput {
     CommitteeOutput {
         accumulator_commitment,
@@ -489,6 +495,8 @@ fn test_justification_round_trip() {
     // half the validator set: 128 ETH in all, a supermajority.
     let slot_proof_outputs = vec![
         SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment,
             committee_root: COMMITTEE_ROOT,
             target_epoch,
@@ -497,6 +505,8 @@ fn test_justification_round_trip() {
             slots_mask: 0b01,
         },
         SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment,
             committee_root: COMMITTEE_ROOT,
             target_epoch,
@@ -507,6 +517,8 @@ fn test_justification_round_trip() {
     ];
 
     let witness = JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment,
         acc_root,
@@ -542,6 +554,8 @@ fn test_justification_rejects_an_understated_active_balance() {
 
     // One slot attests, a quarter of the stake — nowhere near two thirds.
     let slot_proof_outputs = vec![SlotProofOutput {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         accumulator_commitment: commitment,
         committee_root: COMMITTEE_ROOT,
         target_epoch,
@@ -551,6 +565,8 @@ fn test_justification_rejects_an_understated_active_balance() {
     }];
 
     let witness = JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment,
         acc_root,
@@ -583,6 +599,8 @@ fn test_justification_rejects_a_slot_counted_twice() {
     // exactly one slot, so a slot counted twice is a validator counted twice.
     let slot_proof_outputs = vec![
         SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment,
             committee_root: COMMITTEE_ROOT,
             target_epoch,
@@ -591,6 +609,8 @@ fn test_justification_rejects_a_slot_counted_twice() {
             slots_mask: 0b011,
         },
         SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment,
             committee_root: COMMITTEE_ROOT,
             target_epoch,
@@ -601,6 +621,8 @@ fn test_justification_rejects_a_slot_counted_twice() {
     ];
 
     let witness = JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment,
         acc_root,
@@ -634,6 +656,8 @@ fn test_justification_below_two_thirds_is_not_justified() {
 
     // One slot carrying one validator (32 ETH) — not enough for 2/3 of 128 ETH
     let witness = JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment,
         acc_root,
@@ -645,6 +669,8 @@ fn test_justification_below_two_thirds_is_not_justified() {
         previous: None,
         previous_proof: vec![],
         slot_proof_outputs: vec![SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment,
             committee_root: COMMITTEE_ROOT,
             target_epoch,
@@ -675,6 +701,8 @@ fn justification_link(
 ) -> JustificationWitness {
     let commitment = acc::commitment(&acc_root, total_active_balance);
     JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment,
         acc_root,
@@ -694,6 +722,8 @@ fn justification_link(
 
 fn slot_output(commitment: acc::Digest, mask: u64, balance: u64) -> SlotProofOutput {
     SlotProofOutput {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         accumulator_commitment: commitment,
         committee_root: COMMITTEE_ROOT,
         target_epoch: 100,
@@ -725,6 +755,8 @@ fn test_justification_chain_matches_a_single_fold() {
     let chained = chained.expect("four links");
 
     let at_once = zkasper_justification_guest::verify_justification(&JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         slot_proof_outputs: slots,
         slot_proofs: vec![vec![]; 4],
         ..justification_link(
@@ -879,9 +911,11 @@ fn linked_accumulators() -> (acc::Digest, acc::Digest, EpochDiffOutput) {
 
 fn finalization_witness(
     just_e: JustificationOutput,
-    just_e1: JustificationOutput,
+    mut just_e1: JustificationOutput,
     epoch_diff_output: EpochDiffOutput,
 ) -> FinalizationWitness {
+    just_e1.source_epoch = just_e.target_epoch;
+    just_e1.source_root = just_e.target_root;
     FinalizationWitness {
         boundary: fin().anchor,
         justification_outputs: vec![just_e, just_e1],
@@ -962,6 +996,15 @@ fn test_finalization_across_an_empty_first_slot() {
     let (commitment_e, commitment_e1, mut diff) = linked_accumulators();
     diff.state_root_1 = empty.boundary_state_root;
 
+    let mut just_e1 = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
+        commitment_e1,
+        101,
+        empty.justified_root,
+    );
+    just_e1.source_epoch = 100;
+    just_e1.source_root = empty.finalized_root;
+
     let output = zkasper_finalization_guest::verify_finalization(&FinalizationWitness {
         boundary: empty.anchor,
         justification_outputs: vec![
@@ -971,12 +1014,7 @@ fn test_finalization_across_an_empty_first_slot() {
                 100,
                 empty.finalized_root,
             ),
-            zkasper_common::test_utils::justified_output(
-                child_vks::JUSTIFICATION,
-                commitment_e1,
-                101,
-                empty.justified_root,
-            ),
+            just_e1,
         ],
         justification_proofs: vec![vec![], vec![]],
         epoch_diff_output: diff,
@@ -1158,6 +1196,8 @@ fn test_full_justification_to_finalization_pipeline() {
     // Build justification for epoch 100
     let epoch_100_root = fin_root();
     let just_witness_100 = JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment_e,
         acc_root: diff.acc_root,
@@ -1169,6 +1209,8 @@ fn test_full_justification_to_finalization_pipeline() {
         previous: None,
         previous_proof: vec![],
         slot_proof_outputs: vec![SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment_e,
             committee_root: COMMITTEE_ROOT,
             target_epoch: 100,
@@ -1186,6 +1228,8 @@ fn test_full_justification_to_finalization_pipeline() {
     // produced rather than the one epoch 100 used.
     let epoch_101_root = fin().justified_root;
     let just_witness_101 = JustificationWitness {
+        source_epoch: SOURCE_EPOCH,
+        source_root: SOURCE_ROOT,
         justification_program_vk: child_vks::JUSTIFICATION,
         accumulator_commitment: commitment_e1,
         acc_root: diff.acc_root,
@@ -1197,6 +1241,8 @@ fn test_full_justification_to_finalization_pipeline() {
         previous: None,
         previous_proof: vec![],
         slot_proof_outputs: vec![SlotProofOutput {
+            source_epoch: SOURCE_EPOCH,
+            source_root: SOURCE_ROOT,
             accumulator_commitment: commitment_e1,
             committee_root: COMMITTEE_ROOT,
             target_epoch: 101,
@@ -1353,5 +1399,90 @@ fn test_justification_rejects_a_predecessor_from_another_program() {
         total_active_balance,
         Some(previous),
         slot_output(commitment, 0b10, 32_000_000_000),
+    ));
+}
+
+// -----------------------------------------------------------------------
+// The FFG link
+// -----------------------------------------------------------------------
+
+/// A finalization is a *link*, not two unrelated supermajorities.
+///
+/// Epoch E+1 has to have been justified *from* E. Without that clause the proof
+/// says only that two thirds attested to E and two thirds attested to E+1, and
+/// two thirds can then abandon E by voting `(E-1 -> E+7)`: the source epochs are
+/// equal so there is no surround, the target epochs differ so there is no double
+/// vote, and nobody is slashable. With the link, abandoning E takes a surround
+/// vote and costs a third of the stake.
+#[test]
+#[should_panic(expected = "epoch 101 was justified from a different checkpoint of epoch 100")]
+fn test_finalization_rejects_a_justification_from_another_checkpoint() {
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
+
+    let just_e = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
+        commitment_e,
+        100,
+        fin_root(),
+    );
+    let just_e1 = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
+        commitment_e1,
+        101,
+        fin().justified_root,
+    );
+
+    let mut witness = finalization_witness(just_e, just_e1, diff);
+    // A supermajority for E+1 that named some other checkpoint of epoch 100.
+    witness.justification_outputs[1].source_root = [0x11; 32];
+
+    zkasper_finalization_guest::verify_finalization(&witness);
+}
+
+/// The same, by epoch: a justification of E+1 whose source is an older epoch is
+/// the two-epoch rule, which this circuit does not implement and must not be
+/// made to look like the one-epoch rule.
+#[test]
+#[should_panic(expected = "epoch 101 was justified from epoch 99 rather than from 100")]
+fn test_finalization_rejects_a_justification_from_an_older_epoch() {
+    let (commitment_e, commitment_e1, diff) = linked_accumulators();
+
+    let just_e = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
+        commitment_e,
+        100,
+        fin_root(),
+    );
+    let just_e1 = zkasper_common::test_utils::justified_output(
+        child_vks::JUSTIFICATION,
+        commitment_e1,
+        101,
+        fin().justified_root,
+    );
+
+    let mut witness = finalization_witness(just_e, just_e1, diff);
+    witness.justification_outputs[1].source_epoch = 99;
+
+    zkasper_finalization_guest::verify_finalization(&witness);
+}
+
+/// A fold chain has to agree on the source as well as the target, or a chain
+/// could count `(E-1 -> E)` votes in one link and `(E-2 -> E)` votes in the
+/// next and call the sum a supermajority for either link.
+#[test]
+#[should_panic(expected = "slot proof 0 source_root mismatch")]
+fn test_justification_rejects_a_slot_proof_from_another_source() {
+    let acc_root = [42u64; 4];
+    let total_active_balance: u64 = 4 * 32_000_000_000;
+    let commitment = acc::commitment(&acc_root, total_active_balance);
+
+    let mut slot = slot_output(commitment, 0b01, 2 * 32_000_000_000);
+    slot.source_root = [0x33; 32];
+
+    zkasper_justification_guest::verify_justification(&justification_link(
+        acc_root,
+        total_active_balance,
+        None,
+        slot,
     ));
 }

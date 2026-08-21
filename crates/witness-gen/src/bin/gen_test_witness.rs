@@ -185,6 +185,8 @@ fn slot_witness(fixture: &Epoch, slot_in_epoch: u64, absent: &[u64]) -> SlotProo
     SlotProofWitness {
         accumulator_commitment: fixture.accumulator_commitment,
         committee_root: fixture.committees.root(),
+        source_epoch: fixture.epoch - 1,
+        source_root: fixture.source_root,
         target_epoch: fixture.epoch,
         target_root: fixture.target_root,
         signing_domain: fixture.signing_domain,
@@ -253,6 +255,8 @@ fn gen_justification(output_path: &str) {
     let witness = JustificationWitness {
         accumulator_commitment: fixture.accumulator_commitment,
         acc_root: fixture.acc_root,
+        source_epoch: fixture.epoch - 1,
+        source_root: fixture.source_root,
         target_epoch: fixture.epoch,
         target_root: fixture.target_root,
         total_active_balance: fixture.total_active_balance,
@@ -363,6 +367,7 @@ fn gen_stream(output_path: &str, stage: &str, n_validators: usize) {
         total_active_balance: data.total_active_balance,
         target_epoch: epoch,
         target_root,
+        source_root: data.source_root,
         signing_domain: data.signing_domain,
         aggregate_program_vk: child_vks::AGGREGATE,
         stream_program_vk: zkasper_common::recursion::UNSET_VK,
