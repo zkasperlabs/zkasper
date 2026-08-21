@@ -382,8 +382,17 @@ def unrouted(inst):
         held = [i for i in idle if str(i["id"]) in spare]
         loose = [i for i in idle if str(i["id"]) not in spare]
         def money(cards):
-            c = sum(i.get("dph_total") or 0 for i in cards)
-            return f"${c:.2f}/hr = ${c * 730:.0f}/month"
+            # A stopped card is not charged its hourly rate -- it accrues
+            # storage only. Quoting $/hr for an `exited` instance reads as money
+            # burning and is how an instrument loses the reader's trust.
+            live = [i for i in cards if i.get("actual_status") == "running"]
+            c = sum(i.get("dph_total") or 0 for i in live)
+            st = sum(i.get("storage_total_cost") or 0 for i in cards if i not in live)
+            if live and st:
+                return f"${c:.2f}/hr = ${c * 730:.0f}/month, plus ${st:.2f}/month stopped"
+            if live:
+                return f"${c:.2f}/hr = ${c * 730:.0f}/month"
+            return f"stopped, ${st:.2f}/month storage"
         if not loose:
             return check("routing", True,
                          ", ".join(str(i["id"]) for i in held)
@@ -483,14 +492,29 @@ def gpus():
     except Exception as e:
         return [check("gpu", False, f"vast query failed: {e}")]
 
-    burn = sum(i.get("dph_total") or 0 for i in inst)
+    # Only a *running* card burns. Summing `dph_total` across stopped instances
+    # invented a burn that was not happening, and the credit check then divided
+    # by it -- so a fleet that had already been stopped reported "0h left at
+    # this burn" for ever, red for a reason that was not true.
+    live = [i for i in inst if i.get("actual_status") == "running"]
+    burn = sum(i.get("dph_total") or 0 for i in live)
+    idle_storage = sum(i.get("storage_total_cost") or 0
+                       for i in inst if i.get("actual_status") != "running")
     what = ", ".join(f"{i['id']} {i.get('actual_status')}" for i in inst) or "none"
-    out = [check("gpu", True, f"{len(inst)} instance(s): {what} | ${burn:.2f}/hr")]
+    cost = f"${burn:.2f}/hr" if burn else f"nothing burning, ${idle_storage:.2f}/month storage"
+    out = [check("gpu", True, f"{len(inst)} instance(s): {what} | {cost}")]
     out.append(unrouted(inst))
     # A card left running overnight is the expensive failure, so credit that
-    # cannot cover another day is worth surfacing before it runs out.
-    out.append(check("credit", credit > burn * 24 if burn else credit > 0,
-                     f"${credit:.2f}" + (f", {credit/burn:.0f}h left at this burn" if burn else "")))
+    # cannot cover another day is worth surfacing before it runs out. With
+    # nothing running there is no such deadline, and a standing red would only
+    # teach the reader to ignore the line.
+    if burn:
+        out.append(check("credit", credit > burn * 24,
+                         f"${credit:.2f}, {credit/burn:.0f}h left at this burn"))
+    else:
+        out.append(check("credit", True,
+                         f"${credit:.2f}, nothing burning"
+                         + (f" (${idle_storage:.2f}/month storage)" if idle_storage else "")))
     return out
 
 
