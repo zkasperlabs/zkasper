@@ -14,7 +14,7 @@ notify on the exit code alone.
 
 Nothing here writes anything or spends anything. Read-only by construction.
 """
-import argparse, json, os, re, subprocess, sys, time
+import argparse, difflib, hashlib, json, os, re, subprocess, sys, time
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -518,6 +518,45 @@ def gpus():
     return out
 
 
+def site_is_current():
+    """Is the page the public sees the page in the repo?
+
+    The `site` check above answers HTTP 200 and nothing else, and a green 200 is
+    exactly what a stale deploy looks like. On 2026-08-21 the live page had been
+    a whole release behind for days: 153 lines of `index.html` unpublished,
+    including **"960,974 active validators"** under a heading reading "Measured,
+    not estimated" -- a number an earlier review had already flagged as false and
+    recorded as removed. It was removed from the working tree, never from
+    production, and nothing was watching the difference.
+
+    Compare the served bytes with the repo, not file-by-file over HTTP: Pages
+    serves `index.html` at `/`, and fetching `/index.html` returns empty, which
+    is what made an earlier hand check look clean.
+    """
+    root = Path(__file__).resolve().parent.parent.parent / "zkasper-site"
+    local = root / "index.html"
+    if not local.is_file():
+        return check("deployed", True, "no site checkout beside the repo, not checked")
+    try:
+        req = Request(SITE + "/", headers={"User-Agent": "zkasper-monitor"})
+        with urlopen(req, timeout=20) as r:
+            served = r.read(2_000_000)
+    except (URLError, HTTPError, TimeoutError) as e:
+        return check("deployed", False, f"cannot read the live page: {e}")
+
+    want = local.read_bytes()
+    if hashlib.sha256(served).digest() == hashlib.sha256(want).digest():
+        return check("deployed", True, "the live page is the page in the repo")
+
+    a = served.decode("utf-8", "replace").splitlines()
+    b = want.decode("utf-8", "replace").splitlines()
+    drift = sum(1 for line in difflib.unified_diff(a, b, n=0)
+                if line[:1] in "+-" and line[:3] not in ("---", "+++"))
+    return check("deployed", False,
+                 f"the live page is NOT what the repo says, {drift} lines differ"
+                 " -- `npx wrangler pages deploy . --project-name=zkasper` in zkasper-site")
+
+
 def url(name, u, want):
     # Cloudflare rejects urllib's default agent, so the check would fail on
     # a healthy site. Identify honestly rather than impersonating a browser.
@@ -726,7 +765,7 @@ def main():
 
     checks = (daemon() + [refusals()] + gpus()
               + [url("api", API, api_detail), published_latency(), published_gaps(),
-                 url("site", SITE, None)])
+                 url("site", SITE, None), site_is_current()])
     healthy = all(c["ok"] for c in checks)
 
     if a.json:
