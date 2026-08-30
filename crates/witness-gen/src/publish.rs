@@ -39,7 +39,7 @@ use crate::prover::Stage;
 
 /// Zisk release the guests are built against. Pinned in the workspace manifest;
 /// published so a verifier knows which prover produced a proof.
-pub const ZISK_VERSION: &str = "v1.1.0-alpha";
+pub const ZISK_VERSION: &str = "v1.2.0-alpha";
 
 /// Longest a single request may take before the daemon gives up and spools.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);

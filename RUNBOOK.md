@@ -854,7 +854,7 @@ Check the version before building anything, and do not trust a populated
 `~/.zisk` as evidence the box is ready:
 
 ```sh
-~/.zisk/bin/cargo-zisk --version      # must say 1.1.0-alpha
+~/.zisk/bin/cargo-zisk --version      # must say 1.2.0-alpha
 ```
 
 Reinstalling over the top works. Delete `~/.zisk` first: 180 GB does not hold a

@@ -82,36 +82,36 @@ pub const UNSET_VK: ProgramVk = [0; PROGRAM_VK_LEN];
 ///
 /// `rootC` of the `vadcop_final` circuit, read from
 /// `provingKey/zisk/vadcop_final/vadcop_final.verkey.bin` of the Zisk
-/// **v1.1.0-alpha** proving key — the release `Cargo.toml` pins `ziskos` and
+/// **v1.2.0-alpha** proving key — the release `Cargo.toml` pins `ziskos` and
 /// `zisk-sdk` to. It is a constant of that release and of nothing in this
 /// repository, so unlike the child program keys it depends on no guest ELF,
 /// there is no dependency graph to walk, and one shared constant is enough.
 ///
-/// **It is not a constant of that release any more, and that is not our doing.**
-/// Upstream rebuilt the v1.1.0-alpha proving key in place on 2026-08-19 and
-/// changed this root, while leaving `zisk-provingkey-1.1.0-alpha.hash`
-/// byte-identical, so the same tag yields two different values depending on the
-/// day it was fetched. The value below is the **2026-08-17 build**, which is what
-/// every proof this project has published is proved under. A fresh install today
-/// gives `[13156505134420657395, ..]` and refuses all of them. The Aug-17
-/// proving key survives at `/mnt/ssd/zisk-1.1.0` on the build box and nowhere
-/// else that we know of.
-///
-/// So **do not re-read this from a release to check it** -- that instruction was
-/// safe when a tag meant one artifact. Anyone verifying a published proof needs
-/// this value from here, not from `provingKey`.
+/// **A tag does not pin this value.** Upstream rebuilt the v1.1.0-alpha proving
+/// key in place on 2026-08-19 and changed its root, while leaving
+/// `zisk-provingkey-1.1.0-alpha.hash` byte-identical, so that tag yields two
+/// different values depending on the day it was fetched. Every proof published
+/// before the 1.2 bump is proved under the Aug-17 v1.1 build,
+/// `[11800534191493876478, 6047701255643179780, 11700752144183100736,
+/// 12226993988674551281]`, which survives at `/mnt/ssd/zisk-1.1.0` on the build
+/// box and nowhere else that we know of. Nothing here verifies those any more.
 ///
 /// **Rederive it on a Zisk bump, before anything else.** A stale value refuses
-/// every proof, which is the safe direction and an obvious one; the value for
-/// v1.0.0-alpha is `[16418290590932191654, 2682920145730279116,
-/// 9421690135668477588, 7053485478104629196]` and is not this. Compressed
-/// proofs are a different circuit with a different root again, and the layout
-/// check rejects them before this is consulted.
+/// every proof, which is the safe direction and an obvious one. Rederiving needs
+/// no proving key: `zisk-verifykey-<version>.tar.gz` in the `zisk-setup` bucket
+/// is 214 bytes and holds exactly the 32-byte file named above, little-endian.
+/// The value below is that file, and it agrees with the root hardcoded in
+/// upstream's own `zisk-contracts/ZiskVerifier.sol` at the same tag — on
+/// v1.1.0-alpha those two disagreed, which is what #1282 fixed. v1.0.0-alpha was
+/// `[16418290590932191654, 2682920145730279116, 9421690135668477588,
+/// 7053485478104629196]`. Compressed proofs are a different circuit with a
+/// different root again, and the layout check rejects them before this is
+/// consulted.
 pub const VADCOP_FINAL_VK: ProgramVk = [
-    11800534191493876478,
-    6047701255643179780,
-    11700752144183100736,
-    12226993988674551281,
+    6218392583875695404,
+    9353885302538021251,
+    8280779842059074605,
+    10684020678174455855,
 ];
 
 /// The VADCOP final verification key a proof asks to be checked under.

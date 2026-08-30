@@ -203,13 +203,13 @@ two threat models, two thresholds and two sets of circuits.
 
 ## Requirements
 
-Zisk **v1.1.0-alpha**. The toolchain and `ziskos` must match, because
-v1.1.0-alpha changed the guest linker script. A guest that is built against one
-version and linked by another fails with undefined symbols.
+Zisk **v1.2.0-alpha**. The toolchain and `ziskos` must match: v1.1.0-alpha
+changed the guest linker script, and a guest that is built against one version
+and linked by another fails with undefined symbols.
 
 ```sh
 curl -sSf https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
-ziskup --version 1.1.0-alpha --cpu --nokey -y
+ziskup --version 1.2.0-alpha --cpu --nokey -y
 ```
 
 ## License
