@@ -8,6 +8,7 @@ members = [
     "crates/justification-guest",
     "crates/finalization-guest",
     "crates/group-proof-guest",
+    "crates/fcr-proof-guest",
     "crates/aggregation-guest",
     "crates/stream-final-guest",
     "crates/bench-guest",

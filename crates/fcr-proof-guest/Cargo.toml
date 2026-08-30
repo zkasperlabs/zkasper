@@ -1,0 +1,17 @@
+[package]
+name = "zkasper-fcr-proof-guest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkasper-fcr-proof-guest"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }

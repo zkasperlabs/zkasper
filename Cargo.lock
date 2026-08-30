@@ -7903,6 +7903,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkasper-fcr-proof-guest"
+version = "0.1.0"
+dependencies = [
+ "bincode 1.3.3",
+ "serde",
+ "ziskos",
+ "zkasper-common",
+]
+
+[[package]]
 name = "zkasper-finalization-guest"
 version = "0.1.0"
 dependencies = [
@@ -7998,6 +8008,7 @@ dependencies = [
  "zkasper-aggregation-guest",
  "zkasper-common",
  "zkasper-epoch-diff-guest",
+ "zkasper-fcr-proof-guest",
  "zkasper-finalization-guest",
  "zkasper-justification-guest",
  "zkasper-slot-proof-guest",
