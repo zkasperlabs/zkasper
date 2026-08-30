@@ -7,44 +7,19 @@ Every number here is labelled MEASURED (with where and when) or MODELLED.
 `scripts/gpu_bench.sh` is the companion document for the proving box; this one
 covers the daemon and the chain it follows.
 
-## State of play, 2026-08-18
+## State of play
 
-Written from a live mainnet run on this machine: Lighthouse v8.2.1 checkpoint-
-synced with a mock execution layer, `zkasperd --mode streaming --prover native`.
+**This section used to hold a dated snapshot from 2026-08-18, three weeks and one
+production run out of date.** Current state lives in one place:
+`zkasper-pm/LAUNCH.md`. What a snapshot here reliably does is send the next
+reader down a road that has already been walked.
 
-**Works.** Starting from a real 2.34M-validator state; all-subnets gossip at
-28,033 attestations a slot with zero drops; the singles-first collector; the
-schedule; the 2/3 trigger; reorg handling; the status manifest; restart recovery.
-The three arrival-timing assumptions the design rests on are confirmed (§8).
-
-**The warm prover now works on a GPU.** On 2026-08-18 a rented RTX 5090 built
-`--features zisk-prover` under CUDA 12.9.1, produced real group and slot proofs
-that `verify_child` accepted, and proved again with no re-initialisation. A
-daemon with no CUDA drove the same prover over the network through
-`zkasper-prover-server`, and kept running when the server was killed. The
-per-stage times are in [BENCHMARKS.md](BENCHMARKS.md); nothing in §8 below is a
-proving measurement, because §8 is the `--prover native` run.
-
-**Does not work yet, in order of how much it matters.**
-
-1. **The trigger's rate rule can fire on a quiet 200 ms window** in the middle of
-   the burst. Two of the three steady-state epochs fired at 924 ms and 1,355 ms
-   of wait, nowhere near the cap, with 8,159 and 6,822 attesters still in flight.
-   Raising the cap does not reach those two (§8).
-
-**Fixed during the run**: a slot could be proved twice; an empty boundary wedged
-the epoch diff; a 404 was reported as a parse error; a pruned bootstrap state
-wedged startup. See §8 and §6.
-
-**Fixed since**: bootstrap is gone. The daemon starts from a trusted init point —
-see [docs/shared/assumptions.md](docs/shared/assumptions.md) — which deletes
-the two-minute
-startup and the whole "bootstrap epoch pruned" failure mode with it.
-
-**Fixed after it**: an empty epoch boundary slot no longer ends the run — the
-boundary state root is proven out of the justified checkpoint's `state_roots`
-rather than read off a header that does not exist — and the trigger cap is
-10,000 ms, above the range in which waiting still pays (§8).
+What is stable enough to state: the daemon runs against mainnet from a real
+2.34M-validator state, the warm prover works on a rented RTX 5090, and the last
+run proved 80 contiguous epochs at $0.022 each before the cards were stopped.
+Sections 1 to 7 below are the operating procedure and are current. Section 8 is a
+native-mode measurement baseline from 2026-08-18 and is labelled as such — the
+arrival-timing assumptions in it are the ones the schedule still rests on.
 
 ## Contents
 
