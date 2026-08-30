@@ -2,14 +2,15 @@
 
 Read this before you trust a zkasper **fast confirmation** proof.
 
-FCR is designed and **not built**. No `fcr` code exists in this repository.
-[architecture.md](architecture.md) holds the design, so everything below is an
-assumption of a design rather than of running code. Two standing decisions bound
-it, and they are sections 2 and 3.
+The batch proof exists — `crates/fcr-proof-guest`, verified natively against
+real signatures — but nothing has proved an FCR statement on a GPU, and the
+committee proof it needs does not yet prove the shuffle. So everything below is
+an assumption of a design that is partly built.
+[architecture.md](architecture.md) holds the design.
 
-An FCR confirmation claims one thing. **At one slot, validators holding more
-than 75% of the total active effective balance cast head votes that descend from
-one block.** The accumulator commits to the validator set behind those balances,
+An FCR confirmation claims one thing. **Over a run of slots, validators the
+proven committee assignment placed in those slots cast head votes, worth more
+effective balance than the specification's own threshold, for one block.** The accumulator commits to the validator set behind those balances,
 and a chain of `parent_root` openings binds the descent.
 
 This is a different product from the finality proof, with a different threshold,
@@ -25,47 +26,46 @@ soundness (a false proof).
 
 ---
 
-## 1. FCR does not use the committee proof
+## 1. FCR requires the committee proof, and requires its shuffle proven
 
-**This is the distinction that gets confused, so it is first.** The committee
-proof is a finality stage. It runs an epoch ahead, partitions the epoch's
-validators into one bucket per slot, and publishes one
-`(summed public key, summed effective balance)` pair per bucket. **No FCR
-circuit consumes it, and the design does not need it.**
+**This is the distinction that gets confused, so it is first, and it has been
+settled more than once.** An earlier version of this page said the opposite —
+that no FCR circuit consumes the committee proof — on the strength of a threshold
+stated over total active balance rather than over a slot's committee weight. That
+threshold is real and it is conservative, but it is **not a fast path**: one slot
+carries 1/32 of the validator set, so a total-stake threshold high enough to be
+secure needs about 24 slots, roughly five minutes. A page claiming one-slot
+confirmation and a 75%-of-total threshold in the same breath was asking for
+something arithmetically impossible.
 
-That is a deliberate consequence of the threshold. FCR states its threshold over
-the **total active balance** rather than over a slot's committee weight,
-precisely so that the circuit never has to know which validator was assigned to
-which slot:
+**Sub-minute confirmation requires a per-slot committee denominator, and the
+moment the denominator is a bucket, the bucket has to be proven.** See
+[../shared/committee-and-shuffle.md](../shared/committee-and-shuffle.md), which
+is the settled design: one proof per epoch establishes the assignment *and* the
+per-slot sums, proved an epoch ahead off the E-2 RANDAO fix, measured at 44.2 s —
+11.5% of one card, once an epoch, never on the critical path.
 
-```
-adversarial = byzantine_threshold_pct * total_active_balance / 100
-threshold   = (total_active_balance + 2 * adversarial) / 2
-```
+So the reuse list **includes** the committee proof, and the shuffle question is
+FCR's as much as finality's. Finality does not need the assignment proven and is
+unharmed by it; FCR cannot exist without it.
 
-With the default `byzantine_threshold_pct = 25` that is **more than 75% of total
-active balance**. A slot's committee weight is always at most the total active
-balance, so a threshold computed against the total is at least the true per-slot
-threshold. It is conservative, and what it costs is participation headroom
-rather than soundness. The derivation is in [architecture.md](architecture.md).
+---
 
-Two things follow, and both are easy to get backwards:
+## 1a. The threshold is the spec's, unmodified
 
-- **The reuse list excludes it.** What FCR takes from zkasper is the accumulator
-  infrastructure, the BLS aggregate signature verification, the Poseidon
-  multi-proof, the cross-slot dedup pattern and the witness-generator framework.
-  The committee proof is not on that list, and neither is the epoch-ahead
-  scheduling built around it.
-- **The shuffle question is finality's, not FCR's.** "Is the shuffle necessary?
-  Yes to compute, no to prove", in
-  [../finality/assumptions.md](../finality/assumptions.md), is an argument about
-  a proof that sums over per-slot buckets. FCR sums over head votes and never
-  partitions validators by slot, so that argument neither applies to it nor is
-  needed by it. Carrying a conclusion across in either direction is a mistake.
+zkasper proves the rule `consensus-specs` writes, not one shaped to what is cheap
+to prove. Thresholds derived for provability — budgeting the adversary's whole
+stake as `0.5*M + beta*T + P/2` to survive an unproven assignment — are **not
+adopted.** They buy soundness under a weaker circuit at the price of claiming a
+safety property nobody has analysed, and a bridge that says "confirmed" on terms
+Ethereum never defined is worth less than one that waits.
 
-Per-slot committee weights would buy a tighter threshold, and
-[architecture.md](architecture.md) prices three ways of obtaining them. All three
-are V2, and **none is assumed by the design as written.**
+The consequence is that no threshold lives in a circuit at all. An FCR proof
+publishes scalars — support, total active balance, the slot run, the committee
+root, the head chain — and the verifier evaluates
+`(maximum_support + proposer_score + 2*adversarial_weight - support_discount) / 2`
+over them. A circuit that hard-coded the formula would need a rebuild, and a new
+verification key, every time the specification moved.
 
 ---
 
@@ -92,12 +92,9 @@ unhealthy case that finality takes back.
 
 ---
 
-## 4. The adversary budget is the whole stake, not a committee share
+## 4. The wrong-slot attestation attack, and what closes it
 
-The design budgets the whole stake of the adversary rather than a per-slot
-committee share. An unproven assignment lets a colluding prover place
-adversarial stake into a one-slot window. The default byzantine threshold is
-25%.
+**Confirmed, not theoretical, and it is the reason the shuffle is proven.**
 
 **The attack this defends against, stated plainly.** The committee partition is
 prover-chosen -- disjoint, because leaves are consumed in strictly increasing
@@ -108,7 +105,14 @@ vote, and any percentage clears with a small fraction of total stake. Ordering,
 pairing and leaf binding all pass. **Finality is immune to this because its
 denominator is global** -- two thirds of total active balance, summed over every
 bucket, so moving stake between buckets changes nothing. A per-slot denominator
-is not, and that is why this design states its threshold over the total.
+is not, and no threshold this project is willing to state fixes that — only
+proving the assignment does.
+
+On mainnet the attack needs **2.97% of stake** against the spec threshold at a
+one-slot window, and an adversarial validator signing for a slot it was never
+assigned to is **not slashable**: a double vote needs two attestations sharing a
+target epoch, and this validator casts one. The attestation is invalid on the
+wire, so it is never included and never leaves on-chain evidence.
 
 **This is resolved, and the resolution is written down**: the shuffle is proven
 once per epoch, inside the committee proof, an epoch ahead. RANDAO fixes epoch
@@ -119,8 +123,16 @@ so FCR can state a per-slot committee threshold and confirm inside a minute.
 Complement proving then works for both products off the same sums. See
 [../shared/committee-and-shuffle.md](../shared/committee-and-shuffle.md).
 
-What remains open is the **cost** of the shuffle inside that proof, not whether
-it belongs there.
+The cost is no longer open either: **44.2 s an epoch, measured** on the
+901,001-validator mainnet active set, bit-sliced over five bitplanes. That is
+11.5% of one card, once an epoch, with a full epoch of lead time.
+
+**What the circuit does about it: nothing, and it cannot.**
+`crates/fcr-proof-guest` binds one `committee_root` across a batch and asserts
+each bucket's slot index against the `data.slot` of the message it is paired
+with, which stops an *honest* validator being relocated. Neither check can tell a
+proven partition from an invented one. Handing that circuit a committee root from
+an unproven partition does not make it fail — it makes it lie.
 
 ---
 
@@ -135,12 +147,12 @@ it belongs there.
   An FCR confirmation names a block root and a slot; it names no state root and
   discharges nothing. A deployment that runs FCR without the finality pipeline
   behind it holds an unanchored accumulator.
-- **Child program keys are not baked, because no guest exists.** The discipline
-  in finality's "Which program a child proof came from" is what an FCR build
-  would have to follow before `fcr-confirm-guest` could trust an
-  `fcr-slot-proof-guest` child. The VADCOP final key underneath it needs nothing:
-  it is one constant in `zkasper-common` and FCR gets it by calling
-  `verify_child`.
+- **No child program keys, by construction.** An FCR batch verifies its own
+  signatures and runs its own final exponentiation; accumulation across batches
+  is the verifier's, not a circuit's. So finality's "Which program a child proof
+  came from" discipline has nothing to bite on here, and the unmeasured cost of
+  in-guest `verify_zisk_proof` stays off the critical path. The VADCOP final key
+  is one constant in `zkasper-common` either way.
 
 ---
 

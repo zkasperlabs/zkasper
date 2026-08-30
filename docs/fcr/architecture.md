@@ -2,7 +2,9 @@
 
 Based on [Lighthouse PR #8951](https://github.com/sigp/lighthouse/pull/8951) (Fast Confirmation Rule).
 
-FCR is designed and **not built**. No `fcr` code exists in this repository.
+The batch proof is built — `crates/fcr-proof-guest` — and the confirmation guest
+below is not: accumulation moved to the verifier. Nothing has proved an FCR
+statement on a GPU.
 [assumptions.md](assumptions.md) holds what this design trusts, and
 [../shared/assumptions.md](../shared/assumptions.md) holds what it shares with
 the finality proof. The finality pipeline is a separate product with separate
@@ -25,9 +27,9 @@ instead of waiting for full finality.
 | Latency | ~13 min (2 epochs) | ~12 sec (1 slot) |
 | Attestation semantics | Target (FFG) votes for checkpoint | Head (LMD-GHOST) votes for blocks |
 | Chain awareness | None (just a checkpoint root) | Needs block ancestry proofs |
-| Threshold | Simple: `balance * 3 >= total * 2` | Complex: adversary-aware safety bound |
+| Threshold | Simple: `balance * 3 >= total * 2` | the spec's adversary-aware bound, unmodified, evaluated by the verifier |
 | Security assumption | Byzantine fault tolerance 1/3 | Configurable `byzantine_threshold` (default 25%) |
-| Committee data | one committee proof per epoch, produced an epoch ahead | **none** — see below |
+| Committee data | one committee proof per epoch, produced an epoch ahead | the same proof, and its **shuffle proven** — see below |
 
 ## What can be reused from zkasper
 
@@ -37,26 +39,27 @@ instead of waiting for full finality.
 - **Cross-slot dedup**: `counted_validators_commitment` pattern
 - **Witness generator framework**: beacon API, attestation collection (minor mods)
 
-## What is not reused: the committee proof
+## What is also reused, and must be: the committee proof
 
-**FCR does not use the committee proof.** The list above is exhaustive, and the
-committee proof is deliberately absent from it. That stage belongs to the
-finality pipeline: it runs an epoch ahead, partitions the epoch's validators into
-one bucket per slot, and publishes one `(summed public key, summed effective
-balance)` pair per bucket.
+**Superseded.** This section used to read "FCR does not use the committee proof",
+on the strength of a threshold stated over total active balance so that no
+circuit had to know which validator was assigned to which slot. That is sound and
+it is not a fast path: one slot carries 1/32 of the validator set, so a
+total-stake threshold high enough to be secure needs about 24 slots — five
+minutes — which is not the product this page is named after.
 
-The threshold below is stated over **total active balance** rather than over a
-slot's committee weight precisely so that no FCR circuit has to know which
-validator was assigned to which slot. That is what buys the independence, and it
-is paid for in headroom: >75% of total active balance instead of the ~60-65% of
-committee weight the per-slot rule would ask for. "Committee refinement" below
-prices three ways of getting the tighter bound back, and all three are V2.
+**FCR takes the committee proof, and needs its shuffle proven.** The denominator
+of the spec threshold is a slot's committee weight, and a partition the prover
+chose is a denominator the prover chose. Proving the shuffle is the only thing
+that closes it; it is measured at 44.2 s an epoch, once per epoch, an epoch
+ahead. See [../shared/committee-and-shuffle.md](../shared/committee-and-shuffle.md)
+and [assumptions.md](assumptions.md) sections 1, 1a and 4.
 
-One consequence is worth stating explicitly, because it has been confused. The
-shuffle argument in [../finality/assumptions.md](../finality/assumptions.md) —
-"Is the shuffle necessary? Yes to compute, no to prove" — is about a proof that
-sums over per-slot buckets. FCR sums over head votes and never partitions
-validators by slot, so that argument is neither available to it nor needed by it.
+The consequence for the shuffle argument in
+[../finality/assumptions.md](../finality/assumptions.md) — "Is the shuffle
+necessary? Yes to compute, no to prove" — is that it is finality's alone. It
+holds there because finality's denominator is global. It does not carry to FCR,
+and carrying it across is the mistake this section used to make.
 
 ## What's new
 
@@ -311,9 +314,17 @@ within 1 slot on a healthy network (typical participation is ~98%).
 
 For comparison, full Casper finality requires 66.7% but over 2 epochs.
 
-## Committee refinement (optional, tighter threshold)
+## Committee refinement — required, not optional
 
-The full FCR uses per-slot committee weights for a tighter threshold. To support this in ZK:
+**Superseded framing.** This section used to call the committee assignment a V2
+refinement and price three ways of getting it. It is not optional: the spec
+threshold's denominator is a slot's committee weight, and an unproven partition
+lets a colluding prover choose that denominator and forge a one-slot confirmation
+with 2.97% of stake. Option A below is the answer, it is settled design, and it
+is measured at 44.2 s an epoch — see
+[../shared/committee-and-shuffle.md](../shared/committee-and-shuffle.md) and
+[assumptions.md](assumptions.md) sections 1 and 4. The alternatives are kept
+because knowing why they were rejected is worth more than the space:
 
 **Option A — Committee accumulator** (recommended for V2):
 - Add a Poseidon tree that commits to `(validator_index, assigned_slot)` per epoch
@@ -326,9 +337,9 @@ The full FCR uses per-slot committee weights for a tighter threshold. To support
 - Verify via SSZ Merkle path from state_root
 - Avoids recomputing RANDAO shuffle but requires deep state access
 
-**Option C — Accept as trusted input** (fastest to implement, weaker):
-- Committee assignments provided in witness, not verified in circuit
-- Still useful when the bridge operator is trusted
+**Option C — Accept as trusted input**: rejected. This is the attack, not a
+weaker version of the defence: an unverified assignment in the witness is exactly
+the prover-chosen partition that forges confirmations.
 
 ## Witness generation changes
 
