@@ -9,9 +9,9 @@ documentation is split so that cannot happen quietly.
 |---|---|---|
 | claim | in each of two consecutive epochs, at least 2/3 of the active effective balance attested to the target checkpoint | at one slot, head votes above an adversary-aware threshold all descend from one block |
 | latency | ~13 min (2 epochs) | ~12 s (1 slot) |
-| threshold | 2/3 of active effective balance | >75% of total active balance, at the default 25% byzantine threshold |
-| committee proof | yes, one per epoch, produced an epoch ahead | **no** |
-| status | runs against mainnet | designed, not built |
+| threshold | 2/3 of active effective balance | the specification's own adversary-aware bound, unmodified, evaluated by the verifier |
+| committee proof | yes, one per epoch, produced an epoch ahead | **yes, and it needs the shuffle proven** — its denominator is a bucket |
+| status | runs against mainnet | batch proof built (`crates/fcr-proof-guest`), no GPU run, no witness generation |
 
 ## The pages
 
