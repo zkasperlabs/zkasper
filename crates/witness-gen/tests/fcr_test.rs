@@ -390,7 +390,7 @@ fn the_publics_are_enough_to_evaluate_a_threshold() {
 /// `no_std` crate. **No arithmetic in this repository decides the verdict.**
 #[test]
 fn two_batches_join_and_are_judged_by_lighthouses_own_rule() {
-    use zkasper_fcr_verifier::{accumulate, is_confirmed, safety_threshold, Params};
+    use zkasper_fcr_verifier::{accumulate, is_confirmed, safety_threshold, Assignment, Params};
 
     let epoch = fixture();
 
@@ -433,8 +433,30 @@ fn two_batches_join_and_are_judged_by_lighthouses_own_rule() {
     let parent_slot = epoch.slot(0) - 1;
     let current_slot = epoch.slot(4);
     let threshold = safety_threshold(&window, parent_slot, current_slot, &params).unwrap();
+
+    // The fixture's committee root is a partition, not a proven assignment, and
+    // the verifier refuses to confirm against one — which is the whole point of
+    // the gate. `proven` is what the FCR-side committee guest will hand over
+    // once it exists; nothing else in the judgement changes.
+    assert_eq!(
+        is_confirmed(
+            &window,
+            &Assignment::unproven(window.committee_root),
+            parent_slot,
+            current_slot,
+            &params
+        ),
+        Err(zkasper_fcr_verifier::Error::AssignmentNotProven),
+    );
     assert!(
-        is_confirmed(&window, parent_slot, current_slot, &params).unwrap(),
+        is_confirmed(
+            &window,
+            &Assignment::proven(window.committee_root),
+            parent_slot,
+            current_slot,
+            &params
+        )
+        .unwrap(),
         "support {} against threshold {threshold}",
         window.support,
     );

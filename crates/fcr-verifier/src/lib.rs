@@ -55,11 +55,68 @@ pub enum Error {
     SlotGap { expected: u64, found: u64 },
     /// Support summed past `u64`.
     Overflow,
+    /// The window was judged against a committee root whose assignment is not
+    /// proven. See [`Assignment`].
+    AssignmentNotProven,
+    /// The supplied assignment is not the root the batches were proved against.
+    AssignmentRootMismatch,
 }
 
 impl From<spec::ArithError> for Error {
     fn from(_: spec::ArithError) -> Self {
         Error::Overflow
+    }
+}
+
+/// Where a window's committee root came from.
+///
+/// **The batch circuit cannot check this and neither can any circuit downstream
+/// of it.** The committee root arrives as witness; a partition that is merely
+/// disjoint is not a partition that RANDAO produced, and the specification's
+/// threshold has a slot's committee weight as its denominator. A prover that
+/// picks the partition picks its own denominator and forges a one-slot
+/// confirmation with 2.97% of stake, with ordering, pairing and leaf binding all
+/// passing.
+///
+/// So the fact lives here, where something can act on it, and it is a value
+/// rather than a comment: [`is_confirmed`] will not take an [`Assignment`] that
+/// does not claim a proven shuffle. Today nothing produces one — the finality
+/// pipeline's committee proof partitions without proving the assignment, and an
+/// FCR-side guest that proves it does not exist yet — so every caller has to go
+/// through [`Assignment::unproven`] and say so out loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    root: Digest,
+    shuffle_proven: bool,
+}
+
+impl Assignment {
+    /// A committee root from a proof that establishes the RANDAO assignment.
+    ///
+    /// `shuffle-bench-guest` measures the assignment at 44.2 s an epoch and
+    /// nothing yet publishes it as a proof, so this constructor currently has no
+    /// honest caller. It exists so that the day one appears, nothing else has to
+    /// change.
+    pub fn proven(root: Digest) -> Self {
+        Self {
+            root,
+            shuffle_proven: true,
+        }
+    }
+
+    /// A committee root whose assignment is unproven witness.
+    ///
+    /// Sound for finality, whose denominator is the whole active set. **Not
+    /// sound for a confirmation**, which is why [`is_confirmed`] refuses it.
+    pub fn unproven(root: Digest) -> Self {
+        Self {
+            root,
+            shuffle_proven: false,
+        }
+    }
+
+    pub fn root(&self) -> Digest {
+        self.root
     }
 }
 
@@ -196,12 +253,23 @@ pub fn safety_threshold(
 }
 
 /// Whether the window confirms its head, under the specification's own rule.
+///
+/// Refuses outright unless the committee assignment behind the window is proven,
+/// because a confirmation against a prover-chosen partition is not a weaker
+/// confirmation — it is not one.
 pub fn is_confirmed(
     window: &Window,
+    assignment: &Assignment,
     parent_slot: u64,
     current_slot: u64,
     params: &Params,
 ) -> Result<bool, Error> {
+    if assignment.root != window.committee_root {
+        return Err(Error::AssignmentRootMismatch);
+    }
+    if !assignment.shuffle_proven {
+        return Err(Error::AssignmentNotProven);
+    }
     let threshold = safety_threshold(window, parent_slot, current_slot, params)?;
     // A proof of an optimistic or invalid payload is a fact this layer does not
     // hold; a caller that tracks execution status supplies it by refusing to ask.
@@ -294,7 +362,31 @@ mod tests {
     #[test]
     fn support_below_the_threshold_does_not_confirm() {
         let w = accumulate(&[batch(100, 1, 1_000, 0xaa, 0xbb)]).unwrap();
-        assert!(!is_confirmed(&w, 99, 101, &Params::default()).unwrap());
+        let a = Assignment::proven(w.committee_root);
+        assert!(!is_confirmed(&w, &a, 99, 101, &Params::default()).unwrap());
+    }
+
+    /// The hole the circuit cannot close, closed here: no proven assignment, no
+    /// confirmation, however much support was published.
+    #[test]
+    fn an_unproven_assignment_confirms_nothing() {
+        let w = accumulate(&[batch(0, 32, T, 0xaa, 0xbb)]).unwrap();
+        let a = Assignment::unproven(w.committee_root);
+        assert_eq!(
+            is_confirmed(&w, &a, 0, 33, &Params::default()).unwrap_err(),
+            Error::AssignmentNotProven,
+        );
+    }
+
+    /// And it must be the assignment these batches were actually proved against.
+    #[test]
+    fn an_assignment_for_another_committee_is_refused() {
+        let w = accumulate(&[batch(0, 32, T, 0xaa, 0xbb)]).unwrap();
+        let a = Assignment::proven([9, 9, 9, 9]);
+        assert_eq!(
+            is_confirmed(&w, &a, 0, 33, &Params::default()).unwrap_err(),
+            Error::AssignmentRootMismatch,
+        );
     }
 
     /// A window long enough to cover the whole validator set: the estimator
@@ -303,7 +395,8 @@ mod tests {
     #[test]
     fn a_long_window_with_the_set_behind_it_confirms() {
         let w = accumulate(&[batch(0, 32, T * 3 / 4, 0xaa, 0xbb)]).unwrap();
-        assert!(is_confirmed(&w, 0, 33, &Params::default()).unwrap());
+        let a = Assignment::proven(w.committee_root);
+        assert!(is_confirmed(&w, &a, 0, 33, &Params::default()).unwrap());
     }
 
     #[test]
