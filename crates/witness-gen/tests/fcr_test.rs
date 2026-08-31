@@ -8,6 +8,7 @@
 //! conservative direction.
 
 use zkasper_common::types::*;
+use zkasper_fcr_types::*;
 use zkasper_common::{committee, ChainConfig};
 use zkasper_fcr_proof_guest::verify_fcr_batch_with_depth;
 use zkasper_witness_gen::fixture::Epoch;

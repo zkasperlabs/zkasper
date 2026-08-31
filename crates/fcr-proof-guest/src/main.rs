@@ -3,7 +3,7 @@
 
 #![cfg_attr(target_os = "zkvm", no_main)]
 
-use zkasper_common::types::FcrBatchWitness;
+use zkasper_fcr_types::FcrBatchWitness;
 use zkasper_fcr_proof_guest::verify_fcr_batch;
 
 #[cfg(target_os = "zkvm")]

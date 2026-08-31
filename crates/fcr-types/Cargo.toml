@@ -1,0 +1,12 @@
+[package]
+name = "zkasper-fcr-types"
+version.workspace = true
+edition.workspace = true
+
+# FCR's witness and output types live here rather than in `zkasper-common`
+# so that no finality guest compiles them. A finality guest's ELF decides its
+# verification key, and a verification key that moves costs a re-bake of every
+# guest that verifies it — so the shared crate is left byte-identical.
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+serde = { workspace = true }

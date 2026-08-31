@@ -62,7 +62,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use zkasper_common::acc::{Digest, G1Point};
-use zkasper_common::types::{AttestationWitness, FcrBatchOutput, FcrBatchWitness};
+use zkasper_common::types::AttestationWitness;
+use zkasper_fcr_types::{FcrBatchOutput, FcrBatchWitness};
 
 /// Verify an FCR batch at the mainnet accumulator depth.
 pub fn verify_fcr_batch(witness: &FcrBatchWitness) -> FcrBatchOutput {

@@ -33,7 +33,7 @@
 
 use fast_confirmation_core as spec;
 use zkasper_common::acc::Digest;
-use zkasper_common::types::FcrBatchOutput;
+use zkasper_fcr_types::FcrBatchOutput;
 
 /// Why a run of batches is not a window.
 #[derive(Debug, Clone, PartialEq, Eq)]

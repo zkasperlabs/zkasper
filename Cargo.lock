@@ -7915,6 +7915,15 @@ dependencies = [
  "serde",
  "ziskos",
  "zkasper-common",
+ "zkasper-fcr-types",
+]
+
+[[package]]
+name = "zkasper-fcr-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "zkasper-common",
 ]
 
 [[package]]
@@ -7923,6 +7932,7 @@ version = "0.1.0"
 dependencies = [
  "fast_confirmation_core",
  "zkasper-common",
+ "zkasper-fcr-types",
 ]
 
 [[package]]
@@ -8023,6 +8033,7 @@ dependencies = [
  "zkasper-common",
  "zkasper-epoch-diff-guest",
  "zkasper-fcr-proof-guest",
+ "zkasper-fcr-types",
  "zkasper-fcr-verifier",
  "zkasper-finalization-guest",
  "zkasper-justification-guest",
