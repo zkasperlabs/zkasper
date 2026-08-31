@@ -1,0 +1,8 @@
+[package]
+name = "zkasper-fcr-verifier"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+fast_confirmation_core = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-no-std" }

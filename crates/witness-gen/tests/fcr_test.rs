@@ -350,7 +350,8 @@ fn a_batch_cannot_omit_a_slot_that_carried_little_support() {
     assert!(message.contains("contiguous run of slots"), "{message}");
 }
 
-/// The verifier can evaluate the threshold from the publics alone. It could not
+/// The verifier can evaluate the specification's threshold from the publics
+/// alone, with the specification's own code. It could not
 /// before: `accumulator_commitment` is `poseidon(acc_root, total_active_balance)`
 /// and a consumer that tracks only the finality chain's commitments holds the
 /// hash, not the balance, so it had no `T` to put in `M(k) = (T / 32) * k`.
@@ -360,12 +361,81 @@ fn the_publics_are_enough_to_evaluate_a_threshold() {
     let (slots, _) = three_slot_chain(&epoch);
     let out = verify(&batch(&epoch, slots));
 
-    let committee_weight = out.total_active_balance / zkasper_common::constants::SLOTS_PER_EPOCH;
-    let spec_threshold = 3 * committee_weight * 3 / 4;
     assert_eq!(out.slot_count, 3);
+    // The specification's own arithmetic, not a restatement of it.
+    let maximum_support = fast_confirmation_core::estimate_committee_weight_between_slots(
+        out.total_active_balance,
+        out.first_slot,
+        out.first_slot + out.slot_count - 1,
+        SLOTS,
+    )
+    .unwrap();
+    let threshold = fast_confirmation_core::safety_threshold(maximum_support, 0, 0, 0).unwrap();
     assert!(
-        out.support > spec_threshold,
-        "support {} against spec threshold {spec_threshold}",
+        fast_confirmation_core::is_one_confirmed(false, out.support, threshold),
+        "support {} against spec threshold {threshold}",
         out.support,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// End to end: proofs in, a confirmation out, under the specification's own rule
+// ---------------------------------------------------------------------------
+
+/// Two batches, joined and judged.
+///
+/// This is the whole FCR path that exists today: the circuit publishes facts,
+/// `zkasper-fcr-verifier` joins them into a window, and the threshold comes from
+/// `fast_confirmation_core` — Lighthouse's own implementation, extracted to a
+/// `no_std` crate. **No arithmetic in this repository decides the verdict.**
+#[test]
+fn two_batches_join_and_are_judged_by_lighthouses_own_rule() {
+    use zkasper_fcr_verifier::{accumulate, is_confirmed, safety_threshold, Params};
+
+    let epoch = fixture();
+
+    // Slots 0-1 under one proof, slots 2-3 under the next.
+    let mut parent = PARENT_HEAD;
+    let mut outputs = Vec::new();
+    for chunk in [0..2u64, 2..4] {
+        let mut slots = Vec::new();
+        let first_parent = parent;
+        for slot_in_epoch in chunk {
+            let h = header(&epoch, slot_in_epoch, parent);
+            parent = root_of(&h);
+            slots.push(FcrSlotWitness {
+                complement: slot_voting(&epoch, slot_in_epoch, parent, &[], [0; 32]),
+                head_header: Some(h),
+            });
+        }
+        let mut w = batch(&epoch, slots);
+        w.parent_head_root = first_parent;
+        w.parent_head_slot = epoch.slot(0) - 1;
+        outputs.push(verify(&w));
+    }
+
+    let window = accumulate(&outputs).expect("the batches join");
+    assert_eq!(window.first_slot, epoch.slot(0));
+    assert_eq!(window.slot_count(), 4);
+    assert_eq!(window.head_root, outputs[1].head_root);
+    assert_eq!(
+        window.support,
+        4 * PER_SLOT as u64 * BALANCE_GWEI,
+        "four full committees",
+    );
+
+    // The fixture's four validators are the whole set, so a window covering
+    // every slot they are assigned to clears the specification's bar.
+    let params = Params {
+        slots_per_epoch: SLOTS,
+        ..Params::default()
+    };
+    let parent_slot = epoch.slot(0) - 1;
+    let current_slot = epoch.slot(4);
+    let threshold = safety_threshold(&window, parent_slot, current_slot, &params).unwrap();
+    assert!(
+        is_confirmed(&window, parent_slot, current_slot, &params).unwrap(),
+        "support {} against threshold {threshold}",
+        window.support,
     );
 }
