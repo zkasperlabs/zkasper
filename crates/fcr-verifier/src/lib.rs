@@ -33,7 +33,7 @@
 
 use fast_confirmation_core as spec;
 use zkasper_common::acc::Digest;
-use zkasper_fcr_types::FcrBatchOutput;
+use zkasper_fcr_types::{FcrBatchOutput, FcrCommitteeOutput};
 
 /// Why a run of batches is not a window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,12 +91,24 @@ pub struct Assignment {
 }
 
 impl Assignment {
-    /// A committee root from a proof that establishes the RANDAO assignment.
+    /// From an FCR committee proof, which establishes the RANDAO assignment.
     ///
-    /// `shuffle-bench-guest` measures the assignment at 44.2 s an epoch and
-    /// nothing yet publishes it as a proof, so this constructor currently has no
-    /// honest caller. It exists so that the day one appears, nothing else has to
-    /// change.
+    /// The seed comes with it and is not checked here: the circuit proves that
+    /// *an* assignment was computed correctly under that seed, and only a
+    /// verifier that ties the seed to a state root — through a finalization
+    /// proof — learns *which*. [`Window::seed_matches`] is the caller's
+    /// obligation and this type cannot discharge it.
+    pub fn from_committee_proof(proof: &FcrCommitteeOutput) -> Self {
+        Self {
+            root: proof.committee_root,
+            shuffle_proven: true,
+        }
+    }
+
+    /// A committee root asserted to come from a proven assignment.
+    ///
+    /// Prefer [`Assignment::from_committee_proof`]; this exists for a caller
+    /// that has verified the proof itself and holds only the root.
     pub fn proven(root: Digest) -> Self {
         Self {
             root,

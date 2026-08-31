@@ -60,6 +60,7 @@ dependencies = [
  "derive_more",
  "fixed-cache",
  "foldhash 0.2.0",
+ "getrandom 0.4.1",
  "hashbrown 0.17.1",
  "indexmap 2.13.0",
  "itoa",
@@ -1834,6 +1835,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethereum_hashing"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa93f58bb1eb3d1e556e4f408ef1dac130bad01ac37db4e7ade45de40d1c86a"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "ring",
+ "sha2",
+]
+
+[[package]]
 name = "evmap"
 version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1925,6 +1937,15 @@ dependencies = [
  "rand 0.8.5",
  "rustc-hex",
  "static_assertions",
+]
+
+[[package]]
+name = "fixed_bytes"
+version = "0.1.0"
+source = "git+https://github.com/dapplion/lighthouse.git?branch=fcr-no-std#b20363743a492f684957fbc9ff55e5c78b77d2ac"
+dependencies = [
+ "alloy-primitives",
+ "safe_arith",
 ]
 
 [[package]]
@@ -4879,6 +4900,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "safe_arith"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b147bb6111014916d3ef9d4c85173124a8e12193a67f6176d67244afd558d6c1"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5312,6 +5339,16 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "swap_or_not_shuffle"
+version = "0.2.0"
+source = "git+https://github.com/dapplion/lighthouse.git?branch=fcr-no-std#b20363743a492f684957fbc9ff55e5c78b77d2ac"
+dependencies = [
+ "alloy-primitives",
+ "ethereum_hashing",
+ "fixed_bytes",
+]
 
 [[package]]
 name = "symbolic-common"
@@ -7908,6 +7945,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkasper-fcr-committee-guest"
+version = "0.1.0"
+dependencies = [
+ "bincode 1.3.3",
+ "serde",
+ "swap_or_not_shuffle",
+ "ziskos",
+ "zkasper-common",
+ "zkasper-fcr-types",
+]
+
+[[package]]
 name = "zkasper-fcr-proof-guest"
 version = "0.1.0"
 dependencies = [
@@ -8032,6 +8081,7 @@ dependencies = [
  "zkasper-aggregation-guest",
  "zkasper-common",
  "zkasper-epoch-diff-guest",
+ "zkasper-fcr-committee-guest",
  "zkasper-fcr-proof-guest",
  "zkasper-fcr-types",
  "zkasper-fcr-verifier",

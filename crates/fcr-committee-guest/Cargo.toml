@@ -1,0 +1,23 @@
+[package]
+name = "zkasper-fcr-committee-guest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkasper-fcr-committee-guest"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+zkasper-fcr-types = { path = "../fcr-types" }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }
+
+[dev-dependencies]
+# The reference implementation, to hold the transcription to it. Same branch the
+# threshold arithmetic comes from.
+swap_or_not_shuffle = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-no-std" }

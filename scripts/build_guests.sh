@@ -33,6 +33,7 @@ GUESTS=(
   aggregation-guest
   stream-final-guest
   fcr-proof-guest
+  fcr-committee-guest
 )
 
 for guest in "${@:-${GUESTS[@]}}"; do

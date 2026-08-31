@@ -5,9 +5,16 @@
 //! a re-bake of every guest that verifies it. Nothing here is reachable from the
 //! finality pipeline.
 
+
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
 use serde::{Deserialize, Serialize};
 use zkasper_common::acc::Digest;
 use zkasper_common::recursion::PublicWriter;
+
+
+use alloc::vec::Vec;
 use zkasper_common::types::{AccMultiProof, SlotComplementWitness};
 
 
@@ -107,6 +114,58 @@ impl FcrBatchOutput {
             .u64(self.total_active_balance)
             .u64(self.first_slot)
             .u64(self.slot_count)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The committee proof FCR needs: a *proven* assignment
+// ---------------------------------------------------------------------------
+
+/// Everything the FCR committee proof reads.
+///
+/// `active` is **every** active validator, opened from the accumulator in
+/// increasing index order. That is the expensive part and it is not avoidable:
+/// the shuffle is over the active set, so a proof that the assignment is right
+/// has to have the whole set in front of it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FcrCommitteeWitness {
+    pub accumulator_commitment: Digest,
+    pub acc_root: Digest,
+    pub total_active_balance: u64,
+    /// `get_seed(state, epoch, DOMAIN_BEACON_ATTESTER)`. Carried, not derived:
+    /// it comes from `state.randao_mixes`, which is an SSZ opening against a
+    /// state root this circuit does not hold. It is published so a verifier can
+    /// check it against a finalization proof, the same way the threshold is
+    /// evaluated outside the circuit rather than baked into it.
+    pub seed: [u8; 32],
+    pub epoch: u64,
+    pub active: Vec<zkasper_common::types::OpenedValidator>,
+    pub acc_multi_proof: AccMultiProof,
+}
+
+/// What the FCR committee proof establishes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FcrCommitteeOutput {
+    pub accumulator_commitment: Digest,
+    /// The seed the assignment was computed under. A verifier that cannot tie
+    /// this to a state root has learned nothing about *which* assignment.
+    pub seed: [u8; 32],
+    pub epoch: u64,
+    /// Per-slot `(summed public key, summed effective balance)`, as a tree.
+    pub committee_root: Digest,
+    /// Size of the active set the shuffle ran over.
+    pub active_count: u64,
+}
+
+impl FcrCommitteeOutput {
+    pub fn public_bytes(&self) -> Vec<u8> {
+        PublicWriter::new()
+            .digest(&self.accumulator_commitment)
+            .bytes32(&self.seed)
+            .u64(self.epoch)
+            .digest(&self.committee_root)
+            .u64(self.active_count)
             .finish()
     }
 }

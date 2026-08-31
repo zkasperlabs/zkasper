@@ -10,3 +10,7 @@ edition.workspace = true
 [dependencies]
 zkasper-common = { path = "../common", default-features = false }
 serde = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["zkasper-common/std"]

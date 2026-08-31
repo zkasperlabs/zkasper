@@ -85,6 +85,7 @@ zkasper-epoch-diff-guest = { path = "../epoch-diff-guest", features = ["count-op
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
 zkasper-fcr-proof-guest = { path = "../fcr-proof-guest" }
 zkasper-fcr-types = { path = "../fcr-types" }
+zkasper-fcr-committee-guest = { path = "../fcr-committee-guest" }
 zkasper-fcr-verifier = { path = "../fcr-verifier" }
 fast_confirmation_core = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-no-std" }
 zkasper-justification-guest = { path = "../justification-guest" }
