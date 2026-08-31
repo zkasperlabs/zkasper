@@ -2,10 +2,18 @@
 
 Read this before you trust a zkasper **fast confirmation** proof.
 
-The batch proof exists — `crates/fcr-proof-guest`, verified natively against
-real signatures — but nothing has proved an FCR statement on a GPU, and the
-committee proof it needs does not yet prove the shuffle. So everything below is
-an assumption of a design that is partly built.
+**Built, as of 2026-08-31:** `crates/fcr-proof-guest` (the batch circuit, 12
+tests against real BLS signatures) and `crates/fcr-verifier` (the judgement,
+10 tests). The verifier holds **no arithmetic of its own** — every number comes
+from `fast_confirmation_core`, Lighthouse's own implementation of the rule
+extracted to a `no_std` crate and validated 10/10 against the consensus spec
+vectors. Neither touches the finality pipeline: the diff across all nine finality
+guest crates and `zkasper-common` is empty.
+
+**Not built:** witness generation from a live node, an ELF or verification key,
+and the committee proof that proves the shuffle. Nothing has proved an FCR
+statement on a GPU. `Assignment::proven` has no honest caller yet, which is why
+[`is_confirmed`] refuses every window today — see section 1.
 [architecture.md](architecture.md) holds the design.
 
 An FCR confirmation claims one thing. **Over a run of slots, validators the
