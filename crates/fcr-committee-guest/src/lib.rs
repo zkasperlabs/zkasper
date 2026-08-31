@@ -145,7 +145,7 @@ pub fn verify_fcr_committee_with_depth(
     let mut sums: Vec<Option<(PointSum, u64)>> = (0..slots_per_epoch).map(|_| None).collect();
     let pivots = pivots(&witness.seed, n);
     for (index, v) in witness.active.iter().enumerate() {
-        let position = shuffled_index(index, n, &witness.seed, &pivots);
+        let position = committee_position(index, n, &witness.seed, &pivots);
         let slot = slot_of_position(position, n, slots_per_epoch);
         let entry = sums[slot as usize].get_or_insert_with(|| (PointSum::default(), 0));
         entry
@@ -187,7 +187,40 @@ fn pivots(seed: &[u8; 32], n: usize) -> [u64; ROUNDS as usize] {
     out
 }
 
-/// Spec: `compute_shuffled_index`, transcribed.
+/// Where in the epoch's shuffled committee list a validator sits.
+///
+/// **This is the inverse of `compute_shuffled_index`, and the direction is the
+/// whole point.** `compute_committee` reads
+/// `indices[compute_shuffled_index(i, ...)]` for each committee position `i`, so
+/// the spec maps *position to validator*. What a per-validator circuit needs is
+/// the other way round, and swap-or-not inverts by running its rounds backwards
+/// — the pivots are the same, only the order changes.
+///
+/// Applying the forward permutation here instead produces a committee root that
+/// disagrees with the chain, which is how this was found.
+fn committee_position(
+    mut index: usize,
+    n: usize,
+    seed: &[u8; 32],
+    pivots: &[u64; ROUNDS as usize],
+) -> usize {
+    let mut buf = [0u8; 37];
+    buf[..32].copy_from_slice(seed);
+    for r in (0..ROUNDS as usize).rev() {
+        buf[32] = r as u8;
+        let flip = (pivots[r] as usize + n - index) % n;
+        let position = if index > flip { index } else { flip };
+        buf[33..37].copy_from_slice(&((position / 256) as u32).to_le_bytes());
+        let source = sha256_short(&buf);
+        if (source[(position % 256) / 8] >> (position % 8)) & 1 == 1 {
+            index = flip;
+        }
+    }
+    index
+}
+
+/// Spec: `compute_shuffled_index`, transcribed. Kept because the inverse above
+/// is only meaningful against it, and the equivalence test checks this one.
 fn shuffled_index(
     mut index: usize,
     n: usize,
@@ -299,9 +332,30 @@ mod tests {
         let pivots = pivots(&seed, n);
         let mut seen = alloc::vec![false; n];
         for index in 0..n {
-            let p = shuffled_index(index, n, &seed, &pivots);
+            let p = committee_position(index, n, &seed, &pivots);
             assert!(!seen[p], "position {p} assigned twice");
             seen[p] = true;
+        }
+    }
+
+    /// And it is the *inverse* of the reference, which is the direction
+    /// `compute_committee` reads it in. Getting this backwards produces a
+    /// committee root that disagrees with the chain and nothing else complains.
+    #[test]
+    fn committee_position_inverts_the_reference_shuffle() {
+        for seed_byte in [1u8, 42] {
+            let seed = [seed_byte; 32];
+            for n in [2usize, 31, 128, 999] {
+                let pivots = pivots(&seed, n);
+                for index in 0..n {
+                    let position = committee_position(index, n, &seed, &pivots);
+                    let back = swap_or_not_shuffle::compute_shuffled_index(
+                        position, n, &seed, ROUNDS,
+                    )
+                    .unwrap();
+                    assert_eq!(back, index, "seed {seed_byte}, n {n}, index {index}");
+                }
+            }
         }
     }
 

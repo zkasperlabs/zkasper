@@ -45,6 +45,10 @@ zkasper-common = { path = "../common", features = ["test-utils"] }
 # same logic that will later prove it.
 zkasper-epoch-diff-guest = { path = "../epoch-diff-guest" }
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
+zkasper-fcr-types = { path = "../fcr-types" }
+zkasper-fcr-proof-guest = { path = "../fcr-proof-guest" }
+zkasper-fcr-verifier = { path = "../fcr-verifier" }
+zkasper-fcr-committee-guest = { path = "../fcr-committee-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }
 zkasper-finalization-guest = { path = "../finalization-guest" }
 zkasper-aggregation-guest = { path = "../aggregation-guest" }
@@ -83,10 +87,6 @@ zisk-prover = ["dep:zisk-sdk"]
 [dev-dependencies]
 zkasper-epoch-diff-guest = { path = "../epoch-diff-guest", features = ["count-ops"] }
 zkasper-slot-proof-guest = { path = "../slot-proof-guest" }
-zkasper-fcr-proof-guest = { path = "../fcr-proof-guest" }
-zkasper-fcr-types = { path = "../fcr-types" }
-zkasper-fcr-committee-guest = { path = "../fcr-committee-guest" }
-zkasper-fcr-verifier = { path = "../fcr-verifier" }
 fast_confirmation_core = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-no-std" }
 zkasper-justification-guest = { path = "../justification-guest" }
 zkasper-finalization-guest = { path = "../finalization-guest" }
