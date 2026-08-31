@@ -387,7 +387,12 @@ def unrouted(inst):
             # burning and is how an instrument loses the reader's trust.
             live = [i for i in cards if i.get("actual_status") == "running"]
             c = sum(i.get("dph_total") or 0 for i in live)
-            st = sum(i.get("storage_total_cost") or 0 for i in cards if i not in live)
+            # `storage_total_cost` is per DAY, not per month. The invoice says so
+            # outright -- `quantity: 10.261, rate: 0.0833` is days times $/day --
+            # and reading it as monthly under-reported the idle burn 30x, which
+            # is how the account reached a negative balance while the plan said
+            # stopped cards cost $0.15 a month.
+            st = sum(i.get("storage_total_cost") or 0 for i in cards if i not in live) * 30.4
             if live and st:
                 return f"${c:.2f}/hr = ${c * 730:.0f}/month, plus ${st:.2f}/month stopped"
             if live:
@@ -498,7 +503,7 @@ def gpus():
     # this burn" for ever, red for a reason that was not true.
     live = [i for i in inst if i.get("actual_status") == "running"]
     burn = sum(i.get("dph_total") or 0 for i in live)
-    idle_storage = sum(i.get("storage_total_cost") or 0
+    idle_storage = 30.4 * sum(i.get("storage_total_cost") or 0
                        for i in inst if i.get("actual_status") != "running")
     what = ", ".join(f"{i['id']} {i.get('actual_status')}" for i in inst) or "none"
     cost = f"${burn:.2f}/hr" if burn else f"nothing burning, ${idle_storage:.2f}/month storage"
