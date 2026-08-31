@@ -10,9 +10,15 @@ extracted to a `no_std` crate and validated 10/10 against the consensus spec
 vectors. Neither touches the finality pipeline: the diff across all nine finality
 guest crates and `zkasper-common` is empty.
 
-**Not built:** witness generation from a live node, an ELF or verification key,
-and the committee proof that proves the shuffle. Nothing has proved an FCR
-statement on a GPU. `Assignment::proven` has no honest caller yet, which is why
+**Proven on mainnet, 2026-08-31.** Block `0x27c54edc...17aa` at slot 15,109,506,
+confirmed under the specification's own threshold from a **single slot** of head
+votes -- support 1,300,640 ETH against 1,266,216 -- with the committee assignment
+proven from the RANDAO seed and matching the chain bit for bit. On an RTX 5090
+the proof takes **15.9 s warm** (3.8 s of it proving) and verifies in **23 ms**;
+on CPU the same proof is 14 m 14 s.
+
+**Still not built:** a continuous feed. Everything above is a one-shot run from
+`scripts/fcr_mainnet.sh`. `Assignment::proven` has no honest caller yet, which is why
 [`is_confirmed`] refuses every window today — see section 1.
 [architecture.md](architecture.md) holds the design.
 
