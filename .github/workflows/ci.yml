@@ -30,7 +30,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
-                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     libopenmpi-dev openmpi-bin libsodium-dev pkg-config \
                      clang libclang-dev libssl-dev
           do
             sudo apt-get install -y --no-install-recommends "$pkg"
@@ -54,7 +54,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
-                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     libopenmpi-dev openmpi-bin libsodium-dev pkg-config \
                      clang libclang-dev libssl-dev
           do
             sudo apt-get install -y --no-install-recommends "$pkg"
@@ -207,7 +207,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
-                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     libopenmpi-dev openmpi-bin libsodium-dev pkg-config \
                      clang libclang-dev libssl-dev
           do
             sudo apt-get install -y --no-install-recommends "$pkg"
@@ -237,7 +237,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
-                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     libopenmpi-dev openmpi-bin libsodium-dev pkg-config \
                      clang libclang-dev libssl-dev
           do
             sudo apt-get install -y --no-install-recommends "$pkg"

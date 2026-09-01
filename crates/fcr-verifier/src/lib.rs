@@ -219,7 +219,10 @@ pub fn accumulate(batches: &[FcrBatchOutput]) -> Result<Window, Error> {
             });
         }
 
-        window.support = window.support.checked_add(batch.support).ok_or(Error::Overflow)?;
+        window.support = window
+            .support
+            .checked_add(batch.support)
+            .ok_or(Error::Overflow)?;
         window.last_slot = batch.first_slot + batch.slot_count - 1;
         window.head_root = batch.head_root;
         window.head_slot = batch.head_slot;
@@ -294,7 +297,13 @@ mod tests {
 
     const T: u64 = 42_328_615_000_000_000;
 
-    fn batch(first_slot: u64, slot_count: u64, support: u64, parent: u8, head: u8) -> FcrBatchOutput {
+    fn batch(
+        first_slot: u64,
+        slot_count: u64,
+        support: u64,
+        parent: u8,
+        head: u8,
+    ) -> FcrBatchOutput {
         FcrBatchOutput {
             accumulator_commitment: [1, 2, 3, 4],
             committee_root: [5, 6, 7, 8],
@@ -310,11 +319,8 @@ mod tests {
 
     #[test]
     fn batches_join_into_one_window() {
-        let w = accumulate(&[
-            batch(100, 2, 10, 0xaa, 0xbb),
-            batch(102, 2, 20, 0xbb, 0xcc),
-        ])
-        .unwrap();
+        let w =
+            accumulate(&[batch(100, 2, 10, 0xaa, 0xbb), batch(102, 2, 20, 0xbb, 0xcc)]).unwrap();
         assert_eq!(w.first_slot, 100);
         assert_eq!(w.last_slot, 103);
         assert_eq!(w.slot_count(), 4);
@@ -325,11 +331,8 @@ mod tests {
 
     #[test]
     fn a_gap_between_batches_is_refused() {
-        let e = accumulate(&[
-            batch(100, 2, 10, 0xaa, 0xbb),
-            batch(103, 2, 20, 0xbb, 0xcc),
-        ])
-        .unwrap_err();
+        let e = accumulate(&[batch(100, 2, 10, 0xaa, 0xbb), batch(103, 2, 20, 0xbb, 0xcc)])
+            .unwrap_err();
         assert_eq!(
             e,
             Error::SlotGap {
@@ -341,11 +344,8 @@ mod tests {
 
     #[test]
     fn a_batch_that_does_not_extend_the_previous_head_is_refused() {
-        let e = accumulate(&[
-            batch(100, 2, 10, 0xaa, 0xbb),
-            batch(102, 2, 20, 0x99, 0xcc),
-        ])
-        .unwrap_err();
+        let e = accumulate(&[batch(100, 2, 10, 0xaa, 0xbb), batch(102, 2, 20, 0x99, 0xcc)])
+            .unwrap_err();
         assert_eq!(e, Error::ChainBroken { at_slot: 102 });
     }
 

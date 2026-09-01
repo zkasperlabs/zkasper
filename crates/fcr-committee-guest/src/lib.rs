@@ -55,16 +55,19 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ziskos::syscalls::{syscall_sha256_f, SyscallSha256Params};
 use zkasper_common::acc::Digest;
 use zkasper_common::types::CommitteeAggregate;
 use zkasper_fcr_types::{FcrCommitteeOutput, FcrCommitteeWitness};
-use ziskos::syscalls::{syscall_sha256_f, SyscallSha256Params};
 
 /// `SHUFFLE_ROUND_COUNT`.
 const ROUNDS: u8 = 90;
 
 /// Prove the epoch's committee assignment and its per-slot sums.
-pub fn verify_fcr_committee(witness: &FcrCommitteeWitness, slots_per_epoch: u64) -> FcrCommitteeOutput {
+pub fn verify_fcr_committee(
+    witness: &FcrCommitteeWitness,
+    slots_per_epoch: u64,
+) -> FcrCommitteeOutput {
     verify_fcr_committee_with_depth(
         witness,
         slots_per_epoch,
@@ -159,7 +162,9 @@ pub fn verify_fcr_committee_with_depth(
         .into_iter()
         .map(|entry| {
             entry.map(|(keys, balance)| CommitteeAggregate {
-                pubkey: keys.get().expect("a slot's committee summed to the identity"),
+                pubkey: keys
+                    .get()
+                    .expect("a slot's committee summed to the identity"),
                 balance,
             })
         })
@@ -349,10 +354,9 @@ mod tests {
                 let pivots = pivots(&seed, n);
                 for index in 0..n {
                     let position = committee_position(index, n, &seed, &pivots);
-                    let back = swap_or_not_shuffle::compute_shuffled_index(
-                        position, n, &seed, ROUNDS,
-                    )
-                    .unwrap();
+                    let back =
+                        swap_or_not_shuffle::compute_shuffled_index(position, n, &seed, ROUNDS)
+                            .unwrap();
                     assert_eq!(back, index, "seed {seed_byte}, n {n}, index {index}");
                 }
             }

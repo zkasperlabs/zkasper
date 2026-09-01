@@ -8,9 +8,9 @@
 //! conservative direction.
 
 use zkasper_common::types::*;
-use zkasper_fcr_types::*;
 use zkasper_common::{committee, ChainConfig};
 use zkasper_fcr_proof_guest::verify_fcr_batch_with_depth;
+use zkasper_fcr_types::*;
 use zkasper_witness_gen::fixture::Epoch;
 
 const ACC_DEPTH: u32 = 4;
@@ -216,7 +216,10 @@ fn a_minority_head_vote_is_dropped_not_counted() {
     slots[1].complement = slot_voting(&epoch, 1, canonical, &[defector], [0x33; 32]);
 
     let out = verify(&batch(&epoch, slots));
-    assert_eq!(out.support, 3 * PER_SLOT as u64 * BALANCE_GWEI - BALANCE_GWEI);
+    assert_eq!(
+        out.support,
+        3 * PER_SLOT as u64 * BALANCE_GWEI - BALANCE_GWEI
+    );
 }
 
 /// A whole slot voting for something that is not its canonical block
@@ -253,7 +256,11 @@ fn a_skipped_slot_still_votes_for_the_head_it_inherited() {
 
     let out = verify(&batch(&epoch, slots));
     assert_eq!(out.support, 2 * PER_SLOT as u64 * BALANCE_GWEI);
-    assert_eq!(out.head_slot, epoch.slot(0), "no block was proposed at slot 1");
+    assert_eq!(
+        out.head_slot,
+        epoch.slot(0),
+        "no block was proposed at slot 1"
+    );
 }
 
 /// A block that does not extend what the batch inherited is refused outright.
@@ -300,7 +307,10 @@ fn a_committee_cannot_be_paired_against_another_slots_message() {
 fn the_batch_publishes_the_committee_root_it_opened() {
     let epoch = fixture();
     let (slots, _) = three_slot_chain(&epoch);
-    assert_eq!(verify(&batch(&epoch, slots)).committee_root, epoch.committees.root());
+    assert_eq!(
+        verify(&batch(&epoch, slots)).committee_root,
+        epoch.committees.root()
+    );
 }
 
 /// The public outputs fit, and that is not a given: the reason a batch reports

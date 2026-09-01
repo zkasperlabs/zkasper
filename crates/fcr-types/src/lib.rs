@@ -5,7 +5,6 @@
 //! a re-bake of every guest that verifies it. Nothing here is reachable from the
 //! finality pipeline.
 
-
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
@@ -13,10 +12,8 @@ use serde::{Deserialize, Serialize};
 use zkasper_common::acc::Digest;
 use zkasper_common::recursion::PublicWriter;
 
-
 use alloc::vec::Vec;
 use zkasper_common::types::{AccMultiProof, SlotComplementWitness};
-
 
 /// A `BeaconBlockHeader`, at the five fields its root is built from.
 ///

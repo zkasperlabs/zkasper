@@ -5,7 +5,7 @@
 //! over the wrong set proves the wrong assignment, and the set arrives as
 //! witness.
 
-use zkasper_common::{ChainConfig, types::OpenedValidator};
+use zkasper_common::{types::OpenedValidator, ChainConfig};
 use zkasper_fcr_committee_guest::verify_fcr_committee_with_depth;
 use zkasper_fcr_types::FcrCommitteeWitness;
 use zkasper_witness_gen::fixture::Epoch;
@@ -104,7 +104,10 @@ fn an_omitted_validator_is_caught_by_the_total() {
     let message = rejection("a short active set verified", || {
         verify(&w);
     });
-    assert!(message.contains("do not sum to the committed total"), "{message}");
+    assert!(
+        message.contains("do not sum to the committed total"),
+        "{message}"
+    );
 }
 
 /// Adding an inactive validator keeps the sum right — its accumulator balance is
@@ -125,7 +128,10 @@ fn an_inactive_validator_cannot_pad_the_set() {
     let message = rejection("a padded active set verified", || {
         verify(&w);
     });
-    assert!(message.contains("opened as active with no balance"), "{message}");
+    assert!(
+        message.contains("opened as active with no balance"),
+        "{message}"
+    );
 }
 
 /// Out of order is a validator opened twice waiting to happen.

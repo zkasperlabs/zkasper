@@ -18,7 +18,9 @@ const PARENT_HEAD: [u8; 32] = [0x11; 32];
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let out = args.next().expect("usage: gen-fcr-witness <out.bin> [slots]");
+    let out = args
+        .next()
+        .expect("usage: gen-fcr-witness <out.bin> [slots]");
     let slots: u64 = args.next().map_or(3, |s| s.parse().expect("slots"));
 
     let epoch = Epoch::new(ChainConfig::MAINNET, EPOCH, slots.max(4), PER_SLOT);

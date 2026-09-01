@@ -74,10 +74,7 @@ async fn main() -> Result<()> {
 
     let indices: Vec<u64> = active.iter().map(|v| v.validator_index).collect();
     let witness = FcrCommitteeWitness {
-        accumulator_commitment: zkasper_common::acc::commitment(
-            &tree.root(),
-            total_active_balance,
-        ),
+        accumulator_commitment: zkasper_common::acc::commitment(&tree.root(), total_active_balance),
         acc_root: tree.root(),
         total_active_balance,
         seed,
@@ -88,10 +85,7 @@ async fn main() -> Result<()> {
 
     eprintln!("proving the assignment (90 rounds per validator)...");
     let started = std::time::Instant::now();
-    let out = zkasper_fcr_committee_guest::verify_fcr_committee(
-        &witness,
-        config.slots_per_epoch,
-    );
+    let out = zkasper_fcr_committee_guest::verify_fcr_committee(&witness, config.slots_per_epoch);
     eprintln!("  {:?}", started.elapsed());
 
     // The node's own assignment, for comparison.
@@ -106,11 +100,18 @@ async fn main() -> Result<()> {
     )?;
 
     println!();
-    println!("circuit committee root  0x{}", hex_digest(&out.committee_root));
+    println!(
+        "circuit committee root  0x{}",
+        hex_digest(&out.committee_root)
+    );
     println!("node    committee root  0x{}", hex_digest(&theirs.root()));
     println!(
         "agree                   {}",
-        if out.committee_root == theirs.root() { "YES" } else { "NO" }
+        if out.committee_root == theirs.root() {
+            "YES"
+        } else {
+            "NO"
+        }
     );
     Ok(())
 }

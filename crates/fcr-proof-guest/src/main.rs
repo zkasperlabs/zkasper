@@ -3,8 +3,8 @@
 
 #![cfg_attr(target_os = "zkvm", no_main)]
 
-use zkasper_fcr_types::FcrBatchWitness;
 use zkasper_fcr_proof_guest::verify_fcr_batch;
+use zkasper_fcr_types::FcrBatchWitness;
 
 #[cfg(target_os = "zkvm")]
 ziskos::entrypoint!(main);

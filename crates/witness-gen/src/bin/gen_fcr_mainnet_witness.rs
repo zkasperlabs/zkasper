@@ -74,13 +74,9 @@ async fn main() -> Result<()> {
         .map(zkasper_witness_gen::state_diff::validator_response_to_data)
         .collect();
     let tree = AccTree::build(&data, epoch, config.acc_tree_depth);
-    let total_active_balance: u64 = data
-        .iter()
-        .map(|v| v.active_effective_balance(epoch))
-        .sum();
+    let total_active_balance: u64 = data.iter().map(|v| v.active_effective_balance(epoch)).sum();
     let acc_root = tree.root();
-    let accumulator_commitment =
-        zkasper_common::acc::commitment(&acc_root, total_active_balance);
+    let accumulator_commitment = zkasper_common::acc::commitment(&acc_root, total_active_balance);
 
     // The committee tree, from the node's own assignment.
     eprintln!("building the committee tree...");
@@ -103,10 +99,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut parent_head_root = api
-        .get_header(&(first_slot - 1).to_string())
-        .await?
-        .root();
+    let mut parent_head_root = api.get_header(&(first_slot - 1).to_string()).await?.root();
     let parent_head_slot = first_slot - 1;
 
     let mut entries = Vec::new();
@@ -141,7 +134,11 @@ async fn main() -> Result<()> {
             "  slot {slot}: {} absentees, {} minority aggregates, primary head {}",
             complement.witness.absentees.len(),
             complement.witness.secondary.len(),
-            if voted == parent_head_root { "canonical" } else { "NOT canonical" },
+            if voted == parent_head_root {
+                "canonical"
+            } else {
+                "NOT canonical"
+            },
         );
         entries.push(FcrSlotWitness {
             complement: complement.witness,
@@ -172,17 +169,17 @@ async fn main() -> Result<()> {
         total_active_balance,
         committee_root: committees.root(),
         acc_multi_proof: tree.build_multi_proof(&named),
-        committee_multi_proof: committees
-            .multi_proof(&(first_slot..=last_slot).map(|s| s % spe).collect::<Vec<_>>()),
+        committee_multi_proof: committees.multi_proof(
+            &(first_slot..=last_slot)
+                .map(|s| s % spe)
+                .collect::<Vec<_>>(),
+        ),
         signing_domain: zkasper_common::bls::compute_domain(
             &zkasper_common::constants::DOMAIN_BEACON_ATTESTER,
             &fork_version,
             &genesis_validators_root,
         ),
-        parent_head_root: api
-            .get_header(&(first_slot - 1).to_string())
-            .await?
-            .root(),
+        parent_head_root: api.get_header(&(first_slot - 1).to_string()).await?.root(),
         parent_head_slot,
         slots: entries,
     };
@@ -232,19 +229,25 @@ async fn main() -> Result<()> {
     let window = zkasper_fcr_verifier::accumulate(std::slice::from_ref(&out))
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let params = zkasper_fcr_verifier::Params::default();
-    let threshold = zkasper_fcr_verifier::safety_threshold(
-        &window,
-        parent_head_slot,
-        last_slot + 1,
-        &params,
-    )
-    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let threshold =
+        zkasper_fcr_verifier::safety_threshold(&window, parent_head_slot, last_slot + 1, &params)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     println!();
-    println!("head           slot {} root 0x{}", out.head_slot, hex(&out.head_root));
+    println!(
+        "head           slot {} root 0x{}",
+        out.head_slot,
+        hex(&out.head_root)
+    );
     println!("support        {:>20} gwei", out.support);
-    println!("threshold      {:>20} gwei  (spec, via fast_confirmation_core)", threshold);
-    println!("margin         {:>20} gwei", out.support as i128 - threshold as i128);
+    println!(
+        "threshold      {:>20} gwei  (spec, via fast_confirmation_core)",
+        threshold
+    );
+    println!(
+        "margin         {:>20} gwei",
+        out.support as i128 - threshold as i128
+    );
     println!(
         "verdict        {}",
         match zkasper_fcr_verifier::is_confirmed(
