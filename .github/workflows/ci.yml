@@ -20,6 +20,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The workspace pulls `zisk-lib-c` and `proofman-starks-lib-c`, whose build
+      # scripts compile C++ against nlohmann/json and link MPI. A bare cargo job
+      # therefore does not build, and has not since 2026-08-20 -- every run on
+      # `main` failed here while the code itself was fine. Installed one package
+      # per invocation: a single apt call is atomic, so one unresolvable name
+      # would silently take every other dependency with it.
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
+                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     clang libclang-dev libssl-dev
+          do
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          done
       - run: cargo check --workspace
 
   test:
@@ -29,6 +44,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The workspace pulls `zisk-lib-c` and `proofman-starks-lib-c`, whose build
+      # scripts compile C++ against nlohmann/json and link MPI. A bare cargo job
+      # therefore does not build, and has not since 2026-08-20 -- every run on
+      # `main` failed here while the code itself was fine. Installed one package
+      # per invocation: a single apt call is atomic, so one unresolvable name
+      # would silently take every other dependency with it.
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
+                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     clang libclang-dev libssl-dev
+          do
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          done
       - run: cargo test --release --workspace
 
   fmt:
@@ -176,8 +206,9 @@ jobs:
       - name: System dependencies
         run: |
           sudo apt-get update -qq
-          for pkg in nasm libgmp-dev libomp-dev libopenmpi-dev openmpi-bin \
-                     libsodium23 pkg-config clang libclang-dev libssl-dev
+          for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
+                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     clang libclang-dev libssl-dev
           do
             sudo apt-get install -y --no-install-recommends "$pkg"
           done
@@ -196,4 +227,19 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # The workspace pulls `zisk-lib-c` and `proofman-starks-lib-c`, whose build
+      # scripts compile C++ against nlohmann/json and link MPI. A bare cargo job
+      # therefore does not build, and has not since 2026-08-20 -- every run on
+      # `main` failed here while the code itself was fine. Installed one package
+      # per invocation: a single apt call is atomic, so one unresolvable name
+      # would silently take every other dependency with it.
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
+                     libopenmpi-dev openmpi-bin libsodium23 pkg-config \
+                     clang libclang-dev libssl-dev
+          do
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          done
       - run: cargo clippy --workspace -- -D warnings
