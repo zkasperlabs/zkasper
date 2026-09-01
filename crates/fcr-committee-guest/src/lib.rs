@@ -150,6 +150,18 @@ pub fn verify_fcr_committee_with_depth(
     for (index, v) in witness.active.iter().enumerate() {
         let position = committee_position(index, n, &witness.seed, &pivots);
         let slot = slot_of_position(position, n, slots_per_epoch);
+        // Lighthouse's own predicate, running inside the guest.
+        assert!(
+            fast_confirmation_core::counts_toward_support(
+                v.active_effective_balance,
+                false,
+                false,
+                true,
+                true,
+            ),
+            "validator {} does not count toward support",
+            v.validator_index,
+        );
         let entry = sums[slot as usize].get_or_insert_with(|| (PointSum::default(), 0));
         entry
             .0

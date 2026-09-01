@@ -80,6 +80,9 @@ fn main() {
         signing_domain: epoch.signing_domain,
         parent_head_root: PARENT_HEAD,
         parent_head_slot: epoch.slot(0) - 1,
+        byzantine_threshold: 25,
+        proposer_score_boost: 40,
+        current_slot: epoch.slot(0) + slots,
         slots: entries,
     };
 

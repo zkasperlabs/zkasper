@@ -314,6 +314,11 @@ mod tests {
             total_active_balance: T,
             first_slot,
             slot_count,
+            threshold: 0,
+            confirmed: false,
+            byzantine_threshold: 25,
+            proposer_score_boost: 40,
+            empty_slot_support: 0,
         }
     }
 

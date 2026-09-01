@@ -145,6 +145,9 @@ fn batch(epoch: &Epoch, slots: Vec<FcrSlotWitness>) -> FcrBatchWitness {
         signing_domain: epoch.signing_domain,
         parent_head_root: PARENT_HEAD,
         parent_head_slot: epoch.slot(0) - 1,
+        byzantine_threshold: 25,
+        proposer_score_boost: 40,
+        current_slot: epoch.slot(0) + slots.len() as u64,
         slots,
     }
 }
@@ -255,7 +258,20 @@ fn a_skipped_slot_still_votes_for_the_head_it_inherited() {
     ];
 
     let out = verify(&batch(&epoch, slots));
-    assert_eq!(out.support, 2 * PER_SLOT as u64 * BALANCE_GWEI);
+    // Both committees voted the same head, but only one slot carried a block.
+    // The rule counts them apart: a vote cast while no block was proposed
+    // supports the head that slot *inherited*, and feeds the discount rather
+    // than the support.
+    assert_eq!(
+        out.support,
+        PER_SLOT as u64 * BALANCE_GWEI,
+        "the proposed slot"
+    );
+    assert_eq!(
+        out.empty_slot_support,
+        PER_SLOT as u64 * BALANCE_GWEI,
+        "the skipped slot",
+    );
     assert_eq!(
         out.head_slot,
         epoch.slot(0),
@@ -321,7 +337,7 @@ fn the_public_outputs_fit_the_proof() {
     let epoch = fixture();
     let (slots, _) = three_slot_chain(&epoch);
     let bytes = verify(&batch(&epoch, slots)).public_bytes();
-    assert_eq!(bytes.len(), 168);
+    assert_eq!(bytes.len(), 208);
     assert!(bytes.len() <= zkasper_common::recursion::MAX_PUBLIC_BYTES);
 }
 

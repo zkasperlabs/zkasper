@@ -34,6 +34,28 @@ struct Args {
     /// proves the committee assignment rather than trusting the node's.
     #[arg(long)]
     randao: Option<String>,
+    /// Evaluate every slot in the range on its own, as a one-slot window, and
+    /// report which of them clear the threshold alone. The registry, the
+    /// accumulator and the committee tree are built once and reused across all
+    /// of them -- they are a property of the epoch, not of the slot.
+    #[arg(long)]
+    scan: bool,
+}
+
+/// The canonical head at `slot`, walking back through missed slots.
+///
+/// A slot with no block has no header to fetch -- the API 404s -- and the head a
+/// later slot inherits is the last block *before* it, which can be several slots
+/// back. Asking for `slot - 1` and trusting it is wrong exactly when a block was
+/// missed, which is the case the whole empty-slot discount exists for.
+async fn head_at(api: &BeaconApiClient, mut slot: u64) -> Result<(u64, [u8; 32])> {
+    for _ in 0..64 {
+        if let Ok(h) = api.get_header(&slot.to_string()).await {
+            return Ok((slot, h.root()));
+        }
+        slot = slot.checked_sub(1).context("walked past genesis")?;
+    }
+    anyhow::bail!("no block within 64 slots")
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -101,6 +123,79 @@ async fn main() -> Result<()> {
 
     let mut parent_head_root = api.get_header(&(first_slot - 1).to_string()).await?.root();
     let parent_head_slot = first_slot - 1;
+
+    if args.scan {
+        println!();
+        println!(
+            "{:>10}  {:>10}  {:>20}  {:>20}  {:>9}  {}",
+            "slot", "absentees", "support (gwei)", "threshold (gwei)", "support/C", "k=1"
+        );
+        let committee_weight = total_active_balance / spe;
+        for slot in first_slot..=last_slot {
+            let Some(complement) = stream.close(slot) else {
+                println!("{slot:>10}  (no attestations)");
+                continue;
+            };
+            let header = api.get_header(&slot.to_string()).await.ok().map(|h| {
+                let f = h.fields();
+                BlockHeaderWitness {
+                    slot: f.slot,
+                    proposer_index: f.proposer_index,
+                    parent_root: f.parent_root,
+                    state_root: f.state_root,
+                    body_root: f.body_root,
+                }
+            });
+            let absentees = complement.witness.absentees.len();
+            let mut named: Vec<u64> = complement
+                .witness
+                .absentees
+                .iter()
+                .map(|v| v.validator_index)
+                .chain(
+                    complement
+                        .witness
+                        .secondary
+                        .iter()
+                        .flat_map(|a| a.attesting_validators.iter().map(|v| v.validator_index)),
+                )
+                .collect();
+            named.sort_unstable();
+            let one = FcrBatchWitness {
+                accumulator_commitment,
+                acc_root,
+                total_active_balance,
+                committee_root: committees.root(),
+                acc_multi_proof: tree.build_multi_proof(&named),
+                committee_multi_proof: committees.multi_proof(&[slot % spe]),
+                signing_domain: zkasper_common::bls::compute_domain(
+                    &zkasper_common::constants::DOMAIN_BEACON_ATTESTER,
+                    &fork_version,
+                    &genesis_validators_root,
+                ),
+                parent_head_root: head_at(&api, slot - 1).await?.1,
+                parent_head_slot: head_at(&api, slot - 1).await?.0,
+                byzantine_threshold: 25,
+                proposer_score_boost: 40,
+                current_slot: slot + 1,
+                slots: vec![FcrSlotWitness {
+                    complement: complement.witness,
+                    head_header: header,
+                }],
+            };
+            let out = zkasper_fcr_proof_guest::verify_fcr_batch(&one);
+            println!(
+                "{:>10}  {:>10}  {:>20}  {:>20}  {:>8.2}%  {}",
+                slot,
+                absentees,
+                out.support,
+                out.threshold,
+                100.0 * out.support as f64 / committee_weight as f64,
+                if out.confirmed { "CONFIRMED" } else { "no" },
+            );
+        }
+        return Ok(());
+    }
 
     let mut entries = Vec::new();
     for slot in first_slot..=last_slot {
@@ -181,6 +276,9 @@ async fn main() -> Result<()> {
         ),
         parent_head_root: api.get_header(&(first_slot - 1).to_string()).await?.root(),
         parent_head_slot,
+        byzantine_threshold: 25,
+        proposer_score_boost: 40,
+        current_slot: last_slot + 1,
         slots: entries,
     };
 

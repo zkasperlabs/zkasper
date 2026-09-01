@@ -61,6 +61,15 @@ pub struct FcrBatchWitness {
     /// chain: this is the previous batch's `head_root` and `head_slot`.
     pub parent_head_root: [u8; 32],
     pub parent_head_slot: u64,
+    /// The rule's two policy constants, carried rather than compiled in so that
+    /// changing either does not mean a new verification key. They are published,
+    /// so a verifier checks two integers instead of re-deriving the formula.
+    pub byzantine_threshold: u64,
+    pub proposer_score_boost: u64,
+    /// The slot the confirmation is being decided at. The window the threshold
+    /// is sized over is `[parent_head_slot + 1, current_slot - 1]`, exactly as
+    /// `compute_safety_threshold` reads it.
+    pub current_slot: u64,
     pub slots: Vec<FcrSlotWitness>,
 }
 
@@ -97,6 +106,18 @@ pub struct FcrBatchOutput {
     /// `first_slot + slot_count`.
     pub first_slot: u64,
     pub slot_count: u64,
+    /// The specification's safety threshold, computed in circuit by
+    /// `fast_confirmation_core` -- Lighthouse's own implementation -- and the
+    /// verdict against it. The proof carries the answer, not just the input to
+    /// one.
+    pub threshold: u64,
+    pub confirmed: bool,
+    pub byzantine_threshold: u64,
+    pub proposer_score_boost: u64,
+    /// Support that went to the inherited head in slots where no block was
+    /// proposed. Published because it is what the discount is computed from, and
+    /// a verifier that cannot see it cannot check the threshold.
+    pub empty_slot_support: u64,
 }
 
 impl FcrBatchOutput {
@@ -111,6 +132,11 @@ impl FcrBatchOutput {
             .u64(self.total_active_balance)
             .u64(self.first_slot)
             .u64(self.slot_count)
+            .u64(self.threshold)
+            .u64(self.confirmed as u64)
+            .u64(self.byzantine_threshold)
+            .u64(self.proposer_score_boost)
+            .u64(self.empty_slot_support)
             .finish()
     }
 }

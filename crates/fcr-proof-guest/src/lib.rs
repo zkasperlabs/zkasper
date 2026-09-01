@@ -84,6 +84,12 @@ pub fn verify_fcr_batch_with_depth(witness: &FcrBatchWitness, acc_depth: u32) ->
     assert!(!witness.slots.is_empty(), "an FCR batch covers no slots");
 
     let mut support: u64 = 0;
+    // Votes cast in slots where no block was proposed go to the head those slots
+    // inherited -- the parent -- not to the block being confirmed. The rule
+    // treats the two differently, and `compute_empty_slot_support_discount` is
+    // where the difference is paid, so they are counted apart rather than summed
+    // and corrected later.
+    let mut empty_slot_support: u64 = 0;
     let mut opened: Vec<(Digest, u64)> = Vec::new();
     let mut committee_leaves: Vec<(Digest, u64)> = Vec::new();
     let mut aggregate_keys: Vec<Vec<G1Point>> = Vec::new();
@@ -246,7 +252,11 @@ pub fn verify_fcr_batch_with_depth(witness: &FcrBatchWitness, acc_depth: u32) ->
         // accumulation O(1). The signatures are still verified — the slot's
         // committee is still bound — only its weight is not claimed.
         if first.data_beacon_block_root == head_root {
-            support += counted;
+            if entry.head_header.is_some() {
+                support += counted;
+            } else {
+                empty_slot_support += counted;
+            }
         }
     }
 
@@ -303,7 +313,63 @@ pub fn verify_fcr_batch_with_depth(witness: &FcrBatchWitness, acc_depth: u32) ->
         "BLS aggregate signature verification failed",
     );
 
+    // The verdict, computed here by Lighthouse's own implementation of the rule.
+    //
+    // It is O(1) -- a handful of integer operations against the 980,636 steps
+    // the pairing and the openings already cost -- so the proof carrying its own
+    // answer is close to free. The alternative was publishing `support` and
+    // trusting whoever compared it, which is a weaker artifact for no saving.
+    //
+    // `estimate_committee_weight_between_slots` reads no committee: it is a
+    // function of the total active balance and a slot range, which is why the
+    // assignment has to be proven elsewhere or the denominator is the prover's
+    // to choose.
+    let spe = zkasper_common::constants::SLOTS_PER_EPOCH;
+    let maximum_support = fast_confirmation_core::estimate_committee_weight_between_slots(
+        witness.total_active_balance,
+        witness.parent_head_slot + 1,
+        witness.current_slot - 1,
+        spe,
+    )
+    .expect("committee weight estimate overflowed");
+    let proposer_score = fast_confirmation_core::compute_proposer_score(
+        witness.total_active_balance,
+        spe,
+        witness.proposer_score_boost,
+    )
+    .expect("proposer score overflowed");
+    let adversarial = fast_confirmation_core::adversarial_weight(
+        fast_confirmation_core::max_adversarial_weight(
+            maximum_support,
+            witness.byzantine_threshold,
+        )
+        .expect("adversarial weight overflowed"),
+        // No circuit sees `store.equivocating_indices`. Zero raises the bar here,
+        // which is the conservative direction for this term.
+        0,
+    );
+    // Spec: `compute_empty_slot_support_discount`. Support the parent picked up
+    // while no block was proposed, less what the adversary could have supplied
+    // over the same slots, floored at zero. The circuit can see which slots were
+    // empty -- they are the ones carrying no header -- so this is computed
+    // rather than assumed away.
+    let support_discount =
+        fast_confirmation_core::adversarial_weight(empty_slot_support, adversarial);
+
+    let threshold = fast_confirmation_core::safety_threshold(
+        maximum_support,
+        proposer_score,
+        adversarial,
+        support_discount,
+    )
+    .expect("safety threshold overflowed");
+
     FcrBatchOutput {
+        threshold,
+        empty_slot_support,
+        confirmed: fast_confirmation_core::is_one_confirmed(false, support, threshold),
+        byzantine_threshold: witness.byzantine_threshold,
+        proposer_score_boost: witness.proposer_score_boost,
         accumulator_commitment: witness.accumulator_commitment,
         committee_root: witness.committee_root,
         parent_head_root: witness.parent_head_root,
