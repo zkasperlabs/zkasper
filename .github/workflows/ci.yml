@@ -10,7 +10,10 @@ env:
   # Pinned deliberately. syscall_poseidon2 lands in v0.16.0, zisk_verifier in
   # v0.18.0 and zisklib hash_to_curve in v1.0.0-alpha; zkasper needs all three,
   # and the cost model in BENCHMARKS.md is tied to a specific version.
-  ZISK_VERSION: "1.1.0-alpha"
+  # Must track the tag `Cargo.toml` pins for `ziskos` and `zisk-sdk`: the
+  # toolchain and the guest OS have to match, and a mismatch shows up as
+  # undefined symbols at link time rather than as a version error.
+  ZISK_VERSION: "1.2.0-alpha"
 
 jobs:
   check:
@@ -78,6 +81,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
+                     libopenmpi-dev openmpi-bin libsodium-dev pkg-config \
+                     clang libclang-dev libssl-dev
+          do
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          done
       - name: Cache SSZ test data
         uses: actions/cache@v4
         with:
@@ -94,6 +106,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          for pkg in nlohmann-json3-dev nasm libgmp-dev libomp-dev \
+                     libopenmpi-dev openmpi-bin libsodium-dev pkg-config \
+                     clang libclang-dev libssl-dev
+          do
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          done
       - name: Generate test witnesses for all proof types
         run: |
           for proof in bootstrap epoch-diff slot-proof justification finalization \
@@ -109,7 +130,7 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - name: Install dependencies
         working-directory: crates/onchain-verifier
-        run: forge install --no-git
+        run: forge install foundry-rs/forge-std --no-git
       - name: Run Solidity tests
         working-directory: crates/onchain-verifier
         run: forge test -vvv
@@ -148,8 +169,14 @@ jobs:
       - name: Install Zisk toolchain
         run: |
           curl -sSf https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
-          "$HOME/.zisk/bin/ziskup" --version "${ZISK_VERSION}" --cpu --nokey -y
-          echo "$HOME/.zisk/bin" >> "$GITHUB_PATH"
+          # `ziskup` reads a menu from /dev/tty even when --cpu says which
+          # branch to take, and a runner has no tty -- so the answer is piped in.
+          # It also does not always land in $HOME/.zisk, so the path is resolved
+          # rather than assumed.
+          ZISKUP=$(command -v ziskup || echo "$HOME/.zisk/bin/ziskup")
+          [ -x "$ZISKUP" ] || ZISKUP=$(find "$HOME" -name ziskup -type f -perm -u+x 2>/dev/null | head -1)
+          printf '1\n' | "$ZISKUP" --version "${ZISK_VERSION}" --cpu --nokey -y
+          echo "$(dirname "$ZISKUP")" >> "$GITHUB_PATH"
 
       - name: Generate test witness
         run: |
@@ -182,8 +209,14 @@ jobs:
       - name: Install Zisk toolchain
         run: |
           curl -sSf https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
-          "$HOME/.zisk/bin/ziskup" --version "${ZISK_VERSION}" --cpu --nokey -y
-          echo "$HOME/.zisk/bin" >> "$GITHUB_PATH"
+          # `ziskup` reads a menu from /dev/tty even when --cpu says which
+          # branch to take, and a runner has no tty -- so the answer is piped in.
+          # It also does not always land in $HOME/.zisk, so the path is resolved
+          # rather than assumed.
+          ZISKUP=$(command -v ziskup || echo "$HOME/.zisk/bin/ziskup")
+          [ -x "$ZISKUP" ] || ZISKUP=$(find "$HOME" -name ziskup -type f -perm -u+x 2>/dev/null | head -1)
+          printf '1\n' | "$ZISKUP" --version "${ZISK_VERSION}" --cpu --nokey -y
+          echo "$(dirname "$ZISKUP")" >> "$GITHUB_PATH"
 
       # Re-measures the weights in BENCHMARKS.md, so a Zisk bump that shifts
       # them shows up here rather than silently invalidating the cost model.
@@ -216,7 +249,7 @@ jobs:
       # green while it is broken. That has already happened once: a merge left
       # zisk_prover.rs uncompilable and Pipeline::stages() panicking on a
       # missing VK, and every other job passed.
-      - run: cargo clippy --workspace --features zisk-prover --all-targets -- -D warnings
+      - run: cargo clippy --workspace --features zisk-prover --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
 
   clippy:
     name: Clippy
@@ -242,4 +275,10 @@ jobs:
           do
             sudo apt-get install -y --no-install-recommends "$pkg"
           done
-      - run: cargo clippy --workspace -- -D warnings
+      # `chunks_exact_to_as_chunks` landed in Rust 1.98 and fires on six sites in
+      # `common` and the guests. Rewriting them would change every guest ELF, and
+      # therefore every baked verification key, to satisfy a style lint. The lint
+      # is allowed rather than obeyed; if the `as_chunks` codegen ever turns out
+      # to be measurably cheaper in-guest, that is a circuit change with a
+      # re-bake, not a CI fix.
+      - run: cargo clippy --workspace -- -D warnings -A clippy::chunks_exact_to_as_chunks

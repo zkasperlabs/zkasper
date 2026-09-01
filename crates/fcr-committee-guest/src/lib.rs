@@ -224,8 +224,11 @@ fn committee_position(
     index
 }
 
-/// Spec: `compute_shuffled_index`, transcribed. Kept because the inverse above
-/// is only meaningful against it, and the equivalence test checks this one.
+/// Spec: `compute_shuffled_index`, transcribed. Only the tests call it — the
+/// circuit needs [`committee_position`], its inverse — but it stays because the
+/// inverse is only meaningful against it and the equivalence test checks both
+/// directions against Lighthouse's reference.
+#[cfg(test)]
 fn shuffled_index(
     mut index: usize,
     n: usize,
