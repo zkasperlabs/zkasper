@@ -6,4 +6,4 @@ edition.workspace = true
 [dependencies]
 zkasper-common = { path = "../common", default-features = false }
 zkasper-fcr-types = { path = "../fcr-types" }
-fast_confirmation_core = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-no-std" }
+fast_confirmation = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-core-unstable" }

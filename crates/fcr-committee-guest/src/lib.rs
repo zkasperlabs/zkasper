@@ -152,7 +152,7 @@ pub fn verify_fcr_committee_with_depth(
         let slot = slot_of_position(position, n, slots_per_epoch);
         // Lighthouse's own predicate, running inside the guest.
         assert!(
-            fast_confirmation_core::counts_toward_support(
+            fast_confirmation::arith::counts_toward_support(
                 v.active_effective_balance,
                 false,
                 false,

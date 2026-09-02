@@ -4,7 +4,7 @@
 //! made. It is deliberately not a circuit — it is what a light client, a
 //! contract, or anyone auditing the feed runs — and it holds **no arithmetic of
 //! its own**. Every number it compares comes from
-//! [`fast_confirmation_core`], which is Lighthouse's own implementation of the
+//! [`fast_confirmation`], which is Lighthouse's own implementation of the
 //! fast confirmation rule extracted to a `no_std` crate. Retyping the rule here
 //! is exactly how a prover and a client come to disagree about what "confirmed"
 //! means without either looking wrong.
@@ -31,7 +31,7 @@
 //! stated here rather than buried because it is the kind of thing a reviewer
 //! finds first.
 
-use fast_confirmation_core as spec;
+use fast_confirmation as spec;
 use zkasper_common::acc::Digest;
 use zkasper_fcr_types::{FcrBatchOutput, FcrCommitteeOutput};
 
@@ -60,12 +60,41 @@ pub enum Error {
     AssignmentNotProven,
     /// The supplied assignment is not the root the batches were proved against.
     AssignmentRootMismatch,
+    /// `slots_per_epoch` is not one this verifier was built for.
+    UnsupportedSlotsPerEpoch(u64),
 }
 
 impl From<spec::ArithError> for Error {
     fn from(_: spec::ArithError) -> Self {
         Error::Overflow
     }
+}
+
+/// The rule's arithmetic can only fail by overflowing; the other variants need
+/// a store, which the verifier never hands it.
+impl From<spec::Error> for Error {
+    fn from(_: spec::Error) -> Self {
+        Error::Overflow
+    }
+}
+
+/// `estimate_committee_weight_between_slots` takes its spec as a type. A
+/// verifier learns `slots_per_epoch` at run time, so it picks the type here.
+fn estimate_committee_weight_between_slots(
+    total_active_balance: u64,
+    start_slot: u64,
+    end_slot: u64,
+    slots_per_epoch: u64,
+) -> Result<u64, Error> {
+    use spec::{SlotsPerEpoch, Slot};
+    let (start, end) = (Slot::new(start_slot), Slot::new(end_slot));
+    Ok(match slots_per_epoch {
+        32 => spec::estimate_committee_weight_between_slots::<SlotsPerEpoch<32>>(total_active_balance, start, end)?,
+        16 => spec::estimate_committee_weight_between_slots::<SlotsPerEpoch<16>>(total_active_balance, start, end)?,
+        8 => spec::estimate_committee_weight_between_slots::<SlotsPerEpoch<8>>(total_active_balance, start, end)?,
+        4 => spec::estimate_committee_weight_between_slots::<SlotsPerEpoch<4>>(total_active_balance, start, end)?,
+        other => return Err(Error::UnsupportedSlotsPerEpoch(other)),
+    })
 }
 
 /// Where a window's committee root came from.
@@ -244,20 +273,20 @@ pub fn safety_threshold(
     let t = window.total_active_balance;
     let spe = params.slots_per_epoch;
 
-    let maximum_support = spec::estimate_committee_weight_between_slots(
+    let maximum_support = estimate_committee_weight_between_slots(
         t,
         parent_slot.saturating_add(1),
         current_slot.saturating_sub(1),
         spe,
     )?;
-    let proposer_score = spec::compute_proposer_score(t, spe, params.proposer_score_boost)?;
-    let adversarial = spec::adversarial_weight(
-        spec::max_adversarial_weight(maximum_support, params.byzantine_threshold)?,
+    let proposer_score = spec::arith::compute_proposer_score(t, spe, params.proposer_score_boost)?;
+    let adversarial = spec::arith::adversarial_weight(
+        spec::arith::max_adversarial_weight(maximum_support, params.byzantine_threshold)?,
         // No circuit sees `store.equivocating_indices`; see the module docs.
         0,
     );
 
-    Ok(spec::safety_threshold(
+    Ok(spec::arith::safety_threshold(
         maximum_support,
         proposer_score,
         adversarial,
@@ -288,7 +317,7 @@ pub fn is_confirmed(
     let threshold = safety_threshold(window, parent_slot, current_slot, params)?;
     // A proof of an optimistic or invalid payload is a fact this layer does not
     // hold; a caller that tracks execution status supplies it by refusing to ask.
-    Ok(spec::is_one_confirmed(false, window.support, threshold))
+    Ok(spec::arith::is_one_confirmed(false, window.support, threshold))
 }
 
 #[cfg(test)]
@@ -366,7 +395,7 @@ mod tests {
 
     /// The threshold over a one-slot window is roughly one committee's weight,
     /// plus the adversary's budget over the same window. Nothing here is our
-    /// arithmetic: it is `fast_confirmation_core` end to end.
+    /// arithmetic: it is `fast_confirmation` end to end.
     #[test]
     fn a_one_slot_window_needs_about_one_committee_plus_the_budget() {
         let w = accumulate(&[batch(100, 1, 0, 0xaa, 0xbb)]).unwrap();

@@ -107,7 +107,7 @@ pub struct FcrBatchOutput {
     pub first_slot: u64,
     pub slot_count: u64,
     /// The specification's safety threshold, computed in circuit by
-    /// `fast_confirmation_core` -- Lighthouse's own implementation -- and the
+    /// `fast_confirmation` -- Lighthouse's own implementation -- and the
     /// verdict against it. The proof carries the answer, not just the input to
     /// one.
     pub threshold: u64,

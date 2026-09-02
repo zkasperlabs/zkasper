@@ -16,7 +16,7 @@ zkasper-fcr-types = { path = "../fcr-types" }
 serde = { workspace = true }
 bincode = { workspace = true }
 ziskos = { workspace = true }
-fast_confirmation_core = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-no-std" }
+fast_confirmation = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-core-unstable" }
 
 [dev-dependencies]
 # The reference implementation, to hold the transcription to it. Same branch the

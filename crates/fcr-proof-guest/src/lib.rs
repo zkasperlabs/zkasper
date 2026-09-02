@@ -325,21 +325,22 @@ pub fn verify_fcr_batch_with_depth(witness: &FcrBatchWitness, acc_depth: u32) ->
     // assignment has to be proven elsewhere or the denominator is the prover's
     // to choose.
     let spe = zkasper_common::constants::SLOTS_PER_EPOCH;
-    let maximum_support = fast_confirmation_core::estimate_committee_weight_between_slots(
+    let maximum_support = fast_confirmation::estimate_committee_weight_between_slots::<
+        fast_confirmation::SlotsPerEpoch<{ zkasper_common::constants::SLOTS_PER_EPOCH }>,
+    >(
         witness.total_active_balance,
-        witness.parent_head_slot + 1,
-        witness.current_slot - 1,
-        spe,
+        fast_confirmation::Slot::new(witness.parent_head_slot + 1),
+        fast_confirmation::Slot::new(witness.current_slot - 1),
     )
     .expect("committee weight estimate overflowed");
-    let proposer_score = fast_confirmation_core::compute_proposer_score(
+    let proposer_score = fast_confirmation::arith::compute_proposer_score(
         witness.total_active_balance,
         spe,
         witness.proposer_score_boost,
     )
     .expect("proposer score overflowed");
-    let adversarial = fast_confirmation_core::adversarial_weight(
-        fast_confirmation_core::max_adversarial_weight(
+    let adversarial = fast_confirmation::arith::adversarial_weight(
+        fast_confirmation::arith::max_adversarial_weight(
             maximum_support,
             witness.byzantine_threshold,
         )
@@ -354,9 +355,9 @@ pub fn verify_fcr_batch_with_depth(witness: &FcrBatchWitness, acc_depth: u32) ->
     // empty -- they are the ones carrying no header -- so this is computed
     // rather than assumed away.
     let support_discount =
-        fast_confirmation_core::adversarial_weight(empty_slot_support, adversarial);
+        fast_confirmation::arith::adversarial_weight(empty_slot_support, adversarial);
 
-    let threshold = fast_confirmation_core::safety_threshold(
+    let threshold = fast_confirmation::arith::safety_threshold(
         maximum_support,
         proposer_score,
         adversarial,
@@ -367,7 +368,7 @@ pub fn verify_fcr_batch_with_depth(witness: &FcrBatchWitness, acc_depth: u32) ->
     FcrBatchOutput {
         threshold,
         empty_slot_support,
-        confirmed: fast_confirmation_core::is_one_confirmed(false, support, threshold),
+        confirmed: fast_confirmation::arith::is_one_confirmed(false, support, threshold),
         byzantine_threshold: witness.byzantine_threshold,
         proposer_score_boost: witness.proposer_score_boost,
         accumulator_commitment: witness.accumulator_commitment,

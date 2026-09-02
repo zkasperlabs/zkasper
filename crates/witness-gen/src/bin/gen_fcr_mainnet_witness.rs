@@ -339,7 +339,7 @@ async fn main() -> Result<()> {
     );
     println!("support        {:>20} gwei", out.support);
     println!(
-        "threshold      {:>20} gwei  (spec, via fast_confirmation_core)",
+        "threshold      {:>20} gwei  (spec, via fast_confirmation)",
         threshold
     );
     println!(

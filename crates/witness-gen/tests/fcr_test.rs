@@ -390,16 +390,16 @@ fn the_publics_are_enough_to_evaluate_a_threshold() {
 
     assert_eq!(out.slot_count, 3);
     // The specification's own arithmetic, not a restatement of it.
-    let maximum_support = fast_confirmation_core::estimate_committee_weight_between_slots(
-        out.total_active_balance,
-        out.first_slot,
-        out.first_slot + out.slot_count - 1,
-        SLOTS,
-    )
-    .unwrap();
-    let threshold = fast_confirmation_core::safety_threshold(maximum_support, 0, 0, 0).unwrap();
+    let maximum_support =
+        fast_confirmation::estimate_committee_weight_between_slots::<fast_confirmation::SlotsPerEpoch<SLOTS>>(
+            out.total_active_balance,
+            fast_confirmation::Slot::new(out.first_slot),
+            fast_confirmation::Slot::new(out.first_slot + out.slot_count - 1),
+        )
+        .unwrap();
+    let threshold = fast_confirmation::arith::safety_threshold(maximum_support, 0, 0, 0).unwrap();
     assert!(
-        fast_confirmation_core::is_one_confirmed(false, out.support, threshold),
+        fast_confirmation::arith::is_one_confirmed(false, out.support, threshold),
         "support {} against spec threshold {threshold}",
         out.support,
     );
@@ -413,7 +413,7 @@ fn the_publics_are_enough_to_evaluate_a_threshold() {
 ///
 /// This is the whole FCR path that exists today: the circuit publishes facts,
 /// `zkasper-fcr-verifier` joins them into a window, and the threshold comes from
-/// `fast_confirmation_core` — Lighthouse's own implementation, extracted to a
+/// `fast_confirmation` — Lighthouse's own implementation, extracted to a
 /// `no_std` crate. **No arithmetic in this repository decides the verdict.**
 #[test]
 fn two_batches_join_and_are_judged_by_lighthouses_own_rule() {
