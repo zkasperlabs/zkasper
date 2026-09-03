@@ -13,7 +13,7 @@
 //! The big arrays (votes, the base registry) sit behind the bincode header as
 //! 8-byte-aligned blobs and are read in place; only the small header is parsed.
 
-use core::cell::RefCell;
+use core::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use fast_confirmation::{
@@ -128,6 +128,8 @@ pub struct Witness<'a> {
     pub balances: &'a [u64],
     /// Registry 0, bitset of slashed flags.
     pub slashed: &'a [u8],
+    /// Registry 0 expanded once, shared by every materialization.
+    pub base: OnceCell<(Vec<u64>, Vec<bool>)>,
 }
 
 fn align8(n: usize) -> usize {
@@ -198,19 +200,43 @@ impl<'a> Witness<'a> {
             vote_slots,
             balances,
             slashed,
+            base: OnceCell::new(),
         })
     }
 
-    fn slashed_bit(&self, i: usize) -> bool {
-        (self.slashed[i / 8] >> (i % 8)) & 1 == 1
+    /// Registry 0 as the rule's owned vectors: the balances copied, the
+    /// slashed bitset expanded a byte at a time through a table.
+    fn base_registry(&self) -> (Vec<u64>, Vec<bool>) {
+        const LUT: [[bool; 8]; 256] = {
+            let mut t = [[false; 8]; 256];
+            let mut b = 0;
+            while b < 256 {
+                let mut i = 0;
+                while i < 8 {
+                    t[b][i] = (b >> i) & 1 == 1;
+                    i += 1;
+                }
+                b += 1;
+            }
+            t
+        };
+        let n = self.header.n_validators as usize;
+        let mut slashed = Vec::with_capacity(self.slashed.len() * 8);
+        for &byte in self.slashed {
+            slashed.extend_from_slice(&LUT[byte as usize]);
+        }
+        slashed.truncate(n);
+        (self.balances.to_vec(), slashed)
     }
 
     /// Materialize registry `idx`: the base blobs with the diff applied.
     pub fn registry(&self, idx: u32) -> BalanceSourceData {
+        let (base_balances, base_slashed) = self
+            .base
+            .get_or_init(|| self.base_registry());
         let r = &self.header.registries[idx as usize];
-        let n = self.header.n_validators as usize;
-        let mut effective_balances = self.balances.to_vec();
-        let mut slashed: Vec<bool> = (0..n).map(|i| self.slashed_bit(i)).collect();
+        let mut effective_balances = base_balances.clone();
+        let mut slashed = base_slashed.clone();
         for &(i, b) in &r.balance_changes {
             effective_balances[i as usize] = b;
         }
@@ -621,6 +647,28 @@ pub fn run(w: &Witness<'_>) -> RuleOutput {
         table: &table,
     };
     let equivocating: BTreeSet<u64> = h.equivocating_indices.iter().copied().collect();
+
+    #[cfg(feature = "decode-only")]
+    {
+        let regs = [
+            w.registry(st.previous_epoch_observed_justified_registry),
+            w.registry(st.current_epoch_observed_justified_registry),
+            w.registry(st.head_balance_registry),
+        ];
+        let touched = regs.iter().map(|r| r.effective_balances.len()).sum::<usize>()
+            + votes.len()
+            + equivocating.len()
+            + store.index.len();
+        return RuleOutput {
+            slot: h.slot,
+            head_root: h.head_root,
+            confirmed_root_before: st.confirmed_root,
+            confirmed_root_after: [touched as u8; 32],
+            outcome: OutcomeBits::default(),
+            pre_state: st.clone(),
+            post_state: st.clone(),
+        };
+    }
 
     let mut rule = FastConfirmationRule::from_parts(
         Hash256(st.confirmed_root),

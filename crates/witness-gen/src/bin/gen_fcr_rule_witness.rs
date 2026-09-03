@@ -411,6 +411,7 @@ async fn main() -> Result<()> {
             vote_slots: &vote_slots,
             balances: &base.balances,
             slashed: &slashed_bits,
+            base: Default::default(),
         };
         let out = run(&w);
         if out.outcome.advanced || out.outcome.restarted_from_justified || out.outcome.reverted_to_finalized {

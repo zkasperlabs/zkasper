@@ -19,3 +19,7 @@ fast_confirmation = { git = "https://github.com/dapplion/lighthouse.git", branch
 
 [target.'cfg(not(target_os = "zkvm"))'.dependencies]
 sha2 = "0.10"
+
+[features]
+# Benchmark aid: materialize the witness and stop before the rule runs.
+decode-only = []
