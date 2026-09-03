@@ -11,6 +11,7 @@ members = [
     "crates/fcr-types",
     "crates/fcr-proof-guest",
     "crates/fcr-committee-guest",
+    "crates/fcr-rule-guest",
     "crates/fcr-verifier",
     "crates/aggregation-guest",
     "crates/stream-final-guest",

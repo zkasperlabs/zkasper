@@ -1859,6 +1859,14 @@ dependencies = [
 [[package]]
 name = "fast_confirmation"
 version = "0.1.0"
+source = "git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-guest#4b2c0751bf05c1d7c250b7a0b6dc812dfc974e1c"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "fast_confirmation"
+version = "0.1.0"
 source = "git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-unstable#1aeb3f7908a9b53c65323de9351e6ff3e743a51d"
 dependencies = [
  "hashbrown 0.16.1",
@@ -7952,7 +7960,7 @@ name = "zkasper-fcr-committee-guest"
 version = "0.1.0"
 dependencies = [
  "bincode 1.3.3",
- "fast_confirmation",
+ "fast_confirmation 0.1.0 (git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-unstable)",
  "serde",
  "swap_or_not_shuffle",
  "ziskos",
@@ -7965,11 +7973,23 @@ name = "zkasper-fcr-proof-guest"
 version = "0.1.0"
 dependencies = [
  "bincode 1.3.3",
- "fast_confirmation",
+ "fast_confirmation 0.1.0 (git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-unstable)",
  "serde",
  "ziskos",
  "zkasper-common",
  "zkasper-fcr-types",
+]
+
+[[package]]
+name = "zkasper-fcr-rule-guest"
+version = "0.1.0"
+dependencies = [
+ "bincode 1.3.3",
+ "fast_confirmation 0.1.0 (git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-guest)",
+ "serde",
+ "sha2",
+ "ziskos",
+ "zkasper-common",
 ]
 
 [[package]]
@@ -7984,7 +8004,7 @@ dependencies = [
 name = "zkasper-fcr-verifier"
 version = "0.1.0"
 dependencies = [
- "fast_confirmation",
+ "fast_confirmation 0.1.0 (git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-unstable)",
  "zkasper-common",
  "zkasper-fcr-types",
 ]
@@ -8066,7 +8086,7 @@ dependencies = [
  "bincode 1.3.3",
  "blst",
  "clap",
- "fast_confirmation",
+ "fast_confirmation 0.1.0 (git+https://github.com/dapplion/lighthouse.git?branch=fcr-core-unstable)",
  "flate2",
  "hex",
  "metrics",
@@ -8088,6 +8108,7 @@ dependencies = [
  "zkasper-epoch-diff-guest",
  "zkasper-fcr-committee-guest",
  "zkasper-fcr-proof-guest",
+ "zkasper-fcr-rule-guest",
  "zkasper-fcr-types",
  "zkasper-fcr-verifier",
  "zkasper-finalization-guest",

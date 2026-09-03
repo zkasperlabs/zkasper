@@ -507,3 +507,80 @@ pub fn parse_committee_entry(entry: &serde_json::Value) -> Result<CommitteeRespo
         validators,
     })
 }
+
+/// One node of `GET /eth/v1/debug/fork_choice`: Lighthouse's proto-array, as
+/// the FCR rule proof consumes it.
+#[derive(Debug, Clone)]
+pub struct ForkChoiceNodeResponse {
+    pub slot: u64,
+    pub block_root: [u8; 32],
+    pub parent_root: Option<[u8; 32]>,
+    pub justified_epoch: u64,
+    pub justified_root: [u8; 32],
+    pub finalized_epoch: u64,
+    pub finalized_root: [u8; 32],
+    pub unrealized_justified_epoch: Option<u64>,
+    pub unrealized_justified_root: Option<[u8; 32]>,
+    pub unrealized_finalized_epoch: Option<u64>,
+    pub unrealized_finalized_root: Option<[u8; 32]>,
+    pub execution_status: String,
+}
+
+fn fc_root(v: &serde_json::Value) -> Result<[u8; 32]> {
+    let s = v.as_str().context("root is not a string")?;
+    let bytes = hex::decode(s.trim_start_matches("0x")).context("root hex")?;
+    bytes.try_into().map_err(|_| anyhow::anyhow!("root is not 32 bytes"))
+}
+
+fn fc_u64(v: &serde_json::Value) -> Result<u64> {
+    match v {
+        serde_json::Value::String(s) => s.parse().context("u64 string"),
+        serde_json::Value::Number(n) => n.as_u64().context("u64 number"),
+        _ => anyhow::bail!("not a u64: {v}"),
+    }
+}
+
+impl BeaconApiClient {
+    pub async fn get_fork_choice_nodes(&self) -> Result<Vec<ForkChoiceNodeResponse>> {
+        let url = format!("{}/eth/v1/debug/fork_choice", self.base_url);
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
+        let nodes = resp["fork_choice_nodes"]
+            .as_array()
+            .context("missing fork_choice_nodes")?;
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            let x = &n["extra_data"];
+            let opt_u64 = |v: &serde_json::Value| -> Result<Option<u64>> {
+                if v.is_null() { Ok(None) } else { fc_u64(v).map(Some) }
+            };
+            let opt_root = |v: &serde_json::Value| -> Result<Option<[u8; 32]>> {
+                if v.is_null() { Ok(None) } else { fc_root(v).map(Some) }
+            };
+            out.push(ForkChoiceNodeResponse {
+                slot: fc_u64(&n["slot"])?,
+                block_root: fc_root(&n["block_root"])?,
+                parent_root: opt_root(&n["parent_root"])?,
+                justified_epoch: fc_u64(&n["justified_epoch"])?,
+                justified_root: fc_root(&x["justified_root"])?,
+                finalized_epoch: fc_u64(&n["finalized_epoch"])?,
+                finalized_root: fc_root(&x["finalized_root"])?,
+                unrealized_justified_epoch: opt_u64(&x["unrealized_justified_epoch"])?,
+                unrealized_justified_root: opt_root(&x["unrealized_justified_root"])?,
+                unrealized_finalized_epoch: opt_u64(&x["unrealized_finalized_epoch"])?,
+                unrealized_finalized_root: opt_root(&x["unrealized_finalized_root"])?,
+                execution_status: x["execution_status"].as_str().unwrap_or("").to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The RANDAO mix of `epoch` as held by state `state_id`.
+    pub async fn get_randao(&self, state_id: &str, epoch: u64) -> Result<[u8; 32]> {
+        let url = format!(
+            "{}/eth/v1/beacon/states/{}/randao?epoch={}",
+            self.base_url, state_id, epoch
+        );
+        let resp = checked_json(self.client.get(&url).send().await?).await?;
+        fc_root(&resp["data"]["randao"])
+    }
+}

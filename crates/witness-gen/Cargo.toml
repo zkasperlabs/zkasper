@@ -49,6 +49,7 @@ zkasper-fcr-types = { path = "../fcr-types" }
 zkasper-fcr-proof-guest = { path = "../fcr-proof-guest" }
 zkasper-fcr-verifier = { path = "../fcr-verifier" }
 zkasper-fcr-committee-guest = { path = "../fcr-committee-guest" }
+zkasper-fcr-rule-guest = { path = "../fcr-rule-guest" }
 zkasper-justification-guest = { path = "../justification-guest" }
 zkasper-finalization-guest = { path = "../finalization-guest" }
 zkasper-aggregation-guest = { path = "../aggregation-guest" }

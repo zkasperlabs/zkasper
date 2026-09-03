@@ -1,0 +1,21 @@
+[package]
+name = "zkasper-fcr-rule-guest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zkasper-fcr-rule-guest"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+zkasper-common = { path = "../common", default-features = false }
+serde = { workspace = true }
+bincode = { workspace = true }
+ziskos = { workspace = true }
+fast_confirmation = { git = "https://github.com/dapplion/lighthouse.git", branch = "fcr-core-guest" }
+
+[target.'cfg(not(target_os = "zkvm"))'.dependencies]
+sha2 = "0.10"
